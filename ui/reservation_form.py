@@ -270,8 +270,8 @@ class ReservationForm(ctk.CTkFrame):
         self.threads_slider = ctk.CTkSlider(
             self.threads_frame,
             from_=1,
-            to=50,
-            number_of_steps=49,
+            to=100,
+            number_of_steps=99,
             fg_color=theme.ELEVATED_COLOR,
             progress_color=theme.ACCENT_BLUE,
             button_color=theme.ACCENT_WHITE,
