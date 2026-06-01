@@ -78,8 +78,7 @@ class BaseEngine:
         self._last_error = ""
         self._lock = threading.Lock()
         self.submission_lock = threading.Lock()
-        self._log_buffer = []
-        self.flusher_stop = threading.Event()
+        self.listener_stop = threading.Event()
 
     def log(self, message, log_type='info'):
         # Discard trailing attempts/retries/errors after stop event is set to prevent logging after success or stop
@@ -100,11 +99,8 @@ class BaseEngine:
             if self.status_callback:
                 self.status_callback(self._attempt_count, error_part)
                 
-        with self._lock:
-            self._log_buffer.append((formatted_message, log_type))
-            
-        if log_type == 'success':
-            self.flush_logs()
+        if self.log_callback:
+            self.log_callback(formatted_message, log_type)
 
     def silent_tick(self, error_message):
         """Count an attempt without flooding the log. Only logs if error type is new."""
@@ -139,16 +135,11 @@ class BaseEngine:
         
         self.is_running = True
         self.stop_event.clear()
-        self.flusher_stop.clear()
+        self.listener_stop.clear()
         self.threads = []
         self.processes = []
         self._attempt_count = 0
         self._seen_errors = set()
-        
-        # Start Log Flusher Thread
-        self.flusher_thread = threading.Thread(target=self._log_flusher_loop, name="LogFlusherThread")
-        self.flusher_thread.daemon = True
-        self.flusher_thread.start()
         
         if is_async:
             self.multiprocess_stop_event = multiprocessing.Event()
@@ -242,21 +233,19 @@ class BaseEngine:
         for t in self.threads:
             t.join()
         self.is_running = False
-        self.flusher_stop.set()
-        self.flush_logs()
+        self.listener_stop.set()
         self.log("All booking threads have stopped.", "info")
         
     def _monitor_processes(self):
         for p in self.processes:
             p.join()
         self.is_running = False
-        self.flusher_stop.set()
-        self.flush_logs()
+        self.listener_stop.set()
         self.log("All booking processes have stopped.", "info")
 
     def _queue_listener(self):
         import queue
-        while self.is_running or not self.flusher_stop.is_set():
+        while self.is_running or not self.listener_stop.is_set():
             try:
                 item = self.log_queue.get(timeout=0.1)
                 itype = item[0]
@@ -278,24 +267,6 @@ class BaseEngine:
             except Exception:
                 break
 
-    def _log_flusher_loop(self):
-        while self.is_running or not self.flusher_stop.is_set():
-            self.flush_logs()
-            time.sleep(0.03)
-            
-    def flush_logs(self):
-        with self._lock:
-            if not self._log_buffer:
-                return
-            batch = list(self._log_buffer)
-            self._log_buffer.clear()
-            
-        if self.log_batch_callback:
-            self.log_batch_callback(batch)
-        elif self.log_callback:
-            for msg, ltype in batch:
-                self.log_callback(msg, ltype)
-
     def stop_reservation(self):
         if not self.is_running:
             self.log("Booking engine is not running.", "warning")
@@ -311,5 +282,4 @@ class BaseEngine:
             if p.is_alive():
                 p.terminate()
                 
-        self.flusher_stop.set()
-        self.flush_logs()
+        self.listener_stop.set()
