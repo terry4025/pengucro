@@ -1,0 +1,585 @@
+
+<!DOCTYPE html>
+<html>
+    <head>
+        <!-- Google Tag Manager -->
+        <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+        new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+        j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+        'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+        })(window,document,'script','dataLayer','GTM-WPV3SKZN');</script>
+        <!-- End Google Tag Manager -->
+        <meta charset="utf-8">
+        <meta name="viewport" content="initial-scale=1, width=device-width, maximum-scale=1, minimum-scale=1, user-scalable=no">
+        <meta property="og:image" content="https://d1kqa23lh2nxjx.cloudfront.net/download/preview_image.png">
+        <meta property="og:type" content="website"> 
+        <meta property="og:title" content="키이스케이프">
+	<meta property="og:description" content="새로운 경험을 설계하다, 키이스케이프 프리미엄 방탈출부터 브랜드, 교육/문화 체험 콘텐츠까지, 온/오프라인 몰입형 경험 기획의 새로운 기준을 만드는 곳.">
+        <meta property="og:url" content="">
+	<meta name="naver-site-verification" content="055fd7ec107a9d8284422b1b80dee0fe2bd22c64" />
+	<meta name="description" content="새로운 경험을 설계하다, 키이스케이프 프리미엄 방탈출부터 브랜드, 교육/문화 체험 콘텐츠까지, 온/오프라인 몰입형 경험 기획의 새로운 기준을 만드는 곳.">
+        <title>키이스케이프</title>
+        <link rel="shortcut icon" type="image/x-icon" href="img/icon.png">
+        <link rel="stylesheet" href="/css/style.css">
+        <link rel="stylesheet" href="/css/key-ui.css">
+        <link rel="stylesheet" href="/css/swiper.min.css" />
+        <link href="https://unpkg.com/aos@2.3.1/dist/aos.css" rel="stylesheet">
+        <link rel="stylesheet" href="https://unpkg.com/lenis@1.1.18/dist/lenis.css">        
+        <link rel="stylesheet" type="text/css" href="/css/subpage.css">        <script
+        src="https://code.jquery.com/jquery-3.7.1.min.js"
+        integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo="
+        crossorigin="anonymous"></script>
+        <script src="https://unpkg.com/aos@2.3.1/dist/aos.js"></script>
+        <script src="https://unpkg.com/lenis@1.1.18/dist/lenis.min.js"></script>
+    </head>
+    <body>
+        <!-- Google Tag Manager (noscript) -->
+        <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-WPV3SKZN"
+        height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+        <!-- End Google Tag Manager (noscript) -->
+        <header id="headerNav" class="">
+            <div class="navBar">
+                <button id="btnMenu"><img src="/img/btnMenu.png" class="icon"><span>MENU<span></button>
+                <a href="index.php"><img src="/img/icon.png" alt="KEYESCAPE" class="logo"></a>
+            </div>
+            <div class="nav_container">
+                <a href="about.php"><img src="/img/nav1.png" ></a>
+                <a href="works.php"><img src="/img/nav2.png" ></a>
+                <a href="reservation.php"><img src="/img/nav3.png" ></a>
+                <a href="keys.php"><img src="/img/nav4.png" ></a>
+                <a href="notice.php"><img src="/img/nav5.png" ></a>
+                <a href="recruit.php"><img src="/img/nav6.png" ></a>
+            </div>            
+                        <div class="navSub navSubResrv">
+                <a href="reservation_branch.php" class="btn_resv">찾아오시는 길</a>
+                <a href="reservation_view.php" class="btn_resv">예약 조회 및 취소</a>
+            </div>
+                    </header>      
+
+<style>
+    select#theme {
+        font-size: 0.8vw;
+    }
+    @media (max-width: 768px) {
+        select#theme {
+            font-size: 0.9em;
+        }
+    }
+</style>
+
+<section class="subpage reservation" id="resrvPage">
+    <h2 class="subTitle" data-aos="fade-up"><img src="/img/resrv_tit.png"></h2>
+    <input type="hidden" id="s3_front_url" value="https://d1kqa23lh2nxjx.cloudfront.net/" />
+    <!-- 예약시스템 Step1 -->
+    <div class="resrvStep step1">
+        <!-- 테마선택 -->
+        <div class="selectContainer innerStep">
+            <!--select name="resrvCategory">            
+                <option value="">방탈출게임</option>           
+            </select-->
+            <select name="zizum" id="zizum">
+                <option value="">지점 선택</option>
+                                <option value="26" >에버랜드</option>
+                                <option value="23" >후즈데어</option>
+                                <option value="22" >STATION</option>
+                                <option value="19" >LOG_IN 1</option>
+                                <option value="20" >LOG_IN 2</option>
+                                <option value="18" >메모리컴퍼니</option>
+                                <option value="16" >우주라이크</option>
+                                <option value="14" selected>더오름</option>
+                                <option value="3" >강남점</option>
+                                <option value="10" >홍대점</option>
+                                <option value="9" >부산점</option>
+                                <option value="7" >전주점</option>
+                                <option value="25" >무비무드</option>
+                                <option value="29" >무비무드 전주</option>
+                            </select>
+            <select name="theme" id="theme">
+                <option value="">테마 선택</option>      
+                                <option value="27" data-doing="7" data-themenum="51" selected>엔제리오</option>            
+                                <option value="26" data-doing="7" data-themenum="48" >네드</option>            
+                            </select> 
+        </div>
+        <!-- 테마설명 -->
+        <div class="main none">
+            <div class="column hasScrollbar">
+                <div class="info">                    
+                    <div class="step1_reserv_info">
+                        <img src="/img/noImage.png" class="themeImg">
+                        <div class="themeInfo2 mb">
+                            <h4 id="themeTitle"></h4>
+                            <div class="item">
+                                <p>
+                                    <strong>장르</strong>
+                                    <span id="themeGenre"></span>
+                                </p>
+                                <p>
+                                    <strong>플레이시간</strong>
+                                    <span id="themeTime"></span>
+                                </p>
+                                <p>
+                                    <strong>난이도</strong>
+                                    <span class="rate">
+                                        <img src="img/star_bk_0.svg">
+                                        <img src="img/star_bk_0.svg">
+                                        <img src="img/star_bk_0.svg">
+                                        <img src="img/star_bk_0.svg">
+                                        <img src="img/star_bk_0.svg">                                   
+                                    </span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    <table class="themeInfo">
+                        <tr>
+                            <th>매장 번호</th>
+                            <td id="phone">010-3776-6082</td>
+                        </tr>                      
+                        <tr>
+                            <th>계좌 번호</th>
+                            <td id="bank">신한은행: 140-015-479226 더오름(주) </td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="description hasScrollbar" data-lenis-prevent-wheelf>
+                    <pre id="memo">해당테마의 시놉시스는 매장에서 확인가능합니다.
+
+
+
+※ 활동성이 높은 테마입니다.
+테마 내부에서 발생한 의류/ 신발의 오염에 대한 보상이 불가하오니, 편한 복장/ 운동화 착용을 권장합니다. 
+(구두/ 치마 비추천)
+(매장에 일부 사이즈 실내화가 구비되어 있습니다.)
+
+※ 2인부터 플레이 가능하시나, 적정 인원은 3인이상입니다.
+
+1)난이도: 4
+2) 시간: 70분
+3) 금액(최소 2인)
+1인 27,000원</pre>    
+                </div>
+            </div>
+        </div>
+
+        <!-- 예약시스템 -->
+        <div class="reservationPick none">
+            <div class="column datepicker" style="display: block;" id="datepicker">                              
+            </div>
+            <form method="post" id="form" action="reservation2.php" enctype="multipart/form-data">
+                <input type="hidden" name="zizumNum" value="">
+                <input type="hidden" name="themeNum" value="">
+                <input type="hidden" name="themeInfoNum" value="">
+                <input type="hidden" name="revDays" value="">
+                <input type="hidden" name="themeTimeNum" value="">
+                <input type="hidden" name="revTimes" value="">
+                <input type="hidden" name="themeName" value="">
+                            </form>            
+            <input type="text" class="reservInfo none small" id="reservInfo" readonly value="" style="display: block;">
+            <button class="btn_next_step">NEXT</button>
+        </div>
+
+        <!-- 현제스텝표시 -->
+        <div class="stepList none">
+            <div class="step active">
+                <h5>STEP 1.</h5>
+                테마 및 날짜<br>선택
+            </div>
+            <span><img src="/img/step_arrow.svg"></span>
+            <div class="step">
+                <h5>STEP 2.</h5>
+                정보 입력 및 <br>결제
+            </div>
+            <span><img src="/img/step_arrow.svg"></span>
+            <div class="step">
+                <h5>STEP 3.</h5>
+                예약 완료
+            </div>
+        </div>
+    </div>
+</section>
+
+        <!-- footer -->
+        <footer class="">
+            <img src="/img/logo_footer.png" class="logo_footer">
+            상호: KEYESCAPE<br>
+            주소: 서울특별시 강남구 강남대로 114길 16 4층<br>
+            Email: contact@keyescape.com<br>
+            통신판매신고번호: 제 2018-서울강남-02342호<br>
+            Copyright ⓒ KEYESCAPE. All rights reserved.
+        </footer>
+        <!-- footer end -->  
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.11.5/gsap.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.11.5/ScrollTrigger.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.1/ScrollToPlugin.min.js"></script>
+        <script src="/js/script.js"></script>        
+        <script src="/js/key-ui.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/devtools-detector/2.0.22/devtools-detector.min.js"></script>
+                <script>            
+            (function() {
+                const blockDevTools = () => {
+                    // Redirect or block content when dev tools are detected
+                    document.body.innerHTML = '<div style="position:fixed; top:0; left:0; width:100%; height:100%; background:black; color:white; z-index:999999; display:flex; align-items:center; justify-content:center; text-align:center; font-size:24px;">개발자 도구 사용이 금지되어 있습니다.</div>';
+                };
+
+                // Block context menu for all devices
+                document.addEventListener('contextmenu', function(e) {
+                    e.preventDefault();
+                });
+
+                // 1. Add listener
+                devtoolsDetector.addListener((isOpen) => {
+                    if (isOpen) {
+                        blockDevTools();
+                    }
+                });
+
+                // 2. Launch detection
+                devtoolsDetector.launch();
+
+
+                // Block key combinations for dev tools
+                document.onkeydown = function(e) {
+                    if (
+                        e.keyCode === 123 || // F12
+                        (e.ctrlKey && e.shiftKey && (e.keyCode === 'I'.charCodeAt(0) || e.keyCode === 'J'.charCodeAt(0) || e.keyCode === 'C'.charCodeAt(0))) || // Ctrl+Shift+I/J/C
+                        (e.ctrlKey && e.keyCode === 'U'.charCodeAt(0)) // Ctrl+U
+                    ) {
+                        e.preventDefault();
+                        blockDevTools();
+                        return false;
+                    }
+                };
+            })();            
+        </script>
+        </body>
+    <!-- 로딩바 -->
+    <div id="mask" class="hide">
+        <img src="/img/ajax-loader.gif" alt="loading" id="loadingImg"/>
+    </div-->
+    <!-- 로딩바 끝-->
+</html><script src="/js/moment.js"></script>
+<script>  
+    let setDate = new Date();
+    let setYear = setDate.getFullYear();
+    let setMonth = ('0' + (setDate.getMonth() + 1)).slice(-2);
+    let zizumNum = '';
+    let themeNum = '';
+    let revDays = '';
+    let themeTimeNum = '';
+    let themeName = '';
+    let themeInfoNum = '';
+    let themeData = [];
+    let calendarHtml = '';
+    let timeTableHtml = '';
+    let doing = 0;
+    $(document).ready(function () {
+        let _themeNum = $('#theme').find("option:selected").data('themenum');
+        let _doing = $('#theme').find("option:selected").data('doing');
+        let _themeInfoNum = $('#theme').val();
+        let _zizumNum = $('#zizum').val();
+
+        if (_themeInfoNum != '' && _doing != '' && _themeInfoNum != '' && _themeInfoNum != null) {
+            zizumNum = _zizumNum;
+            getThemeHtml(_themeNum, _doing, _themeInfoNum);
+        }
+
+        //zizum
+        $(document).on('change','#zizum',function(e) {
+            themeNum = '';
+            
+            revDays = '';
+            themeTimeNum = '';
+
+            $('#themeTitle').text('');
+            $('#themeGenre').text('');
+            $('#themeTime').text('');            
+            $('.rate').html('<img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg">');
+        
+            $('.themeImg').attr('src', '/img/noImage.png');
+            $('select[name=theme]').html('<option value="">테마 선택</option>');               
+            $('.reservationPick').addClass('none');
+            $('.stepList').addClass('none');    
+            if ($(this).val() == '') {     
+                $('.main').addClass('none');          
+                return false;
+            } 
+            loading_bar();            
+            $('#reservInfo').addClass('none');  
+            zizumPhone = $(this).find("option:selected").data('phone');
+            zizumNum = $(this).val();        
+            $.post('/controller/run_proc.php', {           
+                't': 'get_theme_info_list',          
+                'zizum_num' : $(this).val()
+            }, function (data) {
+                if(data.status)
+                {
+                    $('#phone').text(data?.zizum?.phone);
+                    $('#bank').text(data?.zizum?.bank);
+                    $('#memo').html(data?.zizum?.doc_1);
+                    var html = '<option value="">테마 선택</option>';
+                    $.each(data.data, function (index, item) {
+                        html += '<option value="'+item?.info_num+'" data-doing="'+item?.doing+'" data-themenum="'+item?.theme_num+'">'+item?.info_name+'</option>';
+                    });
+                    $('select[name=theme]').html(html);                
+                    $('.main').removeClass('none');          
+                }
+                $('#mask').hide();
+                return false;
+            },'json');    
+        }); 
+
+        //theme
+        $(document).on('change','#theme',function(e) {
+            themeNum = '';
+            themeInfoNum = '';
+            revDays = '';
+            themeTimeNum = '';
+            if ($(this).val() == '') {
+                $('#themeTitle').text('');
+                $('#themeGenre').text('');
+                $('#themeTime').text('');
+                $('.rate').html('<img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg">');
+
+                $('.reservationPick').addClass('none');
+                $('.stepList').addClass('none');
+                $('.themeImg').attr('src', '/img/noImage.png');
+                return false;
+            }
+            // 달력 날짜를 현재 월로 초기화
+            let resetDate = new Date();
+            setYear = resetDate.getFullYear();
+            setMonth = ('0' + (resetDate.getMonth() + 1)).slice(-2);
+
+            let _themeNum = $(this).find("option:selected").data('themenum');
+            let _doing = $(this).find("option:selected").data('doing');
+            let _themeInfoNum = $(this).val();
+            getThemeHtml(_themeNum, _doing, _themeInfoNum);
+        });
+
+        $(document).on('click','.change-month',function(e) {
+            if ($(this).data('num') == '') {
+                return false;
+            }
+            loading_bar();
+            let num = $(this).data('num');
+            setMonth = (parseInt(setMonth) + parseInt(num)) < 10 ? '0'+(parseInt(setMonth) + parseInt(num)) : (parseInt(setMonth) + parseInt(num));
+            if (setMonth > 12) {
+                setMonth = '01';
+                setYear++;
+            } else if (setMonth < 1) {
+                setMonth = 12;
+                setYear--;
+            }     
+            $.post('/controller/run_proc.php', {
+                't': 'get_caledar_data',            
+                'year': setYear,
+                'month': setMonth
+            }, function (data) {
+                if (data.status) {
+                    calendarHtml = generateDatepickerHtml(data.calendarData?.days_in_month, data.calendarData?.first_day_of_month, doing);
+                    $('#datepicker').html(calendarHtml);
+                }
+                $('#mask').hide();
+            }, 'json');    
+        });
+
+        $(document).on('click','.selDate',function(e) {
+            if ($(this).hasClass('disabled')) {
+                return false;
+            }
+            if (zizumNum == '' || themeNum == '') {
+                alert('지점과 테마를 선택해주세요.');
+                return false;
+            }
+            loading_bar();        
+            $('#reservInfo').addClass('none');
+            revDays = $(this).data('date');
+            $.post('/controller/run_proc.php', {
+                't': 'get_theme_time',            
+                'date': revDays,
+                'zizumNum': zizumNum,
+                'themeNum': themeNum,
+                'endDay': $(this).hasClass('endDay') ? 1 : 0
+            }, function (data) {
+                if (!data.status) {
+                    alert(data?.msg);
+                } else {
+                    $('#info_text').html(themeName + '<br>' + revDays);
+                    timeTableHtml = generateTimeList(data?.data);
+                    $('#datepicker').removeClass('datepicker');
+                    $('#datepicker').addClass('timepicker');
+                    $('#datepicker').html(timeTableHtml);
+                }
+                $('#mask').hide();
+            }, 'json');    
+        });
+
+        $(document).on('click','#back_btn',function(e) {  
+            $('#datepicker').removeClass('timepicker');
+            $('#datepicker').addClass('datepicker');
+            $('#datepicker').html(calendarHtml);
+        });
+
+        $(document).on('click','.selThemeTimeNum',function(e) {
+            themeTimeNum = $(this).val();
+            $('#reservInfo').val(themeName + ' - ' + revDays.replace(/-/g, '.') + ' - ' + $(this).next().text());
+            $('#form input[name=revTimes]').val($(this).next().text());
+            $('#form input[name=themeName]').val(themeName);
+            $('#reservInfo').removeClass('none');
+            $('#info_text').html(themeName + '<br>' + revDays + '<br>' + $(this).next().text());
+        }); 
+
+        $(document).on('click','.btn_next_step',function(e) {  
+            if(revDays == '' || themeTimeNum == '') {
+                alert('날짜와 시간을 선택해주세요.');
+                return false;
+            }
+            if(zizumNum == '' || themeNum == '') {
+                alert('지점과 테마를 선택해주세요.');
+                return false;
+            }
+            $('#form input[name=zizumNum]').val(zizumNum);
+            $('#form input[name=themeNum]').val(themeNum);
+            $('#form input[name=themeInfoNum]').val(themeInfoNum);
+            $('#form input[name=revDays]').val(revDays);
+            $('#form input[name=themeTimeNum]').val(themeTimeNum);
+            $('#form').submit();
+        });          
+    });
+    function generateDatepickerHtml(days_in_month, first_day_of_month, doing) {
+        let toDay = new Date();;
+        let currDay = toDay.getFullYear() + '-' + ('0' + (toDay.getMonth() + 1)).slice(-2) + '-' + toDay.getDate();    
+        let highlightDay = new Date();
+        let toDayObj = moment().startOf('day').toDate();
+        highlightDay.setDate(toDay.getDate() + ((doing-1) > 0 ? (doing-1) : 0));
+        let highlightDayObj = moment(highlightDay).startOf('day').toDate();
+        highlightDay = highlightDay.getFullYear() + '-' + ('0' + (highlightDay.getMonth() + 1)).slice(-2) + '-' + highlightDay.getDate();
+        
+        let html = '<div class="datepicker-ui">';
+        html += '<div class="datepicker-header">';
+        html += '<button class="prev-month change-month" data-num="-1">◀</button>';
+        html += '<span class="current-month-year">'+setYear+'년 '+setMonth+'월</span>';
+        html += '<button class="next-month change-month" data-num="+1">▶</button>';
+        html += '</div>';
+        html += '<table class="datepicker-calendar"><thead><tr>';
+        const daysOfWeek = ['일', '월', '화', '수', '목', '금', '토'];
+        
+        for (let day of daysOfWeek) {
+            html += `<th>${day}</th>`;
+        }
+        html += '</tr></thead><tbody><tr>';
+
+        let day = 1;
+        for (let i = 0; i < first_day_of_month; i++) {
+            html += '<td></td>';
+        }
+        
+        for (let i = first_day_of_month; i < 7; i++) {
+            let date = `${setMonth}-${day < 10 ? '0' + day : day}`;
+            //let dateObj = new Date(`${setYear}-${date}`);
+            let dateObj =  moment(`${setYear}-${date}`).startOf('day').toDate();
+            //let toDayObj = new Date(toDay.toLocaleDateString());
+            //let highlightDayObj = new Date(highlightDay);
+            let className = (i === 0 ? ' sun' : (i === 6 ? ' sat' : '')) + ((dateObj >= toDayObj && dateObj <= highlightDayObj) ? ' available' : ' disabled');
+            className += (highlightDayObj.toLocaleDateString() == dateObj.toLocaleDateString()) ? ' endDay' : '';
+            html += `<td class="selDate ${className}" data-date="${setYear}-${date}">${day}</td>`;
+            day++;
+        }
+        html += '</tr>';
+
+        while (day <= days_in_month) {
+            html += '<tr>';
+            for (let i = 0; i < 7 && day <= days_in_month; i++) {
+                let date = `${setMonth}-${day < 10 ? '0' + day : day}`;
+                //let dateObj = new Date(`${setYear}-${date}`);
+                let dateObj =  moment(`${setYear}-${date}`).startOf('day').toDate();
+                //let toDayObj = new Date(toDay.toLocaleDateString()); 
+                //let highlightDayObj = new Date(highlightDay);
+                let className = (i === 0 ? ' sun' : (i === 6 ? ' sat' : '')) + ((dateObj >= toDayObj && dateObj <= highlightDayObj) ? ' available' : ' disabled');
+                className += (highlightDayObj.toLocaleDateString() == dateObj.toLocaleDateString()) ? ' endDay' : '';
+                html += `<td class="selDate ${className}" data-date="${setYear}-${date}">${day}</td>`;
+                day++;
+            }
+            html += '</tr>';
+        }
+        html += '</tbody></table></div>';
+        return html;
+    }
+
+    function getThemeHtml(_themenum, _doing, _themeInfoNum) {
+        loading_bar();            
+        $('#reservInfo').addClass('none');       
+        doing = _doing;
+        themeNum = _themenum;
+        themeInfoNum = _themeInfoNum;
+        $.post('/controller/run_proc.php', {           
+            't': 'get_theme_date',          
+            'num' : themeInfoNum
+        }, function (data) {
+            if(data.status)
+            {
+                //테마 세팅
+                $('#memo').html(data.data.memo);                
+                $('.step1').removeClass('none');
+                $('.themeImg').attr('src', data?.data?.image_url);                
+                themeName = data.data.name;    
+                //모바일 테마 정보
+                $('#themeTitle').text(themeName);
+                $('#themeGenre').text(data.data.genre);
+                $('#themeTime').text(data.data.play_time +'분');
+                let rate = (data?.data?.level > 0) ? (data.data.level) : 0;                
+                let start_img = '';
+                if(rate > 0) {
+                    for (let i = 1; i <= 5; i++) {
+                        if (rate >= i) {
+                            start_img += '<img src="img/star_bk_2.svg">';
+                        } else if (rate >= (i - 0.5)) {
+                            start_img += '<img src="img/star_bk_1.svg">';
+                        } else {
+                            start_img += '<img src="img/star_bk_0.svg">';
+                        }
+                    }
+                } else {
+                    start_img = '<img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg"><img src="img/star_bk_0.svg">';
+                }     
+                $('.rate').html(start_img);                
+                //달력 세팅
+                calendarHtml = generateDatepickerHtml(data.calendarData?.days_in_month, data.calendarData?.first_day_of_month, doing);                
+                $('#datepicker').removeClass('timepicker');
+                $('#datepicker').addClass('datepicker');
+                $('#datepicker').html(calendarHtml);
+            }
+            $('.main').removeClass('none');
+            $('.reservationPick').removeClass('none');
+            $('.stepList').removeClass('none');
+            $('#mask').hide();    
+        },'json');
+        return false;
+    }
+
+    function generateTimeList(rev_data) {
+        let timeListHtml = '';
+        timeListHtml += '<div class="timepicker-ui hasScrollbar" data-lenis-prevent-wheel" style="display: block;">';
+        timeListHtml += '<div class="timepicker-header">';
+        timeListHtml += '<button class="icon" id="back_btn"><img src="img/arr_back.png"></button>';
+        timeListHtml += '<span>시간</span>';
+        timeListHtml += '<button class="icon"></button>';
+        timeListHtml += '</div>';
+        timeListHtml += '<ul class="timeList">';
+        rev_data.forEach(function (item) {
+            let time = item.hh + ':' + item.mm;
+            let disabled = item.enable === 'N' ? 'disabled' : '';              
+            timeListHtml += `
+                <li>
+                    <label>
+                        <input type="radio" class="selThemeTimeNum" name="themeTimeNum" value="${item.num}" ${disabled}>
+                        <span>${time}${item?.sale_txt}</span>
+                    </label>
+                </li>
+            `;
+        });
+        timeListHtml += '</ul></div>';
+        return timeListHtml;
+    }
+</script>
