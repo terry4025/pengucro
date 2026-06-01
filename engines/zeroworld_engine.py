@@ -85,14 +85,20 @@ class ZeroWorldEngine(BaseEngine):
         import aiohttp
         import asyncio
         import json
-        from bs4 import BeautifulSoup
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        session = None
+        csrf_token = None
         
-        async with aiohttp.ClientSession(headers=headers) as session:
-            csrf_token = None
+        if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
+            session, csrf_token = self.session_pool[task_idx]
+            
+        if not session:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            session = aiohttp.ClientSession(headers=headers)
+            
+        try:
             while not self.stop_event.is_set():
                 try:
                     if not csrf_token:
@@ -146,6 +152,9 @@ class ZeroWorldEngine(BaseEngine):
                     csrf_token = None
                     self.log(f"{time_slot} 시도 중... (연결 오류 - 재시도)", "info")
                     await asyncio.sleep(0.1)
+        finally:
+            if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
+                await session.close()
 
     async def get_csrf_token_async(self, session):
         async with session.get(self.site_url) as resp:
@@ -161,3 +170,32 @@ class ZeroWorldEngine(BaseEngine):
             'X-CSRF-TOKEN': csrf_token
         }
         return await session.post(self.site_url, json=reservation_data, headers=headers)
+
+    async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
+        import aiohttp
+        import asyncio
+        self.log(f"Pre-fetching {num_sessions} sessions and CSRF tokens...", "info")
+        
+        self.session_pool = []
+        
+        async def fetch_one(idx):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            session = aiohttp.ClientSession(headers=headers)
+            try:
+                csrf = await self.get_csrf_token_async(session)
+                return session, csrf
+            except Exception as e:
+                await session.close()
+                self.log(f"Pre-fetch session {idx} failed: {e}", "warning")
+                return None
+                
+        tasks = [fetch_one(i) for i in range(num_sessions)]
+        results = await asyncio.gather(*tasks)
+        
+        for res in results:
+            if res:
+                self.session_pool.append(res)
+                
+        self.log(f"Pre-fetched {len(self.session_pool)}/{num_sessions} sessions successfully.", "info")

@@ -787,6 +787,9 @@ class MainWindow(ctk.CTk):
                 success_callback=self._on_booking_success
             )
 
+        self.active_engine.status_callback = self._on_engine_status_update
+        self.active_engine.log_batch_callback = self._on_engine_log_batch
+
         # Clear any leftover logs in the queue before starting
         with self.log_queue_lock:
             self.log_queue.clear()
@@ -833,6 +836,23 @@ class MainWindow(ctk.CTk):
         if not self.is_flusher_running:
             self.is_flusher_running = True
             self.after(0, self._flush_logs)
+
+    def _on_engine_log_batch(self, batch):
+        with self.log_queue_lock:
+            self.log_queue.extend(batch)
+            
+        if not self.is_flusher_running:
+            self.is_flusher_running = True
+            self.after(0, self._flush_logs)
+
+    def _on_engine_status_update(self, attempt_count, last_error):
+        self.attempt_count = attempt_count
+        if self.current_status == "running":
+            self.after(0, lambda: self.status_badge.configure(
+                text=f"● 동작 중 (시도: {attempt_count}회)",
+                text_color=theme.TEXT_DARK,
+                fg_color=theme.ACCENT_YELLOW
+            ))
 
     def _flush_logs(self):
         batch = []
