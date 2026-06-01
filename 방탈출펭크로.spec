@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출예약',
+    name='방탈출펭크로',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

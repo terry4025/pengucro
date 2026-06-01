@@ -20,7 +20,7 @@ class LogPanel(ctk.CTkFrame):
             header_frame,
             text="● TERMINAL LOGS",
             font=(theme.FONT_FAMILY, 11, "bold"),
-            text_color=theme.ACCENT_BLUE
+            text_color=theme.TEXT_PRIMARY
         )
         self.header_label.pack(side="left")
 
@@ -68,7 +68,7 @@ class LogPanel(ctk.CTkFrame):
 
         # Configure tags for color logging
         self.textbox.configure(state="normal")
-        self.textbox._textbox.tag_config("info", foreground=theme.ACCENT_BLUE)
+        self.textbox._textbox.tag_config("info", foreground=theme.TEXT_PRIMARY)
         self.textbox._textbox.tag_config("success", foreground=theme.ACCENT_GREEN)
         self.textbox._textbox.tag_config("error", foreground=theme.ACCENT_RED)
         self.textbox._textbox.tag_config("warning", foreground=theme.ACCENT_YELLOW)
