@@ -83,29 +83,19 @@ def make_reservation(reservation_data, stop_event):
         try:
             csrf_token = get_csrf_token(session)
 
-            step1_response = submit_time_selection(session, csrf_token, reservation_data)
-
-            if step1_response.status_code == 200:
-                soup = BeautifulSoup(step1_response.text, 'html.parser')
-                meta_csrf = soup.find('meta', {'name': 'csrf-token'})
-                if meta_csrf:
-                    csrf_token = meta_csrf['content']
-
+            if stop_event.is_set():
+                break
+            with submission_lock:
                 if stop_event.is_set():
                     break
-                with submission_lock:
-                    if stop_event.is_set():
-                        break
-                    step2_response = submit_reservation(session, csrf_token, reservation_data)
+                step2_response = submit_reservation(session, csrf_token, reservation_data)
 
-                    if step2_response.status_code == 200:
-                        print('Success:', step2_response.text[:200])
-                        stop_event.set()
-                        break
-                    else:
-                        handle_error(step2_response, reservation_data, '최종예약')
-            else:
-                handle_error(step1_response, reservation_data, '시간선택')
+                if step2_response.status_code == 200 or step2_response.status_code == 201:
+                    print('Success:', step2_response.text[:200])
+                    stop_event.set()
+                    break
+                else:
+                    handle_error(step2_response, reservation_data, '최종예약')
 
         except Exception as e:
             print(f'Error (time slot {reservation_data["reservationTime"]}): {str(e)}')
