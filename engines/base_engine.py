@@ -4,46 +4,54 @@ from datetime import datetime
 import multiprocessing
 
 def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, stop_event, log_queue, success_event):
-    import asyncio
-    import sys
-    from engines.zeroworld_engine import ZeroWorldEngine
-    from engines.jigubyeol_engine import JigubyeolEngine
-    
-    classes = {
-        'ZeroWorldEngine': ZeroWorldEngine,
-        'JigubyeolEngine': JigubyeolEngine
-    }
-    
-    engine_class = classes[engine_class_name]
-    
-    def child_log(message, log_type='info'):
-        log_queue.put(('log', message, log_type))
-        if "시도 중" in message:
-            error_part = "재시도"
-            if "시도 중... (" in message:
-                error_part = message.split("시도 중... (")[1].rstrip(")")
-            log_queue.put(('tick', 1, error_part))
-            
-    def child_success():
-        success_event.set()
-        log_queue.put(('success',))
-        
-    if engine_class_name == 'ZeroWorldEngine':
-        engine = engine_class(site_url, child_log, child_success)
-    else:
-        engine = engine_class(child_log, child_success, site_url)
-        
-    engine.stop_event = stop_event
-    engine.is_running = True
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(engine.run_async_tasks(reservation_data, num_tasks))
+        import asyncio
+        import sys
+        from engines.zeroworld_engine import ZeroWorldEngine
+        from engines.jigubyeol_engine import JigubyeolEngine
+        
+        classes = {
+            'ZeroWorldEngine': ZeroWorldEngine,
+            'JigubyeolEngine': JigubyeolEngine
+        }
+        
+        engine_class = classes[engine_class_name]
+        
+        def child_log(message, log_type='info'):
+            log_queue.put(('log', message, log_type))
+            if "시도 중" in message:
+                error_part = "재시도"
+                if "시도 중... (" in message:
+                    error_part = message.split("시도 중... (")[1].rstrip(")")
+                log_queue.put(('tick', 1, error_part))
+                
+        def child_success():
+            success_event.set()
+            log_queue.put(('success',))
+            
+        if engine_class_name == 'ZeroWorldEngine':
+            engine = engine_class(site_url, child_log, child_success)
+        else:
+            engine = engine_class(child_log, child_success, site_url)
+            
+        engine.stop_event = stop_event
+        engine.is_running = True
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(engine.run_async_tasks(reservation_data, num_tasks))
+        except Exception as e:
+            child_log(f"Child process async loop error: {e}", "error")
+        finally:
+            loop.close()
     except Exception as e:
-        child_log(f"Child process async loop error: {e}", "error")
-    finally:
-        loop.close()
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            log_queue.put(('log', f"CRITICAL Child Process Boot Error: {e}\n{tb}", "error"))
+        except Exception:
+            pass
 
 class BaseEngine:
     def __init__(self, log_callback, success_callback=None, status_callback=None, log_batch_callback=None):
