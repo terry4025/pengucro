@@ -285,6 +285,34 @@ class ReservationForm(ctk.CTkFrame):
         self.threads_slider.set(30)
         self.threads_slider.pack(side="right", fill="x", expand=True, padx=(12, 0))
 
+        # -------------------------------------------------------------
+        # Row 7: Booking Method (Sync/Async)
+        # -------------------------------------------------------------
+        self.engine_mode_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.engine_mode_frame.grid(row=7, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
+
+        self.engine_mode_label = ctk.CTkLabel(
+            self.engine_mode_frame,
+            text="예약 방식",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE
+        )
+        self.engine_mode_label.pack(side="left", anchor="w")
+
+        self.engine_mode_btn = ctk.CTkSegmentedButton(
+            self.engine_mode_frame,
+            values=["일반 (Sync)", "고속 (Async)"],
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.ELEVATED_COLOR,
+            selected_color=theme.ACCENT_BLUE,
+            selected_hover_color=theme.ACCENT_BLUE,
+            text_color=theme.TEXT_PRIMARY,
+            corner_radius=theme.ROUNDED_MD,
+            height=28
+        )
+        self.engine_mode_btn.set("일반 (Sync)")
+        self.engine_mode_btn.pack(side="right", fill="x", expand=False)
+
         # Initialize layout
         self.set_site(self.current_site)
 
@@ -407,15 +435,15 @@ class ReservationForm(ctk.CTkFrame):
 
         # Validation
         if not theme_pk:
-            return None, "테마를 선택하거나 테마 PK를 입력해주세요.", 0
+            return None, "테마를 선택하거나 테마 PK를 입력해주세요.", 0, False
         if not date:
-            return None, "예약 날짜를 입력해주세요.", 0
+            return None, "예약 날짜를 입력해주세요.", 0, False
         if not time_str:
-            return None, "예약 시간을 입력해주세요.", 0
+            return None, "예약 시간을 입력해주세요.", 0, False
         if not name:
-            return None, "예약자 이름을 입력해주세요.", 0
+            return None, "예약자 이름을 입력해주세요.", 0, False
         if not phone:
-            return None, "전화번호를 입력해주세요.", 0
+            return None, "전화번호를 입력해주세요.", 0, False
 
         res_data = {
             'branch': branch_id,
@@ -429,7 +457,8 @@ class ReservationForm(ctk.CTkFrame):
             'policy': 'true'
         }
 
-        return res_data, None, threads
+        is_async = (self.engine_mode_btn.get() == "고속 (Async)")
+        return res_data, None, threads, is_async
 
     def _format_phone(self, event=None):
         if event and event.keysym in ("BackSpace", "Delete", "Left", "Right", "Up", "Down"):
@@ -586,6 +615,10 @@ class ReservationForm(ctk.CTkFrame):
             if "threads" in config:
                 self.threads_slider.set(config["threads"])
                 self.threads_value_label.configure(text=str(config["threads"]))
+
+            if "is_async" in config:
+                val = "고속 (Async)" if config["is_async"] else "일반 (Sync)"
+                self.engine_mode_btn.set(val)
         except Exception:
             pass
 
@@ -605,7 +638,8 @@ class ReservationForm(ctk.CTkFrame):
                 "name": self.name_entry.get().strip(),
                 "phone": self.phone_entry.get().strip(),
                 "people": self.people_entry.get().strip(),
-                "threads": int(self.threads_slider.get())
+                "threads": int(self.threads_slider.get()),
+                "is_async": (self.engine_mode_btn.get() == "고속 (Async)")
             }
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)

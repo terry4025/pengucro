@@ -149,3 +149,159 @@ class JigubyeolEngine(BaseEngine):
             self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대이거나 결제수단 오류 - 재시도)", "info")
         else:
             self.log(f"{time_slot} 시도 중... ({error_message}, 재시도)", "info")
+
+    async def make_reservation_async_task(self, reservation_data, task_idx):
+        import aiohttp
+        import asyncio
+        from bs4 import BeautifulSoup
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            csrf_token = None
+            while not self.stop_event.is_set():
+                try:
+                    if not csrf_token:
+                        csrf_token = await self.get_csrf_token_async(session)
+                    
+                    step1_response = await self.submit_time_selection_async(session, csrf_token, reservation_data)
+                    
+                    if step1_response.status == 419:
+                        csrf_token = None
+                        continue
+                    
+                    if step1_response.status == 200:
+                        text = await step1_response.text()
+                        soup = BeautifulSoup(text, 'html.parser')
+                        meta_csrf = soup.find('meta', {'name': 'csrf-token'})
+                        if meta_csrf:
+                            csrf_token = meta_csrf['content']
+                        
+                        # Parse payment method
+                        payment_method = '1'
+                        pm_inputs = soup.find_all('input', {'name': 'payment_method'})
+                        if pm_inputs:
+                            checked_pm = next((i for i in pm_inputs if i.get('checked') is not None), None)
+                            if checked_pm:
+                                payment_method = checked_pm.get('value', '1')
+                            else:
+                                payment_method = pm_inputs[0].get('value', '1')
+                                
+                        if self.stop_event.is_set():
+                            break
+                            
+                        async with self.async_submission_lock:
+                            if self.stop_event.is_set():
+                                break
+                            step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
+                            
+                            if step2_response.status == 419:
+                                csrf_token = None
+                                continue
+                                
+                            if step2_response.status in (200, 201):
+                                resp_text = await step2_response.text()
+                                self.log(f"Success: {resp_text[:200]}", "success")
+                                self.stop_event.set()
+                                if self.success_callback:
+                                    self.success_callback()
+                                break
+                            else:
+                                await self.handle_error_async(step2_response, reservation_data, '최종예약')
+                    else:
+                        await self.handle_error_async(step1_response, reservation_data, '시간선택')
+                except Exception as e:
+                    csrf_token = None
+                    self.log(f"{reservation_data['reservationTime'][:5]} 시도 중... (연결 오류 - 재시도)", "info")
+                    await asyncio.sleep(0.1)
+
+    async def get_csrf_token_async(self, session):
+        async with session.get(f'{self.base_url}/reservation') as resp:
+            text = await resp.text()
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(text, 'html.parser')
+            csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
+            return csrf_token
+
+    async def submit_time_selection_async(self, session, csrf_token, reservation_data):
+        time_val = reservation_data['reservationTime']
+        if len(time_val) == 8 and time_val.endswith(':00'):
+            time_val = time_val[:5]
+            
+        form_data = {
+            'branch': reservation_data['branch'],
+            'theme': reservation_data['themePK'],
+            'date': reservation_data['reservationDate'],
+            'time': time_val,
+            '_token': csrf_token,
+        }
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': f'{self.base_url}/reservation',
+            'Origin': self.base_url,
+        }
+        
+        return await session.post(f'{self.base_url}/reservation/create', data=form_data, headers=headers)
+
+    async def submit_reservation_async(self, session, csrf_token, reservation_data, payment_method):
+        time_val = reservation_data['reservationTime']
+        if len(time_val) == 8 and time_val.endswith(':00'):
+            time_val = time_val[:5]
+            
+        form_data = {
+            'branch': reservation_data['branch'],
+            'theme': reservation_data['themePK'],
+            'date': reservation_data['reservationDate'],
+            'time': time_val,
+            'name': reservation_data['name'],
+            'phone': reservation_data['phone'],
+            'people': reservation_data['people'],
+            'payment_method': payment_method,
+            'policy': 'on',
+            '_token': csrf_token,
+        }
+        
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-TOKEN': csrf_token,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Referer': f'{self.base_url}/reservation/create',
+            'Origin': self.base_url,
+        }
+        
+        endpoint = f'{self.base_url}/reservation'
+        if payment_method != '1':
+            endpoint = f'{self.base_url}/reservation/payment'
+            
+        return await session.post(endpoint, data=form_data, headers=headers)
+
+    async def handle_error_async(self, response, reservation_data, step_name):
+        import json
+        time_slot = reservation_data['reservationTime'][:5]
+        try:
+            decoded_text = await response.text()
+        except Exception:
+            decoded_text = str(response)
+            
+        try:
+            error_data = json.loads(decoded_text)
+            if 'Message' in error_data:
+                error_message = error_data['Message']
+            elif 'message' in error_data:
+                error_message = error_data['message']
+            else:
+                error_message = decoded_text[:200]
+        except Exception:
+            error_message = decoded_text[:200]
+            
+        if "이미 예약" in error_message:
+            self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대, 해당 시간대 예약이 다시 열릴때까지 재시도)", "info")
+        elif "결제 수단" in error_message or "결제수단" in error_message:
+            self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대이거나 결제수단 오류 - 재시도)", "info")
+        else:
+            self.log(f"{time_slot} 시도 중... ({error_message}, 재시도)", "info")

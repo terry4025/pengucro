@@ -60,7 +60,10 @@ class BaseEngine:
     def make_reservation_thread(self, reservation_data):
         raise NotImplementedError("Subclasses must implement make_reservation_thread")
 
-    def start_reservation(self, reservation_data, num_threads):
+    async def make_reservation_async_task(self, reservation_data, task_idx):
+        raise NotImplementedError("Subclasses must implement make_reservation_async_task")
+
+    def start_reservation(self, reservation_data, num_threads, is_async=False):
         if self.is_running:
             self.log("Booking engine is already running.", "warning")
             return
@@ -69,22 +72,53 @@ class BaseEngine:
         self.stop_event.clear()
         self.threads = []
         
-        self.log(f"Starting booking attempt with {num_threads} threads...", "info")
-        
-        for i in range(num_threads):
+        if is_async:
+            self.log(f"Starting booking attempt with {num_threads} async tasks...", "info")
             t = threading.Thread(
-                target=self.make_reservation_thread, 
-                args=(reservation_data,),
-                name=f"BookingThread-{i+1}"
+                target=self.start_async_reservation_loop,
+                args=(reservation_data, num_threads),
+                name="AsyncBookingThread"
             )
             t.daemon = True
             self.threads.append(t)
             t.start()
+        else:
+            self.log(f"Starting booking attempt with {num_threads} threads...", "info")
+            for i in range(num_threads):
+                t = threading.Thread(
+                    target=self.make_reservation_thread, 
+                    args=(reservation_data,),
+                    name=f"BookingThread-{i+1}"
+                )
+                t.daemon = True
+                self.threads.append(t)
+                t.start()
 
         # Monitor thread in a separate thread so GUI doesn't freeze
         monitor_thread = threading.Thread(target=self._monitor_threads)
         monitor_thread.daemon = True
         monitor_thread.start()
+
+    def start_async_reservation_loop(self, reservation_data, num_tasks):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self.run_async_tasks(reservation_data, num_tasks))
+        except Exception as e:
+            self.log(f"Async loop error: {e}", "error")
+        finally:
+            loop.close()
+
+    async def run_async_tasks(self, reservation_data, num_tasks):
+        import asyncio
+        self.async_submission_lock = asyncio.Lock()
+        
+        tasks = []
+        for i in range(num_tasks):
+            tasks.append(asyncio.create_task(self.make_reservation_async_task(reservation_data, i)))
+            
+        await asyncio.gather(*tasks)
 
     def _monitor_threads(self):
         for t in self.threads:

@@ -736,7 +736,7 @@ class MainWindow(ctk.CTk):
         if self.active_engine and self.active_engine.is_running:
             self._stop_booking()
         else:
-            res_data, error_msg, threads = self.form.get_reservation_data()
+            res_data, error_msg, threads, is_async = self.form.get_reservation_data()
             if error_msg:
                 self.log_panel.append_log(f"입력 오류: {error_msg}", "error")
                 self.current_status = "error"
@@ -746,9 +746,9 @@ class MainWindow(ctk.CTk):
                     fg_color=theme.ACCENT_RED
                 )
                 return
-            self._start_booking(res_data, threads)
+            self._start_booking(res_data, threads, is_async)
 
-    def _start_booking(self, reservation_data, threads):
+    def _start_booking(self, reservation_data, threads, is_async):
         selected_site = self.site_var.get()
         self.form.save_config(selected_site)
         self.log_panel.clear_log()
@@ -800,7 +800,7 @@ class MainWindow(ctk.CTk):
         with self.log_queue_lock:
             self.log_queue.clear()
 
-        self.active_engine.start_reservation(reservation_data, threads)
+        self.active_engine.start_reservation(reservation_data, threads, is_async)
 
     def _stop_booking(self):
         if self.active_engine and self.active_engine.is_running:
