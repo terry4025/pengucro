@@ -877,14 +877,14 @@ class MainWindow(ctk.CTk):
         self._check_engine_finished()
         
         if self.active_engine and self.active_engine.is_running:
-            self.after(200, self._flush_logs)
+            self.after(30, self._flush_logs)
         else:
             self.is_flusher_running = False
             # Check one last time if any new logs arrived between lock release and this check
             with self.log_queue_lock:
                 if self.log_queue:
                     self.is_flusher_running = True
-                    self.after(50, self._flush_logs)
+                    self.after(30, self._flush_logs)
 
     def _check_engine_finished(self):
         if self.active_engine and not self.active_engine.is_running:

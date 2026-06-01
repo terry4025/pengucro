@@ -273,7 +273,7 @@ class BaseEngine:
     def _log_flusher_loop(self):
         while self.is_running or not self.flusher_stop.is_set():
             self.flush_logs()
-            time.sleep(0.5)
+            time.sleep(0.03)
             
     def flush_logs(self):
         with self._lock:
