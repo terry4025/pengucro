@@ -272,7 +272,7 @@ class MainWindow(ctk.CTk):
         super().__init__()
 
         # Window Config
-        self.title("방탈출 집중예약")
+        self.title("방탈출 펭크로")
         
         # Center the window on startup
         width = 480
@@ -336,7 +336,7 @@ class MainWindow(ctk.CTk):
         # Title Label in the Center
         self.title_label = ctk.CTkLabel(
             self.title_bar,
-            text="방탈출 집중예약",
+            text="방탈출 펭크로",
             font=(theme.FONT_FAMILY, 11, "bold"),
             text_color=theme.TEXT_BODY
         )
@@ -415,20 +415,11 @@ class MainWindow(ctk.CTk):
         # Big Title
         self.big_title_label = ctk.CTkLabel(
             header_frame,
-            text="방탈출 집중예약",
+            text="방탈출 펭크로",
             font=(theme.FONT_FAMILY, 20, "bold"),
             text_color=theme.TEXT_PRIMARY
         )
-        self.big_title_label.pack(anchor="center")
-
-        # Subtitle
-        self.subtitle_label = ctk.CTkLabel(
-            header_frame,
-            text="제로월드 & 지구별방탈출 통합 매크로",
-            font=theme.FONT_BODY_SM,
-            text_color=theme.TEXT_MUTE
-        )
-        self.subtitle_label.pack(anchor="center", pady=(1, 6))
+        self.big_title_label.pack(anchor="center", pady=(0, 6))
 
         # Status Pill Badge
         self.status_badge = ctk.CTkLabel(
