@@ -185,8 +185,9 @@ class NaverEngine(BaseEngine):
                     return
 
             # Step 2: Parallel Headless Booking attempts
-            self.log("예약 백그라운드 태스크 기동 중...", "info")
-            self.browser = await self._launch_browser(p, headless=True)
+            is_dev = reservation_data.get('devMode', False)
+            self.log(f"예약 백그라운드 태스크 기동 중... (개발자 모드: {is_dev})", "info")
+            self.browser = await self._launch_browser(p, headless=not is_dev)
 
             tasks = []
             for i in range(num_threads):
@@ -433,6 +434,16 @@ class NaverEngine(BaseEngine):
                                     f"⚠️ [{worker_id}번 기기] '동의하고 예약하기' 버튼 비활성화 지속 (클래스: {cls})",
                                     "warning"
                                 )
+
+                            # Developer mode: bypass actual submission click and idle
+                            if res_data.get('devMode', False):
+                                self.log(
+                                    f"✓ [{worker_id}번 기기] [개발자 테스트] '동의하고 예약하기' 버튼 직전 멈춤! (제출 우회)",
+                                    "success"
+                                )
+                                while not self.stop_event.is_set():
+                                    await asyncio.sleep(0.5)
+                                break
 
                             await submit.click()
                             self.log(

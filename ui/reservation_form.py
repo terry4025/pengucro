@@ -320,6 +320,25 @@ class ReservationForm(ctk.CTkFrame):
         self.engine_mode_btn.set("일반 (Sync)")
         self.engine_mode_btn.pack(side="right", fill="x", expand=False)
 
+        # -------------------------------------------------------------
+        # Row 8: Developer Test Mode (Naver only)
+        # -------------------------------------------------------------
+        self.dev_mode_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.dev_mode_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="ew")
+        
+        self.dev_mode_var = ctk.BooleanVar(value=False)
+        self.dev_mode_checkbox = ctk.CTkCheckBox(
+            self.dev_mode_frame,
+            text="개발자 테스트 모드 (화면 표시 & 최종 예약 안함)",
+            variable=self.dev_mode_var,
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.ACCENT_BLUE,
+            hover_color=theme.ACCENT_BLUE,
+            text_color=theme.TEXT_PRIMARY,
+            corner_radius=theme.ROUNDED_SM
+        )
+        self.dev_mode_checkbox.pack(side="left", anchor="w")
+
         # Initialize layout
         self.set_site(self.current_site)
 
@@ -367,6 +386,9 @@ class ReservationForm(ctk.CTkFrame):
             # Disable phone entry as Naver Booking autofills phone from active logged in user session
             self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
+            
+            # Enable Developer Mode checkbox
+            self.dev_mode_checkbox.configure(state="normal", text_color=theme.TEXT_PRIMARY)
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
@@ -381,6 +403,10 @@ class ReservationForm(ctk.CTkFrame):
             
             self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             self.phone_label.configure(text_color=theme.TEXT_MUTE)
+            
+            # Disable and uncheck Developer Mode checkbox
+            self.dev_mode_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            self.dev_mode_var.set(False)
             self._toggle_custom_theme()
 
     def set_site(self, site_name):
@@ -556,7 +582,8 @@ class ReservationForm(ctk.CTkFrame):
             'themePK': theme_pk,
             'reservationTime': time_str,
             'paymentType': '1',
-            'policy': 'true'
+            'policy': 'true',
+            'devMode': self.dev_mode_var.get()
         }
 
         is_async = (self.engine_mode_btn.get() == "고속 (Async)")
