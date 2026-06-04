@@ -452,9 +452,16 @@ class NaverEngine(BaseEngine):
                                 break
 
                         if not time_el:
-                            self.silent_tick(
-                                f"{target_time} 비활성화/매진 — 대기"
-                            )
+                            # 20회 시도(약 3초)마다 로그를 출력하여 재시도가 활발히 진행 중임을 표시
+                            if attempt == 1 or attempt % 20 == 0:
+                                self.log(
+                                    f"⚠️ [{worker_id}번 기기] {target_time} 비활성화/매진 — 재시도 중... (시도: {attempt}회)",
+                                    "warning"
+                                )
+                            else:
+                                self.silent_tick(
+                                    f"{target_time} 비활성화/매진 — 대기"
+                                )
                             # Periodic reload to refresh timetable
                             if attempt % 30 == 0:
                                 await page.reload()
