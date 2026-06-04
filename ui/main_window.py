@@ -118,7 +118,7 @@ class LoadingOverlay(ctk.CTkFrame):
             self.particles.append(self._create_particle(random_y=True))
             
         # Start animations
-        self.after(30, self._update_animation)
+        self.after(16, self._update_animation)
         self.after(100, self._animate_progress, 0)
         
     def _create_particle(self, random_y=False):
@@ -166,14 +166,14 @@ class LoadingOverlay(ctk.CTkFrame):
         if w <= 1 or h <= 1:
             w, h = 480, 860
             
-        self.time_counter += 0.05
+        self.time_counter += 0.026
         
         # Update & Draw particles
         for i in range(len(self.particles)):
             p = self.particles[i]
-            p['y'] -= p['speed_y']
-            p['x'] += p['speed_x'] + 0.3 * math.sin(self.time_counter + p['phase'])
-            p['alpha'] -= p['decay']
+            p['y'] -= p['speed_y'] * 0.52
+            p['x'] += (p['speed_x'] + 0.3 * math.sin(self.time_counter + p['phase'])) * 0.52
+            p['alpha'] -= p['decay'] * 0.52
             
             # Re-spawn
             if p['y'] < 40 or p['alpha'] <= 0 or p['x'] < 0 or p['x'] > w:
@@ -243,7 +243,7 @@ class LoadingOverlay(ctk.CTkFrame):
             self.tk_logo_img = ImageTk.PhotoImage(glow_canvas)
             self.canvas.create_image(center_x, center_y, image=self.tk_logo_img)
             
-        self.after(30, self._update_animation)
+        self.after(16, self._update_animation)
         
     def _animate_progress(self, val):
         if not self.winfo_exists():
