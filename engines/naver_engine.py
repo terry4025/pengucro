@@ -671,24 +671,17 @@ class NaverEngine(BaseEngine):
                             except Exception as date_err:
                                 self.silent_tick(f"날짜 클릭 시도 실패: {date_err}")
 
-                            # Print retry status
+                            # Print retry status (shortened to 1 line, removed reload entirely)
                             if attempt == 1 or attempt % 20 == 0:
                                 self.log(
-                                    f"⚠️ [{worker_id}번 기기] {target_time} 비활성화/매진 — 재시도 중... (시도: {attempt}회)",
+                                    f"[{worker_id}기] {target_time} 대기 ({attempt}회)",
                                     "warning"
                                 )
                             else:
                                 self.silent_tick(
-                                    f"{target_time} 비활성화/매진 — 대기"
+                                    f"{target_time} 대기"
                                 )
-                            # Relax reload interval to 60 steps (~10 seconds) to avoid spamming server during loading
-                            if attempt % 60 == 0:
-                                self.log(f"🔄 [{worker_id}번 기기] 시간표 새로고침 (시도: {attempt}회)", "info")
-                                await page.reload()
-                                await page.wait_for_load_state("domcontentloaded")
-                                await wait_for_loading()
-                            else:
-                                await asyncio.sleep(0.15)
+                            await asyncio.sleep(0.15)
                             continue
 
                         self.log(
