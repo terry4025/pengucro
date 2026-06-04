@@ -85,22 +85,12 @@ class LoadingOverlay(ctk.CTkFrame):
         
         # UI controls placed relative to frame over canvas
         # 3. Slide in animation start positions
-        self.title_y = 0.63
-        self.subtitle_y = 0.67
-        
-        self.title_label = ctk.CTkLabel(
-            self,
-            text="방탈출 펭크로",
-            font=(theme.FONT_FAMILY, 20, "bold"),
-            text_color=theme.TEXT_PRIMARY,
-            fg_color="transparent"
-        )
-        self.title_label.place(relx=0.5, rely=self.title_y, anchor="center")
+        self.subtitle_y = 0.65
         
         self.subtitle_label = ctk.CTkLabel(
             self,
-            text="예약 엔진 로딩 및 최적화 중...",
-            font=theme.FONT_BODY_SM,
+            text="로딩 중...",
+            font=(theme.FONT_FAMILY, 14),
             text_color=theme.TEXT_MUTE,
             fg_color="transparent"
         )
@@ -173,9 +163,7 @@ class LoadingOverlay(ctk.CTkFrame):
         self.time_counter += 0.026
         
         # 3. Smooth slide-in interpolation for text labels
-        self.title_y = self.title_y + (0.60 - self.title_y) * 0.08
-        self.subtitle_y = self.subtitle_y + (0.64 - self.subtitle_y) * 0.08
-        self.title_label.place(relx=0.5, rely=self.title_y, anchor="center")
+        self.subtitle_y = self.subtitle_y + (0.62 - self.subtitle_y) * 0.08
         self.subtitle_label.place(relx=0.5, rely=self.subtitle_y, anchor="center")
         
         # Update & Draw particles
@@ -298,24 +286,10 @@ class LoadingOverlay(ctk.CTkFrame):
         if val < 1.0:
             val += 0.038 # 1.3x slower (was 0.05)
             self.progress_val = val
-            
-            # 3. Dynamic Subtitle Text Update
-            if val < 0.25:
-                text_status = "네이버 플레이라이트 모듈 예열 중..."
-            elif val < 0.55:
-                text_status = "시간 계산 알고리즘 최적화 중..."
-            elif val < 0.80:
-                text_status = "우회 예약 차선책 라우터 검사 중..."
-            else:
-                text_status = "UI 렌더링 최적화 및 구동 준비 완료..."
-                
-            self.subtitle_label.configure(text=text_status)
-            
             delay = int(30 + (val * 90))
             self.after(delay, self._animate_progress, val)
         else:
             self.progress_val = 1.0
-            self.subtitle_label.configure(text="구동 완료! 펭크로 엔진 준비 완료.")
             self.after(100, self._fade_out)
             
     def _fade_out(self):
