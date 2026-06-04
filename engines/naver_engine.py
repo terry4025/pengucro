@@ -276,7 +276,7 @@ class NaverEngine(BaseEngine):
             async def wait_for_loading():
                 try:
                     loader = page.locator(".loading_area").first
-                    if await loader.is_visible(timeout=200):
+                    if await loader.is_visible(timeout=0):
                         await loader.wait_for(state="hidden", timeout=3000)
                 except Exception:
                     pass
@@ -641,7 +641,7 @@ class NaverEngine(BaseEngine):
                                 for lv in label_variants:
                                     try:
                                         el = page.locator(f'[aria-label*="{lv}"]').first
-                                        if await el.is_visible(timeout=100):
+                                        if await el.is_visible(timeout=0): # 0ms timeout for ultra-fast check
                                             date_el = el
                                             break
                                     except Exception:
@@ -651,7 +651,7 @@ class NaverEngine(BaseEngine):
                                     for calendar_sel in ['[class*="calendar"]', '[class*="Calendar"]', '.calendar_area', '.calendar_wrap']:
                                         try:
                                             el = page.locator(calendar_sel).locator(f'text="{day}"').first
-                                            if await el.is_visible(timeout=100):
+                                            if await el.is_visible(timeout=0): # 0ms timeout for ultra-fast check
                                                 date_el = el
                                                 break
                                         except Exception:
@@ -666,22 +666,30 @@ class NaverEngine(BaseEngine):
                                     if "disabled" not in cls.lower() and aria_disabled != "true" and disabled_attr is None:
                                         self.silent_tick(f"{target_date} 날짜 활성화 클릭 시도")
                                         await date_el.click(force=True)
-                                        await asyncio.sleep(0.15)
+                                        await asyncio.sleep(0.1)
                                         await wait_for_loading()
                             except Exception as date_err:
                                 self.silent_tick(f"날짜 클릭 시도 실패: {date_err}")
 
-                            # Print retry status (shortened to 1 line, removed reload entirely)
+                            # Print retry status
                             if attempt == 1 or attempt % 20 == 0:
                                 self.log(
-                                    f"[{worker_id}기] {target_time} 대기 ({attempt}회)",
+                                    f"[{worker_id}번 기기] {target_time} 비활성화/매진 - 재시도 ({attempt}회)",
                                     "warning"
                                 )
                             else:
                                 self.silent_tick(
                                     f"{target_time} 대기"
                                 )
-                            await asyncio.sleep(0.15)
+                            
+                            # Periodic reload to refresh timetable (Rollback to every 30 attempts)
+                            if attempt % 30 == 0:
+                                self.log(f"🔄 [{worker_id}번 기기] 시간표 새로고침 (시도: {attempt}회)", "info")
+                                await page.reload()
+                                await page.wait_for_load_state("domcontentloaded")
+                                await wait_for_loading()
+                            else:
+                                await asyncio.sleep(0.15)
                             continue
 
                         self.log(
