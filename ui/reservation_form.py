@@ -324,11 +324,20 @@ class ReservationForm(ctk.CTkFrame):
             self.day_type_frame.grid_forget()
             self.theme_frame.grid_forget()
             self.custom_theme_frame.grid_forget()
+            
+            # Restrict threads slider to maximum of 8
+            self.threads_slider.configure(to=8, number_of_steps=7)
+            if self.threads_slider.get() > 8:
+                self.threads_slider.set(8)
+                self.threads_value_label.configure(text="8")
         else:
             self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
             self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
             self._toggle_custom_theme()
             self.set_site(self.current_site)
+            
+            # Restore threads slider back to 100
+            self.threads_slider.configure(to=100, number_of_steps=99)
             
         if self.mode_callback:
             self.mode_callback(mode)
@@ -645,13 +654,21 @@ class ReservationForm(ctk.CTkFrame):
                 self.people_entry.delete(0, "end")
                 self.people_entry.insert(0, config["people"])
                 
-            if "threads" in config:
-                self.threads_slider.set(config["threads"])
-                self.threads_value_label.configure(text=str(config["threads"]))
-
-            if "is_async" in config:
+            if "engine_mode" in config:
+                mode_val = config["engine_mode"]
+                self.engine_mode_btn.set(mode_val)
+                self._on_mode_change(mode_val)
+            elif "is_async" in config:
                 val = "고속 (Async)" if config["is_async"] else "일반 (Sync)"
                 self.engine_mode_btn.set(val)
+                self._on_mode_change(val)
+
+            if "threads" in config:
+                thread_val = config["threads"]
+                if self.engine_mode_btn.get() == "네이버 (Playwright)" and thread_val > 8:
+                    thread_val = 8
+                self.threads_slider.set(thread_val)
+                self.threads_value_label.configure(text=str(thread_val))
         except Exception:
             pass
 
@@ -672,7 +689,8 @@ class ReservationForm(ctk.CTkFrame):
                 "phone": self.phone_entry.get().strip(),
                 "people": self.people_entry.get().strip(),
                 "threads": int(self.threads_slider.get()),
-                "is_async": (self.engine_mode_btn.get() == "고속 (Async)")
+                "is_async": (self.engine_mode_btn.get() == "고속 (Async)"),
+                "engine_mode": self.engine_mode_btn.get()
             }
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
