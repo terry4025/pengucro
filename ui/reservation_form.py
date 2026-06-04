@@ -19,6 +19,11 @@ class ReservationForm(ctk.CTkFrame):
         self.current_site = "제로월드 강남"
         self.custom_sites = {}
         self.config = SITES_CONFIG[self.current_site]
+        
+        # Thread memory states
+        self.standard_threads = 30
+        self.naver_threads = 5
+        self.last_mode = "일반 (Sync)"
 
         # Grid configuration for 2 columns
         self.columnconfigure((0, 1), weight=1, uniform="equal")
@@ -319,26 +324,34 @@ class ReservationForm(ctk.CTkFrame):
         self.set_site(self.current_site)
 
     def _on_mode_change(self, mode):
+        # Save previous state
+        if self.last_mode == "네이버 (Playwright)":
+            self.naver_threads = int(self.threads_slider.get())
+        else:
+            self.standard_threads = int(self.threads_slider.get())
+
         if mode == "네이버 (Playwright)":
             self.branch_frame.grid_forget()
             self.day_type_frame.grid_forget()
             self.theme_frame.grid_forget()
             self.custom_theme_frame.grid_forget()
             
-            # Restrict threads slider to maximum of 8
+            # Restrict threads slider to maximum of 8 and load cached value
             self.threads_slider.configure(to=8, number_of_steps=7)
-            if self.threads_slider.get() > 8:
-                self.threads_slider.set(8)
-                self.threads_value_label.configure(text="8")
+            self.threads_slider.set(self.naver_threads)
+            self.threads_value_label.configure(text=str(self.naver_threads))
         else:
             self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
             self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
             self._toggle_custom_theme()
             self.set_site(self.current_site)
             
-            # Restore threads slider back to 100
+            # Restore threads slider back to 100 and load cached value
             self.threads_slider.configure(to=100, number_of_steps=99)
+            self.threads_slider.set(self.standard_threads)
+            self.threads_value_label.configure(text=str(self.standard_threads))
             
+        self.last_mode = mode
         if self.mode_callback:
             self.mode_callback(mode)
 
@@ -654,6 +667,12 @@ class ReservationForm(ctk.CTkFrame):
                 self.people_entry.delete(0, "end")
                 self.people_entry.insert(0, config["people"])
                 
+            # Parse memory threads first
+            if "threads" in config:
+                self.standard_threads = config["threads"]
+            if "naver_threads" in config:
+                self.naver_threads = config["naver_threads"]
+
             if "engine_mode" in config:
                 mode_val = config["engine_mode"]
                 self.engine_mode_btn.set(mode_val)
@@ -662,13 +681,6 @@ class ReservationForm(ctk.CTkFrame):
                 val = "고속 (Async)" if config["is_async"] else "일반 (Sync)"
                 self.engine_mode_btn.set(val)
                 self._on_mode_change(val)
-
-            if "threads" in config:
-                thread_val = config["threads"]
-                if self.engine_mode_btn.get() == "네이버 (Playwright)" and thread_val > 8:
-                    thread_val = 8
-                self.threads_slider.set(thread_val)
-                self.threads_value_label.configure(text=str(thread_val))
         except Exception:
             pass
 
@@ -676,6 +688,12 @@ class ReservationForm(ctk.CTkFrame):
         import json
         config_path = "config.json"
         try:
+            # Sync active memory thread counts before saving
+            if self.engine_mode_btn.get() == "네이버 (Playwright)":
+                self.naver_threads = int(self.threads_slider.get())
+            else:
+                self.standard_threads = int(self.threads_slider.get())
+
             config = {
                 "site": site_name,
                 "branch": self.branch_var.get(),
@@ -688,7 +706,8 @@ class ReservationForm(ctk.CTkFrame):
                 "name": self.name_entry.get().strip(),
                 "phone": self.phone_entry.get().strip(),
                 "people": self.people_entry.get().strip(),
-                "threads": int(self.threads_slider.get()),
+                "threads": self.standard_threads,
+                "naver_threads": self.naver_threads,
                 "is_async": (self.engine_mode_btn.get() == "고속 (Async)"),
                 "engine_mode": self.engine_mode_btn.get()
             }
