@@ -363,6 +363,10 @@ class ReservationForm(ctk.CTkFrame):
             
             self.custom_theme_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
             self.theme_pk_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            
+            # Disable phone entry as Naver Booking autofills phone from active logged in user session
+            self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            self.phone_label.configure(text_color=theme.TEXT_DISABLED)
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
@@ -374,6 +378,9 @@ class ReservationForm(ctk.CTkFrame):
             self.theme_label.configure(text_color=theme.TEXT_MUTE)
             self.custom_theme_checkbox.configure(state="normal", text_color=theme.TEXT_MUTE)
             self.theme_pk_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            
+            self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.phone_label.configure(text_color=theme.TEXT_MUTE)
             self._toggle_custom_theme()
 
     def set_site(self, site_name):
@@ -526,6 +533,7 @@ class ReservationForm(ctk.CTkFrame):
         phone = self.phone_entry.get().strip()
         people = self.people_entry.get().strip()
         threads = int(self.threads_slider.get())
+        is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
 
         # Validation
         if not theme_pk:
@@ -536,7 +544,7 @@ class ReservationForm(ctk.CTkFrame):
             return None, "예약 시간을 입력해주세요.", 0, False
         if not name:
             return None, "예약자 이름을 입력해주세요.", 0, False
-        if not phone:
+        if not is_naver and not phone:
             return None, "전화번호를 입력해주세요.", 0, False
 
         res_data = {

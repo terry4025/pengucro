@@ -376,18 +376,6 @@ class NaverEngine(BaseEngine):
                             )
                             await asyncio.sleep(0.2)
 
-                        # Phase 3b — Click "연락처 확인" if visible to validate user details ──
-                        try:
-                            check_phone = page.locator(
-                                'button:has-text("연락처 확인"), '
-                                '.check_btn'
-                            ).first
-                            if await check_phone.is_visible(timeout=300):
-                                await check_phone.click()
-                                await asyncio.sleep(0.2)
-                        except Exception:
-                            pass
-
                         # Phase 4a — Check agreement checkboxes & custom divs ────
                         # 1. Standard HTML checkbox inputs
                         try:
