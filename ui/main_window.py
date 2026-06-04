@@ -47,42 +47,62 @@ class LoadingOverlay(ctk.CTkFrame):
         self.parent = parent
         self.on_complete = on_complete
         
-        # Main container centered
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.place(relx=0.5, rely=0.5, anchor="center")
+        # Load local animation helpers
+        import random
+        import math
+        from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageFilter
         
-        # Animated Emoji Emblem
-        self.logo_label = ctk.CTkLabel(
-            content,
-            text="🐧",
-            font=(theme.FONT_FAMILY, 56),
-            text_color=theme.ACCENT_BLUE
-        )
-        self.logo_label.pack(pady=(0, 15))
+        # Background animation Canvas
+        self.canvas = ctk.CTkCanvas(self, bg=theme.CANVAS_COLOR, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
         
-        # Soft Pulse effect on the Penguin Emoji
-        self.logo_scale = 1
-        self._pulse_logo()
+        # Load local assets
+        self.orig_img = None
+        try:
+            img_path = resource_path("app_icon.png")
+            if os.path.exists(img_path):
+                self.orig_img = Image.open(img_path).convert("RGBA")
+                self.orig_img = self.orig_img.resize((100, 100), Image.Resampling.LANCZOS)
+        except Exception:
+            pass
+            
+        if self.orig_img is None:
+            # Fallback drawing of 🐧 emoji on a transparent background
+            try:
+                # seguiemj is Windows standard color emoji font
+                font = ImageFont.truetype("seguiemj.ttf", 64)
+            except Exception:
+                font = ImageFont.load_default()
+            
+            fallback = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(fallback)
+            draw.text((50, 50), "🐧", fill="#ffffff", font=font, anchor="mm")
+            self.orig_img = fallback
+            
+        self.time_counter = 0.0
         
+        # UI controls placed relative to frame over canvas
         self.title_label = ctk.CTkLabel(
-            content,
+            self,
             text="방탈출 펭크로",
             font=(theme.FONT_FAMILY, 20, "bold"),
-            text_color=theme.TEXT_PRIMARY
+            text_color=theme.TEXT_PRIMARY,
+            fg_color="transparent"
         )
-        self.title_label.pack(pady=(0, 6))
+        self.title_label.place(relx=0.5, rely=0.6, anchor="center")
         
         self.subtitle_label = ctk.CTkLabel(
-            content,
+            self,
             text="예약 엔진 로딩 및 최적화 중...",
             font=theme.FONT_BODY_SM,
-            text_color=theme.TEXT_MUTE
+            text_color=theme.TEXT_MUTE,
+            fg_color="transparent"
         )
-        self.subtitle_label.pack(pady=(0, 25))
+        self.subtitle_label.place(relx=0.5, rely=0.64, anchor="center")
         
         # Flat Premium Progress Bar
         self.progress = ctk.CTkProgressBar(
-            content,
+            self,
             width=200,
             height=4,
             corner_radius=2,
@@ -90,27 +110,147 @@ class LoadingOverlay(ctk.CTkFrame):
             progress_color=theme.ACCENT_BLUE
         )
         self.progress.set(0)
-        self.progress.pack()
+        self.progress.place(relx=0.5, rely=0.7, anchor="center")
         
+        # Generate 12 ambient particles
+        self.particles = []
+        for _ in range(12):
+            self.particles.append(self._create_particle(random_y=True))
+            
+        # Start animations
+        self.after(30, self._update_animation)
         self.after(100, self._animate_progress, 0)
         
-    def _pulse_logo(self):
+    def _create_particle(self, random_y=False):
+        import random
+        import math
+        glyphs = ["❄️", "✨", "•", "*"]
+        glyph = random.choice(glyphs)
+        
+        x = random.randint(10, 470)
+        if random_y:
+            y = random.randint(50, 750)
+        else:
+            y = random.randint(750, 840)
+            
+        speed_y = random.uniform(0.6, 2.2)
+        speed_x = random.uniform(-0.5, 0.5)
+        size = random.randint(8, 14) if glyph in ("❄️", "✨") else random.randint(3, 6)
+        alpha = random.uniform(0.3, 0.9)
+        decay = random.uniform(0.005, 0.015)
+        phase = random.uniform(0, math.pi * 2)
+        
+        return {
+            'x': x,
+            'y': y,
+            'speed_y': speed_y,
+            'speed_x': speed_x,
+            'size': size,
+            'alpha': alpha,
+            'decay': decay,
+            'glyph': glyph,
+            'phase': phase
+        }
+        
+    def _update_animation(self):
         if not self.winfo_exists():
             return
-        # Toggle size slightly to create a breathing penguin look
-        current_font = self.logo_label.cget("font")
-        size = 56 if self.logo_scale == 1 else 62
-        self.logo_scale = 1 - self.logo_scale
-        self.logo_label.configure(font=(theme.FONT_FAMILY, size))
-        self.after(500, self._pulse_logo)
-
+            
+        import math
+        import random
+        from PIL import Image, ImageTk, ImageDraw, ImageFilter
+        
+        self.canvas.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            w, h = 480, 860
+            
+        self.time_counter += 0.05
+        
+        # Update & Draw particles
+        for i in range(len(self.particles)):
+            p = self.particles[i]
+            p['y'] -= p['speed_y']
+            p['x'] += p['speed_x'] + 0.3 * math.sin(self.time_counter + p['phase'])
+            p['alpha'] -= p['decay']
+            
+            # Re-spawn
+            if p['y'] < 40 or p['alpha'] <= 0 or p['x'] < 0 or p['x'] > w:
+                self.particles[i] = self._create_particle(random_y=False)
+                p = self.particles[i]
+                
+            # Render to canvas (blend with black bg)
+            intensity = int(p['alpha'] * 255)
+            intensity = max(0, min(255, intensity))
+            
+            if p['glyph'] in ("❄️", "✨"):
+                color = f"#{intensity:02x}{intensity:02x}{intensity:02x}"
+                self.canvas.create_text(
+                    p['x'], p['y'],
+                    text=p['glyph'],
+                    font=("Segoe UI", p['size']),
+                    fill=color
+                )
+            else:
+                # Accent blue shade: (87, 193, 255)
+                r_val = int(p['alpha'] * 87)
+                g_val = int(p['alpha'] * 193)
+                b_val = int(p['alpha'] * 255)
+                color = f"#{r_val:02x}{g_val:02x}{b_val:02x}"
+                
+                radius = p['size'] / 2
+                self.canvas.create_oval(
+                    p['x'] - radius, p['y'] - radius,
+                    p['x'] + radius, p['y'] + radius,
+                    fill=color, outline=""
+                )
+                
+        # Draw Soft Glow & Pinned/Tilted Logo
+        center_x = w / 2
+        center_y = h / 2 - 80
+        
+        if self.orig_img:
+            pulse = math.sin(self.time_counter)
+            glow_radius = int(55 + 15 * pulse)
+            glow_alpha = int(45 + 20 * pulse)
+            
+            # Alpha compositing canvas
+            glow_canvas = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(glow_canvas)
+            
+            # Draw fuzzy circular gradient
+            for r in range(glow_radius, 10, -5):
+                alpha = int(glow_alpha * (1.0 - r / glow_radius))
+                draw.ellipse(
+                    (80 - r, 80 - r, 80 + r, 80 + r),
+                    fill=(87, 193, 255, alpha)
+                )
+            glow_canvas = glow_canvas.filter(ImageFilter.GaussianBlur(8))
+            
+            # Tilting (Rotation)
+            angle = 8 * math.sin(self.time_counter * 0.7)
+            rotated_penguin = self.orig_img.rotate(angle, resample=Image.Resampling.BICUBIC)
+            
+            # Scale penguin slightly
+            peng_size = int(84 + 8 * pulse)
+            scaled_penguin = rotated_penguin.resize((peng_size, peng_size), Image.Resampling.LANCZOS)
+            
+            offset = (160 - peng_size) // 2
+            glow_canvas.alpha_composite(scaled_penguin, (offset, offset))
+            
+            # Render to canvas
+            self.tk_logo_img = ImageTk.PhotoImage(glow_canvas)
+            self.canvas.create_image(center_x, center_y, image=self.tk_logo_img)
+            
+        self.after(30, self._update_animation)
+        
     def _animate_progress(self, val):
         if not self.winfo_exists():
             return
         if val < 1.0:
-            val += 0.05
+            val += 0.038 # 1.3x slower (was 0.05)
             self.progress.set(val)
-            # Differentiate speed for realistic rendering look
             delay = int(30 + (val * 90))
             self.after(delay, self._animate_progress, val)
         else:
