@@ -648,6 +648,7 @@ class NaverEngine(BaseEngine):
 
                         # Phase 1 — Find & click target time slot ──
                         time_el = None
+                        selected_time_str = target_time
                         for tv in time_variants:
                             for sel in [
                                 f'button:has-text("{tv}")',
@@ -671,6 +672,58 @@ class NaverEngine(BaseEngine):
                                     continue
                             if time_el:
                                 break
+
+                        # --- [대체 시간대(차선책) 탐색 및 새로고침 정지 로직 - v4.1] ---
+                        if not time_el:
+                            active_slots = []
+                            try:
+                                # 시간 포맷(콜론)을 가지며 화면에 보이는 활성 버튼/링크 탐색
+                                locators = await page.locator('button:has-text(":"):visible, a:has-text(":"):visible').all()
+                                for el in locators:
+                                    txt = await el.inner_text()
+                                    import re
+                                    if re.search(r'\d{1,2}\s*:\s*\d{2}', txt):
+                                        cls = (await el.get_attribute("class")) or ""
+                                        aria = (await el.get_attribute("aria-disabled")) or ""
+                                        disabled_attr = await el.get_attribute("disabled")
+                                        if (
+                                            "매진" not in txt
+                                            and "종료" not in txt
+                                            and "disabled" not in cls.lower()
+                                            and aria != "true"
+                                            and disabled_attr is None
+                                        ):
+                                            active_slots.append((el, txt))
+                            except Exception as scan_err:
+                                self.silent_tick(f"시간 후보군 스캔 에러: {scan_err}")
+
+                            if active_slots:
+                                # 다른 시간대는 활성화되어 있으므로, 페이지 새로고침을 멈춤(date_clicked = True 설정)
+                                date_clicked = True
+                                
+                                target_mins = time_to_minutes(target_time)
+                                if target_mins is not None:
+                                    closest_el = None
+                                    min_diff = float('inf')
+                                    closest_time_str = ""
+                                    
+                                    for el, txt in active_slots:
+                                        slot_mins = time_to_minutes(txt)
+                                        if slot_mins is not None:
+                                            diff = abs(target_mins - slot_mins)
+                                            if diff < min_diff:
+                                                min_diff = diff
+                                                closest_el = el
+                                                closest_time_str = txt
+                                    
+                                    if closest_el:
+                                        self.log(
+                                            f"⚠️ [{worker_id}번 기기] 지정 시간({target_time}) 매진 감지! "
+                                            f"가장 가까운 활성 시간대 '{closest_time_str.strip()}'(오차: {min_diff}분)로 자동 우회 예약을 진행합니다.",
+                                            "warning"
+                                        )
+                                        time_el = closest_el
+                                        selected_time_str = closest_time_str.strip()
 
                         if not time_el:
                             # Wait for loading indicator to clear
@@ -749,7 +802,7 @@ class NaverEngine(BaseEngine):
                             continue
 
                         self.log(
-                            f"✓ [{worker_id}번 기기] {target_time} 활성화 감지! "
+                            f"✓ [{worker_id}번 기기] {selected_time_str} 활성화 감지! "
                             f"클릭 시도...",
                             "warning"
                         )
