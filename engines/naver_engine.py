@@ -272,6 +272,15 @@ class NaverEngine(BaseEngine):
             people = res_data.get("people", "2")
             time_variants = self._get_time_variants(target_time)
 
+            # Helper to wait for Naver loading indicator to disappear
+            async def wait_for_loading():
+                try:
+                    loader = page.locator(".loading_area").first
+                    if await loader.is_visible(timeout=200):
+                        await loader.wait_for(state="hidden", timeout=3000)
+                except Exception:
+                    pass
+
             # Build booking URL with startDateTime to pre-select the target date
             start_dt = f"{target_date}T00:00:00+09:00"
             sep = "&" if "?" in url else "?"
@@ -279,6 +288,7 @@ class NaverEngine(BaseEngine):
 
             await page.goto(booking_url)
             await page.wait_for_load_state("domcontentloaded")
+            await wait_for_loading()
             self.log(
                 f"[{worker_id}번 기기] 페이지 로드 완료 "
                 f"(날짜: {target_date}, 시간: {target_time}, 인원: {people}인)",
@@ -611,7 +621,57 @@ class NaverEngine(BaseEngine):
                                 break
 
                         if not time_el:
-                            # 20회 시도(약 3초)마다 로그를 출력하여 재시도가 활발히 진행 중임을 표시
+                            # Wait for loading indicator to clear
+                            await wait_for_loading()
+                            
+                            # Attempt to click target date cell to trigger timetable loading (if date became active)
+                            try:
+                                dt = datetime.strptime(target_date, "%Y-%m-%d")
+                                year, month, day = dt.year, dt.month, dt.day
+                                
+                                label_variants = [
+                                    f"{year}. {month}. {day}.",
+                                    f"{year}.{month:02d}.{day:02d}",
+                                    f"{year}년 {month}월 {day}일",
+                                    f"{month}월 {day}일",
+                                    f"{day}일",
+                                ]
+                                
+                                date_el = None
+                                for lv in label_variants:
+                                    try:
+                                        el = page.locator(f'[aria-label*="{lv}"]').first
+                                        if await el.is_visible(timeout=100):
+                                            date_el = el
+                                            break
+                                    except Exception:
+                                        continue
+                                        
+                                if not date_el:
+                                    for calendar_sel in ['[class*="calendar"]', '[class*="Calendar"]', '.calendar_area', '.calendar_wrap']:
+                                        try:
+                                            el = page.locator(calendar_sel).locator(f'text="{day}"').first
+                                            if await el.is_visible(timeout=100):
+                                                date_el = el
+                                                break
+                                        except Exception:
+                                            continue
+                                            
+                                if date_el:
+                                    cls = (await date_el.get_attribute("class")) or ""
+                                    aria_disabled = (await date_el.get_attribute("aria-disabled")) or ""
+                                    disabled_attr = await date_el.get_attribute("disabled")
+                                    
+                                    # Click if it is enabled and selectable
+                                    if "disabled" not in cls.lower() and aria_disabled != "true" and disabled_attr is None:
+                                        self.silent_tick(f"{target_date} 날짜 활성화 클릭 시도")
+                                        await date_el.click(force=True)
+                                        await asyncio.sleep(0.15)
+                                        await wait_for_loading()
+                            except Exception as date_err:
+                                self.silent_tick(f"날짜 클릭 시도 실패: {date_err}")
+
+                            # Print retry status
                             if attempt == 1 or attempt % 20 == 0:
                                 self.log(
                                     f"⚠️ [{worker_id}번 기기] {target_time} 비활성화/매진 — 재시도 중... (시도: {attempt}회)",
@@ -621,10 +681,12 @@ class NaverEngine(BaseEngine):
                                 self.silent_tick(
                                     f"{target_time} 비활성화/매진 — 대기"
                                 )
-                            # Periodic reload to refresh timetable
-                            if attempt % 30 == 0:
+                            # Relax reload interval to 60 steps (~10 seconds) to avoid spamming server during loading
+                            if attempt % 60 == 0:
+                                self.log(f"🔄 [{worker_id}번 기기] 시간표 새로고침 (시도: {attempt}회)", "info")
                                 await page.reload()
                                 await page.wait_for_load_state("domcontentloaded")
+                                await wait_for_loading()
                             else:
                                 await asyncio.sleep(0.15)
                             continue

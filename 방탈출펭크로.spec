@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로v3.4',
+    name='방탈출펭크로v3.5',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
