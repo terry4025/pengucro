@@ -331,29 +331,50 @@ class ReservationForm(ctk.CTkFrame):
             self.standard_threads = int(self.threads_slider.get())
 
         if mode == "네이버 (Playwright)":
-            self.branch_frame.grid_forget()
-            self.day_type_frame.grid_forget()
-            self.theme_frame.grid_forget()
-            self.custom_theme_frame.grid_forget()
-            
             # Restrict threads slider to maximum of 8 and load cached value
             self.threads_slider.configure(to=8, number_of_steps=7)
             self.threads_slider.set(self.naver_threads)
             self.threads_value_label.configure(text=str(self.naver_threads))
         else:
-            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
-            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
-            self._toggle_custom_theme()
             self.set_site(self.current_site)
-            
             # Restore threads slider back to 100 and load cached value
             self.threads_slider.configure(to=100, number_of_steps=99)
             self.threads_slider.set(self.standard_threads)
             self.threads_value_label.configure(text=str(self.standard_threads))
             
+        self._update_widgets_state()
+            
         self.last_mode = mode
         if self.mode_callback:
             self.mode_callback(mode)
+
+    def _update_widgets_state(self):
+        is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
+        if is_naver:
+            # Disable Naver-incompatible controls but keep them in layout to prevent vertical layout shifting
+            self.branch_dropdown.configure(state="disabled")
+            self.branch_label.configure(text_color=theme.TEXT_DISABLED)
+            
+            self.day_type_segmented.configure(state="disabled")
+            self.day_type_label.configure(text_color=theme.TEXT_DISABLED)
+            
+            self.theme_dropdown.configure(state="disabled")
+            self.theme_label.configure(text_color=theme.TEXT_DISABLED)
+            
+            self.custom_theme_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            self.theme_pk_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+        else:
+            # Enable standard controls
+            self.branch_dropdown.configure(state="normal")
+            self.branch_label.configure(text_color=theme.TEXT_MUTE)
+            
+            self.day_type_segmented.configure(state="normal")
+            self.day_type_label.configure(text_color=theme.TEXT_MUTE)
+            
+            self.theme_label.configure(text_color=theme.TEXT_MUTE)
+            self.custom_theme_checkbox.configure(state="normal", text_color=theme.TEXT_MUTE)
+            self.theme_pk_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self._toggle_custom_theme()
 
     def set_site(self, site_name):
         self.current_site = site_name
@@ -368,13 +389,7 @@ class ReservationForm(ctk.CTkFrame):
         self.branch_frame.grid_forget()
         self.day_type_frame.grid_forget()
 
-        # If Naver mode is active, we don't show branch / day_type / theme / custom_theme controls
-        if self.engine_mode_btn.get() == "네이버 (Playwright)":
-            self.theme_frame.grid_forget()
-            self.custom_theme_frame.grid_forget()
-            return
-
-        # Restore standard inputs if hidden
+        # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
         self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
         self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
 
@@ -388,6 +403,7 @@ class ReservationForm(ctk.CTkFrame):
                 self.branch_var.set(branch_options[0])
 
         self._update_theme_options()
+        self._update_widgets_state()
 
     def _on_branch_change(self, value):
         self._update_theme_options()
@@ -396,6 +412,9 @@ class ReservationForm(ctk.CTkFrame):
         self._update_theme_options()
 
     def _toggle_custom_theme(self):
+        # Only run toggle behavior if not in Naver mode to prevent overriding disabled state
+        if self.engine_mode_btn.get() == "네이버 (Playwright)":
+            return
         if self.custom_theme_checkbox.get() == 1:
             self.theme_dropdown.configure(state="disabled")
             self.theme_pk_entry.pack(fill="x", after=self.custom_theme_checkbox, pady=(2, 0))
@@ -404,7 +423,12 @@ class ReservationForm(ctk.CTkFrame):
             self.theme_pk_entry.pack_forget()
 
     def _on_threads_slider_move(self, value):
-        self.threads_value_label.configure(text=str(int(value)))
+        val = int(value)
+        self.threads_value_label.configure(text=str(val))
+        if self.engine_mode_btn.get() == "네이버 (Playwright)":
+            self.naver_threads = val
+        else:
+            self.standard_threads = val
 
     def _on_date_change(self, event=None):
         """Auto-detect weekday/weekend from the entered date."""

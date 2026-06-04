@@ -435,9 +435,6 @@ class MainWindow(ctk.CTk):
         self.after(10, self.set_appwindow)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         
-        # Bind restore event to detect window mapping
-        self.bind("<Map>", self._on_restore)
-        self._minimized = False
         self._is_maximized = False
 
         # Active engine tracking
@@ -777,23 +774,13 @@ class MainWindow(ctk.CTk):
             pass
 
     def _on_minimize(self):
-        self._minimized = True
-        self.overrideredirect(False)
-        self.iconify()
-
-    def _on_restore(self, event):
-        if event.widget == self and getattr(self, "_minimized", False):
-            if self.state() == "iconic":
-                return
-            self._minimized = False
-            # 약간의 딜레이를 주어 창 상태 복원이 완료된 후 borderless를 씌운다.
-            self.after(100, self._restore_borderless)
-
-    def _restore_borderless(self):
-        self.overrideredirect(True)
-        self._apply_appwindow_style()
-        self.deiconify()
-        self.focus_force()
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            # SW_MINIMIZE = 6
+            ctypes.windll.user32.ShowWindow(hwnd, 6)
+        except Exception:
+            self.iconify()
 
     def _on_maximize(self):
         if getattr(self, "_is_maximized", False):
@@ -810,9 +797,11 @@ class MainWindow(ctk.CTk):
             y = (screen_height - height) // 2
             self.geometry(f"{width}x{height}+{x}+{y}")
             self._apply_appwindow_style()
+            self.update_idletasks()
         else:
             self._is_maximized = True
             self.state("zoomed")
+            self.update_idletasks()
 
     def _on_site_change(self, site_name):
         self.form.set_site(site_name)
