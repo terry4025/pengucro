@@ -391,18 +391,23 @@ class NaverEngine(BaseEngine):
 
                         # 2. Custom agreement divs/texts (which don't use standard input elements)
                         try:
+                            custom_cb = None
                             for sel in [
                                 '.AgreementDesc__section_inner__Ny+MK',
-                                '.AgreementDesc__section_agreement_info__hMLOx',
-                                'text="예약 서비스 이용을 위한 개인정보 제3자 제공 규정을 확인하였으며 이에 동의합니다."'
+                                'text="예약 서비스 이용을 위한 개인정보 제3자 제공 규정을 확인하였으며 이에 동의합니다."',
+                                '.AgreementDesc__section_agreement_info__hMLOx'
                             ]:
                                 try:
-                                    custom_cb = page.locator(sel).first
-                                    if await custom_cb.is_visible(timeout=300):
-                                        await custom_cb.click(force=True)
-                                        await asyncio.sleep(0.1)
+                                    el = page.locator(sel).first
+                                    if await el.is_visible(timeout=300):
+                                        custom_cb = el
+                                        break
                                 except Exception:
-                                    pass
+                                    continue
+                            
+                            if custom_cb:
+                                await custom_cb.click(force=True)
+                                await asyncio.sleep(0.15)
                         except Exception:
                             pass
 
@@ -414,11 +419,20 @@ class NaverEngine(BaseEngine):
                             ).first
 
                             # Wait up to 1.5s (15 * 100ms) for 'disabled' class to clear
+                            activated = False
+                            cls = ""
                             for _ in range(15):
                                 cls = (await submit.get_attribute("class")) or ""
                                 if "disabled" not in cls:
+                                    activated = True
                                     break
                                 await asyncio.sleep(0.1)
+
+                            if not activated:
+                                self.log(
+                                    f"⚠️ [{worker_id}번 기기] '동의하고 예약하기' 버튼 비활성화 지속 (클래스: {cls})",
+                                    "warning"
+                                )
 
                             await submit.click()
                             self.log(
