@@ -305,6 +305,17 @@ class NaverEngine(BaseEngine):
                         #  REQUEST / CONFIRMATION PAGE  (Phases 3-5)
                         # ═══════════════════════════════════════════
 
+                        # Debug: Save page source in developer/test mode to analyze DOM
+                        if res_data.get('devMode', False) and worker_id == 1:
+                            try:
+                                debug_html = await page.content()
+                                debug_path = r"C:\Users\Administrator\.gemini\antigravity\brain\1de2937b-3d9d-446d-87ed-b04f2d021bc6\scratch\naver_request_debug.html"
+                                with open(debug_path, "w", encoding="utf-8") as f:
+                                    f.write(debug_html)
+                                self.log(f"✓ [{worker_id}번 기기] [디버그] 네이버 요청 페이지 HTML 저장 완료: {debug_path}", "info")
+                            except Exception as e:
+                                self.log(f"디버그 HTML 저장 실패: {e}", "warning")
+
                         # Phase 3 — Select 참여인원 설정 dropdown ──
                         target_label = f"{people}인"
                         participant_ok = False
@@ -316,9 +327,10 @@ class NaverEngine(BaseEngine):
                                 if any(target_label in o for o in opts):
                                     await sel_el.select_option(label=target_label)
                                     participant_ok = True
+                                    self.log(f"✓ [{worker_id}번 기기] Strategy A (Select 엘리먼트) 인원 선택 성공", "info")
                                     break
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            self.silent_tick(f"Strategy A 실패: {e}")
 
                         # Strategy B: custom React dropdown (by text trigger)
                         if not participant_ok:
@@ -331,24 +343,55 @@ class NaverEngine(BaseEngine):
                                 try:
                                     trigger = page.locator(f'text="{tt}"').first
                                     if await trigger.is_visible(timeout=300):
+                                        self.log(f"[{worker_id}번 기기] Strategy B 트리거 발견: '{tt}' 클릭 시도", "info")
                                         await trigger.click()
-                                        await asyncio.sleep(0.2)
-                                        # Click the matching option
-                                        opt = page.locator(
-                                            f'li:has-text("{target_label}"), '
-                                            f'div:has-text("{target_label}"), '
-                                            f'span:has-text("{target_label}"), '
-                                            f'text="{target_label}"'
-                                        ).first
+                                        await asyncio.sleep(0.3)
+                                        
+                                        # Find option (prioritize dropdown lists to avoid choosing standard desc texts)
+                                        opt = None
+                                        selectors = [
+                                            f'[class*="dropdown"] li:has-text("{target_label}"):visible',
+                                            f'[class*="Dropdown"] li:has-text("{target_label}"):visible',
+                                            f'[class*="dropdown"] div:has-text("{target_label}"):visible',
+                                            f'[class*="Dropdown"] div:has-text("{target_label}"):visible',
+                                            f'[class*="list"] li:has-text("{target_label}"):visible',
+                                            f'[class*="list"] div:has-text("{target_label}"):visible',
+                                            f'li:has-text("{target_label}"):visible',
+                                            f'div:has-text("{target_label}"):visible',
+                                            f'span:has-text("{target_label}"):visible',
+                                            f'text="{target_label}":visible'
+                                        ]
+                                        
+                                        for opt_sel in selectors:
+                                            try:
+                                                cand = page.locator(opt_sel).first
+                                                if await cand.is_visible(timeout=200):
+                                                    opt = cand
+                                                    self.log(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}", "info")
+                                                    break
+                                            except Exception:
+                                                continue
+                                                
+                                        if not opt:
+                                            opt = page.locator(
+                                                f'li:has-text("{target_label}"):visible, '
+                                                f'div:has-text("{target_label}"):visible, '
+                                                f'span:has-text("{target_label}"):visible, '
+                                                f'text="{target_label}":visible'
+                                            ).first
+                                        
+                                        await opt.wait_for(state="visible", timeout=2000)
                                         try:
-                                            await opt.scroll_into_view_if_needed(timeout=300)
+                                            await opt.scroll_into_view_if_needed(timeout=400)
                                         except Exception:
                                             pass
-                                        if (await opt.count() > 0) or (await opt.is_visible(timeout=300)):
-                                            await opt.click(force=True)
-                                            participant_ok = True
-                                            break
-                                except Exception:
+                                        
+                                        await opt.click(force=True)
+                                        participant_ok = True
+                                        self.log(f"✓ [{worker_id}번 기기] Strategy B 인원 선택 성공", "info")
+                                        break
+                                except Exception as e:
+                                    self.log(f"⚠️ [{worker_id}번 기기] Strategy B 진행 중 에러: {e}", "warning")
                                     continue
 
                         # Strategy C: custom React dropdown (by class container)
@@ -361,23 +404,54 @@ class NaverEngine(BaseEngine):
                                 try:
                                     trigger = page.locator(sel).first
                                     if await trigger.is_visible(timeout=300):
+                                        self.log(f"[{worker_id}번 기기] Strategy C 트리거 발견: {sel} 클릭 시도", "info")
                                         await trigger.click()
-                                        await asyncio.sleep(0.2)
-                                        opt = page.locator(
-                                            f'li:has-text("{target_label}"), '
-                                            f'div:has-text("{target_label}"), '
-                                            f'span:has-text("{target_label}"), '
-                                            f'text="{target_label}"'
-                                        ).first
+                                        await asyncio.sleep(0.3)
+                                        
+                                        opt = None
+                                        selectors = [
+                                            f'[class*="dropdown"] li:has-text("{target_label}"):visible',
+                                            f'[class*="Dropdown"] li:has-text("{target_label}"):visible',
+                                            f'[class*="dropdown"] div:has-text("{target_label}"):visible',
+                                            f'[class*="Dropdown"] div:has-text("{target_label}"):visible',
+                                            f'[class*="list"] li:has-text("{target_label}"):visible',
+                                            f'[class*="list"] div:has-text("{target_label}"):visible',
+                                            f'li:has-text("{target_label}"):visible',
+                                            f'div:has-text("{target_label}"):visible',
+                                            f'span:has-text("{target_label}"):visible',
+                                            f'text="{target_label}":visible'
+                                        ]
+                                        
+                                        for opt_sel in selectors:
+                                            try:
+                                                cand = page.locator(opt_sel).first
+                                                if await cand.is_visible(timeout=200):
+                                                    opt = cand
+                                                    self.log(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}", "info")
+                                                    break
+                                            except Exception:
+                                                continue
+                                                
+                                        if not opt:
+                                            opt = page.locator(
+                                                f'li:has-text("{target_label}"):visible, '
+                                                f'div:has-text("{target_label}"):visible, '
+                                                f'span:has-text("{target_label}"):visible, '
+                                                f'text="{target_label}":visible'
+                                            ).first
+                                        
+                                        await opt.wait_for(state="visible", timeout=2000)
                                         try:
-                                            await opt.scroll_into_view_if_needed(timeout=300)
+                                            await opt.scroll_into_view_if_needed(timeout=400)
                                         except Exception:
                                             pass
-                                        if (await opt.count() > 0) or (await opt.is_visible(timeout=300)):
-                                            await opt.click(force=True)
-                                            participant_ok = True
-                                            break
-                                except Exception:
+                                        
+                                        await opt.click(force=True)
+                                        participant_ok = True
+                                        self.log(f"✓ [{worker_id}번 기기] Strategy C 인원 선택 성공", "info")
+                                        break
+                                except Exception as e:
+                                    self.log(f"⚠️ [{worker_id}번 기기] Strategy C 진행 중 에러: {e}", "warning")
                                     continue
 
                         if participant_ok:
