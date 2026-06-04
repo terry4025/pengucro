@@ -235,6 +235,20 @@ class NaverEngine(BaseEngine):
                 unique.append(v)
         return unique
 
+    def _time_to_minutes(self, time_str):
+        import re
+        is_pm = "오후" in time_str
+        match = re.search(r'(\d{1,2})\s*:\s*(\d{2})', time_str)
+        if not match:
+            return None
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if is_pm and hour < 12:
+            hour += 12
+        elif "오전" in time_str and hour == 12:
+            hour = 0
+        return hour * 60 + minute
+
     async def _booking_worker_task(self, worker_id, url, cookies, res_data):
         """
         Complete Naver Booking automation:
@@ -341,7 +355,7 @@ class NaverEngine(BaseEngine):
                                 if any(target_label in o for o in opts):
                                     await sel_el.select_option(label=target_label)
                                     participant_ok = True
-                                    self.log(f"✓ [{worker_id}번 기기] Strategy A (Select 엘리먼트) 인원 선택 성공", "info")
+                                    self.silent_tick(f"✓ [{worker_id}번 기기] Strategy A (Select 엘리먼트) 인원 선택 성공")
                                     break
                         except Exception as e:
                             self.silent_tick(f"Strategy A 실패: {e}")
@@ -357,7 +371,7 @@ class NaverEngine(BaseEngine):
                                 try:
                                     trigger = page.locator(f'text="{tt}"').first
                                     if await trigger.is_visible(timeout=300):
-                                        self.log(f"[{worker_id}번 기기] Strategy B 트리거 발견: '{tt}' 클릭 시도", "info")
+                                        self.silent_tick(f"[{worker_id}번 기기] Strategy B 트리거 발견: '{tt}' 클릭 시도")
                                         await trigger.click()
                                         await asyncio.sleep(0.3)
                                         
@@ -381,7 +395,7 @@ class NaverEngine(BaseEngine):
                                                 cand = page.locator(opt_sel).first
                                                 if await cand.is_visible(timeout=200):
                                                     opt = cand
-                                                    self.log(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}", "info")
+                                                    self.silent_tick(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}")
                                                     break
                                             except Exception:
                                                 continue
@@ -402,10 +416,10 @@ class NaverEngine(BaseEngine):
                                         
                                         await opt.click(force=True)
                                         participant_ok = True
-                                        self.log(f"✓ [{worker_id}번 기기] Strategy B 인원 선택 성공", "info")
+                                        self.silent_tick(f"✓ [{worker_id}번 기기] Strategy B 인원 선택 성공")
                                         break
                                 except Exception as e:
-                                    self.log(f"⚠️ [{worker_id}번 기기] Strategy B 진행 중 에러: {e}", "warning")
+                                    self.silent_tick(f"⚠️ [{worker_id}번 기기] Strategy B 진행 중 에러: {e}")
                                     continue
 
                         # Strategy C: custom React dropdown (by class container)
@@ -418,7 +432,7 @@ class NaverEngine(BaseEngine):
                                 try:
                                     trigger = page.locator(sel).first
                                     if await trigger.is_visible(timeout=300):
-                                        self.log(f"[{worker_id}번 기기] Strategy C 트리거 발견: {sel} 클릭 시도", "info")
+                                        self.silent_tick(f"[{worker_id}번 기기] Strategy C 트리거 발견: {sel} 클릭 시도")
                                         await trigger.click()
                                         await asyncio.sleep(0.3)
                                         
@@ -441,7 +455,7 @@ class NaverEngine(BaseEngine):
                                                 cand = page.locator(opt_sel).first
                                                 if await cand.is_visible(timeout=200):
                                                     opt = cand
-                                                    self.log(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}", "info")
+                                                    self.silent_tick(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}")
                                                     break
                                             except Exception:
                                                 continue
@@ -462,10 +476,10 @@ class NaverEngine(BaseEngine):
                                         
                                         await opt.click(force=True)
                                         participant_ok = True
-                                        self.log(f"✓ [{worker_id}번 기기] Strategy C 인원 선택 성공", "info")
+                                        self.silent_tick(f"✓ [{worker_id}번 기기] Strategy C 인원 선택 성공")
                                         break
                                 except Exception as e:
-                                    self.log(f"⚠️ [{worker_id}번 기기] Strategy C 진행 중 에러: {e}", "warning")
+                                    self.silent_tick(f"⚠️ [{worker_id}번 기기] Strategy C 진행 중 에러: {e}")
                                     continue
 
                         if participant_ok:
@@ -701,14 +715,14 @@ class NaverEngine(BaseEngine):
                                 # 다른 시간대는 활성화되어 있으므로, 페이지 새로고침을 멈춤(date_clicked = True 설정)
                                 date_clicked = True
                                 
-                                target_mins = time_to_minutes(target_time)
+                                target_mins = self._time_to_minutes(target_time)
                                 if target_mins is not None:
                                     closest_el = None
                                     min_diff = float('inf')
                                     closest_time_str = ""
                                     
                                     for el, txt in active_slots:
-                                        slot_mins = time_to_minutes(txt)
+                                        slot_mins = self._time_to_minutes(txt)
                                         if slot_mins is not None:
                                             diff = abs(target_mins - slot_mins)
                                             if diff < min_diff:
