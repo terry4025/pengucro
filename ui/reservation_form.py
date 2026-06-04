@@ -382,9 +382,17 @@ class ReservationForm(ctk.CTkFrame):
             self.config = self.custom_sites[site_name]
             # Custom sites do not use differentiated weekdays/weekends configurations in SITES_CONFIG
             has_weekday_weekend = False
-        else:
+        elif site_name in SITES_CONFIG:
             self.config = SITES_CONFIG[site_name]
             has_weekday_weekend = self.config["has_weekday_weekend"]
+        else:
+            # Fallback for dummy values (e.g. "(네이버 예약을 등록하세요)")
+            self.config = {
+                "branches": {},
+                "themes": {},
+                "has_weekday_weekend": False
+            }
+            has_weekday_weekend = False
 
         self.branch_frame.grid_forget()
         self.day_type_frame.grid_forget()

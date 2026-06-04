@@ -8,6 +8,8 @@ from engines.naver_engine import NaverEngine
 from PIL import Image
 import os
 import json
+import time
+from datetime import datetime
 import winsound
 import tkinter.messagebox as messagebox
 
@@ -764,6 +766,8 @@ class MainWindow(ctk.CTk):
         self.site_var = ctk.StringVar(value=saved_site)
         self.last_logged_site = saved_site
         self.last_logged_mode = None
+        self.last_standard_site = saved_site
+        self.last_naver_site = None
         
         # Build options list
         self.default_site_names = ["제로월드 강남", "제로월드 홍대", "지구별방탈출"]
@@ -995,6 +999,14 @@ class MainWindow(ctk.CTk):
     def _on_site_change(self, site_name):
         self.form.set_site(site_name)
         self.form.save_config(site_name)
+        
+        # Track active site history based on the selected mode
+        current_mode = self.form.engine_mode_btn.get()
+        if current_mode == "네이버 (Playwright)":
+            self.last_naver_site = site_name
+        else:
+            self.last_standard_site = site_name
+            
         if getattr(self, "last_logged_site", None) != site_name:
             self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
             self.last_logged_site = site_name
@@ -1077,12 +1089,16 @@ class MainWindow(ctk.CTk):
         if mode == "네이버 (Playwright)":
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
             if not site_options:
-                site_options = ["(네이버 예약을 등록하세요)"]
-                self.site_var.set("(네이버 예약을 등록하세요)")
+                target_site = "(네이버 예약을 등록하세요)"
+                site_options = [target_site]
             else:
-                if self.site_var.get() not in site_options:
-                    self.site_var.set(site_options[0])
-                    self._on_site_change(site_options[0])
+                if getattr(self, "last_naver_site", None) in site_options:
+                    target_site = self.last_naver_site
+                else:
+                    target_site = site_options[0]
+                    
+            self.site_var.set(target_site)
+            self._on_site_change(target_site)
             self.site_dropdown.configure(values=site_options)
             
             # Show Naver server time label and start synchronization loop
@@ -1096,9 +1112,13 @@ class MainWindow(ctk.CTk):
                 self._update_server_time_clock()
         else:
             site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
-            if self.site_var.get() not in site_options or self.custom_sites.get(self.site_var.get(), {}).get("style") == "naver":
-                self.site_var.set("제로월드 강남")
-                self._on_site_change("제로월드 강남")
+            if getattr(self, "last_standard_site", None) in site_options:
+                target_site = self.last_standard_site
+            else:
+                target_site = "제로월드 강남"
+                
+            self.site_var.set(target_site)
+            self._on_site_change(target_site)
             self.site_dropdown.configure(values=site_options)
             
             # Hide Naver server time and stop synchronization
