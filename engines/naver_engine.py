@@ -355,10 +355,9 @@ class NaverEngine(BaseEngine):
                                 if any(target_label in o for o in opts):
                                     await sel_el.select_option(label=target_label)
                                     participant_ok = True
-                                    self.silent_tick(f"✓ [{worker_id}번 기기] Strategy A (Select 엘리먼트) 인원 선택 성공")
                                     break
-                        except Exception as e:
-                            self.silent_tick(f"Strategy A 실패: {e}")
+                        except Exception:
+                            pass
 
                         # Strategy B: custom React dropdown (by text trigger)
                         if not participant_ok:
@@ -371,7 +370,6 @@ class NaverEngine(BaseEngine):
                                 try:
                                     trigger = page.locator(f'text="{tt}"').first
                                     if await trigger.is_visible(timeout=300):
-                                        self.silent_tick(f"[{worker_id}번 기기] Strategy B 트리거 발견: '{tt}' 클릭 시도")
                                         await trigger.click()
                                         await asyncio.sleep(0.3)
                                         
@@ -395,7 +393,6 @@ class NaverEngine(BaseEngine):
                                                 cand = page.locator(opt_sel).first
                                                 if await cand.is_visible(timeout=200):
                                                     opt = cand
-                                                    self.silent_tick(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}")
                                                     break
                                             except Exception:
                                                 continue
@@ -416,10 +413,8 @@ class NaverEngine(BaseEngine):
                                         
                                         await opt.click(force=True)
                                         participant_ok = True
-                                        self.silent_tick(f"✓ [{worker_id}번 기기] Strategy B 인원 선택 성공")
                                         break
-                                except Exception as e:
-                                    self.silent_tick(f"⚠️ [{worker_id}번 기기] Strategy B 진행 중 에러: {e}")
+                                except Exception:
                                     continue
 
                         # Strategy C: custom React dropdown (by class container)
@@ -432,7 +427,6 @@ class NaverEngine(BaseEngine):
                                 try:
                                     trigger = page.locator(sel).first
                                     if await trigger.is_visible(timeout=300):
-                                        self.silent_tick(f"[{worker_id}번 기기] Strategy C 트리거 발견: {sel} 클릭 시도")
                                         await trigger.click()
                                         await asyncio.sleep(0.3)
                                         
@@ -455,7 +449,6 @@ class NaverEngine(BaseEngine):
                                                 cand = page.locator(opt_sel).first
                                                 if await cand.is_visible(timeout=200):
                                                     opt = cand
-                                                    self.silent_tick(f"[{worker_id}번 기기] 옵션 매칭 성공: {opt_sel}")
                                                     break
                                             except Exception:
                                                 continue
@@ -476,10 +469,8 @@ class NaverEngine(BaseEngine):
                                         
                                         await opt.click(force=True)
                                         participant_ok = True
-                                        self.silent_tick(f"✓ [{worker_id}번 기기] Strategy C 인원 선택 성공")
                                         break
-                                except Exception as e:
-                                    self.silent_tick(f"⚠️ [{worker_id}번 기기] Strategy C 진행 중 에러: {e}")
+                                except Exception:
                                     continue
 
                         if participant_ok:
