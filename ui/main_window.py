@@ -751,8 +751,29 @@ class MainWindow(ctk.CTk):
             self.withdraw()
             self.after(10, self.deiconify)
             self.after(20, self.update_idletasks)  # Refresh coordinates on startup
+            self.after(50, self.bring_to_front)    # Force window to front/foreground on launch
         except Exception:
             pass
+
+    def bring_to_front(self):
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            # SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_SHOWWINDOW = 0x0040
+            # HWND_TOPMOST = -1
+            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            # HWND_NOTOPMOST = -2. Restore back to non-topmost if Pin option is disabled
+            if not getattr(self, "is_pinned", False):
+                ctypes.windll.user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            try:
+                self.attributes("-topmost", True)
+                if not getattr(self, "is_pinned", False):
+                    self.attributes("-topmost", False)
+                self.focus_force()
+            except Exception:
+                pass
 
     def _apply_appwindow_style(self):
         try:
