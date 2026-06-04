@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import calendar
 
 class ReservationForm(ctk.CTkFrame):
-    def __init__(self, parent, start_callback, stop_callback):
+    def __init__(self, parent, start_callback, stop_callback, mode_callback=None):
         super().__init__(
             parent,
             fg_color=theme.SURFACE_COLOR,
@@ -15,6 +15,7 @@ class ReservationForm(ctk.CTkFrame):
         )
         self.start_callback = start_callback
         self.stop_callback = stop_callback
+        self.mode_callback = mode_callback
         self.current_site = "제로월드 강남"
         self.custom_sites = {}
         self.config = SITES_CONFIG[self.current_site]
@@ -301,20 +302,36 @@ class ReservationForm(ctk.CTkFrame):
 
         self.engine_mode_btn = ctk.CTkSegmentedButton(
             self.engine_mode_frame,
-            values=["일반 (Sync)", "고속 (Async)"],
+            values=["일반 (Sync)", "고속 (Async)", "네이버 (Playwright)"],
             font=theme.FONT_BODY_SM,
             fg_color=theme.ELEVATED_COLOR,
             selected_color=theme.ACCENT_BLUE,
             selected_hover_color=theme.ACCENT_BLUE,
             text_color=theme.TEXT_PRIMARY,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=28,
+            command=self._on_mode_change
         )
         self.engine_mode_btn.set("일반 (Sync)")
         self.engine_mode_btn.pack(side="right", fill="x", expand=False)
 
         # Initialize layout
         self.set_site(self.current_site)
+
+    def _on_mode_change(self, mode):
+        if mode == "네이버 (Playwright)":
+            self.branch_frame.grid_forget()
+            self.day_type_frame.grid_forget()
+            self.theme_frame.grid_forget()
+            self.custom_theme_frame.grid_forget()
+        else:
+            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
+            self._toggle_custom_theme()
+            self.set_site(self.current_site)
+            
+        if self.mode_callback:
+            self.mode_callback(mode)
 
     def set_site(self, site_name):
         self.current_site = site_name
@@ -328,6 +345,16 @@ class ReservationForm(ctk.CTkFrame):
 
         self.branch_frame.grid_forget()
         self.day_type_frame.grid_forget()
+
+        # If Naver mode is active, we don't show branch / day_type / theme / custom_theme controls
+        if self.engine_mode_btn.get() == "네이버 (Playwright)":
+            self.theme_frame.grid_forget()
+            self.custom_theme_frame.grid_forget()
+            return
+
+        # Restore standard inputs if hidden
+        self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+        self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
 
         if has_weekday_weekend:
             self.day_type_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
@@ -398,8 +425,12 @@ class ReservationForm(ctk.CTkFrame):
             self.theme_var.set("")
 
     def get_reservation_data(self):
+        is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
+        
         # Resolve Branch ID
-        if self.current_site in self.custom_sites:
+        if is_naver:
+            branch_id = "1"
+        elif self.current_site in self.custom_sites:
             branch_name = self.branch_var.get()
             branch_id = self.config["branches"].get(branch_name, "1")
             has_weekday_weekend = False
@@ -409,7 +440,9 @@ class ReservationForm(ctk.CTkFrame):
             has_weekday_weekend = self.config["has_weekday_weekend"]
 
         # Resolve Theme PK
-        if self.custom_theme_checkbox.get() == 1:
+        if is_naver:
+            theme_pk = "naver"
+        elif self.custom_theme_checkbox.get() == 1:
             theme_pk = self.theme_pk_entry.get().strip()
         else:
             theme_name = self.theme_var.get()

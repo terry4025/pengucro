@@ -13,6 +13,22 @@ def parse_booking_site(url, site_name=""):
     :param site_name: Optional name for the site
     :return: A dictionary containing site configuration, or raises an Exception.
     """
+    if "booking.naver.com" in url:
+        return {
+            "name": site_name or "네이버 예약",
+            "url": url,
+            "base_url": "https://booking.naver.com",
+            "style": "naver",
+            "branches": {
+                "본점": "1"
+            },
+            "themes": {
+                "1": {
+                    "기본테마": "naver"
+                }
+            }
+        }
+
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
