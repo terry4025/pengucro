@@ -1182,6 +1182,11 @@ class MainWindow(ctk.CTk):
     def _on_close(self):
         self.is_sync_running = False
         try:
+            if hasattr(self, 'active_engine') and self.active_engine and self.active_engine.is_running:
+                self.active_engine.stop_reservation()
+        except Exception:
+            pass
+        try:
             site = self.site_var.get()
             self.form.save_config(site)
         except Exception:

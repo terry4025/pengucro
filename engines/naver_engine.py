@@ -56,10 +56,10 @@ class NaverEngine(BaseEngine):
         self.log("네이버 예약을 정지합니다...", "info")
         self.stop_event.set()
 
-        # Try to stop loop if running
-        if self.loop and self.loop.is_running():
+        # Try to close browser asynchronously inside the loop threadsafe first
+        if self.browser and self.loop and self.loop.is_running():
             try:
-                self.loop.call_soon_threadsafe(self.loop.stop)
+                asyncio.run_coroutine_threadsafe(self.browser.close(), self.loop)
             except Exception:
                 pass
 
