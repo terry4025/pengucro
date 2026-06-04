@@ -84,6 +84,10 @@ class LoadingOverlay(ctk.CTkFrame):
         self.time_counter = 0.0
         
         # UI controls placed relative to frame over canvas
+        # 3. Slide in animation start positions
+        self.title_y = 0.63
+        self.subtitle_y = 0.67
+        
         self.title_label = ctk.CTkLabel(
             self,
             text="방탈출 펭크로",
@@ -91,7 +95,7 @@ class LoadingOverlay(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             fg_color="transparent"
         )
-        self.title_label.place(relx=0.5, rely=0.6, anchor="center")
+        self.title_label.place(relx=0.5, rely=self.title_y, anchor="center")
         
         self.subtitle_label = ctk.CTkLabel(
             self,
@@ -100,19 +104,11 @@ class LoadingOverlay(ctk.CTkFrame):
             text_color=theme.TEXT_MUTE,
             fg_color="transparent"
         )
-        self.subtitle_label.place(relx=0.5, rely=0.64, anchor="center")
+        self.subtitle_label.place(relx=0.5, rely=self.subtitle_y, anchor="center")
         
-        # Flat Premium Progress Bar
-        self.progress = ctk.CTkProgressBar(
-            self,
-            width=200,
-            height=4,
-            corner_radius=2,
-            fg_color=theme.ELEVATED_COLOR,
-            progress_color=theme.ACCENT_BLUE
-        )
-        self.progress.set(0)
-        self.progress.place(relx=0.5, rely=0.7, anchor="center")
+        # 1. Custom progress bar state
+        self.progress_val = 0.0
+        self.shine_x = 0.0
         
         # Generate 12 ambient particles
         self.particles = []
@@ -135,10 +131,15 @@ class LoadingOverlay(ctk.CTkFrame):
         else:
             y = random.randint(750, 840)
             
-        speed_y = random.uniform(0.6, 2.2)
-        speed_x = random.uniform(-0.5, 0.5)
+        # 2. 3D Parallax Depth parameter
+        depth = random.uniform(0.3, 1.0)
+            
+        speed_y = random.uniform(0.6, 2.2) * depth * 1.5
+        speed_x = random.uniform(-0.5, 0.5) * depth
         size = random.randint(8, 14) if glyph in ("❄️", "✨") else random.randint(3, 6)
-        alpha = random.uniform(0.3, 0.9)
+        size = max(2, int(size * depth))
+        
+        alpha = random.uniform(0.3, 0.9) * depth
         decay = random.uniform(0.005, 0.015)
         phase = random.uniform(0, math.pi * 2)
         
@@ -151,7 +152,8 @@ class LoadingOverlay(ctk.CTkFrame):
             'alpha': alpha,
             'decay': decay,
             'glyph': glyph,
-            'phase': phase
+            'phase': phase,
+            'depth': depth
         }
         
     def _update_animation(self):
@@ -169,6 +171,12 @@ class LoadingOverlay(ctk.CTkFrame):
             w, h = 480, 860
             
         self.time_counter += 0.026
+        
+        # 3. Smooth slide-in interpolation for text labels
+        self.title_y = self.title_y + (0.60 - self.title_y) * 0.08
+        self.subtitle_y = self.subtitle_y + (0.64 - self.subtitle_y) * 0.08
+        self.title_label.place(relx=0.5, rely=self.title_y, anchor="center")
+        self.subtitle_label.place(relx=0.5, rely=self.subtitle_y, anchor="center")
         
         # Update & Draw particles
         for i in range(len(self.particles)):
@@ -245,6 +253,43 @@ class LoadingOverlay(ctk.CTkFrame):
             self.tk_logo_img = ImageTk.PhotoImage(glow_canvas)
             self.canvas.create_image(center_x, center_y, image=self.tk_logo_img)
             
+        # 1. Custom Progress Bar & Shine Sweep Drawing on Canvas
+        progress_y = h * 0.7
+        bar_start = center_x - 100
+        bar_end = center_x + 100
+        bar_width = 200
+        
+        # Draw background bar
+        self.canvas.create_rectangle(
+            bar_start, progress_y - 2,
+            bar_end, progress_y + 2,
+            fill=theme.ELEVATED_COLOR, outline=""
+        )
+        
+        # Draw filled progress bar
+        fill_end = bar_start + (bar_width * self.progress_val)
+        if self.progress_val > 0.0:
+            self.canvas.create_rectangle(
+                bar_start, progress_y - 2,
+                fill_end, progress_y + 2,
+                fill=theme.ACCENT_BLUE, outline=""
+            )
+            
+            # Update shine position sweep
+            self.shine_x += 4.5
+            if self.shine_x > bar_end + 50:
+                self.shine_x = bar_start - 50
+                
+            # Draw glow shine overlay line
+            for offset, color_val in [(-12, "#74c2ff"), (-6, "#bfe3ff"), (0, "#ffffff"), (6, "#bfe3ff"), (12, "#74c2ff")]:
+                sx = self.shine_x + offset
+                if bar_start <= sx <= fill_end:
+                    self.canvas.create_line(
+                        sx, progress_y - 2,
+                        sx, progress_y + 2,
+                        fill=color_val, width=2
+                    )
+            
         self.after(16, self._update_animation)
         
     def _animate_progress(self, val):
@@ -252,10 +297,25 @@ class LoadingOverlay(ctk.CTkFrame):
             return
         if val < 1.0:
             val += 0.038 # 1.3x slower (was 0.05)
-            self.progress.set(val)
+            self.progress_val = val
+            
+            # 3. Dynamic Subtitle Text Update
+            if val < 0.25:
+                text_status = "네이버 플레이라이트 모듈 예열 중..."
+            elif val < 0.55:
+                text_status = "시간 계산 알고리즘 최적화 중..."
+            elif val < 0.80:
+                text_status = "우회 예약 차선책 라우터 검사 중..."
+            else:
+                text_status = "UI 렌더링 최적화 및 구동 준비 완료..."
+                
+            self.subtitle_label.configure(text=text_status)
+            
             delay = int(30 + (val * 90))
             self.after(delay, self._animate_progress, val)
         else:
+            self.progress_val = 1.0
+            self.subtitle_label.configure(text="구동 완료! 펭크로 엔진 준비 완료.")
             self.after(100, self._fade_out)
             
     def _fade_out(self):
