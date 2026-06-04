@@ -21,6 +21,120 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+def animate_click(btn, original_height, original_width=None, callback=None):
+    try:
+        btn.configure(height=original_height - 2)
+        if original_width:
+            btn.configure(width=original_width - 4)
+    except Exception:
+        pass
+        
+    def restore():
+        try:
+            btn.configure(height=original_height)
+            if original_width:
+                btn.configure(width=original_width)
+        except Exception:
+            pass
+        if callback:
+            callback()
+            
+    btn.after(80, restore)
+
+class LoadingOverlay(ctk.CTkFrame):
+    def __init__(self, parent, on_complete):
+        super().__init__(parent, fg_color=theme.CANVAS_COLOR, corner_radius=0)
+        self.parent = parent
+        self.on_complete = on_complete
+        
+        # Main container centered
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # Animated Emoji Emblem
+        self.logo_label = ctk.CTkLabel(
+            content,
+            text="🐧",
+            font=(theme.FONT_FAMILY, 56),
+            text_color=theme.ACCENT_BLUE
+        )
+        self.logo_label.pack(pady=(0, 15))
+        
+        # Soft Pulse effect on the Penguin Emoji
+        self.logo_scale = 1
+        self._pulse_logo()
+        
+        self.title_label = ctk.CTkLabel(
+            content,
+            text="방탈출 펭크로",
+            font=(theme.FONT_FAMILY, 20, "bold"),
+            text_color=theme.TEXT_PRIMARY
+        )
+        self.title_label.pack(pady=(0, 6))
+        
+        self.subtitle_label = ctk.CTkLabel(
+            content,
+            text="예약 엔진 로딩 및 최적화 중...",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE
+        )
+        self.subtitle_label.pack(pady=(0, 25))
+        
+        # Flat Premium Progress Bar
+        self.progress = ctk.CTkProgressBar(
+            content,
+            width=200,
+            height=4,
+            corner_radius=2,
+            fg_color=theme.ELEVATED_COLOR,
+            progress_color=theme.ACCENT_BLUE
+        )
+        self.progress.set(0)
+        self.progress.pack()
+        
+        self.after(100, self._animate_progress, 0)
+        
+    def _pulse_logo(self):
+        if not self.winfo_exists():
+            return
+        # Toggle size slightly to create a breathing penguin look
+        current_font = self.logo_label.cget("font")
+        size = 56 if self.logo_scale == 1 else 62
+        self.logo_scale = 1 - self.logo_scale
+        self.logo_label.configure(font=(theme.FONT_FAMILY, size))
+        self.after(500, self._pulse_logo)
+
+    def _animate_progress(self, val):
+        if not self.winfo_exists():
+            return
+        if val < 1.0:
+            val += 0.05
+            self.progress.set(val)
+            # Differentiate speed for realistic rendering look
+            delay = int(30 + (val * 90))
+            self.after(delay, self._animate_progress, val)
+        else:
+            self.after(100, self._fade_out)
+            
+    def _fade_out(self):
+        if not self.winfo_exists():
+            return
+        # Smoothly slide the overlay up
+        h = self.winfo_height()
+        step = max(5, int(h / 12))
+        
+        def slide():
+            if not self.winfo_exists():
+                return
+            y = self.winfo_y()
+            if abs(y) < h:
+                self.place(y=y - step)
+                self.after(12, slide)
+            else:
+                self.destroy()
+                self.on_complete()
+        slide()
+
 class SuccessDialog(ctk.CTkToplevel):
     def __init__(self, parent, title="예약 성공", message="축하합니다! 방탈출 예약에 성공하였습니다."):
         super().__init__(parent)
@@ -252,30 +366,47 @@ class AddSiteDialog(ctk.CTkToplevel):
                 self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 (Playwright)' 모드에서 등록해주세요.", text_color=theme.ACCENT_RED)
                 return
             
-        self.status_label.configure(text="🔄 사이트 구조 분석 중...", text_color=theme.ACCENT_YELLOW)
-        self.add_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="disabled")
+        def proceed():
+            self.status_label.configure(text="🔄 사이트 구조 분석 중...", text_color=theme.ACCENT_YELLOW)
+            self.add_btn.configure(state="disabled")
+            self.cancel_btn.configure(state="disabled")
+            
+            # Start dots animation
+            self._parsing_in_progress = True
+            self.animate_dots(1)
+            
+            # Parse in a background thread to prevent UI freezing
+            import threading
+            def parse_thread():
+                from engines.site_parser import parse_booking_site
+                try:
+                    result = parse_booking_site(url, site_name)
+                    self.parent.after(0, lambda: self._on_parse_success(result))
+                except Exception as e:
+                    self.parent.after(0, lambda: self._on_parse_error(str(e)))
+                    
+            t = threading.Thread(target=parse_thread, name="SiteParserThread")
+            t.daemon = True
+            t.start()
+            
+        animate_click(self.add_btn, 30, 100, proceed)
         
-        # Parse in a background thread to prevent UI freezing
-        import threading
-        def parse_thread():
-            from engines.site_parser import parse_booking_site
-            try:
-                result = parse_booking_site(url, site_name)
-                self.parent.after(0, lambda: self._on_parse_success(result))
-            except Exception as e:
-                self.parent.after(0, lambda: self._on_parse_error(str(e)))
-                
-        t = threading.Thread(target=parse_thread, name="SiteParserThread")
-        t.daemon = True
-        t.start()
-        
+    def animate_dots(self, count=1):
+        if not getattr(self, "_parsing_in_progress", False):
+            return
+        dots = "." * count
+        self.status_label.configure(text=f"🔄 사이트 구조 분석 중{dots}")
+        next_count = 1 if count >= 3 else count + 1
+        self.after(300, lambda: self.animate_dots(next_count))
+
     def _on_parse_success(self, result):
+        self._parsing_in_progress = False
         self.status_label.configure(text="✓ 분석 완료! 저장 중...", text_color=theme.ACCENT_GREEN)
         self.success_callback(result)
         self._on_cancel()
         
     def _on_parse_error(self, error_msg):
+        self._parsing_in_progress = False
         self.status_label.configure(text=f"⚠️ {error_msg}", text_color=theme.ACCENT_RED)
         self.add_btn.configure(state="normal")
         self.cancel_btn.configure(state="normal")
@@ -596,6 +727,14 @@ class MainWindow(ctk.CTk):
         self._start_jigubyeol_theme_fetcher()
         self._update_delete_button_state(saved_site)
 
+        # Show premium loading splash overlay
+        self.loading_overlay = LoadingOverlay(self, self._on_loading_complete)
+        self.loading_overlay.place(x=0, y=36, relwidth=1, relheight=1)
+
+    def _on_loading_complete(self):
+        # Refresh theme UI once loading is completely done
+        self._refresh_themes_ui()
+
     # -------------------------------------------------------------
     # Dragging Functionality for Borderless Window
     # -------------------------------------------------------------
@@ -836,20 +975,23 @@ class MainWindow(ctk.CTk):
             self.pin_btn.configure(fg_color="transparent", text_color=theme.TEXT_MUTE)
 
     def _toggle_cta(self):
-        if self.active_engine and self.active_engine.is_running:
-            self._stop_booking()
-        else:
-            res_data, error_msg, threads, is_async = self.form.get_reservation_data()
-            if error_msg:
-                self.log_panel.append_log(f"입력 오류: {error_msg}", "error")
-                self.current_status = "error"
-                self.status_badge.configure(
-                    text="● 에러 발생",
-                    text_color=theme.TEXT_PRIMARY,
-                    fg_color=theme.ACCENT_RED
-                )
-                return
-            self._start_booking(res_data, threads, is_async)
+        def proceed():
+            if self.active_engine and self.active_engine.is_running:
+                self._stop_booking()
+            else:
+                res_data, error_msg, threads, is_async = self.form.get_reservation_data()
+                if error_msg:
+                    self.log_panel.append_log(f"입력 오류: {error_msg}", "error")
+                    self.current_status = "error"
+                    self.status_badge.configure(
+                        text="● 에러 발생",
+                        text_color=theme.TEXT_PRIMARY,
+                        fg_color=theme.ACCENT_RED
+                    )
+                    return
+                self._start_booking(res_data, threads, is_async)
+                
+        animate_click(self.cta_btn, 38, callback=proceed)
 
     def _start_booking(self, reservation_data, threads, is_async):
         selected_site = self.site_var.get()
