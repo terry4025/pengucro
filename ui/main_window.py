@@ -4,11 +4,13 @@ from ui.reservation_form import ReservationForm
 from ui.log_panel import LogPanel
 from engines.zeroworld_engine import ZeroWorldEngine
 from engines.jigubyeol_engine import JigubyeolEngine
+from engines.naver_engine import NaverEngine
 from PIL import Image
 import os
 import json
 import winsound
 import tkinter.messagebox as messagebox
+
 
 def resource_path(relative_path):
     import sys
@@ -238,6 +240,17 @@ class AddSiteDialog(ctk.CTkToplevel):
         if not url:
             self.status_label.configure(text="⚠️ 예약 페이지 URL을 입력해주세요.", text_color=theme.ACCENT_RED)
             return
+
+        # URL Validation based on Engine Mode
+        current_mode = self.parent.form.engine_mode_btn.get()
+        if current_mode == "네이버 (Playwright)":
+            if "booking.naver.com" not in url:
+                self.status_label.configure(text="⚠️ 네이버 예약 URL (booking.naver.com)만 등록 가능합니다.", text_color=theme.ACCENT_RED)
+                return
+        else:
+            if "booking.naver.com" in url:
+                self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 (Playwright)' 모드에서 등록해주세요.", text_color=theme.ACCENT_RED)
+                return
             
         self.status_label.configure(text="🔄 사이트 구조 분석 중...", text_color=theme.ACCENT_YELLOW)
         self.add_btn.configure(state="disabled")
@@ -299,6 +312,10 @@ class MainWindow(ctk.CTk):
         # Active engine tracking
         self.active_engine = None
         self.is_pinned = False
+        
+        # Naver Server Time synchronization state
+        self.naver_time_offset = 0.0
+        self.is_sync_running = False
 
         # Attempt counter & status tracking
         self.attempt_count = 0
@@ -435,6 +452,15 @@ class MainWindow(ctk.CTk):
         )
         self.status_badge.pack(anchor="center")
 
+        # Naver Server Time Label (initially hidden)
+        self.server_time_label = ctk.CTkLabel(
+            header_frame,
+            text="네이버 서버 시간: 동기화 중...",
+            font=(theme.FONT_FAMILY, 12, "bold"),
+            text_color=theme.ACCENT_YELLOW,
+            fg_color="transparent"
+        )
+
         # Divider
         divider = ctk.CTkFrame(self, height=1, fg_color=theme.HAIRLINE_COLOR)
         divider.pack(fill="x", padx=20, pady=(3, 8))
@@ -533,7 +559,8 @@ class MainWindow(ctk.CTk):
         self.form = ReservationForm(
             self,
             start_callback=self._start_booking,
-            stop_callback=self._stop_booking
+            stop_callback=self._stop_booking,
+            mode_callback=self._on_engine_mode_change
         )
         self.form.custom_sites = self.custom_sites
         self.form.pack(fill="x", padx=20, pady=(0, 6))
@@ -674,13 +701,22 @@ class MainWindow(ctk.CTk):
                 except Exception as e:
                     self.log_panel.append_log(f"설정 저장 중 오류: {e}", "error")
                 
-                # Refresh dropdown values
-                site_options = self.default_site_names + list(self.custom_sites.keys())
+                # Refresh dropdown values with active filter
+                current_mode = self.form.engine_mode_btn.get()
+                if current_mode == "네이버 (Playwright)":
+                    site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
+                    fallback_site = site_options[0] if site_options else "(네이버 예약을 등록하세요)"
+                else:
+                    site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
+                    fallback_site = "제로월드 강남"
+
+                if not site_options:
+                    site_options = [fallback_site]
                 self.site_dropdown.configure(values=site_options)
                 
                 # Switch back to default
-                self.site_var.set("제로월드 강남")
-                self._on_site_change("제로월드 강남")
+                self.site_var.set(fallback_site)
+                self._on_site_change(fallback_site)
                 self.log_panel.append_log(f"커스텀 사이트 '{current_site}'이(가) 삭제되었습니다.", "info")
 
     def _open_add_site_dialog(self):
@@ -697,8 +733,13 @@ class MainWindow(ctk.CTk):
         except Exception as e:
             self.log_panel.append_log(f"설정 저장 중 오류: {e}", "error")
             
-        # Refresh dropdown options
-        site_options = self.default_site_names + list(self.custom_sites.keys())
+        # Refresh dropdown options with active mode filter
+        current_mode = self.form.engine_mode_btn.get()
+        if current_mode == "네이버 (Playwright)":
+            site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
+        else:
+            site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
+            
         self.site_dropdown.configure(values=site_options)
         
         # Select newly added site
@@ -707,7 +748,78 @@ class MainWindow(ctk.CTk):
         
         self.log_panel.append_log(f"커스텀 사이트 '{site_name}'이(가) 등록되었습니다. (엔진 유형: {site_data['style']})", "success")
 
+    def _on_engine_mode_change(self, mode):
+        # Filter site dropdown depending on active engine mode
+        if mode == "네이버 (Playwright)":
+            site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
+            if not site_options:
+                site_options = ["(네이버 예약을 등록하세요)"]
+                self.site_var.set("(네이버 예약을 등록하세요)")
+            else:
+                if self.site_var.get() not in site_options:
+                    self.site_var.set(site_options[0])
+                    self._on_site_change(site_options[0])
+            self.site_dropdown.configure(values=site_options)
+            
+            # Show Naver server time label and start synchronization loop
+            self.server_time_label.pack(anchor="center", pady=(5, 0))
+            if not self.is_sync_running:
+                self.is_sync_running = True
+                import threading
+                t = threading.Thread(target=self._sync_naver_server_time, name="NaverTimeSyncThread")
+                t.daemon = True
+                t.start()
+                self._update_server_time_clock()
+        else:
+            site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
+            if self.site_var.get() not in site_options or self.custom_sites.get(self.site_var.get(), {}).get("style") == "naver":
+                self.site_var.set("제로월드 강남")
+                self._on_site_change("제로월드 강남")
+            self.site_dropdown.configure(values=site_options)
+            
+            # Hide Naver server time and stop synchronization
+            self.server_time_label.pack_forget()
+            self.is_sync_running = False
+
+    def _sync_naver_server_time(self):
+        import urllib.request
+        import time
+        from email.utils import parsedate_to_datetime
+        
+        while self.is_sync_running:
+            try:
+                req = urllib.request.Request("https://booking.naver.com", method="HEAD")
+                start = time.perf_counter()
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    latency = (time.perf_counter() - start) / 2
+                    date_str = response.info().get("Date")
+                    if date_str:
+                        gmt_dt = parsedate_to_datetime(date_str)
+                        server_time = gmt_dt.timestamp() + latency
+                        self.naver_time_offset = server_time - time.time()
+            except Exception:
+                pass
+            
+            # Re-sync every 30 seconds
+            for _ in range(30):
+                if not self.is_sync_running:
+                    break
+                time.sleep(1)
+
+    def _update_server_time_clock(self):
+        if not self.is_sync_running:
+            return
+        
+        now = time.time() + self.naver_time_offset
+        now_dt = datetime.fromtimestamp(now)
+        time_str = now_dt.strftime("네이버 서버 시간: %H:%M:%S.%f")[:-4] # keep milliseconds to 2 decimals
+        self.server_time_label.configure(text=time_str)
+        
+        # Refresh every 100ms
+        self.after(100, self._update_server_time_clock)
+
     def _on_close(self):
+        self.is_sync_running = False
         try:
             site = self.site_var.get()
             self.form.save_config(site)
@@ -760,7 +872,12 @@ class MainWindow(ctk.CTk):
             fg_color=theme.ACCENT_YELLOW
         )
 
-        if selected_site in self.custom_sites:
+        if self.form.engine_mode_btn.get() == "네이버 (Playwright)":
+            self.active_engine = NaverEngine(
+                log_callback=self._on_engine_log,
+                success_callback=self._on_booking_success
+            )
+        elif selected_site in self.custom_sites:
             site_info = self.custom_sites[selected_site]
             if site_info["style"] == "jigubyeol":
                 self.active_engine = JigubyeolEngine(
