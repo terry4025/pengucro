@@ -320,10 +320,10 @@ class ReservationForm(ctk.CTkFrame):
 
     def _on_mode_change(self, mode):
         if mode == "네이버 (Playwright)":
-            self._animate_collapse_frame(self.branch_frame)
-            self._animate_collapse_frame(self.day_type_frame)
-            self._animate_collapse_frame(self.theme_frame)
-            self._animate_collapse_frame(self.custom_theme_frame)
+            self.branch_frame.grid_forget()
+            self.day_type_frame.grid_forget()
+            self.theme_frame.grid_forget()
+            self.custom_theme_frame.grid_forget()
             
             # Restrict threads slider to maximum of 8
             self.threads_slider.configure(to=8, number_of_steps=7)
@@ -331,78 +331,16 @@ class ReservationForm(ctk.CTkFrame):
                 self.threads_slider.set(8)
                 self.threads_value_label.configure(text="8")
         else:
-            # Restore threads slider back to 100
-            self.threads_slider.configure(to=100, number_of_steps=99)
-            
-            # Identify layout configs for standard sites
-            if self.current_site in self.custom_sites:
-                has_weekday_weekend = False
-            else:
-                has_weekday_weekend = self.config.get("has_weekday_weekend", False)
-                
-            if has_weekday_weekend:
-                self._animate_expand_frame(self.day_type_frame, 0, 0, 2, 12, (10, 3), 45)
-            else:
-                self._animate_expand_frame(self.branch_frame, 0, 0, 2, 12, (10, 3), 45)
-                
-            self._animate_expand_frame(self.theme_frame, 1, 0, 2, 12, (3, 3), 48)
-            
-            # If custom theme code input is checked, expand to 48px, otherwise 22px
-            target_h = 48 if self.custom_theme_checkbox.get() == 1 else 22
-            self._animate_expand_frame(self.custom_theme_frame, 2, 0, 2, 12, (1, 3), target_h)
-            
+            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
             self._toggle_custom_theme()
             self.set_site(self.current_site)
             
+            # Restore threads slider back to 100
+            self.threads_slider.configure(to=100, number_of_steps=99)
+            
         if self.mode_callback:
             self.mode_callback(mode)
-
-    def _animate_collapse_frame(self, frame, on_complete=None):
-        frame.pack_propagate(False)
-        frame.grid_propagate(False)
-        
-        orig_height = frame.winfo_height()
-        if orig_height <= 1:
-            orig_height = 45 # fallback
-            
-        step = max(3, int(orig_height / 6))
-        
-        def shrink():
-            if not frame.winfo_exists():
-                return
-            h = frame.winfo_height()
-            if h > step:
-                frame.configure(height=h - step)
-                frame.after(12, shrink)
-            else:
-                frame.configure(height=0)
-                frame.grid_forget()
-                frame.pack_propagate(True)
-                frame.grid_propagate(True)
-                if on_complete:
-                    on_complete()
-        shrink()
-
-    def _animate_expand_frame(self, frame, row, column, columnspan, padx, pady, target_height=45):
-        frame.pack_propagate(False)
-        frame.grid_propagate(False)
-        frame.configure(height=0)
-        frame.grid(row=row, column=column, columnspan=columnspan, padx=padx, pady=pady, sticky="ew")
-        
-        step = max(3, int(target_height / 6))
-        
-        def expand():
-            if not frame.winfo_exists():
-                return
-            h = frame.winfo_height()
-            if h < target_height:
-                frame.configure(height=min(target_height, h + step))
-                frame.after(12, expand)
-            else:
-                frame.configure(height=target_height)
-                frame.pack_propagate(True)
-                frame.grid_propagate(True)
-        expand()
 
     def set_site(self, site_name):
         self.current_site = site_name
