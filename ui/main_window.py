@@ -762,6 +762,8 @@ class MainWindow(ctk.CTk):
                 pass
 
         self.site_var = ctk.StringVar(value=saved_site)
+        self.last_logged_site = saved_site
+        self.last_logged_mode = None
         
         # Build options list
         self.default_site_names = ["제로월드 강남", "제로월드 홍대", "지구별방탈출"]
@@ -993,7 +995,9 @@ class MainWindow(ctk.CTk):
     def _on_site_change(self, site_name):
         self.form.set_site(site_name)
         self.form.save_config(site_name)
-        self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
+        if getattr(self, "last_logged_site", None) != site_name:
+            self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
+            self.last_logged_site = site_name
         self._update_delete_button_state(site_name)
 
     def _update_delete_button_state(self, site_name):
@@ -1064,6 +1068,11 @@ class MainWindow(ctk.CTk):
         self.log_panel.append_log(f"커스텀 사이트 '{site_name}'이(가) 등록되었습니다. (엔진 유형: {site_data['style']})", "success")
 
     def _on_engine_mode_change(self, mode):
+        # Log mode change if not redundant
+        if getattr(self, "last_logged_mode", None) != mode:
+            self.log_panel.append_log(f"예약 방식이 '{mode}'(으)로 변경되었습니다.", "info")
+            self.last_logged_mode = mode
+            
         # Filter site dropdown depending on active engine mode
         if mode == "네이버 (Playwright)":
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
