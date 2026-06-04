@@ -759,18 +759,44 @@ class MainWindow(ctk.CTk):
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            # SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_SHOWWINDOW = 0x0040
-            # HWND_TOPMOST = -1
+            
+            # Attach current thread input to the active foreground window thread to bypass Foreground Lock policy
+            fore_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            fore_thread = 0
+            curr_thread = 0
+            if fore_hwnd:
+                fore_thread = ctypes.windll.user32.GetWindowThreadProcessId(fore_hwnd, 0)
+                curr_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+                if fore_thread != curr_thread:
+                    ctypes.windll.user32.AttachThreadInput(curr_thread, fore_thread, True)
+                    
+            # 1. Bring window to topmost layout (HWND_TOPMOST = -1)
             ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
-            # HWND_NOTOPMOST = -2. Restore back to non-topmost if Pin option is disabled
-            if not getattr(self, "is_pinned", False):
-                ctypes.windll.user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            
+            # 2. Force focus activation
             ctypes.windll.user32.SetForegroundWindow(hwnd)
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+            ctypes.windll.user32.SetFocus(hwnd)
+            
+            # 3. Detach thread input
+            if fore_hwnd and fore_thread != curr_thread:
+                ctypes.windll.user32.AttachThreadInput(curr_thread, fore_thread, False)
+                
+            # 4. Remove topmost status after a short 100ms delay to let DWM render it in front
+            if not getattr(self, "is_pinned", False):
+                def remove_topmost():
+                    try:
+                        if not getattr(self, "is_pinned", False):
+                            # HWND_NOTOPMOST = -2
+                            ctypes.windll.user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+                    except Exception:
+                        pass
+                self.after(100, remove_topmost)
         except Exception:
             try:
                 self.attributes("-topmost", True)
                 if not getattr(self, "is_pinned", False):
-                    self.attributes("-topmost", False)
+                    self.after(100, lambda: self.attributes("-topmost", False))
                 self.focus_force()
             except Exception:
                 pass
