@@ -1012,7 +1012,10 @@ class MainWindow(ctk.CTk):
         else:
             self.last_standard_site = site_name
             
-        if getattr(self, "last_logged_site", None) != site_name:
+        if (
+            getattr(self, "last_logged_site", None) != site_name
+            and not getattr(self, "_suppress_site_log", False)
+        ):
             if hasattr(self, "log_panel") and self.log_panel:
                 self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
             self.last_logged_site = site_name
@@ -1091,6 +1094,10 @@ class MainWindow(ctk.CTk):
             if hasattr(self, "log_panel") and self.log_panel:
                 self.log_panel.append_log(f"예약 방식이 '{mode}'(으)로 변경되었습니다.", "info")
             self.last_logged_mode = mode
+
+        # Suppress site-change logs while switching engine modes (the engine-mode
+        # log above is sufficient context for the user).
+        self._suppress_site_log = True
             
         # Filter site dropdown depending on active engine mode
         if mode == "네이버 (Playwright)":
@@ -1131,6 +1138,9 @@ class MainWindow(ctk.CTk):
             # Hide Naver server time and stop synchronization
             self.server_time_label.pack_forget()
             self.is_sync_running = False
+
+        # Re-enable site-change logging for user-initiated site switches
+        self._suppress_site_log = False
 
     def _sync_naver_server_time(self):
         import urllib.request

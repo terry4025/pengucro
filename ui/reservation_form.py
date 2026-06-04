@@ -397,18 +397,24 @@ class ReservationForm(ctk.CTkFrame):
         self.branch_frame.grid_forget()
         self.day_type_frame.grid_forget()
 
-        # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
-        self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
-        self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
-
-        if has_weekday_weekend:
-            self.day_type_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
+        # In Naver mode, hide all standard-engine-only form sections entirely
+        is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
+        if is_naver:
+            self.theme_frame.grid_forget()
+            self.custom_theme_frame.grid_forget()
         else:
-            self.branch_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
-            branch_options = list(self.config["branches"].keys())
-            self.branch_dropdown.configure(values=branch_options)
-            if branch_options:
-                self.branch_var.set(branch_options[0])
+            # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
+            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
+
+            if has_weekday_weekend:
+                self.day_type_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
+            else:
+                self.branch_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
+                branch_options = list(self.config["branches"].keys())
+                self.branch_dropdown.configure(values=branch_options)
+                if branch_options:
+                    self.branch_var.set(branch_options[0])
 
         self._update_theme_options()
         self._update_widgets_state()
