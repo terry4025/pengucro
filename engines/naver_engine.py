@@ -319,7 +319,7 @@ class NaverEngine(BaseEngine):
                         except Exception:
                             pass
 
-                        # Strategy B: custom React dropdown
+                        # Strategy B: custom React dropdown (by text trigger)
                         if not participant_ok:
                             trigger_texts = [
                                 "해당하는 항목을 선택해주세요.",
@@ -329,16 +329,40 @@ class NaverEngine(BaseEngine):
                             for tt in trigger_texts:
                                 try:
                                     trigger = page.locator(f'text="{tt}"').first
-                                    if await trigger.is_visible(timeout=400):
+                                    if await trigger.is_visible(timeout=300):
                                         await trigger.click()
-                                        await asyncio.sleep(0.3)
+                                        await asyncio.sleep(0.2)
                                         # Click the matching option
                                         opt = page.locator(
                                             f'li:has-text("{target_label}"), '
                                             f'div:has-text("{target_label}"), '
                                             f'span:has-text("{target_label}")'
                                         ).first
-                                        if await opt.is_visible(timeout=500):
+                                        if await opt.is_visible(timeout=400):
+                                            await opt.click()
+                                            participant_ok = True
+                                            break
+                                except Exception:
+                                    continue
+
+                        # Strategy C: custom React dropdown (by class container)
+                        if not participant_ok:
+                            for sel in [
+                                '.UserDropdown__dropdown_area__aOccG',
+                                '[class*="UserDropdown__dropdown_area"]',
+                                '.booking_user_request'
+                            ]:
+                                try:
+                                    trigger = page.locator(sel).first
+                                    if await trigger.is_visible(timeout=300):
+                                        await trigger.click()
+                                        await asyncio.sleep(0.2)
+                                        opt = page.locator(
+                                            f'li:has-text("{target_label}"), '
+                                            f'div:has-text("{target_label}"), '
+                                            f'span:has-text("{target_label}")'
+                                        ).first
+                                        if await opt.is_visible(timeout=400):
                                             await opt.click()
                                             participant_ok = True
                                             break
@@ -352,7 +376,20 @@ class NaverEngine(BaseEngine):
                             )
                             await asyncio.sleep(0.2)
 
-                        # Phase 4a — Check agreement checkboxes ────
+                        # Phase 3b — Click "연락처 확인" if visible to validate user details ──
+                        try:
+                            check_phone = page.locator(
+                                'button:has-text("연락처 확인"), '
+                                '.check_btn'
+                            ).first
+                            if await check_phone.is_visible(timeout=300):
+                                await check_phone.click()
+                                await asyncio.sleep(0.2)
+                        except Exception:
+                            pass
+
+                        # Phase 4a — Check agreement checkboxes & custom divs ────
+                        # 1. Standard HTML checkbox inputs
                         try:
                             cbs = await page.locator("input[type='checkbox']").all()
                             for cb in cbs:
@@ -364,19 +401,44 @@ class NaverEngine(BaseEngine):
                         except Exception:
                             pass
 
-                        # Phase 4b — Click "동의하고 예약하기" ──────
+                        # 2. Custom agreement divs/texts (which don't use standard input elements)
+                        try:
+                            for sel in [
+                                '.AgreementDesc__section_inner__Ny+MK',
+                                '.AgreementDesc__section_agreement_info__hMLOx',
+                                'text="예약 서비스 이용을 위한 개인정보 제3자 제공 규정을 확인하였으며 이에 동의합니다."'
+                            ]:
+                                try:
+                                    custom_cb = page.locator(sel).first
+                                    if await custom_cb.is_visible(timeout=300):
+                                        await custom_cb.click(force=True)
+                                        await asyncio.sleep(0.1)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # Phase 4b — Click "동의하고 예약하기" (Wait for activation if needed) ──
                         try:
                             submit = page.locator(
                                 'button:has-text("동의하고 예약하기"), '
                                 'a:has-text("동의하고 예약하기")'
                             ).first
+
+                            # Wait up to 1.5s (15 * 100ms) for 'disabled' class to clear
+                            for _ in range(15):
+                                cls = (await submit.get_attribute("class")) or ""
+                                if "disabled" not in cls:
+                                    break
+                                await asyncio.sleep(0.1)
+
                             await submit.click()
                             self.log(
                                 f"🚀 [{worker_id}번 기기] '동의하고 예약하기' 클릭!",
                                 "warning"
                             )
-                        except Exception:
-                            self.silent_tick("'동의하고 예약하기' 버튼 클릭 실패")
+                        except Exception as e:
+                            self.silent_tick(f"'동의하고 예약하기' 클릭 실패: {str(e)[:40]}")
                             await page.goto(booking_url)
                             await page.wait_for_load_state("domcontentloaded")
                             continue
