@@ -1013,7 +1013,8 @@ class MainWindow(ctk.CTk):
             self.last_standard_site = site_name
             
         if getattr(self, "last_logged_site", None) != site_name:
-            self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
+            if hasattr(self, "log_panel") and self.log_panel:
+                self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
             self.last_logged_site = site_name
         self._update_delete_button_state(site_name)
 
@@ -1087,7 +1088,8 @@ class MainWindow(ctk.CTk):
     def _on_engine_mode_change(self, mode):
         # Log mode change if not redundant
         if getattr(self, "last_logged_mode", None) != mode:
-            self.log_panel.append_log(f"예약 방식이 '{mode}'(으)로 변경되었습니다.", "info")
+            if hasattr(self, "log_panel") and self.log_panel:
+                self.log_panel.append_log(f"예약 방식이 '{mode}'(으)로 변경되었습니다.", "info")
             self.last_logged_mode = mode
             
         # Filter site dropdown depending on active engine mode
