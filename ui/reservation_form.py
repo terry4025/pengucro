@@ -324,7 +324,7 @@ class ReservationForm(ctk.CTkFrame):
         # Row 8: Developer Test Mode (Naver only)
         # -------------------------------------------------------------
         self.dev_mode_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.dev_mode_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="ew")
+        # Frame placement is handled by _update_widgets_state dynamically
         
         self.dev_mode_var = ctk.BooleanVar(value=False)
         self.dev_mode_checkbox = ctk.CTkCheckBox(
@@ -341,6 +341,7 @@ class ReservationForm(ctk.CTkFrame):
 
         # Initialize layout
         self.set_site(self.current_site)
+        self._update_widgets_state()
 
     def _on_mode_change(self, mode):
         # Save previous state
@@ -387,7 +388,8 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
             
-            # Enable Developer Mode checkbox
+            # Show frame and enable Developer Mode checkbox
+            self.dev_mode_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="ew")
             self.dev_mode_checkbox.configure(state="normal", text_color=theme.TEXT_PRIMARY)
         else:
             # Enable standard controls
@@ -404,8 +406,8 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             self.phone_label.configure(text_color=theme.TEXT_MUTE)
             
-            # Disable and uncheck Developer Mode checkbox
-            self.dev_mode_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            # Hide and uncheck Developer Mode checkbox
+            self.dev_mode_frame.grid_forget()
             self.dev_mode_var.set(False)
             self._toggle_custom_theme()
 

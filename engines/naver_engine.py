@@ -337,10 +337,15 @@ class NaverEngine(BaseEngine):
                                         opt = page.locator(
                                             f'li:has-text("{target_label}"), '
                                             f'div:has-text("{target_label}"), '
-                                            f'span:has-text("{target_label}")'
+                                            f'span:has-text("{target_label}"), '
+                                            f'text="{target_label}"'
                                         ).first
-                                        if await opt.is_visible(timeout=400):
-                                            await opt.click()
+                                        try:
+                                            await opt.scroll_into_view_if_needed(timeout=300)
+                                        except Exception:
+                                            pass
+                                        if (await opt.count() > 0) or (await opt.is_visible(timeout=300)):
+                                            await opt.click(force=True)
                                             participant_ok = True
                                             break
                                 except Exception:
@@ -361,10 +366,15 @@ class NaverEngine(BaseEngine):
                                         opt = page.locator(
                                             f'li:has-text("{target_label}"), '
                                             f'div:has-text("{target_label}"), '
-                                            f'span:has-text("{target_label}")'
+                                            f'span:has-text("{target_label}"), '
+                                            f'text="{target_label}"'
                                         ).first
-                                        if await opt.is_visible(timeout=400):
-                                            await opt.click()
+                                        try:
+                                            await opt.scroll_into_view_if_needed(timeout=300)
+                                        except Exception:
+                                            pass
+                                        if (await opt.count() > 0) or (await opt.is_visible(timeout=300)):
+                                            await opt.click(force=True)
                                             participant_ok = True
                                             break
                                 except Exception:
