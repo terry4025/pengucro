@@ -4,7 +4,7 @@ import json
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from engines.base_engine import BaseEngine
 
 class NaverEngine(BaseEngine):
@@ -296,6 +296,10 @@ class NaverEngine(BaseEngine):
             )
 
             attempt = 0
+            date_clicked = False
+            has_awaited_open = False
+            naver_time_offset = res_data.get('naver_time_offset', 0.0)
+
             while not self.stop_event.is_set():
                 attempt += 1
                 try:
@@ -594,6 +598,45 @@ class NaverEngine(BaseEngine):
                         #  BOOKING PAGE  (Phases 1-2)
                         # ═══════════════════════════════════════════
 
+                        # 1. 정각 오픈 전 대기 로직 (하이브리드 대기 - 최초 1회 판별)
+                        if not has_awaited_open:
+                            server_now = time.time() + naver_time_offset
+                            dt_now = datetime.fromtimestamp(server_now)
+                            
+                            # Calculate next 30-minute interval target
+                            minutes_to_add = 30 - (dt_now.minute % 30)
+                            dt_target = dt_now.replace(second=0, microsecond=0)
+                            if dt_now.minute % 30 != 0 or dt_now.second > 0:
+                                dt_target += timedelta(minutes=minutes_to_add)
+                                
+                            target_open_timestamp = dt_target.timestamp()
+                            time_left = target_open_timestamp - server_now
+                            
+                            # If we are within 180 seconds (3 minutes) before target open time
+                            if 0 < time_left <= 180:
+                                self.log(
+                                    f"⏰ [{worker_id}번 기기] 정각 오픈 대기 중... "
+                                    f"(서버시간: {dt_now.strftime('%H:%M:%S')}, "
+                                    f"오픈예정: {dt_target.strftime('%H:%M:%S')}, "
+                                    f"남은시간: {time_left:.1f}초)",
+                                    "info"
+                                )
+                                
+                                # Sleep until 0.15 seconds before target_open_timestamp
+                                sleep_target = target_open_timestamp - 0.15
+                                while time.time() + naver_time_offset < sleep_target:
+                                    if self.stop_event.is_set():
+                                        break
+                                    await asyncio.sleep(0.01) # Ultra-fine check
+                                    
+                                if not self.stop_event.is_set():
+                                    self.log(f"🔄 [{worker_id}번 기기] 오픈 정각 감지! 1차 새로고침 실행...", "info")
+                                    await page.reload()
+                                    await page.wait_for_load_state("domcontentloaded")
+                                    await wait_for_loading()
+                                    
+                            has_awaited_open = True
+
                         # Phase 1 — Find & click target time slot ──
                         time_el = None
                         for tv in time_variants:
@@ -604,7 +647,7 @@ class NaverEngine(BaseEngine):
                             ]:
                                 try:
                                     el = page.locator(sel).first
-                                    if await el.is_visible(timeout=200):
+                                    if await el.is_visible(timeout=0): # 0ms timeout for ultra-fast check
                                         txt = await el.inner_text()
                                         cls = (await el.get_attribute("class")) or ""
                                         aria = (await el.get_attribute("aria-disabled")) or ""
@@ -666,8 +709,9 @@ class NaverEngine(BaseEngine):
                                     if "disabled" not in cls.lower() and aria_disabled != "true" and disabled_attr is None:
                                         self.silent_tick(f"{target_date} 날짜 활성화 클릭 시도")
                                         await date_el.click(force=True)
-                                        await asyncio.sleep(0.1)
+                                        await asyncio.sleep(0.05) # Reduced sleep
                                         await wait_for_loading()
+                                        date_clicked = True
                             except Exception as date_err:
                                 self.silent_tick(f"날짜 클릭 시도 실패: {date_err}")
 
@@ -682,14 +726,17 @@ class NaverEngine(BaseEngine):
                                     f"{target_time} 대기"
                                 )
                             
-                            # Periodic reload to refresh timetable (Rollback to every 30 attempts)
-                            if attempt % 30 == 0:
-                                self.log(f"🔄 [{worker_id}번 기기] 시간표 새로고침 (시도: {attempt}회)", "info")
+                            # 새로고침 규칙:
+                            # 1. 이미 날짜 클릭이 성공해서 시간표가 떠 있어야 하는 상황(`date_clicked = True`)이라면 새로고침 절대 금지!
+                            # 2. 날짜가 아직 비활성화 상태인 경우에만 1.2초마다 새로고침 시도
+                            if not date_clicked:
+                                self.log(f"🔄 [{worker_id}번 기기] 날짜 대기 새로고침 (시도: {attempt}회)", "info")
                                 await page.reload()
                                 await page.wait_for_load_state("domcontentloaded")
                                 await wait_for_loading()
                             else:
-                                await asyncio.sleep(0.15)
+                                # 날짜가 이미 클릭되었으므로, 새로고침 없이 초고속으로 시간 버튼 검사만 수행 (루프 딜레이 최소화)
+                                await asyncio.sleep(0.01)
                             continue
 
                         self.log(

@@ -1275,6 +1275,10 @@ class MainWindow(ctk.CTk):
         with self.log_queue_lock:
             self.log_queue.clear()
 
+        # Inject server time offset into reservation_data for NaverEngine
+        if self.form.engine_mode_btn.get() == "네이버 (Playwright)":
+            reservation_data['naver_time_offset'] = getattr(self, 'naver_time_offset', 0.0)
+
         self.active_engine.start_reservation(reservation_data, threads, is_async)
 
     def _stop_booking(self):
