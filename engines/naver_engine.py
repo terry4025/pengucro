@@ -311,6 +311,7 @@ class NaverEngine(BaseEngine):
 
             attempt = 0
             date_clicked = False
+            last_reload_time = 0.0
             has_awaited_open = False
             naver_time_offset = res_data.get('naver_time_offset', 0.0)
 
@@ -734,7 +735,7 @@ class NaverEngine(BaseEngine):
                             # Wait for loading indicator to clear
                             await wait_for_loading()
                             
-                            # Attempt to click target date cell to trigger timetable loading (if date became active)
+                            # Attempt to detect/click target date cell to trigger timetable loading (if date became active)
                             try:
                                 dt = datetime.strptime(target_date, "%Y-%m-%d")
                                 year, month, day = dt.year, dt.month, dt.day
@@ -770,10 +771,21 @@ class NaverEngine(BaseEngine):
                                 if date_el:
                                     cls = (await date_el.get_attribute("class")) or ""
                                     aria_disabled = (await date_el.get_attribute("aria-disabled")) or ""
+                                    aria_selected = (await date_el.get_attribute("aria-selected")) or ""
                                     disabled_attr = await date_el.get_attribute("disabled")
                                     
-                                    # Click if it is enabled and selectable
-                                    if "disabled" not in cls.lower() and aria_disabled != "true" and disabled_attr is None:
+                                    cls_lower = cls.lower()
+                                    # 만약 이미 날짜가 선택되어 활성화된 상태라면 클릭 생략하고 바로 date_clicked = True 설정
+                                    is_already_selected = (
+                                        "selected" in cls_lower 
+                                        or "active" in cls_lower 
+                                        or "on" in cls_lower 
+                                        or aria_selected == "true"
+                                    )
+                                    
+                                    if is_already_selected:
+                                        date_clicked = True
+                                    elif "disabled" not in cls_lower and aria_disabled != "true" and disabled_attr is None:
                                         self.silent_tick(f"{target_date} 날짜 활성화 클릭 시도")
                                         await date_el.click(force=True)
                                         await asyncio.sleep(0.05) # Reduced sleep
@@ -781,6 +793,14 @@ class NaverEngine(BaseEngine):
                                         date_clicked = True
                             except Exception as date_err:
                                 self.silent_tick(f"날짜 클릭 시도 실패: {date_err}")
+
+                            # 만약 날짜 감지/클릭이 완료되었으나 아직 시간 버튼(time_el)이 없다면 미세한 렌더링 시간 대기 (Smart Wait)
+                            if date_clicked:
+                                try:
+                                    # 시간표 렌더링 완료(보이기) 대기 (최대 600ms)
+                                    await page.locator('button:has-text(":"):visible, a:has-text(":"):visible').first.wait_for(state="visible", timeout=600)
+                                except Exception:
+                                    pass
 
                             # Print retry status
                             if attempt == 1 or attempt % 20 == 0:
@@ -797,10 +817,16 @@ class NaverEngine(BaseEngine):
                             # 1. 이미 날짜 클릭이 성공해서 시간표가 떠 있어야 하는 상황(`date_clicked = True`)이라면 새로고침 절대 금지!
                             # 2. 날짜가 아직 비활성화 상태인 경우에만 1.2초마다 새로고침 시도
                             if not date_clicked:
-                                self.log(f"🔄 [{worker_id}번 기기] 날짜 대기 새로고침 (시도: {attempt}회)", "info")
-                                await page.reload()
-                                await page.wait_for_load_state("domcontentloaded")
-                                await wait_for_loading()
+                                now = time.time()
+                                if now - last_reload_time >= 1.2:
+                                    self.log(f"🔄 [{worker_id}번 기기] 날짜 대기 새로고침 (시도: {attempt}회)", "info")
+                                    last_reload_time = now
+                                    await page.reload()
+                                    await page.wait_for_load_state("domcontentloaded")
+                                    await wait_for_loading()
+                                else:
+                                    # 1.2초 간격 쿨다운 미도달 시 새로고침을 억제하고 CPU 부하 절감을 위해 대기
+                                    await asyncio.sleep(0.05)
                             else:
                                 # 날짜가 이미 클릭되었으므로, 새로고침 없이 초고속으로 시간 버튼 검사만 수행 (루프 딜레이 최소화)
                                 await asyncio.sleep(0.01)
@@ -846,6 +872,8 @@ class NaverEngine(BaseEngine):
 
                 except Exception as e:
                     self.silent_tick(f"에러: {str(e)[:60]}")
+                    date_clicked = False
+                    last_reload_time = 0.0
                     try:
                         await page.goto(booking_url)
                         await page.wait_for_load_state("domcontentloaded")
