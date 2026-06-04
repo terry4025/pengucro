@@ -4,6 +4,138 @@ import re
 import urllib.parse
 from datetime import datetime, timedelta
 
+def resolve_short_url(url):
+    """
+    naver.me 단축 URL의 HTTP 리다이렉션을 추적하여 최종 목적지 URL을 반환합니다.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        response = requests.head(url, headers=headers, allow_redirects=True, timeout=5)
+        return response.url
+    except Exception:
+        try:
+            response = requests.get(url, headers=headers, allow_redirects=True, timeout=5)
+            return response.url
+        except Exception:
+            return url
+
+def extract_place_id_and_product_id(url):
+    """
+    네이버 지도 및 플레이스 URL에서 placeId와 bookingProductId를 추출합니다.
+    """
+    parsed = urllib.parse.urlparse(url)
+    query_params = urllib.parse.parse_qs(parsed.query)
+    
+    product_id = query_params.get("bookingProductId", [None])[0]
+    
+    place_id = query_params.get("id", [None])[0]
+    if not place_id:
+        match = re.search(r'/(?:entry/)?place/(\d+)', parsed.path)
+        if match:
+            place_id = match.group(1)
+            
+    return place_id, product_id
+
+def get_booking_url_from_map_api(place_id):
+    """
+    네이버 지도 요약 API를 호출하여 플레이스에 매핑된 네이버 예약 URL을 조회합니다.
+    """
+    api_url = f"https://map.naver.com/v5/api/sites/summary/{place_id}?lang=ko"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://map.naver.com/"
+    }
+    try:
+        response = requests.get(api_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            booking_hub = data.get("bookingHub")
+            if booking_hub:
+                bizes_list = booking_hub.get("bookingBizes")
+                if bizes_list and len(bizes_list) > 0:
+                    booking_url = bizes_list[0].get("bookingUrl")
+                    if booking_url:
+                        return booking_url
+            booking = data.get("booking")
+            if booking:
+                booking_url = booking.get("bookingUrl")
+                if booking_url:
+                    return booking_url
+    except Exception:
+        pass
+    return None
+
+def get_booking_url_from_place_html(place_id):
+    """
+    플레이스 HTML 페이지를 크롤링하여 예약 링크나 스크립트 데이터 내 예약 주소를 파싱합니다.
+    """
+    url = f"https://pcmap.place.naver.com/place/{place_id}/home"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "booking.naver.com" in href:
+                    return href
+            for script in soup.find_all("script"):
+                if script.string and "booking.naver.com" in script.string:
+                    match = re.search(r'https://booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?', script.string)
+                    if match:
+                        return match.group(0)
+    except Exception:
+        pass
+    return None
+
+def normalize_naver_url(url):
+    """
+    모바일/PC 네이버 예약 URL, 단축 URL, 네이버 지도 URL을 최종 예약 주소로 변환합니다.
+    """
+    if not url:
+        return None
+        
+    url = url.strip()
+
+    if "naver.me" in url:
+        url = resolve_short_url(url)
+        if not url or "naver.me" in url:
+            return None
+
+    place_id, item_id = extract_place_id_and_product_id(url)
+    
+    booking_match = re.search(
+        r'booking\.naver\.com/booking/(?P<service_id>\d+)/bizes/(?P<bizes_id>\d+)(/items/(?P<item_id>\d+))?',
+        url
+    )
+    
+    if booking_match:
+        service_id = booking_match.group("service_id")
+        bizes_id = booking_match.group("bizes_id")
+        final_item_id = booking_match.group("item_id") or item_id
+        
+        normalized = f"https://booking.naver.com/booking/{service_id}/bizes/{bizes_id}"
+        if final_item_id:
+            normalized += f"/items/{final_item_id}"
+        return normalized
+
+    if place_id:
+        booking_url = get_booking_url_from_map_api(place_id)
+        if not booking_url:
+            booking_url = get_booking_url_from_place_html(place_id)
+            
+        if booking_url:
+            normalized_base = normalize_naver_url(booking_url)
+            if normalized_base and item_id and "/items/" not in normalized_base:
+                normalized_base += f"/items/{item_id}"
+            return normalized_base
+
+    return None
+
 def parse_booking_site(url, site_name=""):
     """
     Fetches and automatically parses the branch and theme configuration of a booking site.
@@ -13,10 +145,11 @@ def parse_booking_site(url, site_name=""):
     :param site_name: Optional name for the site
     :return: A dictionary containing site configuration, or raises an Exception.
     """
-    if "booking.naver.com" in url:
+    normalized_naver = normalize_naver_url(url)
+    if normalized_naver:
         return {
             "name": site_name or "네이버 예약",
-            "url": url,
+            "url": normalized_naver,
             "base_url": "https://booking.naver.com",
             "style": "naver",
             "branches": {

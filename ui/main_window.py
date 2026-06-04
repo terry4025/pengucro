@@ -500,11 +500,16 @@ class AddSiteDialog(ctk.CTkToplevel):
         # URL Validation based on Engine Mode
         current_mode = self.parent.form.engine_mode_btn.get()
         if current_mode == "네이버 (Playwright)":
-            if "booking.naver.com" not in url:
-                self.status_label.configure(text="⚠️ 네이버 예약 URL (booking.naver.com)만 등록 가능합니다.", text_color=theme.ACCENT_RED)
+            from engines.site_parser import normalize_naver_url
+            normalized_url = normalize_naver_url(url)
+            if not normalized_url:
+                self.status_label.configure(text="⚠️ 올바른 네이버 예약 또는 지도 URL이 아닙니다.", text_color=theme.ACCENT_RED)
                 return
+            url = normalized_url
+            self.url_entry.delete(0, "end")
+            self.url_entry.insert(0, url)
         else:
-            if "booking.naver.com" in url:
+            if any(p in url for p in ["booking.naver.com", "naver.me", "map.naver.com", "place.naver.com"]):
                 self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 (Playwright)' 모드에서 등록해주세요.", text_color=theme.ACCENT_RED)
                 return
             

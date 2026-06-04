@@ -495,7 +495,8 @@ class ReservationForm(ctk.CTkFrame):
 
         # Resolve Theme PK
         if is_naver:
-            theme_pk = "naver"
+            # For Naver Playwright mode, the themePK argument holds the actual normalized booking URL
+            theme_pk = self.config.get("url", "naver")
         elif self.custom_theme_checkbox.get() == 1:
             theme_pk = self.theme_pk_entry.get().strip()
         else:
