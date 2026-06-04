@@ -3,6 +3,7 @@ import os
 import json
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from engines.base_engine import BaseEngine
 
@@ -200,204 +201,314 @@ class NaverEngine(BaseEngine):
                 await self.browser.close()
                 self.browser = None
 
+    def _get_time_variants(self, time_str):
+        """Convert HH:MM to possible Naver Booking display format variants.
+        
+        Naver displays times in Korean 12-hour format:
+          - 12:10 → "오후 12:10"
+          - 13:20 → "오후 1:20"
+          - 09:30 → "오전 9:30"
+        We generate search strings that will match via has-text().
+        """
+        parts = time_str.split(":")
+        hour = int(parts[0])
+        minute = parts[1]
+
+        variants = []
+        # Original format
+        variants.append(f"{hour}:{minute}")
+        # With leading zero
+        variants.append(f"{hour:02d}:{minute}")
+        # 12-hour conversion for PM hours (13–23)
+        if hour > 12:
+            variants.append(f"{hour - 12}:{minute}")
+        elif hour == 0:
+            variants.append(f"12:{minute}")
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for v in variants:
+            if v not in seen:
+                seen.add(v)
+                unique.append(v)
+        return unique
+
     async def _booking_worker_task(self, worker_id, url, cookies, res_data):
+        """
+        Complete Naver Booking automation:
+          Phase 1: Navigate to page → find & click target time slot
+          Phase 2: Click "다음" (Next)
+          Phase 3: Select "참여인원 설정" (participant count) dropdown
+          Phase 4: Click "동의하고 예약하기" (Agree & Book)
+          Phase 5: Verify booking success
+        """
         context = None
         try:
-            # Isolated context
             context = await self.browser.new_context(
                 viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
             )
             await context.add_cookies(cookies)
             page = await context.new_page()
 
-            # Set short timeouts for aggressive booking attempts
+            # Auto-dismiss native alert / confirm dialogs
+            async def handle_dialog(dialog):
+                msg = dialog.message[:80] if dialog.message else ""
+                self.log(f"⚠️ [{worker_id}번 기기] 팝업: {msg}", "warning")
+                await dialog.dismiss()
+            page.on("dialog", handle_dialog)
+
             page.set_default_timeout(5000)
-            page.set_default_navigation_timeout(8000)
+            page.set_default_navigation_timeout(10000)
 
-            target_date = res_data.get("reservationDate") # YYYY-MM-DD
-            target_time = res_data.get("reservationTime")[:5] # HH:MM
+            target_date = res_data.get("reservationDate")      # YYYY-MM-DD
+            target_time = res_data.get("reservationTime")[:5]  # HH:MM
+            people = res_data.get("people", "2")
+            time_variants = self._get_time_variants(target_time)
 
-            # Navigate to booking page
-            await page.goto(url)
+            # Build booking URL with startDateTime to pre-select the target date
+            start_dt = f"{target_date}T00:00:00+09:00"
+            sep = "&" if "?" in url else "?"
+            booking_url = f"{url}{sep}startDateTime={urllib.parse.quote(start_dt)}"
+
+            await page.goto(booking_url)
             await page.wait_for_load_state("domcontentloaded")
-
-            self.log(f"[{worker_id}번 기기] 사이트 로드 완료. 날짜: {target_date}, 시간: {target_time}", "info")
+            self.log(
+                f"[{worker_id}번 기기] 페이지 로드 완료 "
+                f"(날짜: {target_date}, 시간: {target_time}, 인원: {people}인)",
+                "info"
+            )
 
             attempt = 0
             while not self.stop_event.is_set():
                 attempt += 1
                 try:
-                    # 1. Click target date to trigger React SPA timetable refresh
-                    # Naver booking dates are represented by 'calendar-date' or data-date attribute
-                    # e.g., <a data-date="2026-06-05"> or similar elements
-                    date_selectors = [
-                        f'a[data-date="{target_date}"]',
-                        f'td[data-date="{target_date}"]',
-                        f'button[data-date="{target_date}"]',
-                        f'div[data-date="{target_date}"]',
-                        f'[aria-label*="{target_date}"]',
-                    ]
-                    
-                    date_element = None
-                    for sel in date_selectors:
-                        try:
-                            el = page.locator(sel).first
-                            if await el.is_visible():
-                                date_element = el
-                                break
-                        except Exception:
-                            continue
-
-                    if not date_element:
-                        # Parse day from date (e.g. 2026-06-05 -> 5)
-                        day = str(int(target_date.split("-")[2]))
-                        fallback_sel = f"//a[contains(text(), '{day}') or span[contains(text(), '{day}')]]"
-                        el = page.locator(fallback_sel).first
-                        if await el.is_visible():
-                            date_element = el
-
-                    if date_element:
-                        await date_element.click()
-                        # Short delay for AJAX DOM update
-                        await asyncio.sleep(0.1)
-                    else:
-                        self.silent_tick("달력 날짜 요소를 찾을 수 없음")
-                        await asyncio.sleep(0.5)
-                        continue
-
-                    # 2. Check if the target time is visible and clickable
-                    # Time selectors can vary, but generally contain the time string in button or list items
-                    time_selectors = [
-                        f'button:has-text("{target_time}")',
-                        f'a:has-text("{target_time}")',
-                        f'span:has-text("{target_time}")',
-                        f'li:has-text("{target_time}")',
-                        f'.time_btn:has-text("{target_time}")',
-                        f'[aria-label*="{target_time}"]',
-                    ]
-
-                    time_element = None
-                    for sel in time_selectors:
-                        try:
-                            el = page.locator(sel).first
-                            if await el.is_visible() and await el.is_enabled():
-                                time_element = el
-                                break
-                        except Exception:
-                            continue
-
-                    if not time_element:
-                        # Time slot not open or sold out
-                        self.silent_tick(f"{target_time} 시간 예약 비활성화 (대기 중)")
-                        # Wait a bit before repeating date click
-                        await asyncio.sleep(0.2)
-                        continue
-
-                    # Target time found! Click it.
-                    self.log(f"✓ [{worker_id}번 기기] {target_time} 시간표 활성화 감지! 클릭 시도 중...", "warning")
-                    await time_element.click()
-                    await asyncio.sleep(0.1)
-
-                    # 3. Click NEXT / BOOK button
-                    # Typical next buttons: "다음", "예약하기", "다음단계"
-                    next_selectors = [
-                        'a:has-text("다음")',
-                        'button:has-text("다음")',
-                        'a:has-text("예약하기")',
-                        'button:has-text("예약하기")',
-                        'a:has-text("다음단계")',
-                        'button:has-text("다음단계")',
-                    ]
-
-                    next_element = None
-                    for sel in next_selectors:
-                        try:
-                            el = page.locator(sel).first
-                            if await el.is_visible():
-                                next_element = el
-                                break
-                        except Exception:
-                            continue
-
-                    if next_element:
-                        await next_element.click()
-                        await page.wait_for_load_state("domcontentloaded")
-                    else:
-                        # Some sites direct to booking forms immediately upon time click.
-                        pass
-
-                    # 4. Fill Booking Form (If redirected)
-                    # Check all required check-boxes (terms, agreements)
+                    # ── Detect which page we are on ──────────────
+                    on_request_page = False
                     try:
-                        checkboxes = await page.locator("input[type='checkbox']").all()
-                        for cb in checkboxes:
-                            try:
-                                if not await cb.is_checked():
-                                    await cb.check(force=True)
-                            except Exception:
-                                pass
+                        submit_loc = page.locator(
+                            'button:has-text("동의하고 예약하기"), '
+                            'a:has-text("동의하고 예약하기")'
+                        ).first
+                        on_request_page = await submit_loc.is_visible(timeout=300)
                     except Exception:
                         pass
 
-                    # Populate user inputs if empty
-                    inputs = {
-                        "name": ["input[name*='name']", "input[placeholder*='이름']", "input[id*='name']"],
-                        "phone": ["input[name*='phone']", "input[name*='tel']", "input[placeholder*='전화번호']", "input[placeholder*='휴대폰']"]
-                    }
+                    if on_request_page:
+                        # ═══════════════════════════════════════════
+                        #  REQUEST / CONFIRMATION PAGE  (Phases 3-5)
+                        # ═══════════════════════════════════════════
 
-                    for key, val in [("name", res_data.get("name")), ("phone", res_data.get("phone"))]:
-                        for sel in inputs[key]:
-                            try:
-                                el = page.locator(sel).first
-                                if await el.is_visible():
-                                    current_val = await el.input_value()
-                                    if not current_val:
-                                        await el.fill(val)
-                                    break
-                            except Exception:
-                                continue
+                        # Phase 3 — Select 참여인원 설정 dropdown ──
+                        target_label = f"{people}인"
+                        participant_ok = False
 
-                    # 5. Click final Submit Button
-                    submit_selectors = [
-                        'button:has-text("예약")',
-                        'a:has-text("예약")',
-                        'button:has-text("결제")',
-                        'a:has-text("결제")',
-                        'button[type="submit"]',
-                    ]
-
-                    submit_element = None
-                    for sel in submit_selectors:
+                        # Strategy A: native <select> element
                         try:
-                            el = page.locator(sel).first
-                            if await el.is_visible():
-                                submit_element = el
-                                break
+                            for sel_el in await page.locator("select").all():
+                                opts = await sel_el.locator("option").all_text_contents()
+                                if any(target_label in o for o in opts):
+                                    await sel_el.select_option(label=target_label)
+                                    participant_ok = True
+                                    break
                         except Exception:
+                            pass
+
+                        # Strategy B: custom React dropdown
+                        if not participant_ok:
+                            trigger_texts = [
+                                "해당하는 항목을 선택해주세요.",
+                                "참여인원 설정",
+                                "선택해주세요",
+                            ]
+                            for tt in trigger_texts:
+                                try:
+                                    trigger = page.locator(f'text="{tt}"').first
+                                    if await trigger.is_visible(timeout=400):
+                                        await trigger.click()
+                                        await asyncio.sleep(0.3)
+                                        # Click the matching option
+                                        opt = page.locator(
+                                            f'li:has-text("{target_label}"), '
+                                            f'div:has-text("{target_label}"), '
+                                            f'span:has-text("{target_label}")'
+                                        ).first
+                                        if await opt.is_visible(timeout=500):
+                                            await opt.click()
+                                            participant_ok = True
+                                            break
+                                except Exception:
+                                    continue
+
+                        if participant_ok:
+                            self.log(
+                                f"✓ [{worker_id}번 기기] 참여인원 {target_label} 선택 완료",
+                                "info"
+                            )
+                            await asyncio.sleep(0.2)
+
+                        # Phase 4a — Check agreement checkboxes ────
+                        try:
+                            cbs = await page.locator("input[type='checkbox']").all()
+                            for cb in cbs:
+                                try:
+                                    if not await cb.is_checked():
+                                        await cb.check(force=True)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # Phase 4b — Click "동의하고 예약하기" ──────
+                        try:
+                            submit = page.locator(
+                                'button:has-text("동의하고 예약하기"), '
+                                'a:has-text("동의하고 예약하기")'
+                            ).first
+                            await submit.click()
+                            self.log(
+                                f"🚀 [{worker_id}번 기기] '동의하고 예약하기' 클릭!",
+                                "warning"
+                            )
+                        except Exception:
+                            self.silent_tick("'동의하고 예약하기' 버튼 클릭 실패")
+                            await page.goto(booking_url)
+                            await page.wait_for_load_state("domcontentloaded")
                             continue
 
-                    if submit_element:
-                        await submit_element.click()
-                        # Wait for booking detail page or success URL redirect
-                        await page.wait_for_load_state("networkidle")
-                        
-                        # Verify Success
-                        current_url = page.url
-                        if "booking-detail" in current_url or "success" in current_url or "complete" in current_url:
-                            self.log(f"🎉 [{worker_id}번 기기] 네이버 예약 성공!! URL: {current_url}", "success")
+                        # Phase 5 — Verify booking result ─────────
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+
+                        cur = page.url
+                        body_text = ""
+                        try:
+                            body_text = await page.locator("body").inner_text(timeout=2000)
+                        except Exception:
+                            pass
+
+                        success_url = ["booking-detail", "success", "complete", "my/"]
+                        success_txt = ["예약이 완료", "예약되었습니다", "예약 완료"]
+
+                        if (
+                            any(k in cur for k in success_url)
+                            or any(k in body_text for k in success_txt)
+                        ):
+                            self.log(
+                                f"🎉 [{worker_id}번 기기] 네이버 예약 성공!! URL: {cur}",
+                                "success"
+                            )
                             self.stop_event.set()
                             if self.success_callback:
                                 self.success_callback()
                             break
                         else:
-                            self.log(f"⚠️ [{worker_id}번 기기] 폼 제출 후 주소: {current_url}", "warning")
+                            self.log(
+                                f"⚠️ [{worker_id}번 기기] 제출 후 재확인 — {cur}",
+                                "warning"
+                            )
+                            # Return to booking page and retry
+                            await page.goto(booking_url)
+                            await page.wait_for_load_state("domcontentloaded")
+                            continue
+
                     else:
-                        self.log(f"❌ [{worker_id}번 기기] 최종 예약 완료 버튼을 찾지 못함", "error")
+                        # ═══════════════════════════════════════════
+                        #  BOOKING PAGE  (Phases 1-2)
+                        # ═══════════════════════════════════════════
+
+                        # Phase 1 — Find & click target time slot ──
+                        time_el = None
+                        for tv in time_variants:
+                            for sel in [
+                                f'button:has-text("{tv}")',
+                                f'a:has-text("{tv}")',
+                                f'li:has-text("{tv}")',
+                            ]:
+                                try:
+                                    el = page.locator(sel).first
+                                    if await el.is_visible(timeout=200):
+                                        txt = await el.inner_text()
+                                        cls = (await el.get_attribute("class")) or ""
+                                        aria = (await el.get_attribute("aria-disabled")) or ""
+                                        if (
+                                            "매진" not in txt
+                                            and "disabled" not in cls
+                                            and aria != "true"
+                                        ):
+                                            time_el = el
+                                            break
+                                except Exception:
+                                    continue
+                            if time_el:
+                                break
+
+                        if not time_el:
+                            self.silent_tick(
+                                f"{target_time} 비활성화/매진 — 대기"
+                            )
+                            # Periodic reload to refresh timetable
+                            if attempt % 30 == 0:
+                                await page.reload()
+                                await page.wait_for_load_state("domcontentloaded")
+                            else:
+                                await asyncio.sleep(0.15)
+                            continue
+
+                        self.log(
+                            f"✓ [{worker_id}번 기기] {target_time} 활성화 감지! "
+                            f"클릭 시도...",
+                            "warning"
+                        )
+                        await time_el.click()
+                        await asyncio.sleep(0.15)
+
+                        # Phase 2 — Click "다음" button ────────────
+                        next_clicked = False
+                        for sel in [
+                            'a:has-text("다음")',
+                            'button:has-text("다음")',
+                        ]:
+                            try:
+                                el = page.locator(sel).first
+                                if await el.is_visible(timeout=800):
+                                    await el.click()
+                                    next_clicked = True
+                                    self.log(
+                                        f"✓ [{worker_id}번 기기] '다음' 버튼 클릭",
+                                        "info"
+                                    )
+                                    try:
+                                        await page.wait_for_load_state(
+                                            "domcontentloaded", timeout=5000
+                                        )
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(0.3)
+                                    break
+                            except Exception:
+                                continue
+
+                        if not next_clicked:
+                            self.silent_tick("'다음' 버튼 미발견")
+                            continue
 
                 except Exception as e:
-                    self.silent_tick(f"에러: {str(e)[:50]}")
-                    await asyncio.sleep(0.5)
+                    self.silent_tick(f"에러: {str(e)[:60]}")
+                    try:
+                        await page.goto(booking_url)
+                        await page.wait_for_load_state("domcontentloaded")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.3)
 
         except Exception as e:
             self.log(f"❌ [{worker_id}번 기기] 중단 에러: {e}", "error")
