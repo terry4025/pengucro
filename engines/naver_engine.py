@@ -314,6 +314,7 @@ class NaverEngine(BaseEngine):
             last_reload_time = 0.0
             has_awaited_open = False
             naver_time_offset = res_data.get('naver_time_offset', 0.0)
+            target_open_timestamp = None
 
             while not self.stop_event.is_set():
                 attempt += 1
@@ -670,48 +671,84 @@ class NaverEngine(BaseEngine):
                         
                         try:
                             import re
-                            elements = await page.locator(combined_sel).all()
-                            for el in elements:
-                                if await el.is_visible(timeout=0):
-                                    txt = await el.inner_text()
-                                    cls = (await el.get_attribute("class")) or ""
-                                    aria = (await el.get_attribute("aria-disabled")) or ""
-                                    disabled_attr = await el.get_attribute("disabled")
-                                    if (
-                                        "매진" not in txt
-                                        and "disabled" not in cls.lower()
-                                        and aria != "true"
-                                        and disabled_attr is None
-                                    ):
-                                        time_el = el
-                                        # Parse text to set selected_time_str
-                                        match = re.search(r'\d{1,2}\s*:\s*\d{2}', txt)
-                                        if match:
-                                            selected_time_str = match.group(0)
-                                        break
-                        except Exception:
-                            pass
+                            # 단 한 번의 evaluate 호출로 모든 variant 요소의 상태를 읽어옴 (CDP roundtrip 병목 제거)
+                            js_time_scan = """
+                            (selector) => {
+                                const els = Array.from(document.querySelectorAll(selector));
+                                return els.map((el, idx) => {
+                                    const rect = el.getBoundingClientRect();
+                                    const visible = !!(rect.top || rect.bottom || rect.width || rect.height);
+                                    if (!visible) return null;
+                                    return {
+                                        idx: idx,
+                                        txt: el.innerText || "",
+                                        cls: el.className || "",
+                                        aria: el.getAttribute("aria-disabled") || "",
+                                        disabled: el.hasAttribute("disabled")
+                                    };
+                                }).filter(Boolean);
+                            }
+                            """
+                            scan_res = await page.evaluate(js_time_scan, combined_sel)
+                            for item in scan_res:
+                                txt = item["txt"]
+                                cls = item["cls"]
+                                aria = item["aria"]
+                                disabled = item["disabled"]
+                                if (
+                                    "매진" not in txt
+                                    and "disabled" not in cls.lower()
+                                    and aria != "true"
+                                    and not disabled
+                                ):
+                                    time_el = page.locator(combined_sel).nth(item["idx"])
+                                    match = re.search(r'\d{1,2}\s*:\s*\d{2}', txt)
+                                    if match:
+                                        selected_time_str = match.group(0)
+                                    break
+                        except Exception as scan_err:
+                            self.silent_tick(f"시간 버튼 evaluate 에러: {scan_err}")
 
                         # --- [대체 시간대(차선책) 탐색 및 새로고침 정지 로직 - v4.1] ---
                         if not time_el:
                             active_slots = []
                             try:
-                                # 시간 포맷(콜론)을 가지며 화면에 보이는 활성 버튼/링크 탐색
-                                locators = await page.locator('button:has-text(":"):visible, a:has-text(":"):visible').all()
-                                for el in locators:
-                                    txt = await el.inner_text()
-                                    import re
+                                # evaluate를 사용하여 화면에 보이는 시간표를 일괄 파싱하여 CDP latency 차단
+                                js_alt_scan = """
+                                () => {
+                                    const els = Array.from(document.querySelectorAll('button, a'));
+                                    return els.map((el, idx) => {
+                                        const txt = el.innerText || "";
+                                        if (!txt.includes(":")) return null;
+                                        const rect = el.getBoundingClientRect();
+                                        const visible = !!(rect.top || rect.bottom || rect.width || rect.height);
+                                        if (!visible) return null;
+                                        return {
+                                            idx: idx,
+                                            txt: txt,
+                                            cls: el.className || "",
+                                            aria: el.getAttribute("aria-disabled") || "",
+                                            disabled: el.hasAttribute("disabled")
+                                        };
+                                    }).filter(Boolean);
+                                }
+                                """
+                                eval_alt = await page.evaluate(js_alt_scan)
+                                import re
+                                for item in eval_alt:
+                                    txt = item["txt"]
                                     if re.search(r'\d{1,2}\s*:\s*\d{2}', txt):
-                                        cls = (await el.get_attribute("class")) or ""
-                                        aria = (await el.get_attribute("aria-disabled")) or ""
-                                        disabled_attr = await el.get_attribute("disabled")
+                                        cls = item["cls"]
+                                        aria = item["aria"]
+                                        disabled = item["disabled"]
                                         if (
                                             "매진" not in txt
                                             and "종료" not in txt
                                             and "disabled" not in cls.lower()
                                             and aria != "true"
-                                            and disabled_attr is None
+                                            and not disabled
                                         ):
+                                            el = page.locator('button, a').nth(item["idx"])
                                             active_slots.append((el, txt))
                             except Exception as scan_err:
                                 self.silent_tick(f"시간 후보군 스캔 에러: {scan_err}")
@@ -828,17 +865,28 @@ class NaverEngine(BaseEngine):
                             
                             # 새로고침 규칙:
                             # 1. 이미 날짜 클릭이 성공해서 시간표가 떠 있어야 하는 상황(`date_clicked = True`)이라면 새로고침 절대 금지!
-                            # 2. 날짜가 아직 비활성화 상태인 경우에만 1.2초마다 새로고침 시도
+                            # 2. 날짜가 아직 비활성화 상태인 경우, 정각 오픈 시간 근처(앞뒤 15초)인 경우에만 1.2초마다 새로고침 시도
+                            # 3. 그 외 평시에는 새로고침(page.reload) 없이 계속 날짜 활성화 탐색/클릭 시도
                             if not date_clicked:
-                                now = time.time()
-                                if now - last_reload_time >= 1.2:
-                                    self.log(f"🔄 [{worker_id}번 기기] 날짜 대기 새로고침 (시도: {attempt}회)", "info")
-                                    last_reload_time = now
-                                    await page.reload()
-                                    await page.wait_for_load_state("domcontentloaded")
-                                    await wait_for_loading()
+                                is_near_open_time = False
+                                if target_open_timestamp is not None:
+                                    server_now = time.time() + naver_time_offset
+                                    # 타겟 오픈 시각 기준 전 15초 ~ 후 15초 사이일 때 집중 새로고침 세션 가동
+                                    is_near_open_time = abs(server_now - target_open_timestamp) <= 15.0
+                                
+                                if is_near_open_time:
+                                    now = time.time()
+                                    if now - last_reload_time >= 1.2:
+                                        self.log(f"🔄 [{worker_id}번 기기] 오픈 임박! 날짜 대기 새로고침 (시도: {attempt}회)", "info")
+                                        last_reload_time = now
+                                        await page.reload()
+                                        await page.wait_for_load_state("domcontentloaded")
+                                        await wait_for_loading()
+                                    else:
+                                        # 새로고침 쿨다운 대기
+                                        await asyncio.sleep(0.02)
                                 else:
-                                    # 1.2초 간격 쿨다운 미도달 시 새로고침을 억제하고 CPU 부하 절감을 위해 대기
+                                    # 평시: 새로고침 없이 고속으로 날짜 탐색/클릭 진행 (CPU 절약용 미세 딜레이)
                                     await asyncio.sleep(0.02)
                             else:
                                 # 날짜가 이미 클릭되었으므로, 새로고침 없이 초고속으로 시간 버튼 검사만 수행 (루프 딜레이 최소화)
