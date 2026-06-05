@@ -318,6 +318,7 @@ class NaverEngine(BaseEngine):
 
             while not self.stop_event.is_set():
                 attempt += 1
+                self.silent_tick(f"{target_time} 대기")
                 try:
                     # ── Detect which page we are on ──────────────
                     on_request_page = False
@@ -558,7 +559,7 @@ class NaverEngine(BaseEngine):
                                 "warning"
                             )
                         except Exception as e:
-                            self.silent_tick(f"'동의하고 예약하기' 클릭 실패: {str(e)[:40]}")
+                            self.log(f"⚠️ [{worker_id}번 기기] '동의하고 예약하기' 클릭 실패: {str(e)[:40]}", "warning")
                             await page.goto(booking_url)
                             await page.wait_for_load_state("domcontentloaded")
                             continue
@@ -843,13 +844,13 @@ class NaverEngine(BaseEngine):
                                     if is_already_selected:
                                         date_clicked = True
                                     elif "disabled" not in cls_lower and aria_disabled != "true" and disabled_attr is None:
-                                        self.silent_tick(f"{target_date} 날짜 활성화 클릭 시도")
+                                        self.log(f"⏰ [{worker_id}번 기기] {target_date} 날짜 활성화 클릭 시도", "info")
                                         await date_el.click(force=True)
                                         await asyncio.sleep(0.05) # Reduced sleep
                                         await wait_for_loading()
                                         date_clicked = True
                             except Exception as date_err:
-                                self.silent_tick(f"날짜 클릭 시도 실패: {date_err}")
+                                self.log(f"⚠️ [{worker_id}번 기기] 날짜 클릭 시도 실패: {date_err}", "warning")
 
                             # 만약 날짜 감지/클릭이 완료되었으나 아직 시간 버튼(time_el)이 없다면 미세한 렌더링 시간 대기 (Smart Wait)
                             if date_clicked:
@@ -865,10 +866,7 @@ class NaverEngine(BaseEngine):
                                     f"[{worker_id}번 기기] {target_time} 비활성화/매진 - 재시도 ({attempt}회)",
                                     "warning"
                                 )
-                            else:
-                                self.silent_tick(
-                                    f"{target_time} 대기"
-                                )
+                            
                             
                             # 새로고침 규칙:
                             # 1. 이미 날짜 클릭이 성공해서 시간표가 떠 있어야 하는 상황(`date_clicked = True`)이라면 새로고침 절대 금지!
@@ -935,11 +933,11 @@ class NaverEngine(BaseEngine):
                                 continue
 
                         if not next_clicked:
-                            self.silent_tick("'다음' 버튼 미발견")
+                            self.log(f"⚠️ [{worker_id}번 기기] '다음' 버튼 미발견", "warning")
                             continue
 
                 except Exception as e:
-                    self.silent_tick(f"에러: {str(e)[:60]}")
+                    self.log(f"⚠️ [{worker_id}번 기기] 루프 에러: {str(e)[:60]}", "warning")
                     date_clicked = False
                     last_reload_time = 0.0
                     try:
