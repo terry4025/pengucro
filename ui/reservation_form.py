@@ -378,8 +378,14 @@ class ReservationForm(ctk.CTkFrame):
             self.day_type_segmented.configure(state="disabled")
             self.day_type_label.configure(text_color=theme.TEXT_DISABLED)
             
-            self.theme_dropdown.configure(state="disabled")
-            self.theme_label.configure(text_color=theme.TEXT_DISABLED)
+            themes_dict = self.config.get("themes", {}).get("1", {})
+            has_themes = len(themes_dict) > 0 and not (len(themes_dict) == 1 and list(themes_dict.keys())[0] == "기본테마")
+            if has_themes:
+                self.theme_dropdown.configure(state="normal")
+                self.theme_label.configure(text_color=theme.TEXT_MUTE)
+            else:
+                self.theme_dropdown.configure(state="disabled")
+                self.theme_label.configure(text_color=theme.TEXT_DISABLED)
             
             self.custom_theme_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
             self.theme_pk_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
@@ -432,11 +438,16 @@ class ReservationForm(ctk.CTkFrame):
         self.branch_frame.grid_forget()
         self.day_type_frame.grid_forget()
 
-        # In Naver mode, hide all standard-engine-only form sections entirely
+        # In Naver mode, hide all standard-engine-only form sections entirely, but show theme selection if there are multiple themes
         is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
         if is_naver:
-            self.theme_frame.grid_forget()
             self.custom_theme_frame.grid_forget()
+            themes_dict = self.config.get("themes", {}).get("1", {})
+            has_themes = len(themes_dict) > 0 and not (len(themes_dict) == 1 and list(themes_dict.keys())[0] == "기본테마")
+            if has_themes:
+                self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+            else:
+                self.theme_frame.grid_forget()
         else:
             # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
             self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
@@ -537,7 +548,10 @@ class ReservationForm(ctk.CTkFrame):
         # Resolve Theme PK
         if is_naver:
             # For Naver Playwright mode, the themePK argument holds the actual normalized booking URL
-            theme_pk = self.config.get("url", "naver")
+            theme_name = self.theme_var.get()
+            theme_pk = self.config.get("themes", {}).get("1", {}).get(theme_name, "")
+            if not theme_pk or theme_pk == "naver":
+                theme_pk = self.config.get("url", "naver")
         elif self.custom_theme_checkbox.get() == 1:
             theme_pk = self.theme_pk_entry.get().strip()
         else:

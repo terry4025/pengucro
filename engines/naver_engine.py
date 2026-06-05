@@ -320,14 +320,16 @@ class NaverEngine(BaseEngine):
                 try:
                     # ── Detect which page we are on ──────────────
                     on_request_page = False
-                    try:
-                        submit_loc = page.locator(
-                            'button:has-text("동의하고 예약하기"), '
-                            'a:has-text("동의하고 예약하기")'
-                        ).first
-                        on_request_page = await submit_loc.is_visible(timeout=300)
-                    except Exception:
-                        pass
+                    current_url = page.url
+                    if "booking-request" in current_url or "request" in current_url or "step2" in current_url:
+                        try:
+                            submit_loc = page.locator(
+                                'button:has-text("동의하고 예약하기"), '
+                                'a:has-text("동의하고 예약하기")'
+                            ).first
+                            on_request_page = await submit_loc.is_visible(timeout=0)
+                        except Exception:
+                            pass
 
                     if on_request_page:
                         # ═══════════════════════════════════════════
@@ -655,29 +657,40 @@ class NaverEngine(BaseEngine):
                         # Phase 1 — Find & click target time slot ──
                         time_el = None
                         selected_time_str = target_time
+                        
+                        # Build combined selector to query only once per loop iteration
+                        selectors = []
                         for tv in time_variants:
-                            for sel in [
+                            selectors.extend([
                                 f'button:has-text("{tv}")',
                                 f'a:has-text("{tv}")',
-                                f'li:has-text("{tv}")',
-                            ]:
-                                try:
-                                    el = page.locator(sel).first
-                                    if await el.is_visible(timeout=0): # 0ms timeout for ultra-fast check
-                                        txt = await el.inner_text()
-                                        cls = (await el.get_attribute("class")) or ""
-                                        aria = (await el.get_attribute("aria-disabled")) or ""
-                                        if (
-                                            "매진" not in txt
-                                            and "disabled" not in cls
-                                            and aria != "true"
-                                        ):
-                                            time_el = el
-                                            break
-                                except Exception:
-                                    continue
-                            if time_el:
-                                break
+                                f'li:has-text("{tv}")'
+                            ])
+                        combined_sel = ", ".join(selectors)
+                        
+                        try:
+                            import re
+                            elements = await page.locator(combined_sel).all()
+                            for el in elements:
+                                if await el.is_visible(timeout=0):
+                                    txt = await el.inner_text()
+                                    cls = (await el.get_attribute("class")) or ""
+                                    aria = (await el.get_attribute("aria-disabled")) or ""
+                                    disabled_attr = await el.get_attribute("disabled")
+                                    if (
+                                        "매진" not in txt
+                                        and "disabled" not in cls.lower()
+                                        and aria != "true"
+                                        and disabled_attr is None
+                                    ):
+                                        time_el = el
+                                        # Parse text to set selected_time_str
+                                        match = re.search(r'\d{1,2}\s*:\s*\d{2}', txt)
+                                        if match:
+                                            selected_time_str = match.group(0)
+                                        break
+                        except Exception:
+                            pass
 
                         # --- [대체 시간대(차선책) 탐색 및 새로고침 정지 로직 - v4.1] ---
                         if not time_el:
@@ -826,10 +839,10 @@ class NaverEngine(BaseEngine):
                                     await wait_for_loading()
                                 else:
                                     # 1.2초 간격 쿨다운 미도달 시 새로고침을 억제하고 CPU 부하 절감을 위해 대기
-                                    await asyncio.sleep(0.05)
+                                    await asyncio.sleep(0.02)
                             else:
                                 # 날짜가 이미 클릭되었으므로, 새로고침 없이 초고속으로 시간 버튼 검사만 수행 (루프 딜레이 최소화)
-                                await asyncio.sleep(0.01)
+                                await asyncio.sleep(0.002)
                             continue
 
                         self.log(

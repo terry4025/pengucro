@@ -71,25 +71,35 @@ def get_booking_url_from_place_html(place_id):
     """
     플레이스 HTML 페이지를 크롤링하여 예약 링크나 스크립트 데이터 내 예약 주소를 파싱합니다.
     """
-    url = f"https://pcmap.place.naver.com/place/{place_id}/home"
+    urls = [
+        f"https://m.place.naver.com/place/{place_id}/ticket",
+        f"https://m.place.naver.com/place/{place_id}/home"
+    ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     }
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "booking.naver.com" in href:
-                    return href
-            for script in soup.find_all("script"):
-                if script.string and "booking.naver.com" in script.string:
-                    match = re.search(r'https://booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?', script.string)
-                    if match:
-                        return match.group(0)
-    except Exception:
-        pass
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                # 1. Regex search on full raw HTML text first (simplest and fastest)
+                match = re.search(r'https://booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?', response.text)
+                if match:
+                    return match.group(0)
+                match_no_proto = re.search(r'booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?', response.text)
+                if match_no_proto:
+                    return "https://" + match_no_proto.group(0)
+                
+                # 2. Fallback to anchor tags parsing
+                soup = BeautifulSoup(response.text, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "booking.naver.com" in href:
+                        return href
+        except Exception:
+            pass
     return None
 
 def normalize_naver_url(url):
@@ -147,6 +157,56 @@ def parse_booking_site(url, site_name=""):
     """
     normalized_naver = normalize_naver_url(url)
     if normalized_naver:
+        bizes_match = re.search(r'/bizes/(\d+)', normalized_naver)
+        bizes_id = bizes_match.group(1) if bizes_match else None
+        themes_dict = {}
+        
+        if bizes_id:
+            service_match = re.search(r'/booking/(\d+)/', normalized_naver)
+            service_id = service_match.group(1) if service_match else "12"
+            
+            query = """
+            query bizItems($input: BizItemsParams) {
+              bizItems(input: $input) {
+                bizItemId
+                name
+                desc
+              }
+            }
+            """
+            variables = {
+                "input": {
+                    "businessId": bizes_id,
+                    "lang": "ko",
+                    "projections": "RESOURCE"
+                }
+            }
+            payload = {
+                "operationName": "bizItems",
+                "query": query,
+                "variables": variables
+            }
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Referer": f"https://m.booking.naver.com/booking/{service_id}/bizes/{bizes_id}"
+            }
+            try:
+                r = requests.post("https://m.booking.naver.com/graphql", json=payload, headers=headers, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    items = data.get("data", {}).get("bizItems", [])
+                    for item in items:
+                        name = item.get("name")
+                        item_id = item.get("bizItemId")
+                        if name and item_id:
+                            themes_dict[name] = f"https://booking.naver.com/booking/{service_id}/bizes/{bizes_id}/items/{item_id}"
+            except Exception:
+                pass
+                
+        if not themes_dict:
+            themes_dict = {"기본테마": normalized_naver}
+            
         return {
             "name": site_name or "네이버 예약",
             "url": normalized_naver,
@@ -156,9 +216,7 @@ def parse_booking_site(url, site_name=""):
                 "본점": "1"
             },
             "themes": {
-                "1": {
-                    "기본테마": "naver"
-                }
+                "1": themes_dict
             }
         }
 
