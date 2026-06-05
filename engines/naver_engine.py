@@ -682,12 +682,45 @@ class NaverEngine(BaseEngine):
                             # 단 한 번의 evaluate 호출로 모든 variant 요소의 상태를 읽어옴 (CDP roundtrip 병목 제거)
                             # has-text와 같은 Playwright 고유 선택자는 JS의 querySelector에서 사용할 수 없으므로, 표준 태그 선택 후 JS 단에서 매칭을 수행합니다.
                             js_time_scan = """
-                            (timeVariants) => {
+                            ([timeVariants, targetTime]) => {
                                 const els = Array.from(document.querySelectorAll('button, a, li'));
                                 return els.map((el, idx) => {
-                                    const txt = el.innerText || "";
-                                    const matches = timeVariants.some(tv => txt.includes(tv));
-                                    if (!matches) return null;
+                                    const txt = (el.innerText || "").trim();
+                                    
+                                    // 1. 시간 패턴이 1개만 존재하는지 확인하여 전체 시간 목록을 담고 있는 컨테이너 요소 제외
+                                    const timeMatches = txt.match(/\\d{1,2}\\s*:\\s*\\d{2}/g) || [];
+                                    if (timeMatches.length !== 1) return null;
+                                    
+                                    // 2. 시간 파싱
+                                    const m = txt.match(/(\\d{1,2})\\s*:\\s*(\\d{2})/);
+                                    if (!m) return null;
+                                    const hour = parseInt(m[1], 10);
+                                    const minute = m[2];
+                                    const rawTimeStr = `${hour}:${minute}`;
+                                    
+                                    // 3. 오전/오후 12시간제와 24시간제 매칭 로직 처리
+                                    let normalizedTime = null;
+                                    if (txt.includes("오후") && hour < 12) {
+                                        normalizedTime = `${hour + 12}:${minute}`;
+                                    } else if (txt.includes("오전") && hour === 12) {
+                                        normalizedTime = `0:${minute}`;
+                                    } else if (txt.includes("오전") || txt.includes("오후")) {
+                                        normalizedTime = `${hour}:${minute}`;
+                                    }
+                                    
+                                    let isMatch = false;
+                                    if (normalizedTime !== null) {
+                                        const targetParts = targetTime.split(":");
+                                        const targetH = parseInt(targetParts[0], 10);
+                                        const targetM = targetParts[1];
+                                        const targetNormalized = `${targetH}:${targetM}`;
+                                        isMatch = (normalizedTime === targetNormalized);
+                                    } else {
+                                        // 4. 오전/오후 텍스트가 없는 경우 variants와 정확하게 일치하는지 비교 (18:00가 8:00에 오매칭되는 것 방지)
+                                        isMatch = timeVariants.includes(rawTimeStr);
+                                    }
+                                    
+                                    if (!isMatch) return null;
                                     
                                     const rect = el.getBoundingClientRect();
                                     const visible = !!(rect.top || rect.bottom || rect.width || rect.height);
@@ -702,7 +735,7 @@ class NaverEngine(BaseEngine):
                                 }).filter(Boolean);
                             }
                             """
-                            scan_res = await page.evaluate(js_time_scan, time_variants)
+                            scan_res = await page.evaluate(js_time_scan, [time_variants, target_time])
                             for item in scan_res:
                                 txt = item["txt"]
                                 cls = item["cls"]
