@@ -672,16 +672,21 @@ class NaverEngine(BaseEngine):
                         try:
                             import re
                             # 단 한 번의 evaluate 호출로 모든 variant 요소의 상태를 읽어옴 (CDP roundtrip 병목 제거)
+                            # has-text와 같은 Playwright 고유 선택자는 JS의 querySelector에서 사용할 수 없으므로, 표준 태그 선택 후 JS 단에서 매칭을 수행합니다.
                             js_time_scan = """
-                            (selector) => {
-                                const els = Array.from(document.querySelectorAll(selector));
+                            (timeVariants) => {
+                                const els = Array.from(document.querySelectorAll('button, a, li'));
                                 return els.map((el, idx) => {
+                                    const txt = el.innerText || "";
+                                    const matches = timeVariants.some(tv => txt.includes(tv));
+                                    if (!matches) return null;
+                                    
                                     const rect = el.getBoundingClientRect();
                                     const visible = !!(rect.top || rect.bottom || rect.width || rect.height);
                                     if (!visible) return null;
                                     return {
                                         idx: idx,
-                                        txt: el.innerText || "",
+                                        txt: txt,
                                         cls: el.className || "",
                                         aria: el.getAttribute("aria-disabled") || "",
                                         disabled: el.hasAttribute("disabled")
@@ -689,7 +694,7 @@ class NaverEngine(BaseEngine):
                                 }).filter(Boolean);
                             }
                             """
-                            scan_res = await page.evaluate(js_time_scan, combined_sel)
+                            scan_res = await page.evaluate(js_time_scan, time_variants)
                             for item in scan_res:
                                 txt = item["txt"]
                                 cls = item["cls"]
@@ -701,13 +706,14 @@ class NaverEngine(BaseEngine):
                                     and aria != "true"
                                     and not disabled
                                 ):
-                                    time_el = page.locator(combined_sel).nth(item["idx"])
+                                    time_el = page.locator('button, a, li').nth(item["idx"])
                                     match = re.search(r'\d{1,2}\s*:\s*\d{2}', txt)
                                     if match:
                                         selected_time_str = match.group(0)
                                     break
                         except Exception as scan_err:
-                            self.silent_tick(f"시간 버튼 evaluate 에러: {scan_err}")
+                            # 시도 횟수 중복 증가 방지를 위해 silent_tick 대신 단순 로그만 남깁니다.
+                            self.log(f"⚠️ 시간 버튼 evaluate 에러: {scan_err}", "warning")
 
                         # --- [대체 시간대(차선책) 탐색 및 새로고침 정지 로직 - v4.1] ---
                         if not time_el:
@@ -751,7 +757,8 @@ class NaverEngine(BaseEngine):
                                             el = page.locator('button, a').nth(item["idx"])
                                             active_slots.append((el, txt))
                             except Exception as scan_err:
-                                self.silent_tick(f"시간 후보군 스캔 에러: {scan_err}")
+                                # 시도 횟수 중복 증가 방지를 위해 silent_tick 대신 단순 로그만 남깁니다.
+                                self.log(f"⚠️ 시간 후보군 스캔 에러: {scan_err}", "warning")
 
                             if active_slots:
                                 # 다른 시간대는 활성화되어 있으므로, 페이지 새로고침을 멈춤(date_clicked = True 설정)
