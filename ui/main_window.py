@@ -1373,7 +1373,7 @@ class MainWindow(ctk.CTk):
         self.attempt_count = attempt_count
         if self.current_status == "running":
             self.after(0, lambda: self.status_badge.configure(
-                text=f"● 동작 중 (시도: {attempt_count}회)",
+                text="● 동작 중",
                 text_color=theme.TEXT_DARK,
                 fg_color=theme.ACCENT_YELLOW
             ))

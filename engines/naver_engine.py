@@ -844,13 +844,12 @@ class NaverEngine(BaseEngine):
                                     if is_already_selected:
                                         date_clicked = True
                                     elif "disabled" not in cls_lower and aria_disabled != "true" and disabled_attr is None:
-                                        self.log(f"⏰ [{worker_id}번 기기] {target_date} 날짜 활성화 클릭 시도", "info")
                                         await date_el.click(force=True)
                                         await asyncio.sleep(0.05) # Reduced sleep
                                         await wait_for_loading()
                                         date_clicked = True
-                            except Exception as date_err:
-                                self.log(f"⚠️ [{worker_id}번 기기] 날짜 클릭 시도 실패: {date_err}", "warning")
+                            except Exception:
+                                pass
 
                             # 만약 날짜 감지/클릭이 완료되었으나 아직 시간 버튼(time_el)이 없다면 미세한 렌더링 시간 대기 (Smart Wait)
                             if date_clicked:
