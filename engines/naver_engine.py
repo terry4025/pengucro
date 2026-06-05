@@ -747,7 +747,7 @@ class NaverEngine(BaseEngine):
                                     and aria != "true"
                                     and not disabled
                                 ):
-                                    time_el = page.locator('button, a, li').nth(item["idx"])
+                                    time_el = page.evaluate_handle('document.querySelectorAll("button, a, li")[' + str(item["idx"]) + ']').as_element()
                                     match = re.search(r'\d{1,2}\s*:\s*\d{2}', txt)
                                     if match:
                                         selected_time_str = match.group(0)
