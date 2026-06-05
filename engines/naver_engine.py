@@ -130,6 +130,12 @@ class NaverEngine(BaseEngine):
             # Redirect to login page
             await page.goto("https://nid.naver.com/nidlogin.login?url=" + custom_url)
             
+            # 주소가 로그인 페이지 도메인으로 바뀔 때까지 최대 5초 대기 (이전 주소 오진 방지)
+            try:
+                await page.wait_for_url("**/nidlogin**", timeout=5000)
+            except Exception:
+                pass
+            
             # Wait for user to login and navigate back to booking domain
             login_success = False
             for _ in range(300): # Wait up to 5 minutes
@@ -141,7 +147,8 @@ class NaverEngine(BaseEngine):
                         login_success = True
                         break
                 except Exception:
-                    break
+                    await asyncio.sleep(1)
+                    continue
                 await asyncio.sleep(1)
 
             if login_success:
