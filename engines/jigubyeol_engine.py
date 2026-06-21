@@ -82,15 +82,79 @@ class JigubyeolEngine(BaseEngine):
                 with self.submission_lock:
                     if self.stop_event.is_set():
                         break
-                    payment_method = '1'
+                    
+                    # Step 1: 시간 선택 선등록
+                    step1_response = self.submit_time_selection(session, csrf_token, reservation_data)
+                    if step1_response.status_code == 419:
+                        csrf_token = None
+                        continue
+                    if step1_response.status_code not in (200, 201):
+                        self.handle_error(step1_response, reservation_data, '시간선택')
+                        continue
+                    
+                    # Step 2: 최종 예약 완료
+                    try:
+                        decoded_html = step1_response.content.decode('utf-8')
+                    except Exception:
+                        decoded_html = step1_response.text
+                    
+                    soup = BeautifulSoup(decoded_html, 'html.parser')
+                    payment_input = soup.find('input', {'name': 'payment_method'})
+                    payment_method = payment_input.get('value', '1') if payment_input else '1'
+                    
                     step2_response = self.submit_reservation(session, csrf_token, reservation_data, payment_method)
                     
                     if step2_response.status_code == 419:
                         csrf_token = None
                         continue
                         
-                    if step2_response.status_code == 200 or step2_response.status_code == 201:
-                        self.log(f"Success: {step2_response.text[:200]}", "success")
+                    if step2_response.status_code in (200, 201):
+                        try:
+                            done_url = f"{self.base_url}/reservation/done"
+                            done_res = session.get(done_url)
+                            done_res.encoding = 'utf-8'
+                            done_soup = BeautifulSoup(done_res.text, 'html.parser')
+                            
+                            vbank_num = ""
+                            vbank_deadline = ""
+                            vbank_amount = ""
+                            booking_id = ""
+                            
+                            tables = done_soup.find_all('table')
+                            for table in tables:
+                                for row in table.find_all('tr'):
+                                    th = row.find('th')
+                                    td = row.find('td')
+                                    if th and td:
+                                        th_text = th.text.strip()
+                                        td_text = td.text.strip()
+                                        if '계좌' in th_text or '가상계좌' in th_text:
+                                            vbank_num = td_text
+                                        elif '기한' in th_text or '만료' in th_text:
+                                            vbank_deadline = td_text
+                                        elif '금액' in th_text or '입금액' in th_text:
+                                            vbank_amount = td_text
+                                        elif '예약번호' in th_text:
+                                            booking_id = td_text
+                                            
+                            success_msg = "예약 성공!"
+                            if "임시로" in done_res.text or "입금전" in done_res.text:
+                                success_msg += " (가상계좌 임시 예약 완료)"
+                                if vbank_num:
+                                    success_msg += f" 계좌: {vbank_num}"
+                                if vbank_amount:
+                                    success_msg += f", 금액: {vbank_amount}"
+                                if vbank_deadline:
+                                    success_msg += f", 기한: {vbank_deadline}"
+                            else:
+                                success_msg += " (예약 확정 완료)"
+                                if booking_id:
+                                    success_msg += f" 예약번호: {booking_id}"
+                                    
+                            self.log(success_msg, "success")
+                        except Exception as e:
+                            self.log(f"예약 성공! (상세 정보 파싱 실패: {e})", "success")
+                            
                         self.stop_event.set()
                         if self.success_callback:
                             self.success_callback()
@@ -111,7 +175,17 @@ class JigubyeolEngine(BaseEngine):
 
         try:
             error_data = json.loads(decoded_text)
-            if 'Message' in error_data:
+            if 'errors' in error_data and isinstance(error_data['errors'], dict):
+                err_details = []
+                for field, msgs in error_data['errors'].items():
+                    if isinstance(msgs, list):
+                        msg_str = ", ".join(msgs)
+                    else:
+                        msg_str = str(msgs)
+                    err_details.append(f"{field}: {msg_str}")
+                main_msg = error_data.get('message', 'The given data was invalid.')
+                error_message = f"{main_msg} ({'; '.join(err_details)})"
+            elif 'Message' in error_data:
                 error_message = error_data['Message']
             elif 'message' in error_data:
                 error_message = error_data['message']
@@ -155,7 +229,27 @@ class JigubyeolEngine(BaseEngine):
                     async with self.async_submission_lock:
                         if self.stop_event.is_set():
                             break
-                        payment_method = '1'
+                        
+                        # Step 1: 시간 선택 선등록
+                        step1_response = await self.submit_time_selection_async(session, csrf_token, reservation_data)
+                        if step1_response.status == 419:
+                            csrf_token = None
+                            continue
+                        if step1_response.status not in (200, 201):
+                            await self.handle_error_async(step1_response, reservation_data, '시간선택')
+                            continue
+                        
+                        # Step 2: 최종 예약 완료
+                        try:
+                            decoded_html = await step1_response.text()
+                        except Exception:
+                            decoded_html = str(step1_response)
+                            
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(decoded_html, 'html.parser')
+                        payment_input = soup.find('input', {'name': 'payment_method'})
+                        payment_method = payment_input.get('value', '1') if payment_input else '1'
+                        
                         step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
                         
                         if step2_response.status == 419:
@@ -163,8 +257,52 @@ class JigubyeolEngine(BaseEngine):
                             continue
                             
                         if step2_response.status in (200, 201):
-                            resp_text = await step2_response.text()
-                            self.log(f"Success: {resp_text[:200]}", "success")
+                            try:
+                                done_url = f"{self.base_url}/reservation/done"
+                                async with session.get(done_url) as done_res:
+                                    done_text = await done_res.text()
+                                    done_soup = BeautifulSoup(done_text, 'html.parser')
+                                    
+                                    vbank_num = ""
+                                    vbank_deadline = ""
+                                    vbank_amount = ""
+                                    booking_id = ""
+                                    
+                                    tables = done_soup.find_all('table')
+                                    for table in tables:
+                                        for row in table.find_all('tr'):
+                                            th = row.find('th')
+                                            td = row.find('td')
+                                            if th and td:
+                                                th_text = th.text.strip()
+                                                td_text = td.text.strip()
+                                                if '계좌' in th_text or '가상계좌' in th_text:
+                                                    vbank_num = td_text
+                                                elif '기한' in th_text or '만료' in th_text:
+                                                    vbank_deadline = td_text
+                                                elif '금액' in th_text or '입금액' in th_text:
+                                                    vbank_amount = td_text
+                                                elif '예약번호' in th_text:
+                                                    booking_id = td_text
+                                                    
+                                    success_msg = "예약 성공!"
+                                    if "임시로" in done_text or "입금전" in done_text:
+                                        success_msg += " (가상계좌 임시 예약 완료)"
+                                        if vbank_num:
+                                            success_msg += f" 계좌: {vbank_num}"
+                                        if vbank_amount:
+                                            success_msg += f", 금액: {vbank_amount}"
+                                        if vbank_deadline:
+                                            success_msg += f", 기한: {vbank_deadline}"
+                                    else:
+                                        success_msg += " (예약 확정 완료)"
+                                        if booking_id:
+                                            success_msg += f" 예약번호: {booking_id}"
+                                            
+                                    self.log(success_msg, "success")
+                            except Exception as e:
+                                self.log(f"예약 성공! (상세 정보 파싱 실패: {e})", "success")
+                                
                             self.stop_event.set()
                             if self.success_callback:
                                 self.success_callback()
@@ -252,7 +390,17 @@ class JigubyeolEngine(BaseEngine):
             
         try:
             error_data = json.loads(decoded_text)
-            if 'Message' in error_data:
+            if 'errors' in error_data and isinstance(error_data['errors'], dict):
+                err_details = []
+                for field, msgs in error_data['errors'].items():
+                    if isinstance(msgs, list):
+                        msg_str = ", ".join(msgs)
+                    else:
+                        msg_str = str(msgs)
+                    err_details.append(f"{field}: {msg_str}")
+                main_msg = error_data.get('message', 'The given data was invalid.')
+                error_message = f"{main_msg} ({'; '.join(err_details)})"
+            elif 'Message' in error_data:
                 error_message = error_data['Message']
             elif 'message' in error_data:
                 error_message = error_data['message']

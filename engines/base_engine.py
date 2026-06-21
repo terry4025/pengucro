@@ -9,10 +9,12 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
         import sys
         from engines.zeroworld_engine import ZeroWorldEngine
         from engines.jigubyeol_engine import JigubyeolEngine
+        from engines.keyescape_engine import KeyescapeEngine
         
         classes = {
             'ZeroWorldEngine': ZeroWorldEngine,
-            'JigubyeolEngine': JigubyeolEngine
+            'JigubyeolEngine': JigubyeolEngine,
+            'KeyescapeEngine': KeyescapeEngine
         }
         
         engine_class = classes[engine_class_name]

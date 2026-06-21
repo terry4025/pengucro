@@ -1,5 +1,6 @@
 import customtkinter as ctk
 import ui.theme as theme
+import re
 
 class LogPanel(ctk.CTkFrame):
     def __init__(self, parent):
@@ -54,24 +55,74 @@ class LogPanel(ctk.CTkFrame):
         )
         self.copy_btn.pack(side="right", padx=(0, 4))
 
-        # Scrollable Text Area
+        # Scrollable Text Area with high contrast terminal BG and Apple-style scrollbar
         self.textbox = ctk.CTkTextbox(
             self,
-            fg_color=theme.CARD_COLOR,
+            fg_color="#050505",       # Deeper pitch black for high contrast
             text_color=theme.TEXT_BODY,
             font=theme.FONT_MONO,
             border_color=theme.HAIRLINE_COLOR,
             border_width=1,
-            corner_radius=theme.ROUNDED_MD
+            corner_radius=theme.ROUNDED_MD,
+            scrollbar_button_color=theme.HAIRLINE_COLOR,
+            scrollbar_button_hover_color=theme.CARD_COLOR
         )
         self.textbox.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
-        # Configure tags for color logging
+        # Configure tags for standard log content
         self.textbox.configure(state="normal")
         self.textbox._textbox.tag_config("info", foreground=theme.TEXT_PRIMARY)
         self.textbox._textbox.tag_config("success", foreground=theme.ACCENT_GREEN)
         self.textbox._textbox.tag_config("error", foreground=theme.ACCENT_RED)
         self.textbox._textbox.tag_config("warning", foreground=theme.ACCENT_YELLOW)
+        
+        # Configure tags for category brackets
+        self.textbox._textbox.tag_config("cat_default", foreground=theme.TEXT_MUTE)
+        self.textbox._textbox.tag_config("cat_captcha", foreground=theme.ACCENT_BLUE)
+        self.textbox._textbox.tag_config("cat_warning", foreground=theme.ACCENT_YELLOW)
+        self.textbox._textbox.tag_config("cat_error", foreground=theme.ACCENT_RED)
+        self.textbox._textbox.tag_config("cat_success", foreground=theme.ACCENT_GREEN)
+        self.textbox._textbox.tag_config("cat_device", foreground="#BF5AF2") # iOS system purple
+
+        # Setup custom apply_font_scaling hook to keep tags and base font synchronized
+        orig_apply_font_scaling = self.textbox._apply_font_scaling
+
+        def custom_apply_font_scaling(font):
+            scaled_font = orig_apply_font_scaling(font)
+            
+            if isinstance(scaled_font, (tuple, list)):
+                family = scaled_font[0]
+                size = scaled_font[1]
+            else:
+                try:
+                    family = scaled_font.cget("family")
+                    size = scaled_font.cget("size")
+                except Exception:
+                    family = theme.FONT_MONO[0] if isinstance(theme.FONT_MONO, tuple) else "Segoe UI"
+                    size = theme.FONT_MONO[1] if isinstance(theme.FONT_MONO, tuple) else 11
+                    
+            font_normal = (family, size, "normal")
+            font_bold = (family, size, "bold")
+            
+            self.textbox._textbox.tag_config("info", font=font_normal)
+            self.textbox._textbox.tag_config("success", font=font_normal)
+            self.textbox._textbox.tag_config("error", font=font_normal)
+            self.textbox._textbox.tag_config("warning", font=font_normal)
+            
+            self.textbox._textbox.tag_config("cat_default", font=font_normal)
+            self.textbox._textbox.tag_config("cat_captcha", font=font_bold)
+            self.textbox._textbox.tag_config("cat_warning", font=font_bold)
+            self.textbox._textbox.tag_config("cat_error", font=font_bold)
+            self.textbox._textbox.tag_config("cat_success", font=font_bold)
+            self.textbox._textbox.tag_config("cat_device", font=font_bold)
+            
+            return scaled_font
+
+        self.textbox._apply_font_scaling = custom_apply_font_scaling
+        
+        # Trigger initial configuration of tag fonts
+        self.textbox._apply_font_scaling(self.textbox._font)
+        
         self.textbox.configure(state="disabled")
 
     def append_log(self, message, log_type="info"):
@@ -79,8 +130,40 @@ class LogPanel(ctk.CTkFrame):
 
     def append_logs_batch(self, logs_list):
         self.textbox.configure(state="normal")
+        # Match optional timestamp [HH:MM:SS] followed by optional category [CategoryName]
+        log_pattern = re.compile(r"^(\[(\d{2}:\d{2}:\d{2})\])?\s*(\[([^\]]+)\])?(.*)$")
+        
         for message, log_type in logs_list:
-            self.textbox.insert("end", message + "\n", log_type)
+            match = log_pattern.match(message)
+            if match:
+                ts_part = match.group(1)
+                cat_part = match.group(3)
+                cat_name = match.group(4)
+                body = match.group(5)
+                
+                # 1. Insert timestamp in default muted style if present (append space to separate)
+                if ts_part:
+                    self.textbox.insert("end", ts_part + " ", "cat_default")
+                    
+                # 2. Insert category bracket with highlighted styling if present
+                if cat_part and cat_name:
+                    tag = "cat_default"
+                    if "YesCaptcha" in cat_name:
+                        tag = "cat_captcha"
+                    elif "경고" in cat_name:
+                        tag = "cat_warning"
+                    elif "에러" in cat_name or "실패" in cat_name:
+                        tag = "cat_error"
+                    elif "성공" in cat_name or "완료" in cat_name:
+                        tag = "cat_success"
+                    elif "기기" in cat_name:
+                        tag = "cat_device"
+                    self.textbox.insert("end", cat_part, tag)
+                    
+                # 3. Insert main log message body
+                self.textbox.insert("end", body + "\n", log_type)
+            else:
+                self.textbox.insert("end", message + "\n", log_type)
             
         try:
             line_count = int(self.textbox._textbox.index('end-1c').split('.')[0])

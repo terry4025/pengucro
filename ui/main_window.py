@@ -5,6 +5,7 @@ from ui.log_panel import LogPanel
 from engines.zeroworld_engine import ZeroWorldEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.naver_engine import NaverEngine
+from engines.keyescape_engine import KeyescapeEngine
 from PIL import Image
 import os
 import json
@@ -158,7 +159,7 @@ class LoadingOverlay(ctk.CTkFrame):
         w = self.winfo_width()
         h = self.winfo_height()
         if w <= 1 or h <= 1:
-            w, h = 480, 860
+            w, h = 480, 960
             
         self.time_counter += 0.026
         
@@ -564,7 +565,8 @@ class AddSiteDialog(ctk.CTkToplevel):
                     result = parse_booking_site(url, site_name)
                     self.parent.after(0, lambda: self._on_parse_success(result))
                 except Exception as e:
-                    self.parent.after(0, lambda: self._on_parse_error(str(e)))
+                    err_msg = str(e)
+                    self.parent.after(0, lambda: self._on_parse_error(err_msg))
                     
             t = threading.Thread(target=parse_thread, name="SiteParserThread")
             t.daemon = True
@@ -601,7 +603,7 @@ class MainWindow(ctk.CTk):
         
         # Center the window on startup
         width = 480
-        height = 860
+        height = 960
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
         x = (screen_width - width) // 2
@@ -670,19 +672,32 @@ class MainWindow(ctk.CTk):
         self.title_label.bind("<Button-1>", self.start_drag)
         self.title_label.bind("<B1-Motion>", self.drag)
 
-        # macOS Traffic Light Buttons Container on the Right
+        # macOS Traffic Light Buttons Container on the Left
         dots_frame = ctk.CTkFrame(self.title_bar, fg_color="transparent")
-        dots_frame.pack(side="right", padx=12, pady=8)
+        dots_frame.pack(side="left", padx=12, pady=8)
+
+        # Close Button (Red)
+        self.close_btn = ctk.CTkButton(
+            dots_frame,
+            text="",
+            width=12,
+            height=12,
+            corner_radius=6,
+            fg_color=theme.ACCENT_RED,
+            hover_color=theme.ACCENT_RED_HOVER,
+            command=self._on_close
+        )
+        self.close_btn.pack(side="left", padx=4)
 
         # Minimize Button (Yellow)
         self.min_btn = ctk.CTkButton(
             dots_frame,
             text="",
-            width=14,
-            height=14,
-            corner_radius=7,
-            fg_color="#ffbd2e",
-            hover_color="#e0a624",
+            width=12,
+            height=12,
+            corner_radius=6,
+            fg_color=theme.ACCENT_YELLOW,
+            hover_color=theme.ACCENT_YELLOW_HOVER,
             command=self._on_minimize
         )
         self.min_btn.pack(side="left", padx=4)
@@ -691,29 +706,16 @@ class MainWindow(ctk.CTk):
         self.max_btn = ctk.CTkButton(
             dots_frame,
             text="",
-            width=14,
-            height=14,
-            corner_radius=7,
-            fg_color="#27c93f",
-            hover_color="#1fa232",
+            width=12,
+            height=12,
+            corner_radius=6,
+            fg_color=theme.ACCENT_GREEN,
+            hover_color=theme.ACCENT_GREEN_HOVER,
             command=self._on_maximize
         )
         self.max_btn.pack(side="left", padx=4)
 
-        # Close Button (Red)
-        self.close_btn = ctk.CTkButton(
-            dots_frame,
-            text="",
-            width=14,
-            height=14,
-            corner_radius=7,
-            fg_color="#ff5f56",
-            hover_color="#e04f47",
-            command=self._on_close
-        )
-        self.close_btn.pack(side="left", padx=4)
-
-        # Pin (Always on Top) Button on the Left
+        # Pin (Always on Top) Button on the Right
         self.pin_btn = ctk.CTkButton(
             self.title_bar,
             text="📌",
@@ -726,7 +728,7 @@ class MainWindow(ctk.CTk):
             text_color=theme.TEXT_MUTE,
             command=self._toggle_pin
         )
-        self.pin_btn.pack(side="left", padx=(10, 0))
+        self.pin_btn.pack(side="right", padx=(0, 10))
 
         # Titlebar Bottom Hairline Border
         title_divider = ctk.CTkFrame(self, height=1, fg_color=theme.HAIRLINE_COLOR)
@@ -809,7 +811,7 @@ class MainWindow(ctk.CTk):
         self.last_naver_site = None
         
         # Build options list
-        self.default_site_names = ["제로월드 강남", "제로월드 홍대", "지구별방탈출"]
+        self.default_site_names = ["제로월드 강남", "제로월드 홍대", "지구별방탈출", "키이스케이프"]
         site_options = self.default_site_names + list(self.custom_sites.keys())
         
         # Fallback if saved site is no longer in options
@@ -1022,7 +1024,7 @@ class MainWindow(ctk.CTk):
             
             # Restore to original size and center it
             width = 480
-            height = 860
+            height = 960
             screen_width = self.winfo_screenwidth()
             screen_height = self.winfo_screenheight()
             x = (screen_width - width) // 2
@@ -1046,6 +1048,20 @@ class MainWindow(ctk.CTk):
         else:
             self.last_standard_site = site_name
             
+        # Manage server time visibility: only show for Naver mode
+        if current_mode == "네이버 (Playwright)" and site_name != "(네이버 예약을 등록하세요)":
+            if not self.is_sync_running:
+                self.is_sync_running = True
+                import threading
+                t = threading.Thread(target=self._sync_server_time, name="ServerTimeSyncThread")
+                t.daemon = True
+                t.start()
+                self._update_server_time_clock()
+        else:
+            self.is_sync_running = False
+            self.server_time_label.pack_forget()
+            self.server_time_label.configure(text="")
+
         if (
             getattr(self, "last_logged_site", None) != site_name
             and not getattr(self, "_suppress_site_log", False)
@@ -1129,11 +1145,8 @@ class MainWindow(ctk.CTk):
                 self.log_panel.append_log(f"예약 방식이 '{mode}'(으)로 변경되었습니다.", "info")
             self.last_logged_mode = mode
 
-        # Suppress site-change logs while switching engine modes (the engine-mode
-        # log above is sufficient context for the user).
         self._suppress_site_log = True
-            
-        # Filter site dropdown depending on active engine mode
+
         if mode == "네이버 (Playwright)":
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
             if not site_options:
@@ -1144,46 +1157,33 @@ class MainWindow(ctk.CTk):
                     target_site = self.last_naver_site
                 else:
                     target_site = site_options[0]
-                    
+            
             self.site_var.set(target_site)
             self._on_site_change(target_site)
             self.site_dropdown.configure(values=site_options)
-            
-            # Show Naver server time label and start synchronization loop
-            self.server_time_label.pack(anchor="center", pady=(5, 0))
-            if not self.is_sync_running:
-                self.is_sync_running = True
-                import threading
-                t = threading.Thread(target=self._sync_naver_server_time, name="NaverTimeSyncThread")
-                t.daemon = True
-                t.start()
-                self._update_server_time_clock()
         else:
             site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
             if getattr(self, "last_standard_site", None) in site_options:
                 target_site = self.last_standard_site
             else:
-                target_site = "제로월드 강남"
+                target_site = "제로월드"
                 
             self.site_var.set(target_site)
             self._on_site_change(target_site)
             self.site_dropdown.configure(values=site_options)
-            
-            # Hide Naver server time and stop synchronization
-            self.server_time_label.pack_forget()
-            self.is_sync_running = False
 
-        # Re-enable site-change logging for user-initiated site switches
         self._suppress_site_log = False
 
-    def _sync_naver_server_time(self):
+    def _sync_server_time(self):
         import urllib.request
         import time
         from email.utils import parsedate_to_datetime
         
         while self.is_sync_running:
             try:
-                req = urllib.request.Request("https://booking.naver.com", method="HEAD")
+                current_site = self.site_var.get()
+                target_url = "https://www.keyescape.com" if current_site == "키이스케이프" else "https://booking.naver.com"
+                req = urllib.request.Request(target_url, method="HEAD")
                 start = time.perf_counter()
                 with urllib.request.urlopen(req, timeout=3) as response:
                     latency = (time.perf_counter() - start) / 2
@@ -1204,10 +1204,15 @@ class MainWindow(ctk.CTk):
     def _update_server_time_clock(self):
         if not self.is_sync_running:
             return
+            
+        if not self.server_time_label.winfo_ismapped():
+            self.server_time_label.pack(anchor="center", pady=(5, 0))
         
         now = time.time() + self.naver_time_offset
         now_dt = datetime.fromtimestamp(now)
-        time_str = now_dt.strftime("네이버 서버 시간: %H:%M:%S.%f")[:-4] # keep milliseconds to 2 decimals
+        current_site = self.site_var.get()
+        prefix = "키이스케이프 서버 시간" if current_site == "키이스케이프" else "네이버 서버 시간"
+        time_str = now_dt.strftime(f"{prefix}: %H:%M:%S.%f")[:-4] # keep milliseconds to 2 decimals
         self.server_time_label.configure(text=time_str)
         
         # Refresh every 100ms
@@ -1296,6 +1301,11 @@ class MainWindow(ctk.CTk):
                 )
         elif selected_site == "지구별방탈출":
             self.active_engine = JigubyeolEngine(
+                log_callback=self._on_engine_log,
+                success_callback=self._on_booking_success
+            )
+        elif selected_site == "키이스케이프":
+            self.active_engine = KeyescapeEngine(
                 log_callback=self._on_engine_log,
                 success_callback=self._on_booking_success
             )

@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta http-equiv="pragma" content="no-cache">
+    <meta http-equiv="cache-control" content="no-cache">
+    <meta http-equiv="Expires" content="-1">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge, chrome=1" />
+    <meta http-equiv="Content-Language" content="ko" />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta http-equiv="Content-Style-Type" content="text/css" />
+    <meta http-equiv="Content-Script-Type" content="text/javascript" />
+    <meta http-equiv="imagetoolbar" content="no" />
+    <meta name="referrer" content="always" />
+    <meta name="viewport" content="user-scalable=no, width=device-width, initial-scale=1" />
+    <meta name="csrf-token" id="csrf" content="nCoiw2RwuNWvZz2HtPI5UjU1A9qJYhbq8ezdSWrB">
+    <meta name="format-detection" content="address=no, email=no" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="author" contents="토니빌리" />
+    <meta name="publisher" content="토니빌리" />
+    <meta name="reply-to(email)" content="enoch_choi@naver.com" />
+    <meta name="title" content=" 지구별방탈출 : 예약확인/취소 " />
+    <meta name="description" content=" 예약하신 내용을 확인하세요. " />
+    <meta name="keywords" content="제로월드, 방탈출" />
+    <meta property="og:locale" content="ko_KR" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://www.xn--2e0b040a4xj.com/reservation/confirm" />
+    <meta property="og:site_name" content="지구별방탈출" />
+    <meta property="og:title" content=" 지구별방탈출 : 예약확인/취소 " />
+    <meta property="og:description" content=" 예약하신 내용을 확인하세요. " />
+    <meta property="og:image" content="https://www.xn--2e0b040a4xj.com/images/symbol.jpg" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content=" 지구별방탈출 : 예약확인/취소 " />
+    <meta name="twitter:image" content="https://www.xn--2e0b040a4xj.com/images/symbol.jpg" />
+    <meta name="twitter:domain" content="https://www.xn--2e0b040a4xj.com/reservation/confirm" />
+    <meta name="twitter:description" content=" 예약하신 내용을 확인하세요. " />
+    <link rel="canonical" href="https://www.xn--2e0b040a4xj.com/reservation/confirm" />
+    <link rel="shortcut icon" href="https://www.xn--2e0b040a4xj.com/favicon.ico" type="image/x-icon" />
+        <link rel="stylesheet" href="/css/common.css?id=306aa27c2f9c2cc947465f7370ec1f60">
+        <link rel="stylesheet" href="/css/reservation.confirm.css?id=8747a914b3e0b2dd8d9e1cbf5565d134">
+    <title>
+                    지구별방탈출 : 예약확인/취소            </title>
+</head>
+
+<body>
+    <header class="header" id="header">
+        <div class="container clear-b">
+            <a class="header-logo" href="https://www.xn--2e0b040a4xj.com">
+                <img src="https://www.xn--2e0b040a4xj.com/images/logo.png" alt="지구별방탈출">
+            </a>
+        </div>
+    </header>
+    <button class="header-btn" id="eveLayerToggleBtn" type="button"><em></em></button>
+    <nav class="nav bs-bb" id="nav">
+        <div class="container clear-b">
+            <ul class="nav-list clear-b ff-bhs">
+                <li><a href="https://www.xn--2e0b040a4xj.com/about">지구별</a></li>
+                <li><a href="https://www.xn--2e0b040a4xj.com/theme">테마</a></li>
+                <li><a href="https://www.xn--2e0b040a4xj.com/reservation">예약</a></li>
+                <li><a href="https://www.xn--2e0b040a4xj.com/map">오시는길</a></li>
+                <li><a href="https://www.xn--2e0b040a4xj.com/notice">공지</a></li>
+                <li><a href="https://www.xn--2e0b040a4xj.com/FAQ">FAQ</a></li>
+            </ul>
+        </div>
+    </nav>
+    <article class="wrap" id="wrap">
+        
+
+
+    <div class="subtitle">
+        <div class="container ta-c">
+            <h1 class="ff-bhs">예약확인/취소</h1>
+        </div>
+    </div>
+    <br class="lg-none" />
+
+
+
+    <form class="container">
+        <section class="reservation-confirm-group">
+            
+            <table>
+                <tr>
+                    <th>성함</th>
+                    <td><input class="el-input bs-bb" type="text" name="name" maxlength="30" placeholder="예약자 성함을 입력해주세요."></td>
+                </tr>
+                <tr>
+                    <th>전화번호</th>
+                    <td><input class="el-input bs-bb" type="text" name="phone" maxlength="13" id="phone" placeholder="하이픈(-)을 포함하여 입력해주세요."></td>
+                </tr>
+                <tr>
+                    <th>예약번호</th>
+                    <td><input class="el-input bs-bb" type="text" name="no" placeholder="예약하실때 받은 예약번호를 입력해주세요."></td>
+                </tr>
+                <tr class="active">
+                    <th class="va-t"></th>
+                    <td class="va-t">
+                        <ul>
+                            <li class="bs-bb">예약자 정보를 입력하시면 예약조회가 가능합니다.</li>
+                            <li class="bs-bb">예약번호는 예약시 문자로 발송되고 있습니다.</li>
+                        </ul>
+                    </td>
+                </tr>
+            </table>
+        </section>
+        <button class="resconfirm-btn1 hover1 ff-bhs" type="button" id="searchBtn">예약찾기</button>
+    </form>
+    <br class="sm-none" />
+    <br class="sm-none" />
+    <br class="sm-none" />
+    <br class="sm-none" />
+
+
+
+    </article>
+    <footer class="footer" id="footer">
+        <div class="container">
+            <ul class="footer-group d-f fw-w">
+                <li>
+                    <dl class="footer-info">
+                        <dt class="ff-bhs pax3">지구별 방탈출</dt>
+                        <dd class="pax3">상호 : 주식회사 어스이스케이프</dd>
+                        
+                        <dd class="pax3">사업자등록번호 : 196-86-02531</dd>
+                        <dd class="pax3">주소 : 서울특별시 마포구 와우산로21길 31, 3층</dd>
+                        
+                    </dl>
+                    <div class="footer-social">
+                        <a class="insta" href="javascript:alert('준비중입니다.');"><img src="https://www.xn--2e0b040a4xj.com/images/social_instagram.png" alt="인스타그램"></a>
+                    </div>
+                </li>
+                <li>
+                    <div class="footer-message ff-bhs pax3">
+                        Like all great travellers,<br />
+                        I have seen more than I remember, <br />
+                        and remember more than I have seen !
+                    </div>
+                    <div class="footer-links pax3">
+                        <a href="https://www.xn--2e0b040a4xj.com/reservation">예약</a>
+                        <a href="https://www.xn--2e0b040a4xj.com/map">오시는길</a>
+                        <a href="https://www.xn--2e0b040a4xj.com/policy.pdf">개인정보처리방침</a>
+                    </div>
+                </li>
+            </ul>
+        </div>
+        <div class="footer-copyright ff-bhs">
+            <div class="container pax3">
+                COPYRIGHT 2021. 지구별방탈출 ALL RIGHTS RESERVED.
+                &nbsp; 사이트제작 <a target="_blank" href="http://pf.kakao.com/_uWbZxj/chat"><u>토니빌리</u></a>
+
+            </div>
+        </div>
+    </footer>
+    <script src="/js/manifest.js?id=c3bb400200fc973a2df5dc2b6d66142c"></script>
+    <script src="/js/vendor.js?id=88ed6f1bb604caee5aff7f5915037d09"></script>
+        <script src="/js/common.js?id=cdf8b96f227d6a84a99128b747ac0ea2"></script>
+        <script src="/js/reservation.confirm.js?id=a7f533b5a5f75a9809214d3294b4b8b6"></script>
+    </body>
+
+</html>

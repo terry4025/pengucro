@@ -1,6 +1,12 @@
 import customtkinter as ctk
 import ui.theme as theme
-from data.themes import ZEROWORLD_THEMES_WEEKDAY, ZEROWORLD_THEMES_WEEKEND, JIGUBYEOL_THEMES, SITES_CONFIG, JIGUBYEOL_THEME_ALIASES
+from data.themes import (
+    ZEROWORLD_GANGNAM_THEMES_WEEKDAY, ZEROWORLD_GANGNAM_THEMES_WEEKEND,
+    ZEROWORLD_HONGDAE_THEMES_WEEKDAY, ZEROWORLD_HONGDAE_THEMES_WEEKEND,
+    ZEROWORLD_GIMPO_THEMES_WEEKDAY, ZEROWORLD_GIMPO_THEMES_WEEKEND,
+    JIGUBYEOL_THEMES, PHOBIADUNGEON_THEMES, SITES_CONFIG, JIGUBYEOL_THEME_ALIASES,
+    KEYESCAPE_THEMES
+)
 from datetime import datetime, timedelta
 import calendar
 
@@ -16,7 +22,7 @@ class ReservationForm(ctk.CTkFrame):
         self.start_callback = start_callback
         self.stop_callback = stop_callback
         self.mode_callback = mode_callback
-        self.current_site = "제로월드 강남"
+        self.current_site = "제로월드"
         self.custom_sites = {}
         self.config = SITES_CONFIG[self.current_site]
         
@@ -77,7 +83,7 @@ class ReservationForm(ctk.CTkFrame):
         # Row 1: Theme Selection (Full Width OptionMenu)
         # -------------------------------------------------------------
         self.theme_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+        self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
         
         self.theme_label = ctk.CTkLabel(self.theme_frame, text="테마 선택", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
         self.theme_label.pack(anchor="w", pady=(0, 1))
@@ -105,7 +111,7 @@ class ReservationForm(ctk.CTkFrame):
         # Row 2: Custom Theme Entry (Full Width)
         # -------------------------------------------------------------
         self.custom_theme_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
+        self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
         
         self.custom_theme_checkbox = ctk.CTkCheckBox(
             self.custom_theme_frame,
@@ -139,7 +145,7 @@ class ReservationForm(ctk.CTkFrame):
         # Row 3: Date & Time (Split row)
         # -------------------------------------------------------------
         self.date_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.date_frame.grid(row=3, column=0, padx=(12, 4), pady=3, sticky="ew")
+        self.date_frame.grid(row=3, column=0, padx=(12, 4), pady=4, sticky="ew")
         self.date_label = ctk.CTkLabel(self.date_frame, text="날짜 (YYYY-MM-DD)", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
         self.date_label.pack(anchor="w", pady=(0, 1))
         
@@ -160,7 +166,7 @@ class ReservationForm(ctk.CTkFrame):
         self.date_entry.bind("<FocusOut>", self._on_date_change)
 
         self.time_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.time_frame.grid(row=3, column=1, padx=(4, 12), pady=3, sticky="ew")
+        self.time_frame.grid(row=3, column=1, padx=(4, 12), pady=4, sticky="ew")
         self.time_label = ctk.CTkLabel(self.time_frame, text="시간 (HH:MM)", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
         self.time_label.pack(anchor="w", pady=(0, 1))
         
@@ -181,7 +187,7 @@ class ReservationForm(ctk.CTkFrame):
         # Row 4: Name & People (Split row)
         # -------------------------------------------------------------
         self.name_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.name_frame.grid(row=4, column=0, padx=(12, 4), pady=3, sticky="ew")
+        self.name_frame.grid(row=4, column=0, padx=(12, 4), pady=4, sticky="ew")
         self.name_label = ctk.CTkLabel(self.name_frame, text="이름", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
         self.name_label.pack(anchor="w", pady=(0, 1))
         
@@ -198,7 +204,7 @@ class ReservationForm(ctk.CTkFrame):
         self.name_entry.pack(fill="x")
 
         self.people_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.people_frame.grid(row=4, column=1, padx=(4, 12), pady=3, sticky="ew")
+        self.people_frame.grid(row=4, column=1, padx=(4, 12), pady=4, sticky="ew")
         self.people_label = ctk.CTkLabel(self.people_frame, text="인원 수", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
         self.people_label.pack(anchor="w", pady=(0, 1))
         
@@ -219,7 +225,7 @@ class ReservationForm(ctk.CTkFrame):
         # Row 5: Phone Number (Full Width)
         # -------------------------------------------------------------
         self.phone_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.phone_frame.grid(row=5, column=0, columnspan=2, padx=12, pady=3, sticky="ew")
+        self.phone_frame.grid(row=5, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
         self.phone_label = ctk.CTkLabel(self.phone_frame, text="전화번호", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
         self.phone_label.pack(anchor="w", pady=(0, 1))
         
@@ -339,9 +345,23 @@ class ReservationForm(ctk.CTkFrame):
         )
         self.dev_mode_checkbox.pack(side="left", anchor="w")
 
+        # Setup focus effects for entries
+        self._setup_entry_focus(self.theme_pk_entry)
+        self._setup_entry_focus(self.date_entry)
+        self._setup_entry_focus(self.time_entry)
+        self._setup_entry_focus(self.name_entry)
+        self._setup_entry_focus(self.people_entry)
+        self._setup_entry_focus(self.phone_entry)
+
         # Initialize layout
         self.set_site(self.current_site)
         self._update_widgets_state()
+
+    def _setup_entry_focus(self, entry):
+        # Configure thin Apple hairline border
+        entry.configure(border_width=1, font=theme.FONT_BODY_MD)
+        entry.bind("<FocusIn>", lambda e: entry.configure(border_color=theme.ACCENT_BLUE) if entry.cget("state") == "normal" else None, add="+")
+        entry.bind("<FocusOut>", lambda e: entry.configure(border_color=theme.HAIRLINE_COLOR), add="+")
 
     def _on_mode_change(self, mode):
         # Save previous state
@@ -370,6 +390,24 @@ class ReservationForm(ctk.CTkFrame):
 
     def _update_widgets_state(self):
         is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
+        
+        self.threads_frame.grid(row=6, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+        if self.current_site == "키이스케이프":
+            self.threads_slider.configure(state="disabled")
+            self.threads_slider.set(1)
+            self.threads_value_label.configure(text="1", text_color=theme.TEXT_DISABLED)
+            self.threads_title_label.configure(text_color=theme.TEXT_DISABLED)
+        else:
+            self.threads_slider.configure(state="normal")
+            self.threads_title_label.configure(text_color=theme.TEXT_MUTE)
+            self.threads_value_label.configure(text_color=theme.ACCENT_BLUE)
+            if is_naver:
+                self.threads_slider.set(self.naver_threads)
+                self.threads_value_label.configure(text=str(self.naver_threads))
+            else:
+                self.threads_slider.set(self.standard_threads)
+                self.threads_value_label.configure(text=str(self.standard_threads))
+
         if is_naver:
             # Disable Naver-incompatible controls but keep them in layout to prevent vertical layout shifting
             self.branch_dropdown.configure(state="disabled")
@@ -395,8 +433,9 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
             
             # Show frame and enable Developer Mode checkbox
-            self.dev_mode_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 6), sticky="ew")
+            self.dev_mode_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
             self.dev_mode_checkbox.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.engine_mode_frame.grid(row=7, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
@@ -416,6 +455,7 @@ class ReservationForm(ctk.CTkFrame):
             self.dev_mode_frame.grid_forget()
             self.dev_mode_var.set(False)
             self._toggle_custom_theme()
+            self.engine_mode_frame.grid(row=7, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
 
     def set_site(self, site_name):
         self.current_site = site_name
@@ -445,22 +485,36 @@ class ReservationForm(ctk.CTkFrame):
             themes_dict = self.config.get("themes", {}).get("1", {})
             has_themes = len(themes_dict) > 0 and not (len(themes_dict) == 1 and list(themes_dict.keys())[0] == "기본테마")
             if has_themes:
-                self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
+                self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
             else:
                 self.theme_frame.grid_forget()
         else:
             # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
-            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=(3, 3), sticky="ew")
-            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(1, 3), sticky="ew")
+            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
 
             if has_weekday_weekend:
-                self.day_type_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
-            else:
-                self.branch_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 3), sticky="ew")
+                # Show both branch and day type selection side by side
+                self.branch_frame.grid(row=0, column=0, padx=(12, 4), pady=(10, 4), sticky="ew")
+                self.day_type_frame.grid(row=0, column=1, padx=(4, 12), pady=(10, 4), sticky="ew")
                 branch_options = list(self.config["branches"].keys())
                 self.branch_dropdown.configure(values=branch_options)
                 if branch_options:
-                    self.branch_var.set(branch_options[0])
+                    prev_val = self.branch_var.get()
+                    if prev_val in branch_options:
+                        self.branch_var.set(prev_val)
+                    else:
+                        self.branch_var.set(branch_options[0])
+            else:
+                self.branch_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="ew")
+                branch_options = list(self.config["branches"].keys())
+                self.branch_dropdown.configure(values=branch_options)
+                if branch_options:
+                    prev_val = self.branch_var.get()
+                    if prev_val in branch_options:
+                        self.branch_var.set(prev_val)
+                    else:
+                        self.branch_var.set(branch_options[0])
 
         self._update_theme_options()
         self._update_widgets_state()
@@ -483,6 +537,8 @@ class ReservationForm(ctk.CTkFrame):
             self.theme_pk_entry.pack_forget()
 
     def _on_threads_slider_move(self, value):
+        if self.current_site == "키이스케이프":
+            return
         val = int(value)
         self.threads_value_label.configure(text=str(val))
         if self.engine_mode_btn.get() == "네이버 (Playwright)":
@@ -514,9 +570,25 @@ class ReservationForm(ctk.CTkFrame):
             branch_id = self.config["branches"].get(branch_name, "1")
             themes_dict = self.config["themes"].get(branch_id, {})
             theme_names = sorted(list(themes_dict.keys()))
-        elif self.current_site.startswith("제로월드"):
+        elif self.current_site == "제로월드":
+            branch_name = self.branch_var.get()
             is_weekend = (self.day_type_var.get() == "주말")
-            themes_dict = ZEROWORLD_THEMES_WEEKEND if is_weekend else ZEROWORLD_THEMES_WEEKDAY
+            if "홍대" in branch_name:
+                themes_dict = ZEROWORLD_HONGDAE_THEMES_WEEKEND if is_weekend else ZEROWORLD_HONGDAE_THEMES_WEEKDAY
+            elif "김포" in branch_name:
+                themes_dict = ZEROWORLD_GIMPO_THEMES_WEEKEND if is_weekend else ZEROWORLD_GIMPO_THEMES_WEEKDAY
+            else:
+                themes_dict = ZEROWORLD_GANGNAM_THEMES_WEEKEND if is_weekend else ZEROWORLD_GANGNAM_THEMES_WEEKDAY
+            theme_names = sorted(list(themes_dict.keys()))
+        elif self.current_site == "비트포비아 던전":
+            branch_name = self.branch_var.get()
+            branch_id = self.config["branches"].get(branch_name, "3")
+            themes_dict = PHOBIADUNGEON_THEMES.get(branch_id, {})
+            theme_names = sorted(list(themes_dict.keys()))
+        elif self.current_site == "키이스케이프":
+            branch_name = self.branch_var.get()
+            branch_id = self.config["branches"].get(branch_name, "14")
+            themes_dict = KEYESCAPE_THEMES.get(branch_id, {})
             theme_names = sorted(list(themes_dict.keys()))
         else:
             branch_name = self.branch_var.get()
@@ -536,14 +608,11 @@ class ReservationForm(ctk.CTkFrame):
         # Resolve Branch ID
         if is_naver:
             branch_id = "1"
-        elif self.current_site in self.custom_sites:
-            branch_name = self.branch_var.get()
-            branch_id = self.config["branches"].get(branch_name, "1")
-            has_weekday_weekend = False
         else:
-            branch_name = self.branch_var.get() if not self.config["has_weekday_weekend"] else list(self.config["branches"].keys())[0]
+            branch_name = self.branch_var.get()
+            if not branch_name and self.config["branches"]:
+                branch_name = list(self.config["branches"].keys())[0]
             branch_id = self.config["branches"].get(branch_name, "1")
-            has_weekday_weekend = self.config["has_weekday_weekend"]
 
         # Resolve Theme PK
         if is_naver:
@@ -558,10 +627,22 @@ class ReservationForm(ctk.CTkFrame):
             theme_name = self.theme_var.get()
             if self.current_site in self.custom_sites:
                 theme_pk = self.config["themes"].get(branch_id, {}).get(theme_name, "")
-            elif self.current_site.startswith("제로월드"):
+            elif self.current_site == "제로월드":
+                branch_name = self.branch_var.get()
                 is_weekend = (self.day_type_var.get() == "주말")
-                themes_dict = ZEROWORLD_THEMES_WEEKEND if is_weekend else ZEROWORLD_THEMES_WEEKDAY
+                if "홍대" in branch_name:
+                    themes_dict = ZEROWORLD_HONGDAE_THEMES_WEEKEND if is_weekend else ZEROWORLD_HONGDAE_THEMES_WEEKDAY
+                elif "김포" in branch_name:
+                    themes_dict = ZEROWORLD_GIMPO_THEMES_WEEKEND if is_weekend else ZEROWORLD_GIMPO_THEMES_WEEKDAY
+                else:
+                    themes_dict = ZEROWORLD_GANGNAM_THEMES_WEEKEND if is_weekend else ZEROWORLD_GANGNAM_THEMES_WEEKDAY
                 theme_pk = themes_dict.get(theme_name, "")
+            elif self.current_site == "비트포비아 던전":
+                theme_pk = theme_name
+            elif self.current_site == "키이스케이프":
+                themes_dict = KEYESCAPE_THEMES.get(branch_id, {})
+                theme_info = themes_dict.get(theme_name, {})
+                theme_pk = theme_info.get("info_num", "")
             else:
                 themes_dict = JIGUBYEOL_THEMES.get(branch_id, {})
                 theme_pk = themes_dict.get(theme_name, "")
@@ -575,6 +656,8 @@ class ReservationForm(ctk.CTkFrame):
         phone = self.phone_entry.get().strip()
         people = self.people_entry.get().strip()
         threads = int(self.threads_slider.get())
+        if self.current_site == "키이스케이프":
+            threads = 1
         is_naver = (self.engine_mode_btn.get() == "네이버 (Playwright)")
 
         # Validation
@@ -589,6 +672,13 @@ class ReservationForm(ctk.CTkFrame):
         if not is_naver and not phone:
             return None, "전화번호를 입력해주세요.", 0, False
 
+        site_url = ""
+        if self.current_site == "제로월드":
+            branch_name = self.branch_var.get()
+            site_url = self.config["urls"].get(branch_name, self.config["url"])
+        elif self.current_site in SITES_CONFIG:
+            site_url = self.config.get("url", "")
+
         res_data = {
             'branch': branch_id,
             'reservationDate': date,
@@ -599,7 +689,8 @@ class ReservationForm(ctk.CTkFrame):
             'reservationTime': time_str,
             'paymentType': '1',
             'policy': 'true',
-            'devMode': self.dev_mode_var.get()
+            'devMode': self.dev_mode_var.get(),
+            'site_url': site_url
         }
 
         is_async = (self.engine_mode_btn.get() == "고속 (Async)")
@@ -705,7 +796,10 @@ class ReservationForm(ctk.CTkFrame):
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 
-            saved_site = config.get("site", "제로월드 강남")
+            saved_site = config.get("site", "제로월드")
+            if saved_site in ["제로월드 강남", "제로월드 홍대"]:
+                saved_site = "제로월드"
+                config["branch"] = "강남점" if "강남" in config.get("site", "") else "홍대점"
             if saved_site == self.current_site:
                 if "branch" in config:
                     self.branch_var.set(config["branch"])

@@ -1,0 +1,647 @@
+<!DOCTYPE HTML>
+<html lang="ko">
+	<head>
+		<title>비트포비아 던전</title>
+		<link rel="shortcut icon" href="../images/ico/favicon.ico" type="image/x-icon">
+		<link rel="icon" href="../images/ico/favicon.ico" type="image/x-icon">
+
+		<meta charset="utf-8" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0">
+		<meta name="format-detection" content="telephone=no">
+
+		<meta property="og:type" content="website"/>
+		<meta property="og:title" content=""/>
+		<meta property="og:description" content=""/>
+		<meta property="og:image" content=""/>
+		<meta property="og:url" content=""/>
+				<meta name="naver-site-verification" content="a4fbe65513acf6c1dfe0d1d40ca95b9135386a86" />
+		<meta name="robots" content="index, follow">
+		<meta name="description" content="Dungeon to another universe! 현실에서는 경험할 수 없는 새로운 세계, 던전에서 느껴보세요!">
+		<meta name="keywords" content="비트포비아,던전,방탈출,방탈출카페,던전루나,검은운명의밤,비트포비아 던전">
+		<meta property="og:type" content="website">
+		<meta property="og:title" content="방탈출카페 비트포비아 던전">
+		<meta property="og:description" content="Dungeon to another universe! 현실에서는 경험할 수 없는 새로운 세계, 던전에서 느껴보세요!">
+		<meta property="og:url" content="https://xdungeon.net">
+		<meta property="og:image" content="https://xdungeon.net/layout/images/common/logo_og.png">
+
+		<link rel="canonical" href="https://xdungeon.net">
+		<meta name="publisher" content="(주)신비웹,신비웹,sinbiweb,sinbiweb.com,www.sinbiweb.com,webmaster@sinbiweb.com"/>
+
+		<link rel="stylesheet" type="text/css" href="../css/style.css" />
+		<link rel="stylesheet" type="text/css" href="../css/slick.css" />
+		<link rel="stylesheet" type="text/css" href="../css/slick-theme.css" />
+		<link rel="stylesheet" type="text/css" href="../css/swiper.css">
+
+		<script src="../js/prefixfree.min.js"></script>
+		<script type="text/javascript" src="../js/jquery-1.10.2.min.js"></script>
+		<script type="text/javascript" src="../js/jquery.easing.1.3.js"></script>
+		<script type="text/javascript" src="../js/slick.min.js"></script>
+		<script type="text/javascript" src="../js/swiper.js"></script>
+		<script type="text/javascript" src="../js/TweenMax.min.js"></script>
+		<script type="text/javascript" src="../js/ui.js"></script>
+
+		<link rel="stylesheet" type="text/css" href="../css/board_reaction.css">
+		<script type="text/javascript" src="../../core/res/common.js"></script>
+		<script type="text/javascript" src="../../core/js/board.js"></script>
+		<script type="text/javascript" src="../../cheditor/cheditor.js"></script>
+
+		<!-- Google Tag Manager -->
+		<script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+		new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+		j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+		'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+		})(window,document,'script','dataLayers','GTM-T2R86TFP');</script>
+		<!-- End Google Tag Manager -->
+
+		<!-- Meta Pixel Code -->
+		<script>
+		!function(f,b,e,v,n,t,s)
+		{if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+		n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+		if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+		n.queue=[];t=b.createElement(e);t.async=!0;
+		t.src=v;s=b.getElementsByTagName(e)[0];
+		s.parentNode.insertBefore(t,s)}(window, document,'script',
+		'https://connect.facebook.net/en_US/fbevents.js');
+		fbq('init', '6406033516133179');
+		fbq('track', 'PageView');
+		</script>
+		<noscript><img height="1" width="1" style="display:none"
+		src="https://www.facebook.com/tr?id=6406033516133179&ev=PageView&noscript=1"
+		/></noscript>
+		<!-- End Meta Pixel Code -->
+
+	</head>
+
+	<!-- 달력 -->
+    <div id=popCal  style='position:absolute; left:-400px; top:0px; width:0; height=0; z-index:1; VISIBILITY:hidden;'>
+    <iframe name='pop_frame_cal' src='' frameborder='0' scrolling='no' height='320'></iframe>
+    </div>
+
+	<!-- submit 사용시 -->
+	<div style='position:absolute'>
+	<iframe src='' name='ifr_ok'  width=0 height=0 frameborder=0 scrolling=no></iframe>
+	</div>
+
+	<body>
+	<!-- Google Tag Manager (noscript) -->
+	<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-T2R86TFP"
+	height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+	<!-- End Google Tag Manager (noscript) -->
+
+		<div id="wrap">
+			<dl id="skip">
+				<dt class="hide">메뉴 바로가기</dt>
+				<dd><a href="#self">주메뉴 바로가기</a></dd>
+				<dd><a href="#self">컨텐츠 바로가기</a></dd>
+			</dl>
+
+			<header>
+				<div id="header">
+					<div class="in_Layer">
+						<h1 class="logo"><a href="home.php?go=main"><img src="../images/common/logo.png" alt="로고" /></a></h1>
+						<div class="gnb_area">
+							<ul>
+								<li><a href="home.php?go=theme.list"><div class="wrap"><span>THEME</span></div></a></li>
+								<li>
+									<a href="home.php?go=rev.main"><div class="wrap"><span>RESERVATION</span></div></a>
+									<ul class="depth">
+										<li><a href="home.php?go=rev.guide">예약안내</a></li>
+										<li><a href="home.php?go=rev.main">예약하기</a></li>
+										<li><a href="home.php?go=rev.login">예약확인 및 취소</a></li>
+									</ul>
+								</li>
+								<li>
+									<a href="home.php?go=pds.list&pds_type=1"><div class="wrap"><span>NOTICE</span></div></a>
+									<ul class="depth">
+										<li><a href="home.php?go=pds.list&pds_type=1">NOTICE</a></li>
+										<li><a href="home.php?go=faq.list">FAQ</a></li>
+									</ul>
+								</li>
+								<li><a href="home.php?go=location"><div class="wrap"><span>LOCATION</span></div></a></li>
+							</ul>
+						</div><!-- gnb_area -->
+
+						<div class="ham_btn">
+							<button type="button">
+								<span class="line1">전체메뉴버튼</span>
+								<span class="line2">전체메뉴버튼</span>
+								<span class="line3">전체메뉴버튼</span>
+							</button>
+						</div><!-- ham_btn -->
+
+						<div class="all_menu">
+							<ul>
+								<li><a href="home.php?go=theme.list">THEME</a></li>
+								<li class="nolink01">
+									<a href="">RESERVATION</a>
+									<ul class="depth">
+										<li><a href="home.php?go=rev.guide">예약안내</a></li>
+										<li><a href="home.php?go=rev.main">예약하기</a></li>
+										<li><a href="home.php?go=rev.login">예약확인 및 취소</a></li>
+									</ul>
+								</li>
+								<li class="nolink02">
+									<a href="">NOTICE</a>
+									<ul class="depth">
+										<li><a href="home.php?go=pds.list&pds_type=1">NOTICE</a></li>
+										<li><a href="home.php?go=faq.list">FAQ</a></li>
+									</ul>
+								</li>
+								<li><a href="home.php?go=location">LOCATION</a></li>
+							</ul>
+						</div><!-- all_menu -->
+
+						<div class="bulr_gra">blur background</div>
+					</div><!-- in_Layer -->
+				</div><!-- End of #header -->
+			</header><!-- End of header -->
+
+			<div id="contents">
+				<div class="sub_contents">
+<script type="text/javascript" src="/core/js/text_area.js"></script>
+<script>
+function fun_search() {
+	f = eval('document.f_search');
+	f.submit();
+}
+
+function _fun_theme_view(num) {
+	$.ajax({
+		type: "POST",
+		url: "../../core/res/theme.act.php",
+		data: "not_html=Y&act=view&num="+num+"&ck_rev_but=N",
+		success: function (data) {
+			var result = $.trim(data);
+			if(result=='9999') {
+				alert('잘못된연결입니다');
+			} else {
+				$("#popup_view").html(result);
+			}
+		}
+	});
+}	
+</script>
+
+<script>
+$(document).ready(function () {
+	setTimeout(function(){
+		document.f_search.s_zizum.value="3";
+	},10);
+});
+</script>
+
+<h2 class="sub_tit">RESERVATION</h2>
+
+<div class="sub_resv">
+	<div class="in_Layer3">
+		<div class="fx_box">
+			<div class="locas">
+				<h3 class="c_tit">LOCATION</h3>
+				<div class="swiper-container loca_lnb">
+					<ul class="swiper-wrapper">
+				<li class="swiper-slide on"><a href='home.php?go=rev.main&s_zizum=3&rev_days=2026-06-07'>홍대던전</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=1&rev_days=2026-06-07'>던전101</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=5&rev_days=2026-06-07'>홍대던전Ⅲ</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=2&rev_days=2026-06-07'>강남던전</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=4&rev_days=2026-06-07'>강남던전Ⅱ</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=6&rev_days=2026-06-07'>던전루나(강남)</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=9&rev_days=2026-06-07'>던전스텔라(강남)</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=7&rev_days=2026-06-07'>서면던전(부산)</a></li><li class="swiper-slide "><a href='home.php?go=rev.main&s_zizum=10&rev_days=2026-06-07'>서면던전 레드(부산)</a></li>					</ul>
+				</div><!-- loca_lnb -->
+			</div><!-- locas -->
+
+			<div class="resvs">
+				<div class="inner">
+					<div class="prcs">
+						<ul>
+							<li class="on">01. 예약하기</li>
+							<li>02. 예약정보 입력</li>
+							<li>03. 결제하기</li>
+							<li>04. 예약완료</li>
+						</ul>
+					</div><!-- prcs -->
+
+					<div class="main_form">
+						<form action="home.php" method="get" name="f_search">
+							<div class="resv_day">
+								<div class="wrap">
+									<span class="tt">예약날짜</span>
+									<input type="text" name="rev_days" id="rev_days" value="2026-06-07" size="20" maxlength="10" readonly="" class="selectType" onclick="fun_calendar('f_search.rev_days','B','rev_days','3');" onchange="fun_search()">
+								</div>
+							</div>
+							<div class="resv_loca">
+								<div class="wrap">
+									<span class="tt">지점선택</span>
+									<select name="s_zizum" onChange="fun_search()" class="selectType">
+							<option value="3" selected>홍대던전</option><option value="1" >던전101</option><option value="5" >홍대던전Ⅲ</option><option value="2" >강남던전</option><option value="4" >강남던전Ⅱ</option><option value="6" >던전루나(강남)</option><option value="9" >던전스텔라(강남)</option><option value="7" >서면던전(부산)</option><option value="10" >서면던전 레드(부산)</option>									</select>
+								</div>
+							</div>
+							<input type=hidden name=go		value='rev.main'>
+						</form>
+					</div><!-- form_box -->
+		<div class="thm_box"> 	<div class="box">
+							<div class="img_box">
+								<div class="img_wrap"><a href="javascript:_fun_theme_view('15')"><img src="/file/theme/15/15_3539534119.jpg" /></a></div>
+								<p class="tit">사라진 보물 : 대저택의 비밀</p>
+							</div>
+							<div class="time_box">
+								<ul> 	<li class="dead sale">
+									<a><span>SALE</span>10:00</a>
+								</li> 	<li class="dead sale">
+									<a>11:20</a>
+								</li> 	<li class="dead sale">
+									<a>12:40</a>
+								</li> 	<li class="dead sale">
+									<a>14:00</a>
+								</li> 	<li class="dead sale">
+									<a>15:20</a>
+								</li> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=SGYyT3pjeUJxRFFlWnQydTM3dSt5RkdJNkU2bXdMcEdCcjF6Zmt1V3J5Y25mY0xOU2hQQVBUQWJNZnNJeExLTQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=15&rev_days=2026-06-07&time_index=5" title='예약하기'>
+										-->								
+											16:40</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=SGYyT3pjeUJxRFFlWnQydTM3dSt5RkdJNkU2bXdMcEdCcjF6Zmt1V3J5ZTZ3NVNNS3VULzRCOHNiYktOdUxPbA==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=15&rev_days=2026-06-07&time_index=6" title='예약하기'>
+										-->								
+											18:00</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=SGYyT3pjeUJxRFFlWnQydTM3dSt5RkdJNkU2bXdMcEdCcjF6Zmt1V3J5ZmMrM0VvaUx5ekk0ZXVqTVo2ZVNzZA==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=15&rev_days=2026-06-07&time_index=7" title='예약하기'>
+										-->								
+											19:20</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=SGYyT3pjeUJxRFFlWnQydTM3dSt5RkdJNkU2bXdMcEdCcjF6Zmt1V3J5ZlpNVmZHYVZJZzdhTklvWUxiTkpGNg==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=15&rev_days=2026-06-07&time_index=8" title='예약하기'>
+										-->								
+											20:40</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=SGYyT3pjeUJxRFFlWnQydTM3dSt5RkdJNkU2bXdMcEdCcjF6Zmt1V3J5ZlVxZnR3Uld1cWpFNmkzQUIyc3N5cw==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=15&rev_days=2026-06-07&time_index=9" title='예약하기'>
+										-->								
+											<span>SALE</span>22:00</a>
+									</li>
+								</ul>
+							</div>
+						</div><!-- box --> 	<div class="box">
+							<div class="img_box">
+								<div class="img_wrap"><a href="javascript:_fun_theme_view('14')"><img src="/file/theme/14/14_1175778262.jpg" /></a></div>
+								<p class="tit">날씨의 신 (홍대)</p>
+							</div>
+							<div class="time_box">
+								<ul> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=VkZLQzN5aW56aEE5cU5sN0x0c2FNMjRiTXlNdUxIblN0QU5JS0hWSytWYVhzc1gyNVFwQlZ1ZUZhTTRRMzRVeg==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=14&rev_days=2026-06-07&time_index=0" title='예약하기'>
+										-->								
+											<span>SALE</span>10:20</a>
+									</li>
+								<li class="dead sale">
+									<a>11:40</a>
+								</li> 	<li class="dead sale">
+									<a>13:00</a>
+								</li> 	<li class="dead sale">
+									<a>14:20</a>
+								</li> 	<li class="dead sale">
+									<a>15:40</a>
+								</li> 	<li class="dead sale">
+									<a>17:00</a>
+								</li> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=VkZLQzN5aW56aEE5cU5sN0x0c2FNMjRiTXlNdUxIblN0QU5JS0hWSytWWWJaenI3Vm83QWx4Q2E1NWd5Z3AvbQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=14&rev_days=2026-06-07&time_index=6" title='예약하기'>
+										-->								
+											18:20</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=VkZLQzN5aW56aEE5cU5sN0x0c2FNMjRiTXlNdUxIblN0QU5JS0hWSytWYm5mQ2pVSnhmRmE3YXRBNTgwdTVRbg==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=14&rev_days=2026-06-07&time_index=7" title='예약하기'>
+										-->								
+											19:40</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=VkZLQzN5aW56aEE5cU5sN0x0c2FNMjRiTXlNdUxIblN0QU5JS0hWSytWYTlsdW5BM05GMVI2SWFkMG91Q1FBSw==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=14&rev_days=2026-06-07&time_index=8" title='예약하기'>
+										-->								
+											21:00</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=VkZLQzN5aW56aEE5cU5sN0x0c2FNMjRiTXlNdUxIblN0QU5JS0hWSytWWStUQjZsMXlPNFFrZ0lBL3Y4MHBoQQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=14&rev_days=2026-06-07&time_index=9" title='예약하기'>
+										-->								
+											<span>SALE</span>22:20</a>
+									</li>
+								</ul>
+							</div>
+						</div><!-- box --> 	<div class="box">
+							<div class="img_box">
+								<div class="img_wrap"><a href="javascript:_fun_theme_view('13')"><img src="/file/theme/13/13_7475838983.jpg" /></a></div>
+								<p class="tit">꿈의 공장 (홍대)</p>
+							</div>
+							<div class="time_box">
+								<ul> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqL2srWXQzWmdBZE9WaVJZakt4RlkvWQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=0" title='예약하기'>
+										-->								
+											<span>SALE</span>10:10</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqOW5LNW12Ni9VUXBXZXU3aVprRUkrYw==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=1" title='예약하기'>
+										-->								
+											11:30</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqOUhKbXgwU2d6R0JWVEtuNFVlT3FSbg==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=2" title='예약하기'>
+										-->								
+											12:50</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqOEZHaHRpYnhDY3hkMnBzZFFSZWI5Mg==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=3" title='예약하기'>
+										-->								
+											14:10</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqOFpEZUg1dW1naGdrRVlvNDBDaWZ1RQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=4" title='예약하기'>
+										-->								
+											15:30</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqKzlmZ0RabGdSRlc0SzBZRFFHUGxEaQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=5" title='예약하기'>
+										-->								
+											16:50</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqK281czdBeVl1cnQ5TUkzalE1Y2QySA==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=6" title='예약하기'>
+										-->								
+											18:10</a>
+									</li>
+								<li class="dead sale">
+									<a>19:30</a>
+								</li> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqK3FHSEoxc0MvMzZldWJ6MGI4OEE0cw==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=8" title='예약하기'>
+										-->								
+											20:50</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=K2J3R2s2bkhiWW1CRXpDTDkrc1RGNHhROTA3YkZDZVFWUC9YUFQydmdqKzNVUkEyNjhSL25SdFJHNzB4OWFYdQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=13&rev_days=2026-06-07&time_index=9" title='예약하기'>
+										-->								
+											<span>SALE</span>22:10</a>
+									</li>
+								</ul>
+							</div>
+						</div><!-- box --> 	<div class="box">
+							<div class="img_box">
+								<div class="img_wrap"><a href="javascript:_fun_theme_view('3')"><img src="/file/theme/3/3_8186075995.png" /></a></div>
+								<p class="tit">오늘 나는 (홍대)</p>
+							</div>
+							<div class="time_box">
+								<ul> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=RzRTWkN3YUlaRzdXdlBpbjA5VVhFNVE1QXk5Zys0VHlxVzVEaUo5dGtYdms2SlJZdmpzN1RMcXpGVGloMVBMZA==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=3&rev_days=2026-06-07&time_index=0" title='예약하기'>
+										-->								
+											<span>SALE</span>10:30</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=RzRTWkN3YUlaRzdXdlBpbjA5VVhFNVE1QXk5Zys0VHlxVzVEaUo5dGtYc0lqOGljYjZoRm45dHJQSGtTZE1NZQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=3&rev_days=2026-06-07&time_index=1" title='예약하기'>
+										-->								
+											11:50</a>
+									</li>
+								<li class="dead sale">
+									<a>13:10</a>
+								</li> 	<li class="dead sale">
+									<a>14:30</a>
+								</li> 	<li class="dead sale">
+									<a>15:50</a>
+								</li> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=RzRTWkN3YUlaRzdXdlBpbjA5VVhFNVE1QXk5Zys0VHlxVzVEaUo5dGtYc0dYQlZicEdrdk5ZSDVQUHZRMjN0Rg==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=3&rev_days=2026-06-07&time_index=5" title='예약하기'>
+										-->								
+											17:10</a>
+									</li>
+								<li class="dead sale">
+									<a>18:30</a>
+								</li> 	
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=RzRTWkN3YUlaRzdXdlBpbjA5VVhFNVE1QXk5Zys0VHlxVzVEaUo5dGtYc0lucTlNWjZaNHh4RlRhNWF6Snk3UA==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=3&rev_days=2026-06-07&time_index=7" title='예약하기'>
+										-->								
+											19:50</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=RzRTWkN3YUlaRzdXdlBpbjA5VVhFNVE1QXk5Zys0VHlxVzVEaUo5dGtYdFdIbFVqeUNkaHhySHNRbnJTUDZyUA==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=3&rev_days=2026-06-07&time_index=8" title='예약하기'>
+										-->								
+											21:10</a>
+									</li>
+								
+									<li class="sale">
+										<a href="home.php?go=rev.make&crypt_data=RzRTWkN3YUlaRzdXdlBpbjA5VVhFNVE1QXk5Zys0VHlxVzVEaUo5dGtYdVVTbFFYR0wwaW1GV1hyL1grbEpHcQ==" title='예약하기'>
+										<!--
+										<a href="home.php?go=rev.make&theme_num=3&rev_days=2026-06-07&time_index=9" title='예약하기'>
+										-->								
+											<span>SALE</span>22:30</a>
+									</li>
+								</ul>
+							</div>
+						</div><!-- box --> 	</div><!-- thm_box -->				</div><!-- inner -->
+			</div><!-- resvs -->
+		</div><!-- fx_box -->
+
+		<div class="resv_info">
+			<h3 class="if_tit">예약안내</h3>
+
+			<div class="info">
+				<p class="tit">예약</p>
+				<div class="text_area" style="padding:0 20px;";>
+					<div><span style="font-size: 18px;"><b><span style="font-size: 18px;">1. 예약 안내</span></b></span></div>
+<div><span style="font-size: 16px;">- 예약자 이름, 연락처 두 가지 정보만 입력하시면 예약이 가능합니다.</span></div>
+<div><span style="font-size: 16px;">- 예약 확정 및 예약번호 문자 발송을 위하여 확인 가능한 연락처로 입력 부탁드립니다.</span></div>
+<div><span style="font-size: 16px;">- 가상계좌 입금 대기 시간은 <span style="background-color: #ffe5cc;">예약하기 버튼 클릭부터 최대 10분까지이고, 10분 이내 미입금시 자동 예약 취소</span> 됩니다.</span></div>
+<div><span style="font-size: 16px;">- 입금 시 <span style="background-color: #ffe5cc;">예약자명과 입금자명이 일치</span>해야 합니다.</span></div>
+<div><span style="font-size: 16px;">- 문자로 발송된 예약번호로 예약 조회 및 취소 가능합니다.</span></div>
+<div><span style="font-size: 16px;">- 예약완료 문자를 받지 못하신 경우 예약이 안된 경우이니 해당 매장으로 유선 문의 부탁드립니다.</span></div>
+<div><span style="font-size: 16px;">&nbsp;</span></div>
+<div>
+   <b><span style="font-size: 16px; font-family: 나눔스퀘어;"></span></b>
+</div>
+<div><span style="font-size: 16px;"><b><span style="font-size: 18px;">2. 예약 오픈 시간 안내</span></b></span></div>
+<div><span style="font-size: 16px;">- 평일/주말 상관없이 해당 시간에 예약 오픈됩니다.</span></div>
+<div><span style="font-size: 16px;">- 매일 하루씩 예약 오픈하며 일주일 치의 예약만 가능합니다.</span></div>
+<div><span style="font-size: 16px;">
+      <p>
+         <br>
+      </p>
+      <p>
+         <img src="/file/cheditor/20240424142201_tlhulhfu.jpg" alt="2024_홈페이지 예약오픈 시간 안내.jpg">
+      </p>
+      </span></div>
+<div><span style="font-size: 16px;">&nbsp;</span></div>
+<div><span style="font-size: 16px;"><b><span style="font-size: 18px;">3. 예약 변경 (날짜 / 시간 / 인원변경)</span></b></span></div>
+<div><span style="font-size: 16px;">- 이용 날짜 및 시간, 테마 변경은 불가능합니다. 사이트를 통해 취소 후 재예약 부탁드립니다.</span></div>
+<div><span style="font-size: 16px;">- 이용 인원이 변경된 경우, 이용일 당일 매장에서 추가 결제 및 부분 환불 도와드리겠습니다.</span></div>
+<div><span style="font-size: 16px;">&nbsp;</span></div>
+<div><span style="font-size: 16px;"><b><span style="font-size: 18px;">4. 예약 취소</span></b></span></div>
+<div><span style="font-size: 16px;">- 예약 취소는 <span style="background-color: #ffffff;">게임 플레이 1일 전까지 가능</span>합니다. (자정 기준)</span></div>
+<div><span style="font-size: 16px;">- 홈페이지 상단 &#39;RESERVATION&#39; &gt; &#39;예약확인 및 취소&#39; 탭을 통해 예약 취소하실 수 있습니다.</span></div>
+<div><span style="font-size: 16px;">- 당일 예약 건을 포함하여 게임 <span style="background-color: #ffe5cc;">이용 당일에는 취소 및 환불이 불가</span>합니다.</span></div>
+<div><span style="font-size: 16px;">- 환불 계좌번호 입력 시, <span style="background-color: #ffe5cc;">예약자명과 예금주명이 일치</span>해야 합니다.</span></div>
+<div><span style="font-size: 16px;">- <span style="color: #000000; background-color: #ffe5cc;">환불은 영업일 기준 최대 2-3일 정도 소요되며, 주말 및 공휴일은 제외됩니다. 환불 금액은 &#39;tosspayments&#39; 입금자명으로 입금됩니다.</span></span></div>
+<div>
+   <span 맑은="" 고딕",="" "malgun="" gothic";"="" style="font-size: 16px; font-family: 맑은고딕;"></span>
+</div>
+<div>
+   <span 맑은="" 고딕",="" "malgun="" gothic";"="" style="font-size: 16px; font-family: 맑은고딕;"></span>
+</div>				</div>
+			</div><!-- info -->
+
+			<div class="info">
+				<p class="tit">게임진행</p>
+				<div class="text_area" style="padding:0 20px;";>
+					<div><span 맑은="" 고딕",="" "malgun="" gothic";"="" style="font-size: 16px;">1. 입장 전 게임 설명 및 유의사항 안내를 위하여 <span style="background-color: #ffffff;">이용 시간보다 10분 일찍 도착</span> 부탁드립니다. (게임 시작 시간 이후 도착 시 테마 이용 시간이 차감될 수 있습니다.)</span></div>
+<div><span style="font-size: 16px;">2. 휴대폰, 인화성 물질 및 소지품은 라커룸에 보관하셔야 합니다.</span></div>
+<div><span style="font-size: 16px;">3. 힌트용 태블릿에 힌트 코드를 입력하여 힌트를 사용할 수 있습니다. 힌트 사용 횟수는 무제한이며, 탈출 시 탈출 성공 기념 티켓을 제공합니다.</span></div>
+<div><span 맑은="" 고딕",="" "malgun="" gothic";"=""><span style="font-size: 16px;">4. </span><span 맑은="" 고딕",="" "malgun="" gothic";"="" style="font-size: 16px;">게임의 상세한 내용에 대한 스포일러는 금지되어 있습니다.</span></span></div>
+<div><span 맑은="" 고딕",="" "malgun="" gothic";"=""><span 맑은="" 고딕",="" "malgun="" gothic";"="" style="font-size: 14px; font-family: 나눔스퀘어;"></span></span></div>				</div>
+			</div><!-- info -->
+
+			<div class="info">
+				<p class="tit">입장 제한 및 환불불가 안내</p>
+				<div class="text_area" style="padding:0 20px;";>
+					<div>
+   <span style="color: #000000;"><b><span style="font-size: 18px;">1. 지각 및 NO SHOW</span></b></span>
+</div>
+<div>
+   <span style="font-size: 16px;">테마는 시간대 별 예약으로 진행되어, 최소 <span style="background-color: #ffe5cc;">테마 시작 10분 전 도착</span>하여야 합니다. <span style="background-color: #ffe5cc;">NO SHOW(불참)의 경우 환불 불가</span>합니다.</span>
+</div>
+<div>
+   <span style="font-size: 16px;">　</span>
+</div>
+<div>
+   <span style="color: #000000;"><b><span style="font-size: 18px;">2. 과도한 음주자</span></b></span>
+</div>
+<div>
+   <span style="font-size: 16px;">과도한 음주 후 플레이는 입장이 제한될 수 있습니다.</span>
+</div>
+<div>
+   <span style="font-size: 16px;">　</span>
+</div>
+<div>
+   <span style="color: #000000;"><b><span style="font-size: 18px;">3. 폐쇄공포증 및 심장 질환자, 임산부</span></b></span>
+</div>
+<div>
+   <span style="font-size: 16px;">게임 진행 공간은 해당 테마에 맞춰 최대한 리얼리티를 살리도록 설계 되었습니다.</span>
+</div>
+<div>
+   <span style="font-size: 16px;">경우에 따라 공간이 폐쇄되어 갇히거나 놀라는 연출이 있을 수 있으므로 관련된 질병이나 신체 장애가 있는 분들은 예약 전 각 매장으로 문의 부탁드립니다.</span>
+</div>				</div>
+			</div><!-- info -->
+
+		</div><!-- resv_info -->
+	</div><!-- in_Layer3 -->
+</div><!-- sub_resv -->
+
+
+
+	<div id="popup_view"> <!-- 팝업영역 -->
+	</div>
+				</div><!-- sub_contents -->
+			</div><!-- End of #contents -->
+			<div id="quick">
+				<div class="box">
+					<div class="resv"><a href="home.php?go=rev.find">
+						<div class="wrap">
+							<img src="../images/ico/quick_resv.png" alt="클릭 아이콘" />
+							<span>빠른 예약</span>
+						</div>
+					</a></div><!-- resv -->
+			<div class="insta"><a href="https://www.instagram.com/beat_phobia/" target=_blank><img src="../images/ico/quick_insta.png" alt="인스타그램 아이콘" /></a></div>					<div class="top_btn"><button type="button">
+						<div class="wrap">
+							<img src="../images/ico/quick_top.png" alt="탑버튼 아이콘" />
+							<span>TOP</span>
+						</div>
+					</button></div><!-- top_btn -->
+				</div>
+			</div><!-- quick -->
+			<footer>
+				<div id="footer">
+					<div class="in_Layer">
+						<h3 class="ft_logo"><img src="../images/common/f_logo.png" alt="푸터 로고" /></h3>
+						<p class="ft_dsc">Dungeon To Another Universe</p>
+						<div class="ft_link">
+							<ul>
+								<li><a href="home.php?go=agree">이용약관</a></li>
+								<li><a href="home.php?go=privacy">개인정보취급방침</a></li>
+							</ul>
+						</div><!-- ft_link -->
+						<div class="ft_info">
+							<ul>
+								<li>상호명 : (주)비트포비아</li>
+								<li>전화번호 : 02-322-9657</li>
+								<li>서울시 강남구 테헤란로 6길 46 2층</li>
+								<li>사업자등록번호 : 497-81-00178 <span>deco</span><br /> 통신판매업 신고번호 : 제2015-서울서대문-0447호</li>
+								<li>문의 : help@xphobia.net <span>deco</span><br /> 마케팅 담당 : mkt@xphobia.net</li>
+							</ul>
+						</div><!-- ft_info -->
+						<p class="copy">
+							COPYRIGHT ⓒ 2023 Beat Phobia ALL RIGHT RESERVED. 
+							CREATED BY <a href="http://sinbiweb.co.kr?s_url=xdungeon.net" target="_blank">SINBIWEB</a>
+						</p><!-- copy -->
+					</div><!-- in_Layer -->
+				</div><!-- End of #footer -->
+			</footer><!-- End of footer -->
+		</div><!-- End of #wrap -->
+	</body>
+</html>

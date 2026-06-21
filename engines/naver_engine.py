@@ -615,53 +615,7 @@ class NaverEngine(BaseEngine):
                         #  BOOKING PAGE  (Phases 1-2)
                         # ═══════════════════════════════════════════
 
-                        # 1. 정각 오픈 전 대기 로직 (하이브리드 대기 - 최초 1회 판별)
-                        if not has_awaited_open:
-                            server_now = time.time() + naver_time_offset
-                            dt_now = datetime.fromtimestamp(server_now)
-                            
-                            # Calculate next 30-minute interval target
-                            minutes_to_add = 30 - (dt_now.minute % 30)
-                            dt_target = dt_now.replace(second=0, microsecond=0)
-                            if dt_now.minute % 30 != 0 or dt_now.second > 0:
-                                dt_target += timedelta(minutes=minutes_to_add)
-                                
-                            target_open_timestamp = dt_target.timestamp()
-                            
-                            # Warm-up targets: wake up 10.0 seconds before target_open_timestamp
-                            sleep_target = target_open_timestamp - 10.0
-                            time_left_to_warmup = sleep_target - server_now
-                            
-                            # If we are within 180 seconds (3 minutes) before target open time and not yet at warmup point
-                            if 0 < (target_open_timestamp - server_now) <= 180 and server_now < sleep_target:
-                                self.log(
-                                    f"⏰ [{worker_id}번 기기] 정각 오픈 대기 중... "
-                                    f"(서버시간: {dt_now.strftime('%H:%M:%S')}, "
-                                    f"워밍업 예정: {datetime.fromtimestamp(sleep_target).strftime('%H:%M:%S')}, "
-                                    f"남은대기시간: {time_left_to_warmup:.1f}초)",
-                                    "info"
-                                )
-                                
-                                while True:
-                                    now = time.time() + naver_time_offset
-                                    if now >= sleep_target or self.stop_event.is_set():
-                                        break
-                                        
-                                    rem = sleep_target - now
-                                    if rem > 3.0:
-                                        # Relaxed sleep (0.5s) to prevent CPU lag
-                                        await asyncio.sleep(0.5)
-                                    else:
-                                        # Fine-grained sleep (0.01s) close to warmup point
-                                        await asyncio.sleep(0.01)
-                                    
-                                if not self.stop_event.is_set():
-                                    self.log(f"🔄 [{worker_id}번 기기] 오픈 10초 전 감지! 1차 새로고침 실행 (워밍업)...", "info")
-                                    await page.reload()
-                                    await page.wait_for_load_state("domcontentloaded")
-                                    await wait_for_loading()
-                                    
-                            has_awaited_open = True
+                        has_awaited_open = True
 
                         # Phase 1 — Find & click target time slot ──
                         time_el = None
