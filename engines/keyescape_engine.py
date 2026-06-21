@@ -81,14 +81,24 @@ class KeyescapeEngine(BaseEngine):
         except Exception:
             pass
 
-        # Calculate the earliest date when booking becomes possible
+        # Calculate the earliest datetime when booking becomes possible (midnight KST)
         target_date_obj = datetime.strptime(target_date, "%Y-%m-%d").date()
         kst = timezone(timedelta(hours=9))
         if doing_days > 0:
             min_booking_date = target_date_obj - timedelta(days=doing_days - 1)
-            self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈 예정일={min_booking_date}", "info")
+            min_booking_datetime = datetime(min_booking_date.year, min_booking_date.month, min_booking_date.day, 0, 0, 0, tzinfo=kst)
+            now_kst = datetime.now(kst)
+            time_remaining = min_booking_datetime - now_kst
+            if time_remaining.total_seconds() > 0:
+                days_r = time_remaining.days
+                hours_r = time_remaining.seconds // 3600
+                mins_r = (time_remaining.seconds % 3600) // 60
+                self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈 예정={min_booking_date} 00:00 KST ({days_r}일 {hours_r}시간 {mins_r}분 남음)", "info")
+            else:
+                self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈일={min_booking_date} (이미 오픈 가능 시간)", "info")
         else:
             min_booking_date = None
+            min_booking_datetime = None
             self.log("doing 값을 조회하지 못했습니다. 실시간 백엔드 감시로 전환합니다.", "warning")
 
         self.log("예약 1단계 우회용 Time Slot ID(themeTimeNum)를 조회 중...", "info")
@@ -517,15 +527,25 @@ class KeyescapeEngine(BaseEngine):
                             last_check_time = now
                             backend_check_count += 1
 
-                            # Phase A: Check if today has reached the booking open date
-                            today_date = datetime.now(kst).date()
+                            # Phase A: Check if current time has reached the booking open datetime
+                            now_kst = datetime.now(kst)
                             date_in_window = True  # Default: assume open if no doing info
-                            if min_booking_date and today_date < min_booking_date:
+                            if min_booking_datetime and now_kst < min_booking_datetime:
                                 date_in_window = False
                                 # Progress log every 200 checks (~10 seconds)
                                 if backend_check_count % 200 == 0:
-                                    days_left = (min_booking_date - today_date).days
-                                    self.log(f"[백엔드 감시] 예약 오픈까지 {days_left}일 남음 (오픈일: {min_booking_date})", "info")
+                                    remaining = min_booking_datetime - now_kst
+                                    total_secs = int(remaining.total_seconds())
+                                    days_r = remaining.days
+                                    hours_r = remaining.seconds // 3600
+                                    mins_r = (remaining.seconds % 3600) // 60
+                                    secs_r = remaining.seconds % 60
+                                    if days_r > 0:
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {days_r}일 {hours_r}시간 {mins_r}분 남음 (오픈: {min_booking_date} 00:00)", "info")
+                                    elif hours_r > 0:
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {hours_r}시간 {mins_r}분 남음", "info")
+                                    else:
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {mins_r}분 {secs_r}초 남음!", "warning")
 
                             # Phase B: When date is in window, verify via API with rapid polling
                             if date_in_window:
