@@ -336,11 +336,13 @@ class KeyescapeEngine(BaseEngine):
                 self.log(f"reCAPTCHA 체크박스 자동 클릭 실패 (수동 체크 필요): {e}", "warning")
             
             captcha_solved = False
+            captcha_solve_time = 0  # Track when captcha was solved for 2-min expiration detection
             submit_clicked = False
             is_preset = (theme_time_num != "9999")
             backend_opened = False  # ALWAYS verify via backend API before submit
             last_check_time = 0
             backend_check_count = 0
+            captcha_retry_count = 0  # Track how many times captcha was re-solved
 
             # YesCaptcha API integration configuration
             yescaptcha_token = ""
@@ -438,10 +440,30 @@ class KeyescapeEngine(BaseEngine):
 
             try:
                 while not self.stop_event.is_set():
+                    # 0. Check captcha expiration (token valid for 2 min = 120s, re-solve at 105s)
+                    if captcha_solved and not submit_clicked and captcha_solve_time > 0:
+                        elapsed_since_solve = time.time() - captcha_solve_time
+                        if elapsed_since_solve >= 105:
+                            captcha_retry_count += 1
+                            self.log(f"[경고] 캡차 토큰 만료 ({int(elapsed_since_solve)}초 경과). 자동 재해결을 시작합니다... (#{captcha_retry_count})", "warning")
+                            captcha_solved = False
+                            captcha_solve_time = 0
+                            yescaptcha_token = ""
+                            # Re-click checkbox
+                            try:
+                                await checkbox.click()
+                                self.log("reCAPTCHA 체크박스 재클릭 완료", "info")
+                            except Exception:
+                                self.log("reCAPTCHA 체크박스 재클릭 실패", "warning")
+                            # Launch new API solve task
+                            api_task = asyncio.create_task(solve_captcha_via_api())
+                            self.log("[YesCaptcha] 캡차 자동 재해결 태스크를 시작했습니다.", "info")
+
                     # 1. Update Captcha Solved State (Accept either Playwright manual check or YesCaptcha API token)
                     if yescaptcha_token:
                         if not captcha_solved:
                             captcha_solved = True
+                            captcha_solve_time = time.time()
                             self.log("[YesCaptcha] 우회 토큰을 브라우저에 주입합니다.", "success")
                             await page.evaluate(f"""() => {{
                                 const textareas = document.querySelectorAll('textarea[name="g-recaptcha-response"]');
@@ -459,18 +481,32 @@ class KeyescapeEngine(BaseEngine):
                                     }}
                                 }});
                             }}""")
-                            self.log("[YesCaptcha] 우회 토큰 주입 완료! 예약 개시를 기다리는 중 (실시간 백엔드 감시 중)...", "success")
+                            remaining = 120 - int(time.time() - captcha_solve_time)
+                            self.log(f"[YesCaptcha] 우회 토큰 주입 완료! 토큰 유효시간: {remaining}초 (실시간 백엔드 감시 중)", "success")
                     else:
                         try:
                             checked = await checkbox.get_attribute("aria-checked", timeout=100)
                             if checked == "true":
                                 if not captcha_solved:
                                     captcha_solved = True
+                                    captcha_solve_time = time.time()
                                     self.log("reCAPTCHA 구글 인증 성공을 확인했습니다. (예약 오픈 대기 중...)", "success")
                             else:
                                 if captcha_solved:
                                     captcha_solved = False
-                                    self.log("reCAPTCHA가 해제되었습니다. 다시 인증해주세요.", "warning")
+                                    captcha_solve_time = 0
+                                    self.log("reCAPTCHA가 해제되었습니다. 자동 재해결을 시작합니다...", "warning")
+                                    yescaptcha_token = ""
+                                    captcha_retry_count += 1
+                                    # Re-click checkbox
+                                    try:
+                                        await checkbox.click()
+                                        self.log("reCAPTCHA 체크박스 재클릭 완료", "info")
+                                    except Exception:
+                                        pass
+                                    # Launch new API solve task
+                                    api_task = asyncio.create_task(solve_captcha_via_api())
+                                    self.log(f"[YesCaptcha] 캡차 자동 재해결 태스크 시작 (#{captcha_retry_count})", "info")
                         except Exception:
                             pass
 
@@ -566,11 +602,29 @@ class KeyescapeEngine(BaseEngine):
                             # Submit failed (alert error or timeout) - reset and keep trying
                             self.log(f"제출 후 대기 중 오류 (자동 재시도): {e}", "warning")
                             submit_clicked = False
-                            # If error was about date not open, reset backend_opened to re-verify
+
+                            # Case 1: Date not open → reset backend + re-monitor
                             if "날짜" in last_dialog_msg or "아닙니다" in last_dialog_msg:
                                 backend_opened = False
                                 last_dialog_msg = ""
                                 self.log("예약 오픈 전 상태 - 백엔드 감시를 재개합니다...", "info")
+
+                            # Case 2: "잘못된 접근" = captcha consumed → re-solve captcha
+                            if "잘못된 접근" in last_dialog_msg or "접근" in last_dialog_msg:
+                                self.log("[경고] 제출로 캡차가 소모되었습니다. 자동 재해결을 시작합니다...", "warning")
+                                captcha_solved = False
+                                captcha_solve_time = 0
+                                yescaptcha_token = ""
+                                last_dialog_msg = ""
+                                captcha_retry_count += 1
+                                try:
+                                    await checkbox.click()
+                                    self.log("reCAPTCHA 체크박스 재클릭 완료", "info")
+                                except Exception:
+                                    pass
+                                api_task = asyncio.create_task(solve_captcha_via_api())
+                                self.log(f"[YesCaptcha] 캡차 자동 재해결 태스크 시작 (#{captcha_retry_count})", "info")
+
                             await asyncio.sleep(0.1)
 
                     await asyncio.sleep(0.05)
