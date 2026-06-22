@@ -564,11 +564,11 @@ class KeyescapeEngine(BaseEngine):
                                     mins_r = (remaining.seconds % 3600) // 60
                                     secs_r = remaining.seconds % 60
                                     if days_r > 0:
-                                        self.log(f"[백엔드 감시] 예약 오픈까지 {days_r}일 {hours_r}시간 {mins_r}분 남음 (오픈: {min_booking_date} {open_time_str})", "info")
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {days_r}일 {hours_r}시간 {mins_r}분 남음 (오픈: {min_booking_date} {open_time_str}) | 감시 {backend_check_count:,}회", "info")
                                     elif hours_r > 0:
-                                        self.log(f"[백엔드 감시] 예약 오픈까지 {hours_r}시간 {mins_r}분 남음", "info")
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {hours_r}시간 {mins_r}분 남음 | 감시 {backend_check_count:,}회", "info")
                                     else:
-                                        self.log(f"[백엔드 감시] 예약 오픈까지 {mins_r}분 {secs_r}초 남음!", "warning")
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {mins_r}분 {secs_r}초 남음! | 감시 {backend_check_count:,}회", "warning")
 
                             # Phase B: When date is in window, verify via API with rapid polling
                             if date_in_window:
@@ -601,7 +601,7 @@ class KeyescapeEngine(BaseEngine):
                                     # Progress log every 100 API checks (~10 seconds)
                                     api_count = backend_check_count // 2
                                     if not backend_opened and api_count > 0 and api_count % 100 == 0:
-                                        self.log(f"[백엔드 감시] 예약 오픈 대기 중... (API {api_count}회 조회)", "info")
+                                        self.log(f"[백엔드 감시] 예약 오픈 대기 중... (API {api_count:,}회 조회 | 총 감시 {backend_check_count:,}회)", "info")
 
                     # 3. Click Submit only when Captcha is solved and Backend is opened
                     if captcha_solved and backend_opened and not submit_clicked:
