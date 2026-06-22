@@ -672,35 +672,24 @@ class MainWindow(ctk.CTk):
         self.title_label.bind("<Button-1>", self.start_drag)
         self.title_label.bind("<B1-Motion>", self.drag)
 
-        # macOS Traffic Light Buttons Container on the Left
+        # Pin (Always on Top) Button on the Left
+        self.pin_btn = ctk.CTkButton(
+            self.title_bar,
+            text="📌",
+            width=26,
+            height=22,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=theme.CARD_COLOR,
+            font=(theme.FONT_FAMILY, 11),
+            text_color=theme.TEXT_MUTE,
+            command=self._toggle_pin
+        )
+        self.pin_btn.pack(side="left", padx=(10, 0))
+
+        # macOS Traffic Light Buttons Container on the Right
         dots_frame = ctk.CTkFrame(self.title_bar, fg_color="transparent")
-        dots_frame.pack(side="left", padx=12, pady=8)
-
-        # Close Button (Red)
-        self.close_btn = ctk.CTkButton(
-            dots_frame,
-            text="",
-            width=12,
-            height=12,
-            corner_radius=6,
-            fg_color=theme.ACCENT_RED,
-            hover_color=theme.ACCENT_RED_HOVER,
-            command=self._on_close
-        )
-        self.close_btn.pack(side="left", padx=4)
-
-        # Minimize Button (Yellow)
-        self.min_btn = ctk.CTkButton(
-            dots_frame,
-            text="",
-            width=12,
-            height=12,
-            corner_radius=6,
-            fg_color=theme.ACCENT_YELLOW,
-            hover_color=theme.ACCENT_YELLOW_HOVER,
-            command=self._on_minimize
-        )
-        self.min_btn.pack(side="left", padx=4)
+        dots_frame.pack(side="right", padx=12, pady=8)
 
         # Maximize Button (Green)
         self.max_btn = ctk.CTkButton(
@@ -715,20 +704,31 @@ class MainWindow(ctk.CTk):
         )
         self.max_btn.pack(side="left", padx=4)
 
-        # Pin (Always on Top) Button on the Right
-        self.pin_btn = ctk.CTkButton(
-            self.title_bar,
-            text="📌",
-            width=26,
-            height=22,
+        # Minimize Button (Yellow)
+        self.min_btn = ctk.CTkButton(
+            dots_frame,
+            text="",
+            width=12,
+            height=12,
             corner_radius=6,
-            fg_color="transparent",
-            hover_color=theme.CARD_COLOR,
-            font=(theme.FONT_FAMILY, 11),
-            text_color=theme.TEXT_MUTE,
-            command=self._toggle_pin
+            fg_color=theme.ACCENT_YELLOW,
+            hover_color=theme.ACCENT_YELLOW_HOVER,
+            command=self._on_minimize
         )
-        self.pin_btn.pack(side="right", padx=(0, 10))
+        self.min_btn.pack(side="left", padx=4)
+
+        # Close Button (Red)
+        self.close_btn = ctk.CTkButton(
+            dots_frame,
+            text="",
+            width=12,
+            height=12,
+            corner_radius=6,
+            fg_color=theme.ACCENT_RED,
+            hover_color=theme.ACCENT_RED_HOVER,
+            command=self._on_close
+        )
+        self.close_btn.pack(side="left", padx=4)
 
         # Titlebar Bottom Hairline Border
         title_divider = ctk.CTkFrame(self, height=1, fg_color=theme.HAIRLINE_COLOR)
@@ -881,6 +881,7 @@ class MainWindow(ctk.CTk):
         self.form.pack(fill="x", padx=20, pady=(0, 6))
         self.form.set_site(saved_site)
         self.form.load_config()
+        self._update_server_time_sync_state()
 
         # -------------------------------------------------------------
         # 5. Full Width Primary CTA Button
@@ -1048,8 +1049,29 @@ class MainWindow(ctk.CTk):
         else:
             self.last_standard_site = site_name
             
-        # Manage server time visibility: only show for Naver mode
-        if current_mode == "네이버 (Playwright)" and site_name != "(네이버 예약을 등록하세요)":
+        # Manage server time visibility: toggle server time thread & label
+        self._update_server_time_sync_state()
+
+        if (
+            getattr(self, "last_logged_site", None) != site_name
+            and not getattr(self, "_suppress_site_log", False)
+        ):
+            if hasattr(self, "log_panel") and self.log_panel:
+                self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
+            self.last_logged_site = site_name
+        self._update_delete_button_state(site_name)
+
+    def _update_server_time_sync_state(self):
+        current_mode = self.form.engine_mode_btn.get()
+        site_name = self.site_var.get()
+        
+        show_server_time = False
+        if hasattr(self, "form") and hasattr(self.form, "show_server_time_checkbox"):
+            show_server_time = (self.form.show_server_time_checkbox.get() == 1)
+            
+        is_supported_site = (current_mode == "네이버 (Playwright)" and site_name != "(네이버 예약을 등록하세요)") or (site_name == "키이스케이프")
+        
+        if show_server_time and is_supported_site:
             if not self.is_sync_running:
                 self.is_sync_running = True
                 import threading
@@ -1061,15 +1083,6 @@ class MainWindow(ctk.CTk):
             self.is_sync_running = False
             self.server_time_label.pack_forget()
             self.server_time_label.configure(text="")
-
-        if (
-            getattr(self, "last_logged_site", None) != site_name
-            and not getattr(self, "_suppress_site_log", False)
-        ):
-            if hasattr(self, "log_panel") and self.log_panel:
-                self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
-            self.last_logged_site = site_name
-        self._update_delete_button_state(site_name)
 
     def _update_delete_button_state(self, site_name):
         if site_name in self.custom_sites:

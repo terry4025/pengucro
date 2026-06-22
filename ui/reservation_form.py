@@ -29,7 +29,7 @@ class ReservationForm(ctk.CTkFrame):
         # Thread memory states
         self.standard_threads = 30
         self.naver_threads = 5
-        self.last_mode = "일반 (Sync)"
+        self.last_mode = "고속 (Async)"
 
         # Grid configuration for 2 columns
         self.columnconfigure((0, 1), weight=1, uniform="equal")
@@ -113,8 +113,12 @@ class ReservationForm(ctk.CTkFrame):
         self.custom_theme_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
         
+        # Container to align checkboxes horizontally
+        self.checkbox_container = ctk.CTkFrame(self.custom_theme_frame, fg_color="transparent")
+        self.checkbox_container.pack(fill="x", anchor="w", pady=(0, 1))
+
         self.custom_theme_checkbox = ctk.CTkCheckBox(
-            self.custom_theme_frame,
+            self.checkbox_container,
             text="테마 PK 직접 입력",
             font=theme.FONT_BODY_SM,
             text_color=theme.TEXT_MUTE,
@@ -126,7 +130,22 @@ class ReservationForm(ctk.CTkFrame):
             border_color=theme.HAIRLINE_COLOR,
             command=self._toggle_custom_theme
         )
-        self.custom_theme_checkbox.pack(anchor="w", pady=(0, 1))
+        self.custom_theme_checkbox.pack(side="left", padx=(0, 15))
+
+        self.show_server_time_checkbox = ctk.CTkCheckBox(
+            self.checkbox_container,
+            text="서버 시간 표시",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+            checkbox_width=14,
+            checkbox_height=14,
+            corner_radius=theme.ROUNDED_SM,
+            fg_color=theme.ELEVATED_COLOR,
+            checkmark_color=theme.ACCENT_GREEN,
+            border_color=theme.HAIRLINE_COLOR,
+            command=self._toggle_server_time
+        )
+        self.show_server_time_checkbox.pack(side="left")
         
         self.theme_pk_entry = ctk.CTkEntry(
             self.custom_theme_frame,
@@ -313,7 +332,7 @@ class ReservationForm(ctk.CTkFrame):
 
         self.engine_mode_btn = ctk.CTkSegmentedButton(
             self.engine_mode_frame,
-            values=["일반 (Sync)", "고속 (Async)", "네이버 (Playwright)"],
+            values=["고속 (Async)", "네이버 (Playwright)"],
             font=theme.FONT_BODY_SM,
             fg_color=theme.ELEVATED_COLOR,
             selected_color=theme.ACCENT_BLUE,
@@ -323,7 +342,7 @@ class ReservationForm(ctk.CTkFrame):
             height=28,
             command=self._on_mode_change
         )
-        self.engine_mode_btn.set("일반 (Sync)")
+        self.engine_mode_btn.set("고속 (Async)")
         self.engine_mode_btn.pack(side="right", fill="x", expand=False)
 
         # -------------------------------------------------------------
@@ -531,10 +550,15 @@ class ReservationForm(ctk.CTkFrame):
             return
         if self.custom_theme_checkbox.get() == 1:
             self.theme_dropdown.configure(state="disabled")
-            self.theme_pk_entry.pack(fill="x", after=self.custom_theme_checkbox, pady=(2, 0))
+            self.theme_pk_entry.pack(fill="x", after=self.checkbox_container, pady=(2, 0))
         else:
             self.theme_dropdown.configure(state="normal")
             self.theme_pk_entry.pack_forget()
+
+    def _toggle_server_time(self):
+        # Call MainWindow update function if master has it
+        if hasattr(self.master, "_update_server_time_sync_state"):
+            self.master._update_server_time_sync_state()
 
     def _on_threads_slider_move(self, value):
         if self.current_site == "키이스케이프":
@@ -859,12 +883,22 @@ class ReservationForm(ctk.CTkFrame):
 
             if "engine_mode" in config:
                 mode_val = config["engine_mode"]
+                if mode_val == "일반 (Sync)":
+                    mode_val = "고속 (Async)"
                 self.engine_mode_btn.set(mode_val)
                 self._on_mode_change(mode_val)
             elif "is_async" in config:
-                val = "고속 (Async)" if config["is_async"] else "일반 (Sync)"
+                val = "고속 (Async)"
                 self.engine_mode_btn.set(val)
                 self._on_mode_change(val)
+
+            if "show_server_time" in config:
+                if config["show_server_time"]:
+                    self.show_server_time_checkbox.select()
+                else:
+                    self.show_server_time_checkbox.deselect()
+            else:
+                self.show_server_time_checkbox.deselect()
         except Exception:
             pass
 
@@ -893,7 +927,8 @@ class ReservationForm(ctk.CTkFrame):
                 "threads": self.standard_threads,
                 "naver_threads": self.naver_threads,
                 "is_async": (self.engine_mode_btn.get() == "고속 (Async)"),
-                "engine_mode": self.engine_mode_btn.get()
+                "engine_mode": self.engine_mode_btn.get(),
+                "show_server_time": bool(self.show_server_time_checkbox.get())
             }
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
