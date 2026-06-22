@@ -691,7 +691,7 @@ class MainWindow(ctk.CTk):
         dots_frame = ctk.CTkFrame(self.title_bar, fg_color="transparent")
         dots_frame.pack(side="right", padx=12, pady=8)
 
-        # Maximize Button (Green)
+        # Maximize Button (Green) -> Now minimizing (hiding)
         self.max_btn = ctk.CTkButton(
             dots_frame,
             text="",
@@ -700,11 +700,11 @@ class MainWindow(ctk.CTk):
             corner_radius=6,
             fg_color=theme.ACCENT_GREEN,
             hover_color=theme.ACCENT_GREEN_HOVER,
-            command=self._on_maximize
+            command=self._on_minimize
         )
         self.max_btn.pack(side="left", padx=4)
 
-        # Minimize Button (Yellow)
+        # Minimize Button (Yellow) -> Now maximizing
         self.min_btn = ctk.CTkButton(
             dots_frame,
             text="",
@@ -713,7 +713,7 @@ class MainWindow(ctk.CTk):
             corner_radius=6,
             fg_color=theme.ACCENT_YELLOW,
             hover_color=theme.ACCENT_YELLOW_HOVER,
-            command=self._on_minimize
+            command=self._on_maximize
         )
         self.min_btn.pack(side="left", padx=4)
 
