@@ -81,25 +81,48 @@ class KeyescapeEngine(BaseEngine):
         except Exception:
             pass
 
-        # Calculate the earliest datetime when booking becomes possible (midnight KST)
+        # Official Keyescape booking open times per branch (from open_time_0804.png)
+        # Maps zizum_num -> (hour, minute) KST
+        BRANCH_OPEN_TIMES = {
+            '19': (10, 0),   # LOG_IN 1
+            '20': (10, 0),   # LOG_IN 2
+            '14': (10, 0),   # 강남 더오름
+            '16': (10, 0),   # 우주라이크
+            '18': (10, 30),  # 메모리컴퍼니
+            '23': (11, 0),   # 후즈데어
+            '22': (11, 30),  # STATION
+            '25': (13, 30),  # 무비무드
+            '3':  (18, 0),   # 강남점
+            '9':  (18, 0),   # 부산점
+            '7':  (18, 0),   # 전주점
+            '10': (20, 0),   # 홍대점
+            '26': (10, 0),   # 에버랜드 (default)
+            '29': (13, 30),  # 무비무드 전주
+        }
+        open_hour, open_min = BRANCH_OPEN_TIMES.get(str(zizum_num), (10, 0))
+        branch_name = reservation_data.get("zizum_name", f"지점{zizum_num}")
+
+        # Calculate the earliest datetime when booking becomes possible
         target_date_obj = datetime.strptime(target_date, "%Y-%m-%d").date()
         kst = timezone(timedelta(hours=9))
         if doing_days > 0:
             min_booking_date = target_date_obj - timedelta(days=doing_days - 1)
-            min_booking_datetime = datetime(min_booking_date.year, min_booking_date.month, min_booking_date.day, 0, 0, 0, tzinfo=kst)
+            min_booking_datetime = datetime(min_booking_date.year, min_booking_date.month, min_booking_date.day, open_hour, open_min, 0, tzinfo=kst)
             now_kst = datetime.now(kst)
             time_remaining = min_booking_datetime - now_kst
+            open_time_str = f"{open_hour:02d}:{open_min:02d}"
             if time_remaining.total_seconds() > 0:
                 days_r = time_remaining.days
                 hours_r = time_remaining.seconds // 3600
                 mins_r = (time_remaining.seconds % 3600) // 60
-                self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈 예정={min_booking_date} 00:00 KST ({days_r}일 {hours_r}시간 {mins_r}분 남음)", "info")
+                self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈 예정={min_booking_date} {open_time_str} KST ({days_r}일 {hours_r}시간 {mins_r}분 남음)", "info")
             else:
-                self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈일={min_booking_date} (이미 오픈 가능 시간)", "info")
+                self.log(f"예약 오픈 감지 설정: doing={doing_days}일, 오픈일={min_booking_date} {open_time_str} KST (이미 오픈 가능 시간)", "info")
         else:
             min_booking_date = None
             min_booking_datetime = None
-            self.log("doing 값을 조회하지 못했습니다. 실시간 백엔드 감시로 전환합니다.", "warning")
+            open_time_str = f"{open_hour:02d}:{open_min:02d}"
+            self.log(f"doing 값을 조회하지 못했습니다. 실시간 백엔드 감시로 전환합니다. (지점 오픈시간: {open_time_str})", "warning")
 
         self.log("예약 1단계 우회용 Time Slot ID(themeTimeNum)를 조회 중...", "info")
 
@@ -541,7 +564,7 @@ class KeyescapeEngine(BaseEngine):
                                     mins_r = (remaining.seconds % 3600) // 60
                                     secs_r = remaining.seconds % 60
                                     if days_r > 0:
-                                        self.log(f"[백엔드 감시] 예약 오픈까지 {days_r}일 {hours_r}시간 {mins_r}분 남음 (오픈: {min_booking_date} 00:00)", "info")
+                                        self.log(f"[백엔드 감시] 예약 오픈까지 {days_r}일 {hours_r}시간 {mins_r}분 남음 (오픈: {min_booking_date} {open_time_str})", "info")
                                     elif hours_r > 0:
                                         self.log(f"[백엔드 감시] 예약 오픈까지 {hours_r}시간 {mins_r}분 남음", "info")
                                     else:
