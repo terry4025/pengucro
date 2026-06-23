@@ -1045,6 +1045,7 @@ class MainWindow(ctk.CTk):
     def _on_site_change(self, site_name):
         self.form.set_site(site_name)
         self.form.save_config(site_name)
+        self._keyescape_time_verified = False
         
         # Track active site history based on the selected mode
         current_mode = self.form.engine_mode_btn.get()
@@ -1198,8 +1199,10 @@ class MainWindow(ctk.CTk):
         
         while self.is_sync_running:
             try:
+                if not self.winfo_exists():
+                    break
                 current_site = self.site_var.get()
-                target_url = "https://www.keyescape.com" if current_site == "키이스케이프" else "https://booking.naver.com"
+                target_url = "https://www.keyescape.com/reservation.php" if current_site == "키이스케이프" else "https://booking.naver.com"
                 req = urllib.request.Request(target_url, method="HEAD")
                 start = time.perf_counter()
                 with urllib.request.urlopen(req, timeout=3) as response:
@@ -1209,8 +1212,30 @@ class MainWindow(ctk.CTk):
                         gmt_dt = parsedate_to_datetime(date_str)
                         server_time = gmt_dt.timestamp() + latency
                         self.naver_time_offset = server_time - time.time()
-            except Exception:
-                pass
+                        
+                        # Keyescape server time validation
+                        if current_site == "키이스케이프" and not getattr(self, "_keyescape_time_verified", False):
+                            self._keyescape_time_verified = True
+                            offset_sec = abs(self.naver_time_offset)
+                            if offset_sec > 5:
+                                self.log_panel.append_log(
+                                    f"[경고] 키이스케이프 서버 시간과 로컬 PC 시간의 차이가 큽니다 ({offset_sec:.2f}초 차이). "
+                                    f"PC 시간 동기화(표준시 설정)를 확인해 주세요.", 
+                                    "warning"
+                                )
+                            else:
+                                self.log_panel.append_log(
+                                    f"[정보] 키이스케이프 실제 서버 시간 동기화 완료 (응답 오차: {latency*1000:.1f}ms, 로컬 편차: {self.naver_time_offset:.2f}초)", 
+                                    "success"
+                                )
+            except RuntimeError:
+                break
+            except Exception as e:
+                try:
+                    if self.winfo_exists() and current_site == "키이스케이프":
+                        self.log_panel.append_log(f"[에러] 키이스케이프 서버 시간 동기화 실패: {e}", "error")
+                except Exception:
+                    pass
             
             # Re-sync every 30 seconds
             for _ in range(30):

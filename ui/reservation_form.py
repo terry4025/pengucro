@@ -477,6 +477,19 @@ class ReservationForm(ctk.CTkFrame):
             self._toggle_custom_theme()
             self.engine_mode_frame.grid(row=7, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
 
+        # Update Server Time Checkbox state
+        current_mode = self.engine_mode_btn.get()
+        site_name = self.current_site
+        is_supported_site = (current_mode == "네이버 (Playwright)" and site_name != "(네이버 예약을 등록하세요)") or (site_name == "키이스케이프")
+
+        if is_supported_site:
+            self.show_server_time_checkbox.configure(state="normal", text_color=theme.TEXT_MUTE)
+        else:
+            if self.show_server_time_checkbox.get() == 1:
+                self.show_server_time_checkbox.deselect()
+                self._toggle_server_time()
+            self.show_server_time_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+
     def set_site(self, site_name):
         self.current_site = site_name
         if site_name in self.custom_sites:

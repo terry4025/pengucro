@@ -52,24 +52,24 @@ class TestUIComponents(unittest.TestCase):
         dots_frame = self.app.close_btn.master
         self.assertIsNotNone(dots_frame, "dots_frame should exist as close_btn's parent")
         
-        # Let's verify that dots_frame is packed on the left of title_bar
+        # Let's verify that dots_frame is packed on the right of title_bar
         dots_frame_info = dots_frame.pack_info()
-        self.assertEqual(dots_frame_info.get("side"), "left", "dots_frame must be packed on the left")
+        self.assertEqual(dots_frame_info.get("side"), "right", "dots_frame must be packed on the right")
         self.assertEqual(int(dots_frame_info.get("padx", 0)), 12, "dots_frame padx must be 12")
-        print("[Pass] macOS dots container frame is packed on the left with correct padding.")
+        print("[Pass] macOS dots container frame is packed on the right with correct padding.")
 
         # Get dots_frame children and check their order (only match CTkButton widgets)
         dots_children = [child for child in dots_frame.winfo_children() if isinstance(child, ctk.CTkButton)]
         self.assertEqual(len(dots_children), 3, "dots_frame must contain exactly 3 CTkButton children")
         
-        # Verify close_btn is first
-        self.assertEqual(dots_children[0], self.app.close_btn, "First dot must be the Close button")
-        self.assertEqual(self.app.close_btn.cget("fg_color"), theme.ACCENT_RED, "Close button color should be ACCENT_RED")
-        self.assertEqual(self.app.close_btn.cget("hover_color"), theme.ACCENT_RED_HOVER, "Close button hover color should be ACCENT_RED_HOVER")
-        self.assertEqual(self.app.close_btn.cget("width"), 12, "Close button width should be 12")
-        self.assertEqual(self.app.close_btn.cget("height"), 12, "Close button height should be 12")
-        self.assertEqual(self.app.close_btn.cget("corner_radius"), 6, "Close button corner_radius should be 6")
-        print("[Pass] Close (Red) traffic light is verified at index 0.")
+        # Verify max_btn is first
+        self.assertEqual(dots_children[0], self.app.max_btn, "First dot must be the Maximize button")
+        self.assertEqual(self.app.max_btn.cget("fg_color"), theme.ACCENT_GREEN, "Maximize button color should be ACCENT_GREEN")
+        self.assertEqual(self.app.max_btn.cget("hover_color"), theme.ACCENT_GREEN_HOVER, "Maximize button hover color should be ACCENT_GREEN_HOVER")
+        self.assertEqual(self.app.max_btn.cget("width"), 12, "Maximize button width should be 12")
+        self.assertEqual(self.app.max_btn.cget("height"), 12, "Maximize button height should be 12")
+        self.assertEqual(self.app.max_btn.cget("corner_radius"), 6, "Maximize button corner_radius should be 6")
+        print("[Pass] Maximize (Green) traffic light is verified at index 0.")
 
         # Verify min_btn is second
         self.assertEqual(dots_children[1], self.app.min_btn, "Second dot must be the Minimize button")
@@ -80,23 +80,23 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(self.app.min_btn.cget("corner_radius"), 6, "Minimize button corner_radius should be 6")
         print("[Pass] Minimize (Yellow) traffic light is verified at index 1.")
 
-        # Verify max_btn is third
-        self.assertEqual(dots_children[2], self.app.max_btn, "Third dot must be the Maximize button")
-        self.assertEqual(self.app.max_btn.cget("fg_color"), theme.ACCENT_GREEN, "Maximize button color should be ACCENT_GREEN")
-        self.assertEqual(self.app.max_btn.cget("hover_color"), theme.ACCENT_GREEN_HOVER, "Maximize button hover color should be ACCENT_GREEN_HOVER")
-        self.assertEqual(self.app.max_btn.cget("width"), 12, "Maximize button width should be 12")
-        self.assertEqual(self.app.max_btn.cget("height"), 12, "Maximize button height should be 12")
-        self.assertEqual(self.app.max_btn.cget("corner_radius"), 6, "Maximize button corner_radius should be 6")
-        print("[Pass] Maximize (Green) traffic light is verified at index 2.")
+        # Verify close_btn is third
+        self.assertEqual(dots_children[2], self.app.close_btn, "Third dot must be the Close button")
+        self.assertEqual(self.app.close_btn.cget("fg_color"), theme.ACCENT_RED, "Close button color should be ACCENT_RED")
+        self.assertEqual(self.app.close_btn.cget("hover_color"), theme.ACCENT_RED_HOVER, "Close button hover color should be ACCENT_RED_HOVER")
+        self.assertEqual(self.app.close_btn.cget("width"), 12, "Close button width should be 12")
+        self.assertEqual(self.app.close_btn.cget("height"), 12, "Close button height should be 12")
+        self.assertEqual(self.app.close_btn.cget("corner_radius"), 6, "Close button corner_radius should be 6")
+        print("[Pass] Close (Red) traffic light is verified at index 2.")
 
-        # Verify Pin button is packed on the right
+        # Verify Pin button is packed on the left
         self.assertIsNotNone(self.app.pin_btn, "Pin button should not be None")
         pin_info = self.app.pin_btn.pack_info()
-        self.assertEqual(pin_info.get("side"), "right", "Pin button must be packed on the right")
+        self.assertEqual(pin_info.get("side"), "left", "Pin button must be packed on the left")
         self.assertEqual(self.app.pin_btn.cget("text"), "📌", "Pin button text must be 📌")
         self.assertEqual(self.app.pin_btn.cget("fg_color"), "transparent", "Pin button fg_color must be transparent")
         self.assertEqual(self.app.pin_btn.cget("hover_color"), theme.CARD_COLOR, "Pin button hover_color must be CARD_COLOR")
-        print("[Pass] Pin button is verified on the right with correct styling.")
+        print("[Pass] Pin button is verified on the left with correct styling.")
 
     def test_2_log_panel(self):
         print("\n--- Verifying LogPanel Background, Scrollbars & Tag config ---")
@@ -349,6 +349,46 @@ class TestUIComponents(unittest.TestCase):
         
         dialog._on_cancel()
         print("[Pass] AddSiteDialog exception handler runs safely, schedules lambda, and updates UI status badge.")
+
+    def test_6_server_time_checkbox_disabled_handling(self):
+        print("\n--- Verifying Server Time Checkbox Disable/Enable & Keyescape Sync Logic ---")
+        
+        # 1. Switch to Keyescape
+        self.app.site_var.set("키이스케이프")
+        self.app._on_site_change("키이스케이프")
+        self.app.update()
+        
+        # Check if server time checkbox is enabled for Keyescape
+        cb_state = self.app.form.show_server_time_checkbox.cget("state")
+        self.assertEqual(cb_state, "normal", "Server time checkbox must be enabled for Keyescape")
+        
+        # Checkbox select and toggle
+        self.app.form.show_server_time_checkbox.select()
+        self.app.form._toggle_server_time()
+        self.app.update()
+        time.sleep(0.5) # Allow sync thread to spawn and run
+        self.app.update()
+        
+        # Check if sync thread is running
+        self.assertTrue(self.app.is_sync_running, "Sync thread should be running for Keyescape when checked")
+        
+        # 2. Switch to Zero World (unsupported site)
+        self.app.site_var.set("제로월드 강남")
+        self.app._on_site_change("제로월드 강남")
+        self.app.update()
+        
+        # Check if server time checkbox is deselected and disabled
+        cb_val = self.app.form.show_server_time_checkbox.get()
+        cb_state_new = self.app.form.show_server_time_checkbox.cget("state")
+        self.assertEqual(cb_val, 0, "Server time checkbox must be deselected for Zero World")
+        self.assertEqual(cb_state_new, "disabled", "Server time checkbox must be disabled for Zero World")
+        self.assertFalse(self.app.is_sync_running, "Sync thread should be stopped for Zero World")
+        
+        # Cleanup
+        self.app.site_var.set("제로월드 강남")
+        self.app._on_site_change("제로월드 강남")
+        self.app.update()
+        print("[Pass] Server time checkbox behaves correctly (deselected & disabled) on unsupported sites.")
 
 if __name__ == "__main__":
     unittest.main()
