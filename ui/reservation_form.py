@@ -1,9 +1,7 @@
 import customtkinter as ctk
 import ui.theme as theme
 from data.themes import (
-    ZEROWORLD_GANGNAM_THEMES_WEEKDAY, ZEROWORLD_GANGNAM_THEMES_WEEKEND,
-    ZEROWORLD_HONGDAE_THEMES_WEEKDAY, ZEROWORLD_HONGDAE_THEMES_WEEKEND,
-    ZEROWORLD_GIMPO_THEMES_WEEKDAY, ZEROWORLD_GIMPO_THEMES_WEEKEND,
+    ZEROWORLD_THEMES,
     JIGUBYEOL_THEMES, PHOBIADUNGEON_THEMES, SITES_CONFIG, JIGUBYEOL_THEME_ALIASES,
     KEYESCAPE_THEMES
 )
@@ -596,13 +594,8 @@ class ReservationForm(ctk.CTkFrame):
             theme_names = sorted(list(themes_dict.keys()))
         elif self.current_site == "제로월드":
             branch_name = self.branch_var.get()
-            is_weekend = (self.day_type_var.get() == "주말")
-            if "홍대" in branch_name:
-                themes_dict = ZEROWORLD_HONGDAE_THEMES_WEEKEND if is_weekend else ZEROWORLD_HONGDAE_THEMES_WEEKDAY
-            elif "김포" in branch_name:
-                themes_dict = ZEROWORLD_GIMPO_THEMES_WEEKEND if is_weekend else ZEROWORLD_GIMPO_THEMES_WEEKDAY
-            else:
-                themes_dict = ZEROWORLD_GANGNAM_THEMES_WEEKEND if is_weekend else ZEROWORLD_GANGNAM_THEMES_WEEKDAY
+            branch_id = self.config["branches"].get(branch_name, "1")
+            themes_dict = ZEROWORLD_THEMES.get(branch_id, {})
             theme_names = sorted(list(themes_dict.keys()))
         elif self.current_site == "비트포비아 던전":
             branch_name = self.branch_var.get()
@@ -652,14 +645,7 @@ class ReservationForm(ctk.CTkFrame):
             if self.current_site in self.custom_sites:
                 theme_pk = self.config["themes"].get(branch_id, {}).get(theme_name, "")
             elif self.current_site == "제로월드":
-                branch_name = self.branch_var.get()
-                is_weekend = (self.day_type_var.get() == "주말")
-                if "홍대" in branch_name:
-                    themes_dict = ZEROWORLD_HONGDAE_THEMES_WEEKEND if is_weekend else ZEROWORLD_HONGDAE_THEMES_WEEKDAY
-                elif "김포" in branch_name:
-                    themes_dict = ZEROWORLD_GIMPO_THEMES_WEEKEND if is_weekend else ZEROWORLD_GIMPO_THEMES_WEEKDAY
-                else:
-                    themes_dict = ZEROWORLD_GANGNAM_THEMES_WEEKEND if is_weekend else ZEROWORLD_GANGNAM_THEMES_WEEKDAY
+                themes_dict = ZEROWORLD_THEMES.get(branch_id, {})
                 theme_pk = themes_dict.get(theme_name, "")
             elif self.current_site == "비트포비아 던전":
                 theme_pk = theme_name
