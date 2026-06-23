@@ -795,12 +795,16 @@ class MainWindow(ctk.CTk):
                 pass
 
         # Load saved site config if exists, default to "제로월드 강남"
-        saved_site = "제로월드 강남"
+        saved_site = "제로월드(신)"
         if os.path.exists("config.json"):
             try:
                 with open("config.json", "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    saved_site = config.get("site", "제로월드 강남")
+                    saved_site = config.get("site", "제로월드(신)")
+                    if saved_site in ["제로월드 강남", "제로월드 홍대"]:
+                        saved_site = "제로월드(구)"
+                    elif saved_site == "제로월드":
+                        saved_site = "제로월드(신)"
             except Exception:
                 pass
 
@@ -811,12 +815,12 @@ class MainWindow(ctk.CTk):
         self.last_naver_site = None
         
         # Build options list
-        self.default_site_names = ["제로월드 강남", "제로월드 홍대", "지구별방탈출", "키이스케이프"]
+        self.default_site_names = ["제로월드(신)", "제로월드(구)", "지구별방탈출", "키이스케이프"]
         site_options = self.default_site_names + list(self.custom_sites.keys())
         
         # Fallback if saved site is no longer in options
         if saved_site not in site_options:
-            saved_site = "제로월드 강남"
+            saved_site = "제로월드(신)"
             self.site_var.set(saved_site)
 
         self.site_dropdown = ctk.CTkOptionMenu(
@@ -1322,12 +1326,26 @@ class MainWindow(ctk.CTk):
                 log_callback=self._on_engine_log,
                 success_callback=self._on_booking_success
             )
-        else:
-            url = "https://zerogangnam.com/reservation" if "강남" in selected_site else "https://www.zerohongdae.com/reservation"
+        elif selected_site == "제로월드(신)":
             self.active_engine = ZeroWorldEngine(
-                site_url=url,
+                site_url=reservation_data.get('site_url'),
                 log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
+                success_callback=self._on_booking_success,
+                is_shin=True
+            )
+        elif selected_site == "제로월드(구)":
+            self.active_engine = ZeroWorldEngine(
+                site_url=reservation_data.get('site_url'),
+                log_callback=self._on_engine_log,
+                success_callback=self._on_booking_success,
+                is_shin=False
+            )
+        else:
+            self.active_engine = ZeroWorldEngine(
+                site_url=reservation_data.get('site_url'),
+                log_callback=self._on_engine_log,
+                success_callback=self._on_booking_success,
+                is_shin=False
             )
 
         self.active_engine.status_callback = self._on_engine_status_update

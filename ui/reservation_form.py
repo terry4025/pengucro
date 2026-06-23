@@ -2,6 +2,9 @@ import customtkinter as ctk
 import ui.theme as theme
 from data.themes import (
     ZEROWORLD_THEMES,
+    ZEROWORLD_GANGNAM_THEMES_WEEKDAY, ZEROWORLD_GANGNAM_THEMES_WEEKEND,
+    ZEROWORLD_HONGDAE_THEMES_WEEKDAY, ZEROWORLD_HONGDAE_THEMES_WEEKEND,
+    ZEROWORLD_GIMPO_THEMES_WEEKDAY, ZEROWORLD_GIMPO_THEMES_WEEKEND,
     JIGUBYEOL_THEMES, PHOBIADUNGEON_THEMES, SITES_CONFIG, JIGUBYEOL_THEME_ALIASES,
     KEYESCAPE_THEMES
 )
@@ -20,7 +23,7 @@ class ReservationForm(ctk.CTkFrame):
         self.start_callback = start_callback
         self.stop_callback = stop_callback
         self.mode_callback = mode_callback
-        self.current_site = "제로월드"
+        self.current_site = "제로월드(신)"
         self.custom_sites = {}
         self.config = SITES_CONFIG[self.current_site]
         
@@ -592,10 +595,20 @@ class ReservationForm(ctk.CTkFrame):
             branch_id = self.config["branches"].get(branch_name, "1")
             themes_dict = self.config["themes"].get(branch_id, {})
             theme_names = sorted(list(themes_dict.keys()))
-        elif self.current_site == "제로월드":
+        elif self.current_site == "제로월드(신)":
             branch_name = self.branch_var.get()
             branch_id = self.config["branches"].get(branch_name, "1")
             themes_dict = ZEROWORLD_THEMES.get(branch_id, {})
+            theme_names = sorted(list(themes_dict.keys()))
+        elif self.current_site == "제로월드(구)":
+            branch_name = self.branch_var.get()
+            day_type = self.day_type_var.get()
+            if branch_name == "강남점":
+                themes_dict = ZEROWORLD_GANGNAM_THEMES_WEEKDAY if day_type == "평일" else ZEROWORLD_GANGNAM_THEMES_WEEKEND
+            elif branch_name == "홍대점":
+                themes_dict = ZEROWORLD_HONGDAE_THEMES_WEEKDAY if day_type == "평일" else ZEROWORLD_HONGDAE_THEMES_WEEKEND
+            else: # 김포본점
+                themes_dict = ZEROWORLD_GIMPO_THEMES_WEEKDAY if day_type == "평일" else ZEROWORLD_GIMPO_THEMES_WEEKEND
             theme_names = sorted(list(themes_dict.keys()))
         elif self.current_site == "비트포비아 던전":
             branch_name = self.branch_var.get()
@@ -644,8 +657,18 @@ class ReservationForm(ctk.CTkFrame):
             theme_name = self.theme_var.get()
             if self.current_site in self.custom_sites:
                 theme_pk = self.config["themes"].get(branch_id, {}).get(theme_name, "")
-            elif self.current_site == "제로월드":
+            elif self.current_site == "제로월드(신)":
                 themes_dict = ZEROWORLD_THEMES.get(branch_id, {})
+                theme_pk = themes_dict.get(theme_name, "")
+            elif self.current_site == "제로월드(구)":
+                branch_name = self.branch_var.get()
+                day_type = self.day_type_var.get()
+                if branch_name == "강남점":
+                    themes_dict = ZEROWORLD_GANGNAM_THEMES_WEEKDAY if day_type == "평일" else ZEROWORLD_GANGNAM_THEMES_WEEKEND
+                elif branch_name == "홍대점":
+                    themes_dict = ZEROWORLD_HONGDAE_THEMES_WEEKDAY if day_type == "평일" else ZEROWORLD_HONGDAE_THEMES_WEEKEND
+                else: # 김포본점
+                    themes_dict = ZEROWORLD_GIMPO_THEMES_WEEKDAY if day_type == "평일" else ZEROWORLD_GIMPO_THEMES_WEEKEND
                 theme_pk = themes_dict.get(theme_name, "")
             elif self.current_site == "비트포비아 던전":
                 theme_pk = theme_name
@@ -683,9 +706,11 @@ class ReservationForm(ctk.CTkFrame):
             return None, "전화번호를 입력해주세요.", 0, False
 
         site_url = ""
-        if self.current_site == "제로월드":
+        if self.current_site == "제로월드(구)":
             branch_name = self.branch_var.get()
             site_url = self.config["urls"].get(branch_name, self.config["url"])
+        elif self.current_site == "제로월드(신)":
+            site_url = self.config.get("url", "")
         elif self.current_site in SITES_CONFIG:
             site_url = self.config.get("url", "")
 
@@ -806,10 +831,12 @@ class ReservationForm(ctk.CTkFrame):
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 
-            saved_site = config.get("site", "제로월드")
+            saved_site = config.get("site", "제로월드(신)")
             if saved_site in ["제로월드 강남", "제로월드 홍대"]:
-                saved_site = "제로월드"
+                saved_site = "제로월드(구)"
                 config["branch"] = "강남점" if "강남" in config.get("site", "") else "홍대점"
+            elif saved_site == "제로월드":
+                saved_site = "제로월드(신)"
             if saved_site == self.current_site:
                 if "branch" in config:
                     self.branch_var.set(config["branch"])

@@ -68,44 +68,6 @@ ZEROWORLD_GIMPO_THEMES_WEEKEND = {
     "FEAR": "64"
 }
 
-ZEROWORLD_THEMES = {
-    "1": {  # 김포본점
-        "FEAR": "14",
-        "해리포터의 모험 SE : 마법모자의 위기": "15",
-        "검은사원 SE": "16",
-        "피노키오 대탈출": "17",
-        "복희네 사진관 SE": "18",
-        "최면": "7",
-        "성역전설": "19",
-        "인형괴담": "20",
-        "어느 겨울밤": "21",
-        "탈옥 : 특별수용소": "22",
-        "제로호텔": "23"
-    },
-    "2": {  # 다이브 건대점
-        "인터뷰": "3"
-    },
-    "4": {  # 강남점
-        "아이엠": "28",
-        "어느겨울밤2": "29",
-        "콜러": "30",
-        "나비효과": "31",
-        "링": "32",
-        "제로호텔L": "27",
-        "DONE": "26",
-        "포레스트 (FORREST)": "25",
-        "헐!": "24"
-    },
-    "5": {  # 홍대점
-        "사랑...하는...감?": "36",
-        "깜방탈출": "35",
-        "ALIVE": "34",
-        "NOX": "33",
-        "층간소음": "9"
-    }
-}
-
-
 
 JIGUBYEOL_THEMES = {
     "1": {  # 대구점
@@ -366,17 +328,7 @@ KEYESCAPE_THEMES = {
 }
 
 SITES_CONFIG = {
-    "제로월드(신)": {
-        "url": "https://zeroworldkorea.com/layout/res/home.php?go=rev.main",
-        "branches": {
-            "김포본점": "1",
-            "다이브 건대점": "2",
-            "강남점": "4",
-            "홍대점": "5"
-        },
-        "has_weekday_weekend": False
-    },
-    "제로월드(구)": {
+    "제로월드": {
         "url": "https://zerogangnam.com/reservation",
         "urls": {
             "강남점": "https://zerogangnam.com/reservation",

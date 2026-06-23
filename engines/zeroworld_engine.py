@@ -1,369 +1,475 @@
 import asyncio
-import os
-import threading
+import aiohttp
+import requests
+import json
+import re
 import time
-from datetime import datetime
+from bs4 import BeautifulSoup
 from engines.base_engine import BaseEngine
 
 class ZeroWorldEngine(BaseEngine):
-    def __init__(self, log_callback, success_callback=None, status_callback=None, log_batch_callback=None, site_url=None):
+    def __init__(self, site_url, log_callback, success_callback=None, is_shin=False):
         """
-        Playwright-based parallel Zero World Booking Engine.
+        ZeroWorld high-speed Booking Engine.
+        Supports both Old (Laravel-based) and New (Sinbiweb-based) sites.
         """
-        super().__init__(log_callback, success_callback, status_callback, log_batch_callback)
+        super().__init__(log_callback, success_callback)
         self.site_url = site_url
-        self.playwright_thread = None
-        self.loop = None
-        self.browser = None
+        self.is_shin = is_shin
 
-    def start_reservation(self, reservation_data, num_threads, is_async=False):
-        if self.is_running:
-            self.log("예약 엔진이 이미 실행 중입니다.", "warning")
-            return
+    def get_csrf_token(self, session):
+        response = session.get(self.site_url)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
+        return csrf_token
 
-        self.is_running = True
-        self.stop_event.clear()
-        self._attempt_count = 0
-        self._seen_errors = set()
+    def make_reservation_thread(self, reservation_data):
+        if self.is_shin:
+            self._make_reservation_shin_sync(reservation_data)
+        else:
+            self._make_reservation_old_sync(reservation_data)
 
-        self.log(f"제로월드 예약을 시작합니다. (병렬 인스턴스: {num_threads}개)", "info")
+    def _make_reservation_shin_sync(self, res_data):
+        session = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        session.headers.update(headers)
 
-        # Start Playwright automation loop in a background thread
-        self.playwright_thread = threading.Thread(
-            target=self._run_playwright_loop,
-            args=(reservation_data, num_threads),
-            name="ZeroPlaywrightThread"
-        )
-        self.playwright_thread.daemon = True
-        self.playwright_thread.start()
+        zizum_num = res_data.get("branch", "4")
+        rev_days = res_data.get("reservationDate")
+        theme_num = res_data.get("themePK")
+        target_time = res_data.get("reservationTime")[:5]
+        name = res_data.get("name")
+        phone_digits = "".join(c for c in res_data.get("phone", "") if c.isdigit())
+        people = res_data.get("people", "2")
+        s_subj = "B" if zizum_num == "2" else "A"
 
-        # Monitor thread
-        monitor = threading.Thread(target=self._monitor_playwright_thread, name="ZeroMonitorThread")
-        monitor.daemon = True
-        monitor.start()
+        sel_url = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
+        act_url = "https://zeroworldkorea.com/core/res/rev.act.php"
 
-    def _monitor_playwright_thread(self):
-        if self.playwright_thread:
-            self.playwright_thread.join()
-        self.is_running = False
-        self.log("제로월드 예약 작업이 종료되었습니다.", "info")
+        post_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
+        }
 
-    def stop_reservation(self):
-        if not self.is_running:
-            return
-        self.log("제로월드 예약을 정지합니다...", "info")
-        self.stop_event.set()
+        self.log(f"신 제로월드 고속 감시 시작 (스레드): {target_time}", "info")
 
-        # Close browser inside the loop threadsafe
-        if self.browser and self.loop and self.loop.is_running():
+        slot_id = None
+        while not self.stop_event.is_set():
             try:
-                asyncio.run_coroutine_threadsafe(self.browser.close(), self.loop)
-            except Exception:
-                pass
-
-    def _run_playwright_loop(self, reservation_data, num_threads):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        try:
-            self.loop.run_until_complete(self._run_async_tasks(reservation_data, num_threads))
-        except Exception as e:
-            self.log(f"비동기 실행 루프 에러: {e}", "error")
-        finally:
-            self.loop.close()
-            self.loop = None
-
-    async def _launch_browser(self, playwright, headless=True):
-        browser = None
-        errors = []
-        for channel in ["chrome", "msedge", None]:
-            try:
-                if channel:
-                    browser = await playwright.chromium.launch(channel=channel, headless=headless)
-                else:
-                    browser = await playwright.chromium.launch(headless=headless)
-                if browser:
-                    return browser
-            except Exception as e:
-                errors.append(f"{channel or 'default'}: {e}")
-        
-        raise Exception(f"브라우저 실행 실패 (에러 목록: {', '.join(errors)})")
-
-    async def _run_async_tasks(self, reservation_data, num_threads):
-        from playwright.async_api import async_playwright
-        
-        async with async_playwright() as p:
-            is_dev = reservation_data.get('devMode', False)
-            self.log(f"예약 백그라운드 태스크 기동 중... (개발자 모드: {is_dev})", "info")
-            
-            self.browser = await self._launch_browser(p, headless=not is_dev)
-
-            tasks = []
-            for i in range(num_threads):
-                tasks.append(
-                    self._booking_worker_task(i + 1, reservation_data)
-                )
-
-            await asyncio.gather(*tasks)
-
-            if self.browser:
-                await self.browser.close()
-                self.browser = None
-
-    async def _booking_worker_task(self, worker_id, res_data):
-        context = None
-        try:
-            context = await self.browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            )
-            page = await context.new_page()
-
-            # Auto-dismiss dialogs
-            async def handle_dialog(dialog):
-                msg = dialog.message[:80] if dialog.message else ""
-                self.log(f"⚠️ [{worker_id}번 기기] 경고창: {msg}", "warning")
-                await dialog.dismiss()
-            page.on("dialog", handle_dialog)
-
-            page.set_default_timeout(10000)
-            page.set_default_navigation_timeout(15000)
-
-            # Extract info
-            branch_id = res_data.get("branch", "4") # Default Gangnam
-            target_date = res_data.get("reservationDate")
-            target_time = res_data.get("reservationTime")[:5]
-            theme_pk = res_data.get("themePK")
-            name = res_data.get("name")
-            phone = res_data.get("phone")
-            people = res_data.get("people", "2")
-            dev_mode = res_data.get("devMode", False)
-
-            # Resolve s_subj
-            s_subj = "B" if branch_id == "2" else "A"
-
-            # Phone processing
-            phone_digits = "".join(c for c in phone if c.isdigit())
-
-            booking_url = f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={branch_id}&rev_days={target_date}"
-            self.log(f"[{worker_id}번 기기] 예약 페이지로 이동 중... ({booking_url})", "info")
-            await page.goto(booking_url)
-            await page.wait_for_load_state("domcontentloaded")
-
-            attempt = 0
-            while not self.stop_event.is_set():
-                attempt += 1
-                self.silent_tick(f"{target_time} 대기")
-
-                # Step 1: Select Theme (if not selected)
-                # Check if theme list is loaded
-                theme_link = page.locator(f"a[href*=\"fun_theme_select('{theme_pk}'\"]")
-                if await theme_link.count() > 0:
-                    # Click to load times
-                    await theme_link.first.click()
-                    await asyncio.sleep(0.2)
-                else:
-                    # If theme not visible, reload
-                    if attempt == 1 or attempt % 15 == 0:
-                        self.log(f"[{worker_id}번 기기] 테마 목록 대기 중... ({attempt}회)", "warning")
-                    await page.reload()
-                    await page.wait_for_load_state("domcontentloaded")
-                    await asyncio.sleep(0.3)
+                # 1. Fetch time slots
+                payload = f"act=theme_time_list&zizum_num={zizum_num}&rev_days={rev_days}&theme_num={theme_num}"
+                resp = session.post(sel_url, data=payload, headers=post_headers, timeout=5)
+                if resp.status_code != 200:
+                    self.silent_tick(f"시간 조회 오류 ({resp.status_code})")
+                    time.sleep(0.15)
                     continue
 
-                # Step 2: Select Time
-                time_link = page.locator(f"a.choice-time__time:not(.disable):has-text(\"{target_time}\")")
-                if await time_link.count() > 0:
-                    self.log(f"[{worker_id}번 기기] {target_time} 슬롯 발견! 클릭을 시도합니다.", "info")
-                    await time_link.first.click()
-                    await asyncio.sleep(0.3)
-                else:
-                    # If time slot not found, re-click theme to trigger time AJAX refresh
-                    await theme_link.first.click()
-                    await asyncio.sleep(0.2)
-                    
-                    time_link = page.locator(f"a.choice-time__time:not(.disable):has-text(\"{target_time}\")")
-                    if await time_link.count() == 0:
-                        if attempt == 1 or attempt % 20 == 0:
-                            self.log(f"[{worker_id}번 기기] {target_time} 슬롯 비활성화/매진 - 재시도 ({attempt}회)", "warning")
-                        await asyncio.sleep(0.2)
-                        continue
-
-                # Step 3: Fill Form
-                self.log(f"[{worker_id}번 기기] 예약 정보 입력 단계 진입", "info")
-                
-                # Wait for person dropdown to populate
-                try:
-                    person_select = page.locator("select[name=\"person\"]")
-                    # Wait for it to become visible and have options
-                    await person_select.wait_for(state="visible", timeout=3000)
-                    await person_select.select_option(value=str(people))
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    self.log(f"인원 선택 오류 (임의 대입 시도): {e}", "warning")
-
-                try:
-                    await page.fill('input[name="name"]', name)
-                    await page.fill('input[name="mobile"]', phone_digits)
-                except Exception as e:
-                    self.log(f"정보 입력 오류: {e}", "warning")
-
-                # Submit Form
-                self.log(f"[{worker_id}번 기기] '예약하기' 제출 시도", "info")
-                await page.click('button.rese-form__button')
-
-                # Wait for Redirect to Payment Page
-                try:
-                    await page.wait_for_url("**/rev.pay**", timeout=8000)
-                except Exception:
-                    pass
-
-                if "rev.pay" not in page.url:
-                    self.log(f"[{worker_id}번 기기] 결제 페이지 이동 실패 (선점 실패 또는 폼 작성 에러). 처음부터 다시 시도합니다.", "warning")
-                    await page.goto(booking_url)
-                    await page.wait_for_load_state("domcontentloaded")
+                html_text = resp.text
+                if "에러" in html_text or not html_text.strip():
+                    self.silent_tick(f"시간 데이터 없음")
+                    time.sleep(0.15)
                     continue
 
-                # Step 4: Payment Gateway (Toss Payments)
-                self.log(f"[{worker_id}번 기기] 결제하기 버튼 클릭", "info")
-                pay_btn = page.locator('a:has-text("결제하기"), button:has-text("결제하기"), a:has-text("결제")')
-                await pay_btn.wait_for(state="visible", timeout=5000)
-                await pay_btn.click()
+                soup = BeautifulSoup(html_text, 'html.parser')
+                found_slot = None
+                for a in soup.find_all('a'):
+                    if target_time in a.text:
+                        classes = a.get('class', [])
+                        if any(c in classes for c in ['disable', 'close', 'sold-out']):
+                            continue
+                        
+                        href = a.get('href', '')
+                        match = re.search(r"fun_theme_time_select\('(\d+)'", href)
+                        if match:
+                            found_slot = match.group(1)
+                            break
 
-                # Wait for iframe load
-                iframe_selector = "#__tosspayments_payment-gateway_iframe__"
-                await page.wait_for_selector(iframe_selector, timeout=10000)
+                if not found_slot:
+                    self.silent_tick(f"{target_time} 슬롯 대기")
+                    time.sleep(0.15)
+                    continue
 
-                frame = None
-                frames = page.frames
-                for f in frames:
-                    if "__tosspayments" in f.name:
-                        frame = f
-                        break
-                if not frame:
-                    frame = page.frame(name="__tosspayments_payment-gateway_iframe__")
+                slot_id = found_slot
+                self.log(f"스레드 {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 중...", "info")
 
-                if not frame:
-                    self.log(f"[{worker_id}번 기기] Toss Payments iframe 탐색 실패.", "error")
-                    return
+                # 2. Select slot
+                sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
+                session.post(sel_url, data=sel_payload, headers=post_headers, timeout=5)
 
-                self.log(f"[{worker_id}번 기기] Toss 결제창 진입. 은행 선택 및 알림 연락처 입력을 진행합니다.", "info")
-                await asyncio.sleep(0.8)
+                # 3. Finalize reservation
+                act_data = {
+                    "name": name,
+                    "mobile": phone_digits,
+                    "person": people,
+                    "zizum_num": zizum_num,
+                    "rev_days": rev_days,
+                    "theme_num": theme_num,
+                    "theme_time_num": slot_id,
+                    "act": "make",
+                    "s_subj": s_subj
+                }
 
-                # Bank Selection
-                target_bank = "국민"
-                bank_selected = False
+                act_resp = session.post(act_url, data=act_data, headers=post_headers, timeout=8)
+                act_text = act_resp.text
 
-                # Strategy A: Native select dropdown
-                try:
-                    select_loc = frame.locator("select#vbankBankCode")
-                    if await select_loc.count() > 0:
-                        bank_map = {
-                            "농협": "11", "국민": "06", "우리": "20", "신한": "26", 
-                            "기업": "03", "경남": "39", "광주": "34", "대구": "31", 
-                            "부산": "32", "새마을": "45", "수협": "07", "우체국": "71", "하나": "81"
-                        }
-                        code = bank_map.get(target_bank, "06")
-                        await select_loc.select_option(value=code)
-                        bank_selected = True
-                        self.log(f"[{worker_id}번 기기] 가상계좌 은행 선택 완료 (select): {target_bank}", "info")
-                except Exception:
-                    pass
+                history_urls = [str(h.url) for h in act_resp.history]
+                final_url = str(act_resp.url)
 
-                # Strategy B: UI lists/buttons text match
-                if not bank_selected:
-                    try:
-                        selectors = [
-                            f'button:has-text("{target_bank}"):visible',
-                            f'a:has-text("{target_bank}"):visible',
-                            f'div:has-text("{target_bank}"):visible',
-                            f'span:has-text("{target_bank}"):visible',
-                            f'li:has-text("{target_bank}"):visible',
-                        ]
-                        for sel in selectors:
-                            loc = frame.locator(sel)
-                            if await loc.count() > 0:
-                                await loc.first.click()
-                                bank_selected = True
-                                self.log(f"[{worker_id}번 기기] 가상계좌 은행 선택 완료 (텍스트 매칭): {target_bank}", "info")
+                success = False
+                if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls):
+                    success = True
+                elif "결제" in act_text or "toss" in act_text.lower() or "vbank" in act_text.lower():
+                    success = True
+
+                if success:
+                    self.log(f"🎉 예약 성공! (가상계좌 결제 대기)", "success")
+                    self.stop_event.set()
+                    if self.success_callback:
+                        self.success_callback()
+                    break
+                else:
+                    err_soup = BeautifulSoup(act_text, 'html.parser')
+                    scripts = err_soup.find_all('script')
+                    err_msg = "선점 실패"
+                    for s in scripts:
+                        if "alert" in s.text:
+                            alert_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
+                            if alert_match:
+                                err_msg = alert_match.group(1)
                                 break
-                    except Exception as e:
-                        self.log(f"[{worker_id}번 기기] 은행 선택 매칭 클릭 실패: {e}", "warning")
+                    self.log(f"제출 실패: {err_msg} - 재시도", "warning")
+                    time.sleep(0.5)
 
-                # Cash receipt opt-out
-                try:
-                    cash_receipt = frame.locator("#vbankCashReceiptView, input[name*='Receipt'], input[name*='receipt']")
-                    if await cash_receipt.count() > 0:
-                        if await cash_receipt.first.is_checked():
-                            await cash_receipt.first.uncheck(force=True)
-                except Exception:
-                    pass
+            except Exception as e:
+                self.log(f"통신 에러 발생: {e} - 재시도", "warning")
+                time.sleep(0.15)
 
-                try:
-                    label = frame.locator('label:has-text("발행하지 않음"), label:has-text("미발행"), span:has-text("미발행")')
-                    if await label.count() > 0:
-                        await label.first.click()
-                except Exception:
-                    pass
+    def _make_reservation_old_sync(self, res_data):
+        session = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        session.headers.update(headers)
 
-                # Input phone number for refund/notification inside iframe
-                try:
-                    phone_input = frame.locator('input[aria-label="휴대폰번호"], input[placeholder*="휴대폰"], input[type="tel"]')
-                    await phone_input.wait_for(state="visible", timeout=3000)
-                    await phone_input.fill(phone_digits)
-                    self.log(f"[{worker_id}번 기기] 가상계좌 알림 연락처 입력 완료", "info")
-                except Exception as e:
-                    self.log(f"[{worker_id}번 기기] 가상계좌 알림 연락처 입력칸 탐색 실패: {e}", "warning")
+        target_time = res_data.get("reservationTime")[:5]
+        csrf_token = None
 
-                # DevMode: exit before final submission
-                if dev_mode:
-                    self.log(f"✓ [{worker_id}번 기기] [개발자 테스트] 결제 최종 승인 직전 멈춤! (제출 우회)", "success")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
-                    while not self.stop_event.is_set():
-                        await asyncio.sleep(0.5)
-                    break
+        while not self.stop_event.is_set():
+            try:
+                if not csrf_token:
+                    csrf_token = self.get_csrf_token(session)
 
-                # Submit final payment details
-                self.log(f"[{worker_id}번 기기] 결제 승인 요청 제출 중...", "info")
-                for btn_text in ["다음", "결제하기", "결제"]:
+                post_headers = {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-TOKEN': csrf_token
+                }
+
+                laravel_payload = {
+                    'reservationDate': res_data.get('reservationDate'),
+                    'name': res_data.get('name'),
+                    'phone': res_data.get('phone'),
+                    'people': res_data.get('people'),
+                    'paymentType': '1',
+                    'themePK': res_data.get('themePK'),
+                    'reservationTime': res_data.get('reservationTime'),
+                    'policy': 'true'
+                }
+
+                resp = session.post(self.site_url, json=laravel_payload, headers=post_headers, timeout=8)
+                if resp.status_code == 419:
+                    csrf_token = None
+                    continue
+
+                if resp.status_code == 200:
                     try:
-                        btn = frame.locator(f'button:has-text("{btn_text}"), a:has-text("{btn_text}")')
-                        if await btn.count() > 0:
-                            await btn.first.click()
-                            await asyncio.sleep(0.5)
+                        success_info = resp.json()
                     except Exception:
-                        pass
-                try:
-                    done_btn = frame.locator("#payDoneBtn")
-                    if await done_btn.count() > 0:
-                        await done_btn.click()
-                except Exception:
-                    pass
-
-                # Verify completion redirect
-                self.log(f"[{worker_id}번 기기] 결제 완료 처리 대기 중...", "info")
-                await asyncio.sleep(2.5)
-                cur_url = page.url
-                if "rev.complete" in cur_url or "complete" in cur_url or "ok" in cur_url:
-                    self.log(f"🎉 [{worker_id}번 기기] 예약 성공!! 완료 페이지: {cur_url}", "success")
+                        success_info = resp.text
+                    self.log(f"🎉 예약 성공: {str(success_info)[:200]}", "success")
                     self.stop_event.set()
                     if self.success_callback:
                         self.success_callback()
                     break
                 else:
-                    self.log(f"[{worker_id}번 기기] 완료 페이지 확인 중: {cur_url}", "info")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
-                    break
+                    try:
+                        decoded_text = resp.text
+                    except Exception:
+                        decoded_text = str(resp)
 
-        except Exception as e:
-            self.log(f"[{worker_id}번 기기] 에러 발생: {e}", "error")
-        finally:
-            if context:
-                await context.close()
+                    try:
+                        error_data = json.loads(decoded_text)
+                        error_message = error_data.get('Message', decoded_text[:200])
+                    except Exception:
+                        error_message = decoded_text[:200]
+
+                    if "이미 예약" in error_message or "already" in error_message.lower():
+                        self.silent_tick(f"{target_time} 슬롯 이미 예약 완료")
+                    elif "결제 수단" in error_message or "결제수단" in error_message:
+                        self.silent_tick(f"{target_time} 결제수단 에러 / 마감")
+                    else:
+                        self.silent_tick(f"{target_time} 오류: {error_message}")
+                    time.sleep(0.1)
+
+            except Exception as e:
+                csrf_token = None
+                self.silent_tick(f"연결 오류: {e}")
+                time.sleep(0.2)
+
+    async def make_reservation_async_task(self, reservation_data, task_idx):
+        if self.is_shin:
+            await self._make_reservation_shin_async(reservation_data, task_idx)
+        else:
+            await self._make_reservation_old_async(reservation_data, task_idx)
+
+    async def _make_reservation_shin_async(self, res_data, task_idx):
+        session = None
+        if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
+            session, _ = self.session_pool[task_idx]
+            
+        if not session:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            session = aiohttp.ClientSession(headers=headers)
+            
+        zizum_num = res_data.get("branch", "4")
+        rev_days = res_data.get("reservationDate")
+        theme_num = res_data.get("themePK")
+        target_time = res_data.get("reservationTime")[:5]
+        name = res_data.get("name")
+        phone_digits = "".join(c for c in res_data.get("phone", "") if c.isdigit())
+        people = res_data.get("people", "2")
+        s_subj = "B" if zizum_num == "2" else "A"
+        
+        sel_url = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
+        act_url = "https://zeroworldkorea.com/core/res/rev.act.php"
+        
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
+        }
+        
+        self.log(f"[태스크 {task_idx+1}] 신 제로월드 고속 감시 시작: {target_time}", "info")
+        
+        slot_id = None
+        while not self.stop_event.is_set():
+            try:
+                # 1. Fetch time slots
+                payload = f"act=theme_time_list&zizum_num={zizum_num}&rev_days={rev_days}&theme_num={theme_num}"
+                async with session.post(sel_url, data=payload, headers=headers, timeout=5) as resp:
+                    if resp.status != 200:
+                        self.silent_tick(f"시간 조회 오류 ({resp.status})")
+                        await asyncio.sleep(0.15)
+                        continue
+                        
+                    html_text = await resp.text()
+                    if "에러" in html_text or not html_text.strip():
+                        self.silent_tick(f"시간 데이터 없음")
+                        await asyncio.sleep(0.15)
+                        continue
+                        
+                    soup = BeautifulSoup(html_text, 'html.parser')
+                    found_slot = None
+                    for a in soup.find_all('a'):
+                        if target_time in a.text:
+                            classes = a.get('class', [])
+                            if any(c in classes for c in ['disable', 'close', 'sold-out']):
+                                continue
+                            
+                            href = a.get('href', '')
+                            match = re.search(r"fun_theme_time_select\('(\d+)'", href)
+                            if match:
+                                found_slot = match.group(1)
+                                break
+                                
+                    if not found_slot:
+                        self.silent_tick(f"{target_time} 슬롯 대기")
+                        await asyncio.sleep(0.15)
+                        continue
+                        
+                    slot_id = found_slot
+                    self.log(f"[태스크 {task_idx+1}] {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 중...", "info")
+                    
+                # 2. Select slot
+                sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
+                async with session.post(sel_url, data=sel_payload, headers=headers, timeout=5):
+                    pass
+                
+                # 3. Finalize reservation
+                act_data = {
+                    "name": name,
+                    "mobile": phone_digits,
+                    "person": people,
+                    "zizum_num": zizum_num,
+                    "rev_days": rev_days,
+                    "theme_num": theme_num,
+                    "theme_time_num": slot_id,
+                    "act": "make",
+                    "s_subj": s_subj
+                }
+                
+                async with session.post(act_url, data=act_data, headers=headers, timeout=8) as act_resp:
+                    act_text = await act_resp.text()
+                    
+                    history_urls = [str(h.url) for h in act_resp.history]
+                    final_url = str(act_resp.url)
+                    
+                    success = False
+                    if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls):
+                        success = True
+                    elif "결제" in act_text or "toss" in act_text.lower() or "vbank" in act_text.lower():
+                        success = True
+                        
+                    if success:
+                        self.log(f"🎉 [태스크 {task_idx+1}] 예약 선점 성공! (가상계좌 결제 대기)", "success")
+                        self.stop_event.set()
+                        if self.success_callback:
+                            self.success_callback()
+                        break
+                    else:
+                        err_soup = BeautifulSoup(act_text, 'html.parser')
+                        scripts = err_soup.find_all('script')
+                        err_msg = "선점 실패"
+                        for s in scripts:
+                            if "alert" in s.text:
+                                alert_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
+                                if alert_match:
+                                    err_msg = alert_match.group(1)
+                                    break
+                                    
+                        self.log(f"[태스크 {task_idx+1}] 제출 실패: {err_msg} - 재시도", "warning")
+                        await asyncio.sleep(0.5)
+                        
+            except Exception as e:
+                self.log(f"[태스크 {task_idx+1}] 통신 에러 발생: {e} - 재시도", "warning")
+                await asyncio.sleep(0.15)
+                
+        if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
+            await session.close()
+
+    async def _make_reservation_old_async(self, res_data, task_idx):
+        session = None
+        csrf_token = None
+        
+        if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
+            session, csrf_token = self.session_pool[task_idx]
+            
+        if not session:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            session = aiohttp.ClientSession(headers=headers)
+            
+        target_time = res_data.get("reservationTime")[:5]
+        
+        while not self.stop_event.is_set():
+            try:
+                if not csrf_token:
+                    csrf_token = await self.get_csrf_token_async(session)
+                    
+                if self.stop_event.is_set():
+                    break
+                    
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-TOKEN': csrf_token
+                }
+                
+                laravel_payload = {
+                    'reservationDate': res_data.get('reservationDate'),
+                    'name': res_data.get('name'),
+                    'phone': res_data.get('phone'),
+                    'people': res_data.get('people'),
+                    'paymentType': '1',
+                    'themePK': res_data.get('themePK'),
+                    'reservationTime': res_data.get('reservationTime'),
+                    'policy': 'true'
+                }
+                
+                async with session.post(self.site_url, json=laravel_payload, headers=headers, timeout=8) as resp:
+                    if resp.status == 419:
+                        csrf_token = None
+                        continue
+                        
+                    if resp.status == 200:
+                        try:
+                            res_json = await resp.json()
+                            success_info = str(res_json)
+                        except Exception:
+                            success_info = await resp.text()
+                            
+                        self.log(f"🎉 [태스크 {task_idx+1}] 예약 성공: {success_info[:200]}", "success")
+                        self.stop_event.set()
+                        if self.success_callback:
+                            self.success_callback()
+                        break
+                    else:
+                        try:
+                            decoded_text = await resp.text()
+                        except Exception:
+                            decoded_text = str(resp)
+                            
+                        try:
+                            error_data = json.loads(decoded_text)
+                            error_message = error_data.get('Message', decoded_text[:200])
+                        except Exception:
+                            error_message = decoded_text[:200]
+                            
+                        if "이미 예약" in error_message or "already" in error_message.lower():
+                            self.silent_tick(f"{target_time} 슬롯 이미 예약 완료")
+                        elif "결제 수단" in error_message or "결제수단" in error_message:
+                            self.silent_tick(f"{target_time} 결제수단 에러 / 마감")
+                        else:
+                            self.silent_tick(f"{target_time} 오류: {error_message}")
+                            
+                        await asyncio.sleep(0.1)
+            except Exception as e:
+                csrf_token = None
+                self.silent_tick(f"연결 오류: {e}")
+                await asyncio.sleep(0.2)
+                
+        if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
+            await session.close()
+
+    async def get_csrf_token_async(self, session):
+        async with session.get(self.site_url) as resp:
+            text = await resp.text()
+            soup = BeautifulSoup(text, 'html.parser')
+            csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
+            return csrf_token
+
+    async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
+        import aiohttp
+        import asyncio
+        
+        self.session_pool = []
+        if not self.is_shin:
+            self.log(f"Pre-fetching {num_sessions} sessions and CSRF tokens...", "info")
+            async def fetch_one(idx):
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                session = aiohttp.ClientSession(headers=headers)
+                try:
+                    csrf = await self.get_csrf_token_async(session)
+                    return session, csrf
+                except Exception as e:
+                    await session.close()
+                    self.log(f"Pre-fetch session {idx} failed: {e}", "warning")
+                    return None
+            tasks = [fetch_one(i) for i in range(num_sessions)]
+            results = await asyncio.gather(*tasks)
+            for res in results:
+                if res:
+                    self.session_pool.append(res)
+            self.log(f"Pre-fetched {len(self.session_pool)}/{num_sessions} sessions successfully.", "info")
+        else:
+            self.log(f"Pre-fetching {num_sessions} sessions for Sinbiweb API...", "info")
+            for _ in range(num_sessions):
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                session = aiohttp.ClientSession(headers=headers)
+                self.session_pool.append((session, None))
