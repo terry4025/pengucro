@@ -63,13 +63,13 @@ class ZeroWorldEngine(BaseEngine):
                 resp = session.post(sel_url, data=payload, headers=post_headers, timeout=5)
                 if resp.status_code != 200:
                     self.silent_tick(f"시간 조회 오류 ({resp.status_code})")
-                    time.sleep(0.15)
+                    time.sleep(0.1)
                     continue
 
                 html_text = resp.text
                 if "에러" in html_text or not html_text.strip():
                     self.silent_tick(f"시간 데이터 없음")
-                    time.sleep(0.15)
+                    time.sleep(0.1)
                     continue
 
                 soup = BeautifulSoup(html_text, 'html.parser')
@@ -88,7 +88,7 @@ class ZeroWorldEngine(BaseEngine):
 
                 if not found_slot:
                     self.silent_tick(f"{target_time} 슬롯 대기")
-                    time.sleep(0.15)
+                    time.sleep(0.1)
                     continue
 
                 slot_id = found_slot
@@ -118,7 +118,7 @@ class ZeroWorldEngine(BaseEngine):
                 final_url = str(act_resp.url)
 
                 success = False
-                if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls):
+                if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls) or "rev.pay" in act_text:
                     success = True
                 elif "결제" in act_text or "toss" in act_text.lower() or "vbank" in act_text.lower():
                     success = True
@@ -130,21 +130,24 @@ class ZeroWorldEngine(BaseEngine):
                         self.success_callback()
                     break
                 else:
-                    err_soup = BeautifulSoup(act_text, 'html.parser')
-                    scripts = err_soup.find_all('script')
                     err_msg = "선점 실패"
-                    for s in scripts:
-                        if "alert" in s.text:
-                            alert_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
-                            if alert_match:
-                                err_msg = alert_match.group(1)
-                                break
+                    alert_match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", act_text)
+                    if alert_match:
+                        err_msg = alert_match.group(1)
+                    else:
+                        err_soup = BeautifulSoup(act_text, 'html.parser')
+                        for s in err_soup.find_all('script'):
+                            if "alert" in s.text:
+                                inner_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
+                                if inner_match:
+                                    err_msg = inner_match.group(1)
+                                    break
                     self.log(f"제출 실패: {err_msg} - 재시도", "warning")
                     time.sleep(0.5)
 
             except Exception as e:
                 self.log(f"통신 에러 발생: {e} - 재시도", "warning")
-                time.sleep(0.15)
+                time.sleep(0.1)
 
     def _make_reservation_old_sync(self, res_data):
         session = requests.Session()
@@ -261,13 +264,13 @@ class ZeroWorldEngine(BaseEngine):
                 async with session.post(sel_url, data=payload, headers=headers, timeout=5) as resp:
                     if resp.status != 200:
                         self.silent_tick(f"시간 조회 오류 ({resp.status})")
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(0.1)
                         continue
                         
                     html_text = await resp.text()
                     if "에러" in html_text or not html_text.strip():
                         self.silent_tick(f"시간 데이터 없음")
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(0.1)
                         continue
                         
                     soup = BeautifulSoup(html_text, 'html.parser')
@@ -286,7 +289,7 @@ class ZeroWorldEngine(BaseEngine):
                                 
                     if not found_slot:
                         self.silent_tick(f"{target_time} 슬롯 대기")
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(0.1)
                         continue
                         
                     slot_id = found_slot
@@ -317,7 +320,7 @@ class ZeroWorldEngine(BaseEngine):
                     final_url = str(act_resp.url)
                     
                     success = False
-                    if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls):
+                    if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls) or "rev.pay" in act_text:
                         success = True
                     elif "결제" in act_text or "toss" in act_text.lower() or "vbank" in act_text.lower():
                         success = True
@@ -329,22 +332,25 @@ class ZeroWorldEngine(BaseEngine):
                             self.success_callback()
                         break
                     else:
-                        err_soup = BeautifulSoup(act_text, 'html.parser')
-                        scripts = err_soup.find_all('script')
                         err_msg = "선점 실패"
-                        for s in scripts:
-                            if "alert" in s.text:
-                                alert_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
-                                if alert_match:
-                                    err_msg = alert_match.group(1)
-                                    break
+                        alert_match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", act_text)
+                        if alert_match:
+                            err_msg = alert_match.group(1)
+                        else:
+                            err_soup = BeautifulSoup(act_text, 'html.parser')
+                            for s in err_soup.find_all('script'):
+                                if "alert" in s.text:
+                                    inner_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
+                                    if inner_match:
+                                        err_msg = inner_match.group(1)
+                                        break
                                     
                         self.log(f"[태스크 {task_idx+1}] 제출 실패: {err_msg} - 재시도", "warning")
                         await asyncio.sleep(0.5)
                         
             except Exception as e:
                 self.log(f"[태스크 {task_idx+1}] 통신 에러 발생: {e} - 재시도", "warning")
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.1)
                 
         if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
             await session.close()
