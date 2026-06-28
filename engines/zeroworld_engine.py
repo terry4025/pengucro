@@ -134,9 +134,15 @@ class ZeroWorldEngine(BaseEngine):
                 final_url = str(act_resp.url)
 
                 success = False
-                if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls) or "rev.pay" in act_text:
+                combined_check = act_text + " " + final_url + " " + " ".join(history_urls)
+                combined_lower = combined_check.lower()
+                if "rev.pay" in combined_lower or "rev.kcp" in combined_lower:
                     success = True
-                elif "결제" in act_text or "toss" in act_text.lower() or "vbank" in act_text.lower():
+                elif "location.replace" in combined_lower or "location.href" in combined_lower:
+                    success = True
+                elif "결제" in act_text or "예약확인" in act_text or "payment" in combined_lower:
+                    success = True
+                elif "toss" in combined_lower or "vbank" in combined_lower:
                     success = True
 
                 if success:
@@ -352,9 +358,15 @@ class ZeroWorldEngine(BaseEngine):
                     final_url = str(act_resp.url)
                     
                     success = False
-                    if "rev.pay" in final_url or any("rev.pay" in u for u in history_urls) or "rev.pay" in act_text:
+                    combined_check = act_text + " " + final_url + " " + " ".join(history_urls)
+                    combined_lower = combined_check.lower()
+                    if "rev.pay" in combined_lower or "rev.kcp" in combined_lower:
                         success = True
-                    elif "결제" in act_text or "toss" in act_text.lower() or "vbank" in act_text.lower():
+                    elif "location.replace" in combined_lower or "location.href" in combined_lower:
+                        success = True
+                    elif "결제" in act_text or "예약확인" in act_text or "payment" in combined_lower:
+                        success = True
+                    elif "toss" in combined_lower or "vbank" in combined_lower:
                         success = True
                         
                     if success:
