@@ -146,7 +146,40 @@ class ZeroWorldEngine(BaseEngine):
                     success = True
 
                 if success:
-                    self.log(f"🎉 예약 성공! (가상계좌 결제 대기)", "success")
+                    # 2단계: 개인정보 동의 + 예약하기 자동 제출
+                    final_msg = "예약 선점 성공 (수동 확인 필요)"
+                    try:
+                        code_m = re.search(r"name=['\"]?code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
+                        ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
+                        rev_code = code_m.group(1) if code_m else ""
+                        ck_code_val = ck_m.group(1) if ck_m else ""
+                        if not rev_code:
+                            url_m = re.search(r"code=([a-zA-Z0-9]+)", combined_check)
+                            if url_m:
+                                rev_code = url_m.group(1)
+                        if rev_code:
+                            if not ck_code_val:
+                                kcp_url = f"https://zeroworldkorea.com/layout/res/home.php?go=rev.kcp&code={rev_code}"
+                                kcp_resp = session.get(kcp_url, timeout=8)
+                                kcp_text = kcp_resp.text
+                                ck_m2 = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
+                                if ck_m2:
+                                    ck_code_val = ck_m2.group(1)
+                            mutong_url = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
+                            mutong_params = {"code": rev_code, "ck_code": ck_code_val, "layout_folder": "layout/res", "payment": "A", "privacy": "on"}
+                            mutong_resp = session.get(mutong_url, params=mutong_params, timeout=8)
+                            mutong_text = mutong_resp.text
+                            bnum_m = re.search(r"예약번호[^0-9]*(\d+)", mutong_text)
+                            if "완료" in mutong_text:
+                                bnum = bnum_m.group(1) if bnum_m else ck_code_val
+                                final_msg = f"예약 최종 완료! 예약번호: {bnum}"
+                            else:
+                                final_msg = f"예약 선점 성공! 코드: {rev_code} (결제확인 응답 재확인 필요)"
+                        else:
+                            final_msg = "예약 선점 성공! (코드 추출 실패 - 수동 확인 필요)"
+                    except Exception as e:
+                        final_msg = f"예약 선점 성공! (자동확인 오류: {e})"
+                    self.log(f"🎉 {final_msg}", "success")
                     self.stop_event.set()
                     if self.success_callback:
                         self.success_callback()
@@ -370,7 +403,40 @@ class ZeroWorldEngine(BaseEngine):
                         success = True
                         
                     if success:
-                        self.log(f"🎉 [태스크 {task_idx+1}] 예약 선점 성공! (가상계좌 결제 대기)", "success")
+                        # 2단계: 개인정보 동의 + 예약하기 자동 제출
+                        final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공 (수동 확인 필요)"
+                        try:
+                            code_m = re.search(r"name=['\"]?code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
+                            ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
+                            rev_code = code_m.group(1) if code_m else ""
+                            ck_code_val = ck_m.group(1) if ck_m else ""
+                            if not rev_code:
+                                url_m = re.search(r"code=([a-zA-Z0-9]+)", combined_check)
+                                if url_m:
+                                    rev_code = url_m.group(1)
+                            if rev_code:
+                                if not ck_code_val:
+                                    kcp_url = f"https://zeroworldkorea.com/layout/res/home.php?go=rev.kcp&code={rev_code}"
+                                    async with session.get(kcp_url, timeout=8) as kcp_resp:
+                                        kcp_text = await kcp_resp.text()
+                                        ck_m2 = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
+                                        if ck_m2:
+                                            ck_code_val = ck_m2.group(1)
+                                mutong_url = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
+                                mutong_params = {"code": rev_code, "ck_code": ck_code_val, "layout_folder": "layout/res", "payment": "A", "privacy": "on"}
+                                async with session.get(mutong_url, params=mutong_params, timeout=8) as mutong_resp:
+                                    mutong_text = await mutong_resp.text()
+                                    bnum_m = re.search(r"예약번호[^0-9]*(\d+)", mutong_text)
+                                    if "완료" in mutong_text:
+                                        bnum = bnum_m.group(1) if bnum_m else ck_code_val
+                                        final_msg = f"[태스크 {task_idx+1}] 예약 최종 완료! 예약번호: {bnum}"
+                                    else:
+                                        final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! 코드: {rev_code} (결제확인 응답 재확인 필요)"
+                            else:
+                                final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! (코드 추출 실패 - 수동 확인 필요)"
+                        except Exception as e:
+                            final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! (자동확인 오류: {e})"
+                        self.log(f"🎉 {final_msg}", "success")
                         self.stop_event.set()
                         if self.success_callback:
                             self.success_callback()
