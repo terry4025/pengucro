@@ -112,7 +112,23 @@ class ZeroWorldEngine(BaseEngine):
                 }
 
                 act_resp = session.post(act_url, data=act_data, headers=post_headers, timeout=8)
-                act_text = act_resp.text
+                try:
+                    act_bytes = act_resp.content
+                    try:
+                        act_text = act_bytes.decode('utf-8')
+                    except UnicodeDecodeError:
+                        act_text = act_bytes.decode('cp949', errors='ignore')
+                except Exception:
+                    act_text = act_resp.text
+
+                try:
+                    import os
+                    os.makedirs("scratch", exist_ok=True)
+                    with open("scratch/last_act_response.html", "w", encoding="utf-8") as debug_f:
+                        debug_f.write(act_text)
+                except Exception:
+                    pass
+
 
                 history_urls = [str(h.url) for h in act_resp.history]
                 final_url = str(act_resp.url)
@@ -314,7 +330,23 @@ class ZeroWorldEngine(BaseEngine):
                 }
                 
                 async with session.post(act_url, data=act_data, headers=headers, timeout=8) as act_resp:
-                    act_text = await act_resp.text()
+                    try:
+                        act_bytes = await act_resp.read()
+                        try:
+                            act_text = act_bytes.decode('utf-8')
+                        except UnicodeDecodeError:
+                            act_text = act_bytes.decode('cp949', errors='ignore')
+                    except Exception:
+                        act_text = await act_resp.text()
+
+                    try:
+                        import os
+                        os.makedirs("scratch", exist_ok=True)
+                        with open("scratch/last_act_response.html", "w", encoding="utf-8") as debug_f:
+                            debug_f.write(act_text)
+                    except Exception:
+                        pass
+
                     
                     history_urls = [str(h.url) for h in act_resp.history]
                     final_url = str(act_resp.url)
