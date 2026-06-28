@@ -16,6 +16,13 @@ class ZeroWorldEngine(BaseEngine):
         super().__init__(log_callback, success_callback)
         self.site_url = site_url
         self.is_shin = is_shin
+        
+        import threading
+        self._log_lock = threading.Lock()
+        self._notified_bypass = False
+        self._notified_found = False
+        self._last_err_msg = ""
+        self._last_err_time = 0
 
     def get_csrf_token(self, session):
         response = session.get(self.site_url)
@@ -112,7 +119,13 @@ class ZeroWorldEngine(BaseEngine):
                 if not found_slot and mapped_slot:
                     if len(soup.find_all('a')) >= 3:
                         found_slot = mapped_slot
-                        self.log(f"시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입", "info")
+                        show_log = False
+                        with self._log_lock:
+                            if not self._notified_bypass:
+                                self._notified_bypass = True
+                                show_log = True
+                        if show_log:
+                            self.log(f"시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입 (첫 감지)", "info")
 
                 if not found_slot:
                     self.silent_tick(f"{target_time} 슬롯 대기")
@@ -120,7 +133,13 @@ class ZeroWorldEngine(BaseEngine):
                     continue
 
                 slot_id = found_slot
-                self.log(f"스레드 {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 중...", "info")
+                show_found = False
+                with self._log_lock:
+                    if not self._notified_found:
+                        self._notified_found = True
+                        show_found = True
+                if show_found:
+                    self.log(f"⏰ {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 진행 중...", "info")
 
                 # 2. Select slot
                 sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
@@ -225,11 +244,37 @@ class ZeroWorldEngine(BaseEngine):
                                 if inner_match:
                                     err_msg = inner_match.group(1)
                                     break
-                    self.log(f"제출 실패: {err_msg} - 재시도", "warning")
+                    
+                    # 이미 완료된 예약일 시 예약 시도 전면 중단(Abort)
+                    if any(x in err_msg for x in ["완료", "이미 예약", "매진", "마감", "초과", "선점"]):
+                        self.log(f"❌ [중단] {err_msg} (모든 예약 프로세스 중지)", "warning")
+                        self.stop_event.set()
+                        break
+                        
+                    # 중복 에러 로그 제거 및 2초 쿨다운
+                    show_err = False
+                    now = time.time()
+                    with self._log_lock:
+                        if err_msg != self._last_err_msg or (now - self._last_err_time) > 2.0:
+                            self._last_err_msg = err_msg
+                            self._last_err_time = now
+                            show_err = True
+                    if show_err:
+                        self.log(f"제출 대기 중: {err_msg}", "warning")
+                    
                     time.sleep(0.5)
 
             except Exception as e:
-                self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
+                # 통신 에러도 2초 쿨다운 출력
+                now = time.time()
+                show_conn_err = False
+                with self._log_lock:
+                    if "connection_error" != self._last_err_msg or (now - self._last_err_time) > 2.0:
+                        self._last_err_msg = "connection_error"
+                        self._last_err_time = now
+                        show_conn_err = True
+                if show_conn_err:
+                    self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
                 try:
                     session.close()
                 except Exception:
@@ -402,7 +447,13 @@ class ZeroWorldEngine(BaseEngine):
                     if not found_slot and mapped_slot:
                         if len(soup.find_all('a')) >= 3:
                             found_slot = mapped_slot
-                            self.log(f"[태스크 {task_idx+1}] 시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입", "info")
+                            show_log = False
+                            with self._log_lock:
+                                if not self._notified_bypass:
+                                    self._notified_bypass = True
+                                    show_log = True
+                            if show_log:
+                                self.log(f"시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입 (첫 감지)", "info")
 
                     if not found_slot:
                         self.silent_tick(f"{target_time} 슬롯 대기")
@@ -410,7 +461,13 @@ class ZeroWorldEngine(BaseEngine):
                         continue
                         
                     slot_id = found_slot
-                    self.log(f"[태스크 {task_idx+1}] {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 중...", "info")
+                    show_found = False
+                    with self._log_lock:
+                        if not self._notified_found:
+                            self._notified_found = True
+                            show_found = True
+                    if show_found:
+                        self.log(f"⏰ {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 진행 중...", "info")
                     
                 # 2. Select slot
                 sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
@@ -517,11 +574,36 @@ class ZeroWorldEngine(BaseEngine):
                                         err_msg = inner_match.group(1)
                                         break
                                     
-                        self.log(f"[태스크 {task_idx+1}] 제출 실패: {err_msg} - 재시도", "warning")
+                        # 이미 완료된 예약일 시 예약 시도 전면 중단(Abort)
+                        if any(x in err_msg for x in ["완료", "이미 예약", "매진", "마감", "초과", "선점"]):
+                            self.log(f"❌ [중단] {err_msg} (모든 예약 프로세스 중지)", "warning")
+                            self.stop_event.set()
+                            break
+                            
+                        # 중복 에러 로그 제거 및 2초 쿨다운
+                        show_err = False
+                        now = time.time()
+                        with self._log_lock:
+                            if err_msg != self._last_err_msg or (now - self._last_err_time) > 2.0:
+                                self._last_err_msg = err_msg
+                                self._last_err_time = now
+                                show_err = True
+                        if show_err:
+                            self.log(f"제출 대기 중: {err_msg}", "warning")
+                            
                         await asyncio.sleep(0.5)
                         
             except Exception as e:
-                self.log(f"[태스크 {task_idx+1}] 통신 에러 발생: {e} - 세션 재연결 시도", "warning")
+                # 통신 에러도 2초 쿨다운 출력
+                now = time.time()
+                show_conn_err = False
+                with self._log_lock:
+                    if "connection_error" != self._last_err_msg or (now - self._last_err_time) > 2.0:
+                        self._last_err_msg = "connection_error"
+                        self._last_err_time = now
+                        show_conn_err = True
+                if show_conn_err:
+                    self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
                 try:
                     await session.close()
                 except Exception:
