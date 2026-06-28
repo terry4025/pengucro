@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 import multiprocessing
 
-def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, stop_event, log_queue, success_event):
+def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, stop_event, log_queue, success_event, is_shin=False):
     try:
         import asyncio
         import sys
@@ -32,7 +32,7 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
             log_queue.put(('success',))
             
         if engine_class_name == 'ZeroWorldEngine':
-            engine = engine_class(site_url, child_log, child_success)
+            engine = engine_class(site_url, child_log, child_success, is_shin=is_shin)
         else:
             engine = engine_class(child_log, child_success, site_url)
             
@@ -164,6 +164,7 @@ class BaseEngine:
             
             class_name = self.__class__.__name__
             site_url = self.site_url if hasattr(self, "site_url") else self.base_url
+            is_shin = getattr(self, "is_shin", False)
             for i in range(num_proc):
                 p_tasks = tasks_per_proc + (1 if i < remainder else 0)
                 if p_tasks <= 0:
@@ -177,7 +178,8 @@ class BaseEngine:
                         p_tasks,
                         self.multiprocess_stop_event,
                         self.log_queue,
-                        self.multiprocess_success_event
+                        self.multiprocess_success_event,
+                        is_shin
                     ),
                     name=f"BookingProcess-{i+1}"
                 )
