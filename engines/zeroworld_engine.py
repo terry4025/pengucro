@@ -245,12 +245,6 @@ class ZeroWorldEngine(BaseEngine):
                                     err_msg = inner_match.group(1)
                                     break
                     
-                    # 이미 완료된 예약일 시 예약 시도 전면 중단(Abort)
-                    if any(x in err_msg for x in ["완료", "이미 예약", "매진", "마감", "초과", "선점"]):
-                        self.log(f"❌ [중단] {err_msg} (모든 예약 프로세스 중지)", "warning")
-                        self.stop_event.set()
-                        break
-                        
                     # 중복 에러 로그 제거 및 2초 쿨다운
                     show_err = False
                     now = time.time()
@@ -574,12 +568,6 @@ class ZeroWorldEngine(BaseEngine):
                                         err_msg = inner_match.group(1)
                                         break
                                     
-                        # 이미 완료된 예약일 시 예약 시도 전면 중단(Abort)
-                        if any(x in err_msg for x in ["완료", "이미 예약", "매진", "마감", "초과", "선점"]):
-                            self.log(f"❌ [중단] {err_msg} (모든 예약 프로세스 중지)", "warning")
-                            self.stop_event.set()
-                            break
-                            
                         # 중복 에러 로그 제거 및 2초 쿨다운
                         show_err = False
                         now = time.time()
