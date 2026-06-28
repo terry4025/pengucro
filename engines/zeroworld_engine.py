@@ -229,8 +229,14 @@ class ZeroWorldEngine(BaseEngine):
                     time.sleep(0.5)
 
             except Exception as e:
-                self.log(f"통신 에러 발생: {e} - 재시도", "warning")
-                time.sleep(0.1)
+                self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = requests.Session()
+                session.headers.update(headers)
+                time.sleep(0.5)
 
     def _make_reservation_old_sync(self, res_data):
         session = requests.Session()
@@ -515,8 +521,21 @@ class ZeroWorldEngine(BaseEngine):
                         await asyncio.sleep(0.5)
                         
             except Exception as e:
-                self.log(f"[태스크 {task_idx+1}] 통신 에러 발생: {e} - 재시도", "warning")
-                await asyncio.sleep(0.1)
+                self.log(f"[태스크 {task_idx+1}] 통신 에러 발생: {e} - 세션 재연결 시도", "warning")
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                
+                headers_re = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
+                }
+                session = aiohttp.ClientSession(headers=headers_re)
+                if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
+                    self.session_pool[task_idx] = (session, self.session_pool[task_idx][1])
+                await asyncio.sleep(0.5)
                 
         if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
             await session.close()
