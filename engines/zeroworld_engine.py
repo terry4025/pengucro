@@ -53,7 +53,30 @@ class ZeroWorldEngine(BaseEngine):
             "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
         }
 
-        self.log(f"신 제로월드 고속 감시 시작 (스레드): {target_time}", "info")
+        # 요일 확인 (0~4: 평일, 5~6: 주말)
+        is_weekend = False
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(rev_days, "%Y-%m-%d")
+            if dt.weekday() in [5, 6]:
+                is_weekend = True
+        except Exception:
+            pass
+
+        weekday_map = {
+            "10:50": "694", "12:00": "698", "13:10": "701", "14:20": "16",
+            "15:30": "704", "16:40": "705", "17:50": "706", "19:00": "709",
+            "20:10": "710", "21:20": "711"
+        }
+        weekend_map = {
+            "10:50": "695", "12:00": "699", "13:10": "702", "14:20": "707",
+            "15:30": "712", "16:40": "713", "17:50": "17", "19:00": "714",
+            "20:10": "715", "21:20": "716"
+        }
+        fallback_map = weekend_map if is_weekend else weekday_map
+        mapped_slot = fallback_map.get(target_time)
+
+        self.log(f"신 제로월드 고속 감시 시작 (스레드): {target_time} (매핑 ID: {mapped_slot})", "info")
 
         slot_id = None
         while not self.stop_event.is_set():
@@ -85,6 +108,11 @@ class ZeroWorldEngine(BaseEngine):
                         if match:
                             found_slot = match.group(1)
                             break
+
+                if not found_slot and mapped_slot:
+                    if len(soup.find_all('a')) >= 3:
+                        found_slot = mapped_slot
+                        self.log(f"시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입", "info")
 
                 if not found_slot:
                     self.silent_tick(f"{target_time} 슬롯 대기")
@@ -309,7 +337,30 @@ class ZeroWorldEngine(BaseEngine):
             "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
         }
         
-        self.log(f"[태스크 {task_idx+1}] 신 제로월드 고속 감시 시작: {target_time}", "info")
+        # 요일 확인 (0~4: 평일, 5~6: 주말)
+        is_weekend = False
+        try:
+            from datetime import datetime
+            dt = datetime.strptime(rev_days, "%Y-%m-%d")
+            if dt.weekday() in [5, 6]:
+                is_weekend = True
+        except Exception:
+            pass
+
+        weekday_map = {
+            "10:50": "694", "12:00": "698", "13:10": "701", "14:20": "16",
+            "15:30": "704", "16:40": "705", "17:50": "706", "19:00": "709",
+            "20:10": "710", "21:20": "711"
+        }
+        weekend_map = {
+            "10:50": "695", "12:00": "699", "13:10": "702", "14:20": "707",
+            "15:30": "712", "16:40": "713", "17:50": "17", "19:00": "714",
+            "20:10": "715", "21:20": "716"
+        }
+        fallback_map = weekend_map if is_weekend else weekday_map
+        mapped_slot = fallback_map.get(target_time)
+        
+        self.log(f"[태스크 {task_idx+1}] 신 제로월드 고속 감시 시작: {target_time} (매핑 ID: {mapped_slot})", "info")
         
         slot_id = None
         while not self.stop_event.is_set():
@@ -342,6 +393,11 @@ class ZeroWorldEngine(BaseEngine):
                                 found_slot = match.group(1)
                                 break
                                 
+                    if not found_slot and mapped_slot:
+                        if len(soup.find_all('a')) >= 3:
+                            found_slot = mapped_slot
+                            self.log(f"[태스크 {task_idx+1}] 시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입", "info")
+
                     if not found_slot:
                         self.silent_tick(f"{target_time} 슬롯 대기")
                         await asyncio.sleep(0.1)
