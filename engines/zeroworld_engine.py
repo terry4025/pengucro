@@ -23,6 +23,7 @@ class ZeroWorldEngine(BaseEngine):
         self._notified_found = False
         self._last_err_msg = ""
         self._last_err_time = 0
+        self._last_wait_time = 0
 
     def get_csrf_token(self, session):
         response = session.get(self.site_url)
@@ -86,8 +87,30 @@ class ZeroWorldEngine(BaseEngine):
         self.log(f"신 제로월드 고속 감시 시작 (스레드): {target_time} (매핑 ID: {mapped_slot})", "info")
 
         slot_id = None
+        is_date_opened = False
         while not self.stop_event.is_set():
             try:
+                # 0. Check calendar if date is opened
+                if not is_date_opened:
+                    dt_parts = rev_days.split("-")
+                    cal_payload = f"act=calendar&zizum_num={zizum_num}&rev_days={rev_days}&year={dt_parts[0]}&month={dt_parts[1]}&s_subj={s_subj}"
+                    cal_resp = session.post(sel_url, data=cal_payload, headers=post_headers, timeout=5)
+                    if cal_resp.status_code == 200 and f"fun_days_select('{rev_days}'" in cal_resp.text:
+                        is_date_opened = True
+                        self.log(f"📅 예약 날짜({rev_days}) 오픈 확인! 예약 진행합니다.", "info")
+                    else:
+                        now = time.time()
+                        show_wait = False
+                        with self._log_lock:
+                            if (now - getattr(self, "_last_wait_time", 0)) > 2.0:
+                                self._last_wait_time = now
+                                show_wait = True
+                        if show_wait:
+                            self.log(f"⏳ 아직 열리지 않은 날짜 ({rev_days}) 대기 중... 계속 시도 중", "info")
+                        self.silent_tick(f"아직 열리지 않은 날짜 ({rev_days}) 대기 중")
+                        time.sleep(0.1)
+                        continue
+
                 # 1. Fetch time slots
                 payload = f"act=theme_time_list&zizum_num={zizum_num}&rev_days={rev_days}&theme_num={theme_num}"
                 resp = session.post(sel_url, data=payload, headers=post_headers, timeout=5)
@@ -104,10 +127,12 @@ class ZeroWorldEngine(BaseEngine):
 
                 soup = BeautifulSoup(html_text, 'html.parser')
                 found_slot = None
+                target_found_disabled = False
                 for a in soup.find_all('a'):
                     if target_time in a.text:
                         classes = a.get('class', [])
                         if any(c in classes for c in ['disable', 'close', 'sold-out']):
+                            target_found_disabled = True
                             continue
                         
                         href = a.get('href', '')
@@ -117,7 +142,7 @@ class ZeroWorldEngine(BaseEngine):
                             break
 
                 if not found_slot and mapped_slot:
-                    if len(soup.find_all('a')) >= 3:
+                    if "fun_theme_time_select" in html_text and not target_found_disabled:
                         found_slot = mapped_slot
                         show_log = False
                         with self._log_lock:
@@ -128,7 +153,7 @@ class ZeroWorldEngine(BaseEngine):
                             self.log(f"시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입 (첫 감지)", "info")
 
                 if not found_slot:
-                    self.silent_tick(f"{target_time} 슬롯 대기")
+                    self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
                     time.sleep(0.1)
                     continue
 
@@ -141,9 +166,15 @@ class ZeroWorldEngine(BaseEngine):
                 if show_found:
                     self.log(f"⏰ {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 진행 중...", "info")
 
+                if self.stop_event.is_set():
+                    break
+
                 # 2. Select slot
                 sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
                 session.post(sel_url, data=sel_payload, headers=post_headers, timeout=5)
+
+                if self.stop_event.is_set():
+                    break
 
                 # 3. Finalize reservation
                 act_data = {
@@ -193,6 +224,9 @@ class ZeroWorldEngine(BaseEngine):
                     success = True
 
                 if success:
+                    # 다른 태스크가 이미 성공했으면 중복 처리 방지
+                    if self.stop_event.is_set():
+                        break
                     # 2단계: 개인정보 동의 + 예약하기 자동 제출
                     final_msg = "예약 선점 성공 (수동 확인 필요)"
                     try:
@@ -213,13 +247,28 @@ class ZeroWorldEngine(BaseEngine):
                                 if ck_m2:
                                     ck_code_val = ck_m2.group(1)
                             mutong_url = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
-                            mutong_params = {"code": rev_code, "ck_code": ck_code_val, "layout_folder": "layout/res", "payment": "A", "privacy": "on"}
-                            mutong_resp = session.get(mutong_url, params=mutong_params, timeout=8)
+                            mutong_params = {
+                                "code": rev_code,
+                                "ck_code": ck_code_val,
+                                "layout_folder": "layout/res",
+                                "payment": "A",
+                                "privacy": "on",
+                                "name": name,
+                                "mobile": phone_digits
+                            }
+                            mutong_resp = session.post(mutong_url, data=mutong_params, timeout=8)
                             mutong_text = mutong_resp.text
                             bnum_m = re.search(r"예약번호[^0-9]*(\d+)", mutong_text)
                             if "완료" in mutong_text:
                                 bnum = bnum_m.group(1) if bnum_m else ck_code_val
                                 final_msg = f"예약 최종 완료! 예약번호: {bnum}"
+                                # ponytail: save success reservation details to local file
+                                try:
+                                    time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                                    with open("success_reservations.txt", "a", encoding="utf-8") as sf:
+                                        sf.write(f"[{time_str}] 제로월드(신) | 날짜: {rev_days} | 시간: {target_time} | 이름: {name} | 예약번호: {bnum}\n")
+                                except Exception:
+                                    pass
                             else:
                                 final_msg = f"예약 선점 성공! 코드: {rev_code} (결제확인 응답 재확인 필요)"
                         else:
@@ -408,8 +457,36 @@ class ZeroWorldEngine(BaseEngine):
         self.log(f"[태스크 {task_idx+1}] 신 제로월드 고속 감시 시작: {target_time} (매핑 ID: {mapped_slot})", "info")
         
         slot_id = None
+        is_date_opened = False
         while not self.stop_event.is_set():
             try:
+                # 0. Check calendar if date is opened
+                if not is_date_opened:
+                    dt_parts = rev_days.split("-")
+                    cal_payload = f"act=calendar&zizum_num={zizum_num}&rev_days={rev_days}&year={dt_parts[0]}&month={dt_parts[1]}&s_subj={s_subj}"
+                    async with session.post(sel_url, data=cal_payload, headers=headers, timeout=5) as cal_resp:
+                        if cal_resp.status == 200:
+                            cal_text = await cal_resp.text()
+                            if f"fun_days_select('{rev_days}'" in cal_text:
+                                is_date_opened = True
+                                self.log(f"[태스크 {task_idx+1}] 📅 예약 날짜({rev_days}) 오픈 확인! 예약 진행합니다.", "info")
+                            else:
+                                now = time.time()
+                                show_wait = False
+                                with self._log_lock:
+                                    if (now - getattr(self, "_last_wait_time", 0)) > 2.0:
+                                        self._last_wait_time = now
+                                        show_wait = True
+                                if show_wait:
+                                    self.log(f"⏳ [태스크 {task_idx+1}] 아직 열리지 않은 날짜 ({rev_days}) 대기 중... 계속 시도 중", "info")
+                                self.silent_tick(f"아직 열리지 않은 날짜 ({rev_days}) 대기 중")
+                                await asyncio.sleep(0.1)
+                                continue
+                        else:
+                            self.silent_tick("캘린더 조회 API 에러")
+                            await asyncio.sleep(0.1)
+                            continue
+
                 # 1. Fetch time slots
                 payload = f"act=theme_time_list&zizum_num={zizum_num}&rev_days={rev_days}&theme_num={theme_num}"
                 async with session.post(sel_url, data=payload, headers=headers, timeout=5) as resp:
@@ -426,10 +503,12 @@ class ZeroWorldEngine(BaseEngine):
                         
                     soup = BeautifulSoup(html_text, 'html.parser')
                     found_slot = None
+                    target_found_disabled = False
                     for a in soup.find_all('a'):
                         if target_time in a.text:
                             classes = a.get('class', [])
                             if any(c in classes for c in ['disable', 'close', 'sold-out']):
+                                target_found_disabled = True
                                 continue
                             
                             href = a.get('href', '')
@@ -439,7 +518,7 @@ class ZeroWorldEngine(BaseEngine):
                                 break
                                 
                     if not found_slot and mapped_slot:
-                        if len(soup.find_all('a')) >= 3:
+                        if "fun_theme_time_select" in html_text and not target_found_disabled:
                             found_slot = mapped_slot
                             show_log = False
                             with self._log_lock:
@@ -450,7 +529,7 @@ class ZeroWorldEngine(BaseEngine):
                                 self.log(f"시간표 파싱 우회: 맵핑된 슬롯 ID {found_slot} 강제 주입 (첫 감지)", "info")
 
                     if not found_slot:
-                        self.silent_tick(f"{target_time} 슬롯 대기")
+                        self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
                         await asyncio.sleep(0.1)
                         continue
                         
@@ -463,11 +542,17 @@ class ZeroWorldEngine(BaseEngine):
                     if show_found:
                         self.log(f"⏰ {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 진행 중...", "info")
                     
+                if self.stop_event.is_set():
+                    break
+
                 # 2. Select slot
                 sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
                 async with session.post(sel_url, data=sel_payload, headers=headers, timeout=5):
                     pass
                 
+                if self.stop_event.is_set():
+                    break
+
                 # 3. Finalize reservation
                 act_data = {
                     "name": name,
@@ -516,6 +601,9 @@ class ZeroWorldEngine(BaseEngine):
                         success = True
                         
                     if success:
+                        # 다른 태스크가 이미 성공했으면 중복 처리 방지
+                        if self.stop_event.is_set():
+                            break
                         # 2단계: 개인정보 동의 + 예약하기 자동 제출
                         final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공 (수동 확인 필요)"
                         try:
@@ -536,13 +624,28 @@ class ZeroWorldEngine(BaseEngine):
                                         if ck_m2:
                                             ck_code_val = ck_m2.group(1)
                                 mutong_url = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
-                                mutong_params = {"code": rev_code, "ck_code": ck_code_val, "layout_folder": "layout/res", "payment": "A", "privacy": "on"}
-                                async with session.get(mutong_url, params=mutong_params, timeout=8) as mutong_resp:
+                                mutong_params = {
+                                    "code": rev_code,
+                                    "ck_code": ck_code_val,
+                                    "layout_folder": "layout/res",
+                                    "payment": "A",
+                                    "privacy": "on",
+                                    "name": name,
+                                    "mobile": phone_digits
+                                }
+                                async with session.post(mutong_url, data=mutong_params, timeout=8) as mutong_resp:
                                     mutong_text = await mutong_resp.text()
                                     bnum_m = re.search(r"예약번호[^0-9]*(\d+)", mutong_text)
                                     if "완료" in mutong_text:
                                         bnum = bnum_m.group(1) if bnum_m else ck_code_val
                                         final_msg = f"[태스크 {task_idx+1}] 예약 최종 완료! 예약번호: {bnum}"
+                                        # ponytail: save success reservation details to local file
+                                        try:
+                                            time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                                            with open("success_reservations.txt", "a", encoding="utf-8") as sf:
+                                                sf.write(f"[{time_str}] 제로월드(신) | 날짜: {rev_days} | 시간: {target_time} | 이름: {name} | 예약번호: {bnum}\n")
+                                        except Exception:
+                                            pass
                                     else:
                                         final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! 코드: {rev_code} (결제확인 응답 재확인 필요)"
                             else:
