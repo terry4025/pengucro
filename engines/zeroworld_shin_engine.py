@@ -140,6 +140,14 @@ class ZeroWorldShinEngine(BaseEngine):
 
                 if not found_slot:
                     self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
+                    now = time.time()
+                    show_err = False
+                    with self._log_lock:
+                        if not hasattr(self, "_last_time_err_time") or (now - self._last_time_err_time) > 2.0:
+                            self._last_time_err_time = now
+                            show_err = True
+                    if show_err:
+                        self.log(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중", "warning")
                     time.sleep(0.1)
                     continue
 
@@ -432,6 +440,14 @@ class ZeroWorldShinEngine(BaseEngine):
 
                     if not found_slot:
                         self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
+                        now = time.time()
+                        show_err = False
+                        with self._log_lock:
+                            if not hasattr(self, "_last_time_err_time") or (now - self._last_time_err_time) > 2.0:
+                                self._last_time_err_time = now
+                                show_err = True
+                        if show_err:
+                            self.log(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중", "warning")
                         await asyncio.sleep(0.1)
                         continue
                         
