@@ -7,12 +7,14 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
     try:
         import asyncio
         import sys
-        from engines.zeroworld_engine import ZeroWorldEngine
+        from engines.zeroworld_shin_engine import ZeroWorldShinEngine
+        from engines.zeroworld_gu_engine import ZeroWorldGuEngine
         from engines.jigubyeol_engine import JigubyeolEngine
         from engines.keyescape_engine import KeyescapeEngine
         
         classes = {
-            'ZeroWorldEngine': ZeroWorldEngine,
+            'ZeroWorldShinEngine': ZeroWorldShinEngine,
+            'ZeroWorldGuEngine': ZeroWorldGuEngine,
             'JigubyeolEngine': JigubyeolEngine,
             'KeyescapeEngine': KeyescapeEngine
         }
@@ -31,8 +33,8 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
             success_event.set()
             log_queue.put(('success',))
             
-        if engine_class_name == 'ZeroWorldEngine':
-            engine = engine_class(site_url, child_log, child_success, is_shin=is_shin)
+        if engine_class_name in ['ZeroWorldShinEngine', 'ZeroWorldGuEngine']:
+            engine = engine_class(site_url, child_log, child_success)
         else:
             engine = engine_class(child_log, child_success, site_url)
             
@@ -80,6 +82,7 @@ class BaseEngine:
         self._last_error = ""
         self._lock = threading.Lock()
         self.submission_lock = threading.Lock()
+        self._success_fired = False
         self.listener_stop = threading.Event()
 
     def log(self, message, log_type='info'):
@@ -142,6 +145,7 @@ class BaseEngine:
         self.processes = []
         self._attempt_count = 0
         self._seen_errors = set()
+        self._success_fired = False
         
         if is_async:
             self.multiprocess_stop_event = multiprocessing.Event()
@@ -264,8 +268,10 @@ class BaseEngine:
                     if self.status_callback:
                         self.status_callback(self._attempt_count, error_msg)
                 elif itype == 'success':
-                    if self.success_callback:
-                        self.success_callback()
+                    if not self._success_fired:
+                        self._success_fired = True
+                        if self.success_callback:
+                            self.success_callback()
             except queue.Empty:
                 pass
             except Exception:

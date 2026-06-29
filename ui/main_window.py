@@ -2,7 +2,8 @@ import customtkinter as ctk
 import ui.theme as theme
 from ui.reservation_form import ReservationForm
 from ui.log_panel import LogPanel
-from engines.zeroworld_engine import ZeroWorldEngine
+from engines.zeroworld_shin_engine import ZeroWorldShinEngine
+from engines.zeroworld_gu_engine import ZeroWorldGuEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.naver_engine import NaverEngine
 from engines.keyescape_engine import KeyescapeEngine
@@ -1352,25 +1353,22 @@ class MainWindow(ctk.CTk):
                 success_callback=self._on_booking_success
             )
         elif selected_site == "제로월드(신)":
-            self.active_engine = ZeroWorldEngine(
+            self.active_engine = ZeroWorldShinEngine(
                 site_url=reservation_data.get('site_url'),
                 log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success,
-                is_shin=True
+                success_callback=self._on_booking_success
             )
         elif selected_site == "제로월드(구)":
-            self.active_engine = ZeroWorldEngine(
+            self.active_engine = ZeroWorldGuEngine(
                 site_url=reservation_data.get('site_url'),
                 log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success,
-                is_shin=False
+                success_callback=self._on_booking_success
             )
         else:
-            self.active_engine = ZeroWorldEngine(
+            self.active_engine = ZeroWorldGuEngine(
                 site_url=reservation_data.get('site_url'),
                 log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success,
-                is_shin=False
+                success_callback=self._on_booking_success
             )
 
         self.active_engine.status_callback = self._on_engine_status_update
