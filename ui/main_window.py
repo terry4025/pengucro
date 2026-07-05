@@ -1339,7 +1339,7 @@ class MainWindow(ctk.CTk):
                     site_url=site_info["base_url"]
                 )
             else:
-                self.active_engine = ZeroWorldEngine(
+                self.active_engine = ZeroWorldGuEngine(
                     site_url=site_info["url"],
                     log_callback=self._on_engine_log,
                     success_callback=self._on_booking_success
