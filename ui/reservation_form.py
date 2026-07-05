@@ -26,6 +26,7 @@ class ReservationForm(ctk.CTkFrame):
         self.current_site = "제로월드(신)"
         self.custom_sites = {}
         self.config = SITES_CONFIG[self.current_site]
+        self._is_initializing = True
         
         # Thread memory states
         self.standard_threads = 30
@@ -93,6 +94,7 @@ class ReservationForm(ctk.CTkFrame):
         self.theme_dropdown = ctk.CTkOptionMenu(
             self.theme_frame,
             variable=self.theme_var,
+            command=self._on_theme_change,
             fg_color=theme.ELEVATED_COLOR,
             button_color=theme.ELEVATED_COLOR,
             button_hover_color=theme.CARD_COLOR,
@@ -361,7 +363,8 @@ class ReservationForm(ctk.CTkFrame):
             fg_color=theme.ACCENT_BLUE,
             hover_color=theme.ACCENT_BLUE,
             text_color=theme.TEXT_PRIMARY,
-            corner_radius=theme.ROUNDED_SM
+            corner_radius=theme.ROUNDED_SM,
+            command=self.auto_save
         )
         self.dev_mode_checkbox.pack(side="left", anchor="w")
 
@@ -376,19 +379,23 @@ class ReservationForm(ctk.CTkFrame):
         # Initialize layout
         self.set_site(self.current_site)
         self._update_widgets_state()
+        self._is_initializing = False
 
     def _setup_entry_focus(self, entry):
         # Configure thin Apple hairline border
         entry.configure(border_width=1, font=theme.FONT_BODY_MD)
         entry.bind("<FocusIn>", lambda e: entry.configure(border_color=theme.ACCENT_BLUE) if entry.cget("state") == "normal" else None, add="+")
         entry.bind("<FocusOut>", lambda e: entry.configure(border_color=theme.HAIRLINE_COLOR), add="+")
+        entry.bind("<KeyRelease>", lambda e: self.auto_save(), add="+")
+        entry.bind("<FocusOut>", lambda e: self.auto_save(), add="+")
 
     def _on_mode_change(self, mode):
-        # Save previous state
-        if self.last_mode == "네이버 (Playwright)":
-            self.naver_threads = int(self.threads_slider.get())
-        else:
-            self.standard_threads = int(self.threads_slider.get())
+        # Save current slider value to appropriate variable before switching, but not during initialization
+        if not getattr(self, "_is_initializing", False):
+            if self.last_mode == "네이버 (Playwright)":
+                self.naver_threads = int(self.threads_slider.get())
+            else:
+                self.standard_threads = int(self.threads_slider.get())
 
         if mode == "네이버 (Playwright)":
             # Restrict threads slider to maximum of 8 and load cached value
@@ -491,6 +498,8 @@ class ReservationForm(ctk.CTkFrame):
             self.show_server_time_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
 
     def set_site(self, site_name):
+        was_initializing = getattr(self, "_is_initializing", False)
+        self._is_initializing = True
         self.current_site = site_name
         if site_name in self.custom_sites:
             self.config = self.custom_sites[site_name]
@@ -551,12 +560,15 @@ class ReservationForm(ctk.CTkFrame):
 
         self._update_theme_options()
         self._update_widgets_state()
+        self._is_initializing = was_initializing
 
     def _on_branch_change(self, value):
         self._update_theme_options()
+        self.auto_save()
 
     def _on_day_type_change(self, value):
         self._update_theme_options()
+        self.auto_save()
 
     def _toggle_custom_theme(self):
         # Only run toggle behavior if not in Naver mode to prevent overriding disabled state
@@ -568,11 +580,13 @@ class ReservationForm(ctk.CTkFrame):
         else:
             self.theme_dropdown.configure(state="normal")
             self.theme_pk_entry.pack_forget()
+        self.auto_save()
 
     def _toggle_server_time(self):
         # Call MainWindow update function if master has it
         if hasattr(self.master, "_update_server_time_sync_state"):
             self.master._update_server_time_sync_state()
+        self.auto_save()
 
     def _on_threads_slider_move(self, value):
         if self.current_site == "키이스케이프":
@@ -583,6 +597,7 @@ class ReservationForm(ctk.CTkFrame):
             self.naver_threads = val
         else:
             self.standard_threads = val
+        self.auto_save()
 
     def _on_date_change(self, event=None):
         """Auto-detect weekday/weekend from the entered date."""
@@ -599,8 +614,18 @@ class ReservationForm(ctk.CTkFrame):
             else:
                 self.day_type_var.set("평일")
             self._update_theme_options()
+            self.auto_save()
         except ValueError:
             pass
+
+    def _on_theme_change(self, value):
+        self.auto_save()
+
+    def auto_save(self):
+        if getattr(self, "_is_initializing", False):
+            return
+        if hasattr(self, "current_site") and self.current_site:
+            self.save_config(self.current_site)
 
     def _update_theme_options(self):
         if self.current_site in self.custom_sites:
@@ -641,7 +666,11 @@ class ReservationForm(ctk.CTkFrame):
 
         self.theme_dropdown.configure(values=theme_names)
         if theme_names:
-            self.theme_var.set(theme_names[0])
+            prev_theme = self.theme_var.get()
+            if prev_theme in theme_names:
+                self.theme_var.set(prev_theme)
+            else:
+                self.theme_var.set(theme_names[0])
         else:
             self.theme_var.set("")
 
@@ -840,6 +869,7 @@ class ReservationForm(ctk.CTkFrame):
         config_path = "config.json"
         if not os.path.exists(config_path):
             return
+        self._is_initializing = True
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -869,7 +899,7 @@ class ReservationForm(ctk.CTkFrame):
                     if config["custom_theme"]:
                         self.custom_theme_checkbox.select()
                         self.theme_dropdown.configure(state="disabled")
-                        self.theme_pk_entry.pack(fill="x", after=self.custom_theme_checkbox, pady=(2, 0))
+                        self.theme_pk_entry.pack(fill="x", after=self.checkbox_container, pady=(2, 0))
                     else:
                         self.custom_theme_checkbox.deselect()
                         self.theme_dropdown.configure(state="normal")
@@ -927,6 +957,8 @@ class ReservationForm(ctk.CTkFrame):
                 self.show_server_time_checkbox.deselect()
         except Exception:
             pass
+        finally:
+            self._is_initializing = False
 
     def save_config(self, site_name):
         import json

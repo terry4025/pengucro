@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 import multiprocessing
 
-def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, stop_event, log_queue, success_event, is_shin=False):
+def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, stop_event, log_queue, success_event, is_shin=False, **kwargs):
     try:
         import asyncio
         import sys
@@ -39,6 +39,7 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
             engine = engine_class(child_log, child_success, site_url)
             
         engine.stop_event = stop_event
+        engine.submission_lock = kwargs.get('submission_lock', threading.Lock())
         engine.is_running = True
         
         loop = asyncio.new_event_loop()
@@ -150,6 +151,7 @@ class BaseEngine:
         if is_async:
             self.multiprocess_stop_event = multiprocessing.Event()
             self.multiprocess_success_event = multiprocessing.Event()
+            self.multiprocess_submission_lock = multiprocessing.Lock()
             self.log_queue = multiprocessing.Queue()
             
             # Divide work across processes (up to CPU core count, max 4)
@@ -185,6 +187,7 @@ class BaseEngine:
                         self.multiprocess_success_event,
                         is_shin
                     ),
+                    kwargs={'submission_lock': self.multiprocess_submission_lock},
                     name=f"BookingProcess-{i+1}"
                 )
                 p.daemon = True

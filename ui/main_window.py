@@ -884,6 +884,7 @@ class MainWindow(ctk.CTk):
         )
         self.form.custom_sites = self.custom_sites
         self.form.pack(fill="x", padx=20, pady=(0, 6))
+        self.form._is_initializing = True
         self.form.set_site(saved_site)
         self.form.load_config()
         self._update_server_time_sync_state()
