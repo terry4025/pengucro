@@ -208,8 +208,9 @@ class JigubyeolEngine(BaseEngine):
         session = None
         csrf_token = None
         
-        if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
-            session, csrf_token = self.session_pool[task_idx]
+        if hasattr(self, "session_pool") and len(self.session_pool) > 0:
+            local_idx = task_idx % len(self.session_pool)
+            session, csrf_token = self.session_pool[local_idx]
             
         if not session:
             headers = {
@@ -310,11 +311,14 @@ class JigubyeolEngine(BaseEngine):
                         else:
                             await self.handle_error_async(step2_response, reservation_data, '최종예약')
                 except Exception as e:
+                    if self.stop_event.is_set():
+                        break
                     csrf_token = None
                     self.log(f"{reservation_data['reservationTime'][:5]} 시도 중... (연결 오류 - 재시도)", "info")
                     await asyncio.sleep(0.1)
         finally:
-            if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
+            is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
+            if not is_pooled:
                 await session.close()
 
     async def get_csrf_token_async(self, session):

@@ -323,10 +323,12 @@ class DoomEscapeEngine(BaseEngine):
                     self.log(f"오류 발생: {err_str}", "error")
                 time.sleep(0.1)
 
-    async def make_reservation_async_task(self, session_pool, reservation_data, task_idx):
+    async def make_reservation_async_task(self, reservation_data, task_idx):
         """
         Doom Escape Asynchronous Booking Path
         """
+        import aiohttp
+        import asyncio
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
@@ -359,7 +361,12 @@ class DoomEscapeEngine(BaseEngine):
         list_url = f"https://doomescape.com/layout/res/home.php?go=rev.make&s_zizum={zizum_num}&rev_days={rev_days}"
         act_url = "https://doomescape.com/core/res/rev.act.php"
 
-        session = session_pool[task_idx % len(session_pool)]
+        session = None
+        if hasattr(self, "session_pool") and len(self.session_pool) > 0:
+            session = self.session_pool[task_idx % len(self.session_pool)]
+        if not session:
+            session = aiohttp.ClientSession(headers=headers)
+            
         self.log(f"[태스크 {task_idx+1}] 둠이스케이프 비동기 테스크 시작", "info")
 
         while not self.stop_event.is_set():
@@ -597,6 +604,8 @@ class DoomEscapeEngine(BaseEngine):
                             pass
 
             except Exception as e:
+                if self.stop_event.is_set():
+                    break
                 err_str = str(e)
                 now = time.time()
                 show_log = False
@@ -605,6 +614,45 @@ class DoomEscapeEngine(BaseEngine):
                         self._last_err_msg = err_str
                         self._last_err_time = now
                         show_log = True
-                if show_log:
+                if show_log and not self.stop_event.is_set():
                     self.log(f"[태스크 {task_idx+1}] 오류 발생: {err_str}", "error")
+                
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                
+                headers_re = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                session = aiohttp.ClientSession(headers=headers_re)
+                if hasattr(self, "session_pool") and len(self.session_pool) > 0:
+                    local_idx = task_idx % len(self.session_pool)
+                    self.session_pool[local_idx] = session
+                    
+                if self.stop_event.is_set():
+                    break
                 await asyncio.sleep(0.1)
+                
+        is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
+        if not is_pooled:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+    async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
+        import aiohttp
+        self.session_pool = []
+        self.log(f"Pre-fetching {num_sessions} sessions for Doom Escape...", "info")
+        home_url = "https://doomescape.com/layout/res/home.php?go=main"
+        for _ in range(num_sessions):
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            session = aiohttp.ClientSession(headers=headers)
+            try:
+                await session.get(home_url, timeout=5)
+            except Exception:
+                pass
+            self.session_pool.append(session)

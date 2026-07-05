@@ -11,12 +11,14 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
         from engines.zeroworld_gu_engine import ZeroWorldGuEngine
         from engines.jigubyeol_engine import JigubyeolEngine
         from engines.keyescape_engine import KeyescapeEngine
+        from engines.doomescape_engine import DoomEscapeEngine
         
         classes = {
             'ZeroWorldShinEngine': ZeroWorldShinEngine,
             'ZeroWorldGuEngine': ZeroWorldGuEngine,
             'JigubyeolEngine': JigubyeolEngine,
-            'KeyescapeEngine': KeyescapeEngine
+            'KeyescapeEngine': KeyescapeEngine,
+            'DoomEscapeEngine': DoomEscapeEngine
         }
         
         engine_class = classes[engine_class_name]
@@ -33,7 +35,7 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
             success_event.set()
             log_queue.put(('success',))
             
-        if engine_class_name in ['ZeroWorldShinEngine', 'ZeroWorldGuEngine']:
+        if engine_class_name in ['ZeroWorldShinEngine', 'ZeroWorldGuEngine', 'DoomEscapeEngine']:
             engine = engine_class(site_url, child_log, child_success)
         else:
             engine = engine_class(child_log, child_success, site_url)
@@ -42,10 +44,11 @@ def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, 
         engine.submission_lock = kwargs.get('submission_lock', threading.Lock())
         engine.is_running = True
         
+        start_idx_offset = kwargs.get('start_idx_offset', 0)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(engine.run_async_tasks(reservation_data, num_tasks))
+            loop.run_until_complete(engine.run_async_tasks(reservation_data, num_tasks, start_idx_offset))
         except Exception as e:
             child_log(f"Child process async loop error: {e}", "error")
         finally:
@@ -171,6 +174,7 @@ class BaseEngine:
             class_name = self.__class__.__name__
             site_url = self.site_url if hasattr(self, "site_url") else self.base_url
             is_shin = getattr(self, "is_shin", False)
+            start_idx_offset = 0
             for i in range(num_proc):
                 p_tasks = tasks_per_proc + (1 if i < remainder else 0)
                 if p_tasks <= 0:
@@ -187,12 +191,16 @@ class BaseEngine:
                         self.multiprocess_success_event,
                         is_shin
                     ),
-                    kwargs={'submission_lock': self.multiprocess_submission_lock},
+                    kwargs={
+                        'submission_lock': self.multiprocess_submission_lock,
+                        'start_idx_offset': start_idx_offset
+                    },
                     name=f"BookingProcess-{i+1}"
                 )
                 p.daemon = True
                 self.processes.append(p)
                 p.start()
+                start_idx_offset += p_tasks
                 
             # Monitor processes
             monitor_thread = threading.Thread(target=self._monitor_processes)
@@ -226,7 +234,7 @@ class BaseEngine:
         finally:
             loop.close()
 
-    async def run_async_tasks(self, reservation_data, num_tasks):
+    async def run_async_tasks(self, reservation_data, num_tasks, start_idx_offset=0):
         import asyncio
         self.async_submission_lock = asyncio.Lock()
         
@@ -236,7 +244,7 @@ class BaseEngine:
             
         tasks = []
         for i in range(num_tasks):
-            tasks.append(asyncio.create_task(self.make_reservation_async_task(reservation_data, i)))
+            tasks.append(asyncio.create_task(self.make_reservation_async_task(reservation_data, start_idx_offset + i)))
             
         await asyncio.gather(*tasks)
 

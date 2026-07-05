@@ -373,8 +373,9 @@ class ZeroWorldShinEngine(BaseEngine):
 
     async def make_reservation_async_task(self, reservation_data, task_idx):
         session = None
-        if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
-            session, _ = self.session_pool[task_idx]
+        if hasattr(self, "session_pool") and len(self.session_pool) > 0:
+            local_idx = task_idx % len(self.session_pool)
+            session, _ = self.session_pool[local_idx]
             
         if not session:
             headers = {
@@ -701,9 +702,11 @@ class ZeroWorldShinEngine(BaseEngine):
                                     self._last_err_msg = err_msg
                                     self._last_err_time = now
                                     show_err = True
-                            if show_err:
+                            if show_err and not self.stop_event.is_set():
                                 self.log(f"제출 대기 중: {err_msg}", "warning")
                                 
+                            if self.stop_event.is_set():
+                                break
                             await asyncio.sleep(0.5)
                 finally:
                     if lock_acquired and hasattr(self, "submission_lock"):
@@ -713,6 +716,8 @@ class ZeroWorldShinEngine(BaseEngine):
                             pass
                         
             except Exception as e:
+                if self.stop_event.is_set():
+                    break
                 now = time.time()
                 show_conn_err = False
                 with self._log_lock:
@@ -720,7 +725,7 @@ class ZeroWorldShinEngine(BaseEngine):
                         self._last_err_msg = "connection_error"
                         self._last_err_time = now
                         show_conn_err = True
-                if show_conn_err:
+                if show_conn_err and not self.stop_event.is_set():
                     self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
                 try:
                     await session.close()
@@ -733,11 +738,15 @@ class ZeroWorldShinEngine(BaseEngine):
                     "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
                 }
                 session = aiohttp.ClientSession(headers=headers_re)
-                if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
-                    self.session_pool[task_idx] = (session, self.session_pool[task_idx][1])
+                if hasattr(self, "session_pool") and len(self.session_pool) > 0:
+                    local_idx = task_idx % len(self.session_pool)
+                    self.session_pool[local_idx] = (session, self.session_pool[local_idx][1])
+                if self.stop_event.is_set():
+                    break
                 await asyncio.sleep(0.5)
                 
-        if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
+        is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
+        if not is_pooled:
             await session.close()
 
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):

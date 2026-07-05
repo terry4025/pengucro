@@ -95,8 +95,9 @@ class ZeroWorldGuEngine(BaseEngine):
         session = None
         csrf_token = None
         
-        if hasattr(self, "session_pool") and task_idx < len(self.session_pool):
-            session, csrf_token = self.session_pool[task_idx]
+        if hasattr(self, "session_pool") and len(self.session_pool) > 0:
+            local_idx = task_idx % len(self.session_pool)
+            session, csrf_token = self.session_pool[local_idx]
             
         if not session:
             headers = {
@@ -168,11 +169,14 @@ class ZeroWorldGuEngine(BaseEngine):
                             
                         await asyncio.sleep(0.1)
             except Exception as e:
+                if self.stop_event.is_set():
+                    break
                 csrf_token = None
                 self.silent_tick(f"연결 오류: {e}")
                 await asyncio.sleep(0.2)
                 
-        if not hasattr(self, "session_pool") or task_idx >= len(self.session_pool):
+        is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
+        if not is_pooled:
             await session.close()
 
     async def get_csrf_token_async(self, session):
