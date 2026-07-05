@@ -37,6 +37,12 @@ class ZeroWorldShinEngine(BaseEngine):
         target_time = reservation_data.get("reservationTime")[:5]
         name = reservation_data.get("name")
         phone_digits = "".join(c for c in reservation_data.get("phone", "") if c.isdigit())
+        if len(phone_digits) == 11:
+            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:7]}-{phone_digits[7:11]}"
+        elif len(phone_digits) == 10:
+            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:6]}-{phone_digits[6:10]}"
+        else:
+            phone_formatted = phone_digits
         people = reservation_data.get("people", "2")
         s_subj = "B" if zizum_num == "2" else "A"
 
@@ -184,7 +190,7 @@ class ZeroWorldShinEngine(BaseEngine):
                     # 3. Finalize reservation
                     act_data = {
                         "name": name,
-                        "mobile": phone_digits,
+                        "mobile": phone_formatted,
                         "person": people,
                         "zizum_num": zizum_num,
                         "rev_days": rev_days,
@@ -256,8 +262,8 @@ class ZeroWorldShinEngine(BaseEngine):
                                     "payment": "A",
                                     "privacy": "on",
                                     "name": name,
-                                    "mobile": phone_digits,
-                                    "tel": phone_digits
+                                    "mobile": phone_formatted,
+                                    "tel": phone_formatted
                                 }
                                 mutong_resp = session.post(mutong_url, data=mutong_params, timeout=8)
                                 try:
@@ -389,6 +395,12 @@ class ZeroWorldShinEngine(BaseEngine):
         target_time = reservation_data.get("reservationTime")[:5]
         name = reservation_data.get("name")
         phone_digits = "".join(c for c in reservation_data.get("phone", "") if c.isdigit())
+        if len(phone_digits) == 11:
+            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:7]}-{phone_digits[7:11]}"
+        elif len(phone_digits) == 10:
+            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:6]}-{phone_digits[6:10]}"
+        else:
+            phone_formatted = phone_digits
         people = reservation_data.get("people", "2")
         s_subj = "B" if zizum_num == "2" else "A"
         
@@ -541,7 +553,7 @@ class ZeroWorldShinEngine(BaseEngine):
                     # 3. Finalize reservation
                     act_data = {
                         "name": name,
-                        "mobile": phone_digits,
+                        "mobile": phone_formatted,
                         "person": people,
                         "zizum_num": zizum_num,
                         "rev_days": rev_days,
@@ -613,8 +625,8 @@ class ZeroWorldShinEngine(BaseEngine):
                                         "payment": "A",
                                         "privacy": "on",
                                         "name": name,
-                                        "mobile": phone_digits,
-                                        "tel": phone_digits
+                                        "mobile": phone_formatted,
+                                        "tel": phone_formatted
                                     }
                                     
                                     # The original code used POST. Let's stick to POST with dict to ensure proper UTF-8 urlencoding
