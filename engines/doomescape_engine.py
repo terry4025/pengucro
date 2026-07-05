@@ -92,7 +92,7 @@ class DoomEscapeEngine(BaseEngine):
                     time.sleep(0.1)
                     continue
 
-                html_text = resp.content.decode('cp949', errors='ignore')
+                html_text = resp.content.decode('utf-8', errors='ignore')
                 
                 # Parse available slots
                 soup = BeautifulSoup(html_text, 'html.parser')
@@ -165,7 +165,7 @@ class DoomEscapeEngine(BaseEngine):
                     # 2. Visit input page to extract prices dynamically
                     input_url = f"https://doomescape.com/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
                     resp_input = session.get(input_url, timeout=5)
-                    input_html = resp_input.content.decode('cp949', errors='ignore')
+                    input_html = resp_input.content.decode('utf-8', errors='ignore')
 
                     price_fields = {}
                     # Extract hidden price fields
@@ -230,7 +230,7 @@ class DoomEscapeEngine(BaseEngine):
                         
                         # 4. Fetch KCP page to extract ck_code
                         kcp_resp = session.get(kcp_url, timeout=8)
-                        kcp_text = kcp_resp.content.decode('cp949', errors='ignore')
+                        kcp_text = kcp_resp.content.decode('utf-8', errors='ignore')
                         
                         ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
                         ck_code_val = ck_m.group(1) if ck_m else ""
@@ -380,7 +380,7 @@ class DoomEscapeEngine(BaseEngine):
 
                     # Read raw bytes and decode as CP949
                     html_bytes = await resp.read()
-                    html_text = html_bytes.decode('cp949', errors='ignore')
+                    html_text = html_bytes.decode('utf-8', errors='ignore')
 
                 # Parse available slots
                 soup = BeautifulSoup(html_text, 'html.parser')
@@ -454,7 +454,7 @@ class DoomEscapeEngine(BaseEngine):
                     input_url = f"https://doomescape.com/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
                     async with session.get(input_url, timeout=5) as resp_input:
                         input_bytes = await resp_input.read()
-                        input_html = input_bytes.decode('cp949', errors='ignore')
+                        input_html = input_bytes.decode('utf-8', errors='ignore')
 
                     price_fields = {}
                     # Extract hidden price fields
@@ -521,7 +521,7 @@ class DoomEscapeEngine(BaseEngine):
                         
                         # 4. Fetch KCP page to extract ck_code
                         async with session.get(kcp_url, headers=headers, timeout=8) as kcp_resp:
-                            kcp_text = await kcp_resp.text(encoding='cp949', errors='ignore')
+                            kcp_text = await kcp_resp.text(encoding='utf-8', errors='ignore')
                         
                         ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
                         ck_code_val = ck_m.group(1) if ck_m else ""
