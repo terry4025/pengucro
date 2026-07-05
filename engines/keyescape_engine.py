@@ -334,11 +334,20 @@ class KeyescapeEngine(BaseEngine):
                 # 2. Fill Name
                 await page.locator('input#name_input').fill(reservation_data['name'])
                 
-                # 3. Fill Phone (mobile2, mobile3)
-                phone_parts = reservation_data['phone'].split('-')
-                if len(phone_parts) >= 3:
-                    await page.locator('input[name=mobile2]').fill(phone_parts[1])
-                    await page.locator('input[name=mobile3]').fill(phone_parts[2])
+                phone_digits = "".join(c for c in reservation_data['phone'] if c.isdigit())
+                if len(phone_digits) == 11:
+                    m2 = phone_digits[3:7]
+                    m3 = phone_digits[7:11]
+                elif len(phone_digits) == 10:
+                    m2 = phone_digits[3:6]
+                    m3 = phone_digits[6:10]
+                else:
+                    m2 = ""
+                    m3 = ""
+                
+                if m2 and m3:
+                    await page.locator('input[name=mobile2]').fill(m2)
+                    await page.locator('input[name=mobile3]').fill(m3)
                 
                 # 4. Check Agree All via JS evaluation to avoid hidden-element click failures
                 await page.evaluate("""() => {
