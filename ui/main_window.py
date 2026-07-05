@@ -3,6 +3,7 @@ import ui.theme as theme
 from ui.reservation_form import ReservationForm
 from ui.log_panel import LogPanel
 from engines.zeroworld_shin_engine import ZeroWorldShinEngine
+from engines.doomescape_engine import DoomEscapeEngine
 from engines.zeroworld_gu_engine import ZeroWorldGuEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.naver_engine import NaverEngine
@@ -816,7 +817,7 @@ class MainWindow(ctk.CTk):
         self.last_naver_site = None
         
         # Build options list
-        self.default_site_names = ["제로월드(신)", "제로월드(구)", "지구별방탈출", "키이스케이프"]
+        self.default_site_names = ["제로월드(신)", "제로월드(구)", "지구별방탈출", "키이스케이프", "둠이스케이프"]
         site_options = self.default_site_names + list(self.custom_sites.keys())
         
         # Fallback if saved site is no longer in options
@@ -1350,6 +1351,12 @@ class MainWindow(ctk.CTk):
             )
         elif selected_site == "키이스케이프":
             self.active_engine = KeyescapeEngine(
+                log_callback=self._on_engine_log,
+                success_callback=self._on_booking_success
+            )
+        elif selected_site == "둠이스케이프":
+            self.active_engine = DoomEscapeEngine(
+                site_url=reservation_data.get('site_url'),
                 log_callback=self._on_engine_log,
                 success_callback=self._on_booking_success
             )

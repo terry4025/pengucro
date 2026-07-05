@@ -6,7 +6,7 @@ from data.themes import (
     ZEROWORLD_HONGDAE_THEMES_WEEKDAY, ZEROWORLD_HONGDAE_THEMES_WEEKEND,
     ZEROWORLD_GIMPO_THEMES_WEEKDAY, ZEROWORLD_GIMPO_THEMES_WEEKEND,
     JIGUBYEOL_THEMES, PHOBIADUNGEON_THEMES, SITES_CONFIG, JIGUBYEOL_THEME_ALIASES,
-    KEYESCAPE_THEMES
+    KEYESCAPE_THEMES, DOOMESCAPE_THEMES
 )
 from datetime import datetime, timedelta
 import calendar
@@ -633,6 +633,11 @@ class ReservationForm(ctk.CTkFrame):
             branch_id = self.config["branches"].get(branch_name, "1")
             themes_dict = self.config["themes"].get(branch_id, {})
             theme_names = sorted(list(themes_dict.keys()))
+        elif self.current_site == "둠이스케이프":
+            branch_name = self.branch_var.get()
+            branch_id = self.config["branches"].get(branch_name, "3")
+            themes_dict = DOOMESCAPE_THEMES.get(branch_id, {})
+            theme_names = sorted(list(themes_dict.keys()))
         elif self.current_site == "제로월드(신)":
             branch_name = self.branch_var.get()
             branch_id = self.config["branches"].get(branch_name, "1")
@@ -699,6 +704,9 @@ class ReservationForm(ctk.CTkFrame):
             theme_name = self.theme_var.get()
             if self.current_site in self.custom_sites:
                 theme_pk = self.config["themes"].get(branch_id, {}).get(theme_name, "")
+            elif self.current_site == "둠이스케이프":
+                themes_dict = DOOMESCAPE_THEMES.get(branch_id, {})
+                theme_pk = themes_dict.get(theme_name, "")
             elif self.current_site == "제로월드(신)":
                 themes_dict = ZEROWORLD_THEMES.get(branch_id, {})
                 theme_pk = themes_dict.get(theme_name, "")
