@@ -6,6 +6,7 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta
 from engines.base_engine import BaseEngine
+from pengucro.storage import SecretStore, data_path
 
 class NaverEngine(BaseEngine):
     def __init__(self, log_callback, success_callback=None, status_callback=None, log_batch_callback=None):
@@ -16,7 +17,31 @@ class NaverEngine(BaseEngine):
         self.playwright_thread = None
         self.loop = None
         self.browser = None
-        self.cookies_path = "naver_cookies.json"
+        self.secret_store = SecretStore()
+
+    def _load_cookies(self):
+        encrypted = self.secret_store.get("naver_cookies")
+        if encrypted:
+            try:
+                return json.loads(encrypted)
+            except (TypeError, ValueError):
+                pass
+
+        legacy_path = "naver_cookies.json"
+        if os.path.exists(legacy_path):
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as stream:
+                    cookies = json.load(stream)
+                self._save_cookies(cookies)
+                if self.secret_store.get("naver_cookies"):
+                    os.remove(legacy_path)
+                return cookies
+            except (OSError, TypeError, ValueError):
+                pass
+        return []
+
+    def _save_cookies(self, cookies):
+        self.secret_store.set("naver_cookies", json.dumps(cookies, ensure_ascii=False))
 
     def start_reservation(self, reservation_data, num_threads, is_async=False):
         if self.is_running:
@@ -26,7 +51,9 @@ class NaverEngine(BaseEngine):
         self.is_running = True
         self.stop_event.clear()
         self._attempt_count = 0
+        self._last_error = ""
         self._seen_errors = set()
+        self._success_fired = False
 
         self.log(f"네이버 (Playwright) 예약을 시작합니다. (병렬 인스턴스: {num_threads}개)", "info")
 
@@ -48,7 +75,8 @@ class NaverEngine(BaseEngine):
         if self.playwright_thread:
             self.playwright_thread.join()
         self.is_running = False
-        self.log("네이버 예약 작업이 중단되었습니다.", "info")
+        message = "네이버 예약 작업이 성공적으로 종료되었습니다." if self._success_fired else "네이버 예약 작업이 중단되었습니다."
+        self.log(message, "success" if self._success_fired else "info")
 
     def stop_reservation(self):
         if not self.is_running:
@@ -100,14 +128,12 @@ class NaverEngine(BaseEngine):
         page = await context.new_page()
 
         # Load existing cookies if present
-        cookies = []
-        if os.path.exists(self.cookies_path):
+        cookies = self._load_cookies()
+        if cookies:
             try:
-                with open(self.cookies_path, "r", encoding="utf-8") as f:
-                    cookies = json.load(f)
-                    await context.add_cookies(cookies)
+                await context.add_cookies(cookies)
             except Exception:
-                pass
+                cookies = []
 
         # Go to booking page or Naver home to check if logged in
         await page.goto("https://booking.naver.com")
@@ -154,8 +180,7 @@ class NaverEngine(BaseEngine):
             if login_success:
                 # Save new cookies
                 new_cookies = await context.cookies()
-                with open(self.cookies_path, "w", encoding="utf-8") as f:
-                    json.dump(new_cookies, f, ensure_ascii=False, indent=2)
+                self._save_cookies(new_cookies)
                 self.log("✓ 로그인 완료! 세션 쿠키를 성공적으로 저장했습니다.", "success")
             else:
                 self.log("❌ 로그인 제한시간이 초과되었거나 취소되었습니다.", "error")
@@ -182,14 +207,10 @@ class NaverEngine(BaseEngine):
                 return
 
             # Read saved cookies
-            cookies = []
-            if os.path.exists(self.cookies_path):
-                try:
-                    with open(self.cookies_path, "r", encoding="utf-8") as f:
-                        cookies = json.load(f)
-                except Exception as e:
-                    self.log(f"쿠키 파일 읽기 실패: {e}", "error")
-                    return
+            cookies = self._load_cookies()
+            if not cookies:
+                self.log("네이버 로그인 쿠키를 불러오지 못했습니다.", "error")
+                return
 
             # Step 2: Parallel Headless Booking attempts
             is_dev = reservation_data.get('devMode', False)
@@ -349,8 +370,8 @@ class NaverEngine(BaseEngine):
                         if res_data.get('devMode', False) and worker_id == 1:
                             try:
                                 debug_html = await page.content()
-                                debug_path = r"C:\Users\Administrator\.gemini\antigravity\brain\1de2937b-3d9d-446d-87ed-b04f2d021bc6\scratch\naver_request_debug.html"
-                                with open(debug_path, "w", encoding="utf-8") as f:
+                                debug_path = data_path("naver_request_debug.html")
+                                with debug_path.open("w", encoding="utf-8") as f:
                                     f.write(debug_html)
                                 self.log(f"✓ [{worker_id}번 기기] [디버그] 네이버 요청 페이지 HTML 저장 완료: {debug_path}", "info")
                             except Exception as e:
@@ -596,9 +617,7 @@ class NaverEngine(BaseEngine):
                                 f"🎉 [{worker_id}번 기기] 네이버 예약 성공!! URL: {cur}",
                                 "success"
                             )
-                            self.stop_event.set()
-                            if self.success_callback:
-                                self.success_callback()
+                            self.notify_success()
                             break
                         else:
                             self.log(

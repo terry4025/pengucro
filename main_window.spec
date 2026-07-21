@@ -1,16 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['ui\\main_window.py', 'app.py'],
     pathex=[],
     binaries=[],
     datas=[('icon.ico', '.'), ('app_icon.png', '.')],
-    hiddenimports=[],
+    hiddenimports=['engines.zeroworld_shin_engine', 'engines.doomescape_engine', 'engines.zeroworld_gu_engine', 'engines.jigubyeol_engine', 'engines.keyescape_engine', 'engines.naver_engine', 'playwright.async_api', 'win32crypt'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pydantic', 'pydantic_core'],
     noarchive=False,
     optimize=0,
 )

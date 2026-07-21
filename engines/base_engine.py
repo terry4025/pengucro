@@ -1,306 +1,288 @@
-import threading
-import time
-from datetime import datetime
-import multiprocessing
+from __future__ import annotations
 
-def child_process_run(engine_class_name, site_url, reservation_data, num_tasks, stop_event, log_queue, success_event, is_shin=False, **kwargs):
-    try:
-        import asyncio
-        import sys
-        from engines.zeroworld_shin_engine import ZeroWorldShinEngine
-        from engines.zeroworld_gu_engine import ZeroWorldGuEngine
-        from engines.jigubyeol_engine import JigubyeolEngine
-        from engines.keyescape_engine import KeyescapeEngine
-        from engines.doomescape_engine import DoomEscapeEngine
-        
-        classes = {
-            'ZeroWorldShinEngine': ZeroWorldShinEngine,
-            'ZeroWorldGuEngine': ZeroWorldGuEngine,
-            'JigubyeolEngine': JigubyeolEngine,
-            'KeyescapeEngine': KeyescapeEngine,
-            'DoomEscapeEngine': DoomEscapeEngine
-        }
-        
-        engine_class = classes[engine_class_name]
-        
-        def child_log(message, log_type='info'):
-            log_queue.put(('log', message, log_type))
-            if "시도 중" in message:
-                error_part = "재시도"
-                if "시도 중... (" in message:
-                    error_part = message.split("시도 중... (")[1].rstrip(")")
-                log_queue.put(('tick', 1, error_part))
-                
-        def child_success():
-            success_event.set()
-            log_queue.put(('success',))
-            
-        if engine_class_name in ['ZeroWorldShinEngine', 'ZeroWorldGuEngine', 'DoomEscapeEngine']:
-            engine = engine_class(site_url, child_log, child_success)
-        else:
-            engine = engine_class(child_log, child_success, site_url)
-            
-        engine.stop_event = stop_event
-        engine.submission_lock = kwargs.get('submission_lock', threading.Lock())
-        engine.is_running = True
-        
-        start_idx_offset = kwargs.get('start_idx_offset', 0)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(engine.run_async_tasks(reservation_data, num_tasks, start_idx_offset))
-        except Exception as e:
-            child_log(f"Child process async loop error: {e}", "error")
-        finally:
-            loop.close()
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        try:
-            log_queue.put(('log', f"CRITICAL Child Process Boot Error: {e}\n{tb}", "error"))
-        except Exception:
-            pass
+import asyncio
+import threading
+from datetime import datetime
+from typing import Any, Callable
+
+from pengucro.models import BookingEvent, BookingEventType, BookingResult
+
+
+LogCallback = Callable[[str, str], None]
+SuccessCallback = Callable[[], None]
+StatusCallback = Callable[[int, str], None]
+EventCallback = Callable[[BookingEvent], None]
+
+
+class SubmissionLock:
+    """Lock with compatibility for both `blocking=` and legacy `block=` callers."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def acquire(self, blocking: bool = True, *, block: bool | None = None) -> bool:
+        if block is not None:
+            blocking = block
+        return self._lock.acquire(blocking=blocking)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.release()
+
 
 class BaseEngine:
-    def __init__(self, log_callback, success_callback=None, status_callback=None, log_batch_callback=None):
-        """
-        Base engine for escape room bookings.
-        
-        :param log_callback: A function taking (message, type) to log messages.
-                             Types: 'info', 'success', 'error', 'warning'
-        :param success_callback: A function to call when booking is successful.
-        :param status_callback: A function taking (attempt_count, last_error) to
-                                silently update the UI status badge without logging.
-        :param log_batch_callback: A function taking (list of (message, type)) to log in batches.
-        """
+    """Common lifecycle and event handling for all booking engines.
+
+    HTTP engines run their async workers in one background event-loop thread. This
+    keeps the Tk main thread responsive without the process/queue complexity that
+    previously duplicated state and made graceful shutdown unreliable.
+    """
+
+    def __init__(
+        self,
+        log_callback: LogCallback,
+        success_callback: SuccessCallback | None = None,
+        status_callback: StatusCallback | None = None,
+        log_batch_callback: Callable[[list[tuple[str, str]]], None] | None = None,
+        event_callback: EventCallback | None = None,
+    ) -> None:
         self.log_callback = log_callback
         self.success_callback = success_callback
         self.status_callback = status_callback
         self.log_batch_callback = log_batch_callback
+        self.event_callback = event_callback
+
         self.stop_event = threading.Event()
-        self.threads = []
-        self.processes = []
+        self.listener_stop = threading.Event()
+        self.threads: list[threading.Thread] = []
+        self.async_thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.is_running = False
-        self._seen_errors = set()
+
+        self._seen_errors: set[str] = set()
         self._attempt_count = 0
         self._last_error = ""
         self._lock = threading.Lock()
-        self.submission_lock = threading.Lock()
+        self._success_lock = threading.Lock()
+        self.submission_lock = SubmissionLock()
         self._success_fired = False
-        self.listener_stop = threading.Event()
 
-    def log(self, message, log_type='info'):
-        # Discard trailing attempts/retries/errors after stop event is set to prevent logging after success or stop
-        if self.stop_event.is_set() and ("시도 중" in message or "연결 오류" in message or "오류" in message):
+    @property
+    def attempt_count(self) -> int:
+        with self._lock:
+            return self._attempt_count
+
+    def emit_event(
+        self,
+        event_type: BookingEventType,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self.event_callback:
+            self.event_callback(
+                BookingEvent(
+                    event_type=event_type,
+                    message=message,
+                    attempt_count=self.attempt_count,
+                    details=details or {},
+                )
+            )
+
+    def log(self, message: str, log_type: str = "info") -> None:
+        if self.stop_event.is_set() and any(token in message for token in ("시도 중", "연결 오류", "통신 에러")):
             return
-            
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_message = f"[{timestamp}] {message}"
-        
-        # Accumulate tick count on attempts
+
         if "시도 중" in message:
             error_part = "재시도"
             if "시도 중... (" in message:
-                error_part = message.split("시도 중... (")[1].rstrip(")")
-            with self._lock:
-                self._attempt_count += 1
-                self._last_error = error_part
-            if self.status_callback:
-                self.status_callback(self._attempt_count, error_part)
-                
+                error_part = message.split("시도 중... (", 1)[1].rstrip(")")
+            self._record_attempt(error_part)
+
         if self.log_callback:
             self.log_callback(formatted_message, log_type)
 
-    def silent_tick(self, error_message):
-        """Count an attempt without flooding the log. Only logs if error type is new."""
+        event_type = {
+            "success": BookingEventType.SUCCESS,
+            "error": BookingEventType.ERROR,
+            "warning": BookingEventType.WARNING,
+        }.get(log_type, BookingEventType.INFO)
+        self.emit_event(event_type, message)
+
+    def _record_attempt(self, error_message: str) -> None:
         with self._lock:
             self._attempt_count += 1
             self._last_error = error_message
+            count = self._attempt_count
+        if self.status_callback:
+            self.status_callback(count, error_message)
+        self.emit_event(BookingEventType.ATTEMPT, error_message)
+
+    def silent_tick(self, error_message: str) -> None:
+        with self._lock:
+            self._attempt_count += 1
+            self._last_error = error_message
+            count = self._attempt_count
             is_new = error_message not in self._seen_errors
             if is_new:
                 self._seen_errors.add(error_message)
 
-        # Notify status badge
         if self.status_callback:
-            self.status_callback(self._attempt_count, error_message)
-
-        # Log only the first occurrence of each unique error type
+            self.status_callback(count, error_message)
+        self.emit_event(BookingEventType.ATTEMPT, error_message)
         if is_new:
             self.log(f"⚠️ {error_message} — 재시도 중...", "warning")
 
-    def get_csrf_token(self, session, url):
+    def notify_success(self, result: BookingResult | None = None) -> bool:
+        """Fire success exactly once, even when workers finish simultaneously."""
+        with self._success_lock:
+            if self._success_fired:
+                return False
+            self._success_fired = True
+            self.stop_event.set()
+
+        if result:
+            self.emit_event(
+                BookingEventType.SUCCESS,
+                result.message,
+                details={"booking_number": result.booking_number, **dict(result.details)},
+            )
+        if self.success_callback:
+            self.success_callback()
+        return True
+
+    def get_csrf_token(self, session: Any, url: str | None = None) -> str:
         raise NotImplementedError("Subclasses must implement get_csrf_token")
 
-    def make_reservation_thread(self, reservation_data):
+    def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         raise NotImplementedError("Subclasses must implement make_reservation_thread")
 
-    async def make_reservation_async_task(self, reservation_data, task_idx):
+    async def make_reservation_async_task(self, reservation_data: dict[str, Any], task_idx: int) -> None:
         raise NotImplementedError("Subclasses must implement make_reservation_async_task")
 
-    def start_reservation(self, reservation_data, num_threads, is_async=False):
+    def start_reservation(self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False) -> None:
         if self.is_running:
-            self.log("Booking engine is already running.", "warning")
+            self.log("예약 엔진이 이미 실행 중입니다.", "warning")
             return
-        
+        if num_threads < 1:
+            self.log("동시 시도 수는 1 이상이어야 합니다.", "error")
+            return
+
         self.is_running = True
         self.stop_event.clear()
         self.listener_stop.clear()
         self.threads = []
-        self.processes = []
         self._attempt_count = 0
-        self._seen_errors = set()
+        self._last_error = ""
+        self._seen_errors.clear()
         self._success_fired = False
-        
-        if is_async:
-            self.multiprocess_stop_event = multiprocessing.Event()
-            self.multiprocess_success_event = multiprocessing.Event()
-            self.multiprocess_submission_lock = multiprocessing.Lock()
-            self.log_queue = multiprocessing.Queue()
-            
-            # Divide work across processes (up to CPU core count, max 4)
-            num_proc = min(multiprocessing.cpu_count(), 4)
-            if num_threads < num_proc:
-                num_proc = num_threads
-            tasks_per_proc = num_threads // num_proc
-            remainder = num_threads % num_proc
-            
-            self.log(f"Starting booking attempt with {num_threads} async tasks across {num_proc} processes...", "info")
-            
-            # Start Queue Listener Thread
-            self.queue_thread = threading.Thread(target=self._queue_listener, name="QueueListenerThread")
-            self.queue_thread.daemon = True
-            self.queue_thread.start()
-            
-            class_name = self.__class__.__name__
-            site_url = self.site_url if hasattr(self, "site_url") else self.base_url
-            is_shin = getattr(self, "is_shin", False)
-            start_idx_offset = 0
-            for i in range(num_proc):
-                p_tasks = tasks_per_proc + (1 if i < remainder else 0)
-                if p_tasks <= 0:
-                    continue
-                p = multiprocessing.Process(
-                    target=child_process_run,
-                    args=(
-                        class_name,
-                        site_url,
-                        reservation_data,
-                        p_tasks,
-                        self.multiprocess_stop_event,
-                        self.log_queue,
-                        self.multiprocess_success_event,
-                        is_shin
-                    ),
-                    kwargs={
-                        'submission_lock': self.multiprocess_submission_lock,
-                        'start_idx_offset': start_idx_offset
-                    },
-                    name=f"BookingProcess-{i+1}"
-                )
-                p.daemon = True
-                self.processes.append(p)
-                p.start()
-                start_idx_offset += p_tasks
-                
-            # Monitor processes
-            monitor_thread = threading.Thread(target=self._monitor_processes)
-            monitor_thread.daemon = True
-            monitor_thread.start()
-        else:
-            self.log(f"Starting booking attempt with {num_threads} threads...", "info")
-            for i in range(num_threads):
-                t = threading.Thread(
-                    target=self.make_reservation_thread, 
-                    args=(reservation_data,),
-                    name=f"BookingThread-{i+1}"
-                )
-                t.daemon = True
-                self.threads.append(t)
-                t.start()
-                
-            # Monitor threads
-            monitor_thread = threading.Thread(target=self._monitor_threads)
-            monitor_thread.daemon = True
-            monitor_thread.start()
+        self.emit_event(BookingEventType.STATE, "running")
 
-    def start_async_reservation_loop(self, reservation_data, num_tasks):
-        import asyncio
+        if is_async:
+            self.log(f"{num_threads}개의 비동기 작업으로 예약을 시작합니다.", "info")
+            self.async_thread = threading.Thread(
+                target=self._run_async_loop,
+                args=(reservation_data, num_threads),
+                name=f"{self.__class__.__name__}AsyncLoop",
+                daemon=True,
+            )
+            self.async_thread.start()
+            return
+
+        self.log(f"{num_threads}개의 작업 스레드로 예약을 시작합니다.", "info")
+        for index in range(num_threads):
+            worker = threading.Thread(
+                target=self.make_reservation_thread,
+                args=(reservation_data,),
+                name=f"BookingThread-{index + 1}",
+                daemon=True,
+            )
+            self.threads.append(worker)
+            worker.start()
+        monitor = threading.Thread(target=self._monitor_threads, name="BookingThreadMonitor", daemon=True)
+        monitor.start()
+
+    def _run_async_loop(self, reservation_data: dict[str, Any], num_tasks: int) -> None:
         loop = asyncio.new_event_loop()
+        self._loop = loop
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self.run_async_tasks(reservation_data, num_tasks))
-        except Exception as e:
-            self.log(f"Async loop error: {e}", "error")
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.log(f"비동기 예약 실행 오류: {exc}", "error")
         finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+            self._loop = None
+            self.is_running = False
+            self.listener_stop.set()
+            self.emit_event(BookingEventType.STATE, "stopped")
+            self.log("예약 작업이 종료되었습니다.", "info")
 
-    async def run_async_tasks(self, reservation_data, num_tasks, start_idx_offset=0):
-        import asyncio
+    async def run_async_tasks(
+        self,
+        reservation_data: dict[str, Any],
+        num_tasks: int,
+        start_idx_offset: int = 0,
+    ) -> None:
         self.async_submission_lock = asyncio.Lock()
-        
-        # Pre-fetch if available in subclass
         if hasattr(self, "pre_fetch_sessions_async"):
             await self.pre_fetch_sessions_async(num_tasks, reservation_data)
-            
-        tasks = []
-        for i in range(num_tasks):
-            tasks.append(asyncio.create_task(self.make_reservation_async_task(reservation_data, start_idx_offset + i)))
-            
-        await asyncio.gather(*tasks)
+        try:
+            workers = [
+                asyncio.create_task(
+                    self.make_reservation_async_task(reservation_data, start_idx_offset + index),
+                    name=f"booking-worker-{start_idx_offset + index + 1}",
+                )
+                for index in range(num_tasks)
+            ]
+            results = await asyncio.gather(*workers, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception) and not self.stop_event.is_set():
+                    self.log(f"예약 작업 오류: {result}", "error")
+        finally:
+            await self._close_session_pool()
 
-    def _monitor_threads(self):
-        for t in self.threads:
-            t.join()
-        self.is_running = False
-        self.listener_stop.set()
-        self.log("All booking threads have stopped.", "info")
-        
-    def _monitor_processes(self):
-        for p in self.processes:
-            p.join()
-        self.is_running = False
-        self.listener_stop.set()
-        self.log("All booking processes have stopped.", "info")
-
-    def _queue_listener(self):
-        import queue
-        while self.is_running or not self.listener_stop.is_set():
+    async def _close_session_pool(self) -> None:
+        pool = getattr(self, "session_pool", [])
+        for item in pool:
+            session = item[0] if isinstance(item, tuple) else item
             try:
-                item = self.log_queue.get(timeout=0.1)
-                itype = item[0]
-                if itype == 'log':
-                    _, msg, ltype = item
-                    self.log(msg, ltype)
-                elif itype == 'tick':
-                    _, inc, error_msg = item
-                    with self._lock:
-                        self._attempt_count += inc
-                        self._last_error = error_msg
-                    if self.status_callback:
-                        self.status_callback(self._attempt_count, error_msg)
-                elif itype == 'success':
-                    if not self._success_fired:
-                        self._success_fired = True
-                        if self.success_callback:
-                            self.success_callback()
-            except queue.Empty:
-                pass
+                result = session.close()
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception:
-                break
+                continue
+        if hasattr(self, "session_pool"):
+            self.session_pool = []
 
-    def stop_reservation(self):
-        if not self.is_running:
-            self.log("Booking engine is not running.", "warning")
-            return
-        
-        self.log("Stopping all booking processes/threads...", "info")
-        self.stop_event.set()
-        if hasattr(self, "multiprocess_stop_event"):
-            self.multiprocess_stop_event.set()
-            
-        # Terminate processes
-        for p in self.processes:
-            if p.is_alive():
-                p.terminate()
-                
+    def _monitor_threads(self) -> None:
+        for worker in self.threads:
+            worker.join()
+        self.is_running = False
         self.listener_stop.set()
+        self.emit_event(BookingEventType.STATE, "stopped")
+        self.log("예약 작업이 종료되었습니다.", "info")
+
+    def stop_reservation(self) -> None:
+        if not self.is_running:
+            return
+        self.log("예약 작업을 안전하게 중지하는 중입니다...", "info")
+        self.stop_event.set()
+        self.listener_stop.set()
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(lambda: None)

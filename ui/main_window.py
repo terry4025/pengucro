@@ -2,15 +2,22 @@ import customtkinter as ctk
 import ui.theme as theme
 from ui.reservation_form import ReservationForm
 from ui.log_panel import LogPanel
-from engines.zeroworld_shin_engine import ZeroWorldShinEngine
-from engines.doomescape_engine import DoomEscapeEngine
-from engines.zeroworld_gu_engine import ZeroWorldGuEngine
-from engines.jigubyeol_engine import JigubyeolEngine
-from engines.naver_engine import NaverEngine
-from engines.keyescape_engine import KeyescapeEngine
+from engines.registry import EngineRegistry
+from engines.catalog_providers import (
+    builtin_site_configs,
+    catalog_to_site_config,
+    default_providers,
+    fallback_catalog,
+    migrate_custom_sites,
+)
+from pengucro.catalog import CatalogService
+from pengucro.models import LEGACY_MODE_MAP, NAVER_MODE, STANDARD_MODE, ReservationRequest
+from pengucro.storage import load_json, save_json
+from pengucro import __version__
 from PIL import Image
 import os
-import json
+import queue
+import threading
 import time
 from datetime import datetime
 import winsound
@@ -301,7 +308,7 @@ class LoadingOverlay(ctk.CTkFrame):
         # Smoothly slide the overlay up
         h = self.winfo_height()
         step = max(5, int(h / 12))
-        
+
         def slide():
             if not self.winfo_exists():
                 return
@@ -400,6 +407,7 @@ class AddSiteDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.success_callback = success_callback
+        self._parse_outcome = None
         
         self.title("커스텀 사이트 추가")
         self.geometry("380x250")
@@ -536,7 +544,7 @@ class AddSiteDialog(ctk.CTkToplevel):
 
         # URL Validation based on Engine Mode
         current_mode = self.parent.form.engine_mode_btn.get()
-        if current_mode == "네이버 (Playwright)":
+        if current_mode == NAVER_MODE:
             from engines.site_parser import normalize_naver_url
             normalized_url = normalize_naver_url(url)
             if not normalized_url:
@@ -547,7 +555,7 @@ class AddSiteDialog(ctk.CTkToplevel):
             self.url_entry.insert(0, url)
         else:
             if any(p in url for p in ["booking.naver.com", "naver.me", "map.naver.com", "place.naver.com"]):
-                self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 (Playwright)' 모드에서 등록해주세요.", text_color=theme.ACCENT_RED)
+                self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 예약' 유형에서 등록해주세요.", text_color=theme.ACCENT_RED)
                 return
             
         def proceed():
@@ -560,21 +568,33 @@ class AddSiteDialog(ctk.CTkToplevel):
             self.animate_dots(1)
             
             # Parse in a background thread to prevent UI freezing
-            import threading
             def parse_thread():
-                from engines.site_parser import parse_booking_site
+                from engines.catalog_providers import analyze_booking_site
                 try:
-                    result = parse_booking_site(url, site_name)
-                    self.parent.after(0, lambda: self._on_parse_success(result))
+                    result = analyze_booking_site(url, site_name)
+                    self._parse_outcome = ("success", result)
                 except Exception as e:
-                    err_msg = str(e)
-                    self.parent.after(0, lambda: self._on_parse_error(err_msg))
+                    self._parse_outcome = ("error", str(e))
                     
             t = threading.Thread(target=parse_thread, name="SiteParserThread")
             t.daemon = True
             t.start()
+            self.after(50, self._poll_parse_result)
             
         animate_click(self.add_btn, 30, 100, proceed)
+
+    def _poll_parse_result(self):
+        if not self.winfo_exists():
+            return
+        if self._parse_outcome is None:
+            self.after(50, self._poll_parse_result)
+            return
+        outcome, value = self._parse_outcome
+        self._parse_outcome = None
+        if outcome == "success":
+            self._on_parse_success(value)
+        else:
+            self._on_parse_error(value)
         
     def animate_dots(self, count=1):
         if not getattr(self, "_parsing_in_progress", False):
@@ -586,6 +606,28 @@ class AddSiteDialog(ctk.CTkToplevel):
 
     def _on_parse_success(self, result):
         self._parsing_in_progress = False
+        branch_count = len(result.get("branches", {}))
+        theme_count = sum(len(items) for items in result.get("themes", {}).values())
+        engine_names = {
+            "naver": "네이버 예약",
+            "jigubyeol": "지구별 계열",
+            "sinbiworld": "SinbiWeb 제로월드 계열",
+            "doomescape": "둠이스케이프 계열",
+            "keyescape": "키이스케이프 계열",
+            "zeroworld_laravel": "Laravel 제로월드 계열",
+        }
+        engine_id = result.get("engine_id", "")
+        style = engine_names.get(engine_id, engine_id or "알 수 없음")
+        detection = result.get("detection", {})
+        confidence = detection.get("confidence", 0)
+        evidence = ", ".join(detection.get("evidence", [])[:3]) or "조회 호환성 검사"
+        messagebox.showinfo(
+            "호환 엔진 자동 선택",
+            f"자동 선택 엔진: {style}\n신뢰도 참고 지표: {confidence}%\n근거: {evidence}\n"
+            f"지점: {branch_count}개\n테마: {theme_count}개\n\n"
+            "실제 카탈로그 조회 검증을 통과한 엔진으로 자동 등록합니다.",
+            parent=self,
+        )
         self.status_label.configure(text="✓ 분석 완료! 저장 중...", text_color=theme.ACCENT_GREEN)
         self.success_callback(result)
         self._on_cancel()
@@ -596,23 +638,105 @@ class AddSiteDialog(ctk.CTkToplevel):
         self.add_btn.configure(state="normal")
         self.cancel_btn.configure(state="normal")
 
+
+class CatalogChangesDialog(ctk.CTkToplevel):
+    def __init__(self, parent, site_name, changes, apply_callback):
+        super().__init__(parent)
+        self.apply_callback = apply_callback
+        self.rows = []
+        self.title("사이트 변경 검토")
+        self.geometry("500x420")
+        self.minsize(460, 340)
+        self.configure(fg_color=theme.CANVAS_COLOR)
+        self.transient(parent)
+
+        ctk.CTkLabel(
+            self,
+            text=f"{site_name} · 확인 필요한 변경",
+            font=(theme.FONT_FAMILY, 14, "bold"),
+            text_color=theme.TEXT_PRIMARY,
+        ).pack(anchor="w", padx=18, pady=(16, 4))
+        ctk.CTkLabel(
+            self,
+            text="선택한 삭제 또는 ID 교체만 반영됩니다. 선택하지 않은 항목은 기존 설정을 유지합니다.",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+            wraplength=455,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        scroll = ctk.CTkScrollableFrame(
+            self,
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        for change in changes:
+            variable = ctk.BooleanVar(value=False)
+            action = "삭제" if change.kind == "removed" else "ID 교체"
+            entity = "지점" if change.entity == "branch" else "테마"
+            if change.kind == "id_changed":
+                detail = f"{entity} {change.old_name}: {change.old_id} → {change.new_id}"
+            else:
+                detail = f"{entity} {change.old_name} ({change.old_id})"
+            checkbox = ctk.CTkCheckBox(
+                scroll,
+                text=f"{action} · {detail}",
+                variable=variable,
+                font=theme.FONT_BODY_SM,
+                text_color=theme.TEXT_BODY,
+                checkbox_width=16,
+                checkbox_height=16,
+            )
+            checkbox.pack(fill="x", anchor="w", padx=10, pady=7)
+            self.rows.append((variable, change))
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.pack(fill="x", padx=18, pady=(0, 14))
+        ctk.CTkButton(
+            buttons,
+            text="보류 유지",
+            width=105,
+            fg_color=theme.SURFACE_COLOR,
+            hover_color=theme.CARD_COLOR,
+            command=self.destroy,
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons,
+            text="선택 항목 반영",
+            width=125,
+            text_color=theme.TEXT_DARK,
+            fg_color=theme.ACCENT_WHITE,
+            hover_color=theme.TEXT_BODY,
+            command=self._apply,
+        ).pack(side="right")
+
+    def _apply(self):
+        selected = [change for variable, change in self.rows if variable.get()]
+        if selected:
+            self.apply_callback(selected)
+        self.destroy()
+
 class MainWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         # Window Config
-        self.title("방탈출 펭크로")
+        self.title(f"방탈출 펭크로 v{__version__}")
         
         # Center the window on startup
-        width = 480
-        height = 960
+        width = 520
+        height = 900
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
         x = (screen_width - width) // 2
         y = (screen_height - height) // 2
         self.geometry(f"{width}x{height}+{x}+{y}")
         
-        self.resizable(False, False)
+        self.minsize(480, 720)
+        self.resizable(True, True)
         self.configure(fg_color=theme.CANVAS_COLOR)
 
         # Make Window Borderless
@@ -624,31 +748,36 @@ class MainWindow(ctk.CTk):
 
         # Active engine tracking
         self.active_engine = None
+        self._engine_completion_handled = True
         self.is_pinned = False
         
         # Naver Server Time synchronization state
         self.naver_time_offset = 0.0
         self.is_sync_running = False
+        self._server_sync_generation = 0
+        self._server_sync_thread = None
 
         # Attempt counter & status tracking
         self.attempt_count = 0
         self.current_status = "idle"
+        self.booking_started_at = None
+        self._status_timer_id = None
 
-        # Log buffering
-        import threading
-        self.log_queue = []
-        self.log_queue_lock = threading.Lock()
-        self.is_flusher_running = False
+        # Worker threads only write to this queue. Tk widgets are touched by
+        # the main-thread polling loop below.
+        self.engine_event_queue = queue.Queue()
+        self._ui_polling = True
 
         # Dragging variables
         self.drag_x = 0
         self.drag_y = 0
 
         # Set Window Icon if exists
-        icon_path = resource_path("icon.ico")
-        if os.path.exists(icon_path):
+        self._icon_path = resource_path("icon.ico")
+        self._native_icon_handles = []
+        if os.path.exists(self._icon_path):
             try:
-                self.iconbitmap(icon_path)
+                self.iconbitmap(self._icon_path)
             except Exception:
                 pass
 
@@ -666,7 +795,7 @@ class MainWindow(ctk.CTk):
         # Title Label in the Center
         self.title_label = ctk.CTkLabel(
             self.title_bar,
-            text="방탈출 펭크로",
+            text=f"방탈출 펭크로 v{__version__}",
             font=(theme.FONT_FAMILY, 11, "bold"),
             text_color=theme.TEXT_BODY
         )
@@ -689,48 +818,49 @@ class MainWindow(ctk.CTk):
         )
         self.pin_btn.pack(side="left", padx=(10, 0))
 
-        # macOS Traffic Light Buttons Container on the Right
+        # Accessible window controls
         dots_frame = ctk.CTkFrame(self.title_bar, fg_color="transparent")
-        dots_frame.pack(side="right", padx=12, pady=8)
+        dots_frame.pack(side="right", padx=8, pady=4)
 
-        # Maximize Button (Green) -> Now minimizing (hiding)
-        self.max_btn = ctk.CTkButton(
-            dots_frame,
-            text="",
-            width=12,
-            height=12,
-            corner_radius=6,
-            fg_color=theme.ACCENT_GREEN,
-            hover_color=theme.ACCENT_GREEN_HOVER,
-            command=self._on_minimize
-        )
-        self.max_btn.pack(side="left", padx=4)
-
-        # Minimize Button (Yellow) -> Now maximizing
         self.min_btn = ctk.CTkButton(
             dots_frame,
-            text="",
-            width=12,
-            height=12,
+            text="—",
+            width=30,
+            height=26,
             corner_radius=6,
-            fg_color=theme.ACCENT_YELLOW,
-            hover_color=theme.ACCENT_YELLOW_HOVER,
-            command=self._on_maximize
+            fg_color="transparent",
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_BODY,
+            command=self._on_minimize,
         )
-        self.min_btn.pack(side="left", padx=4)
+        self.min_btn.pack(side="left", padx=2)
+
+        self.max_btn = ctk.CTkButton(
+            dots_frame,
+            text="□",
+            width=30,
+            height=26,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_BODY,
+            command=self._on_maximize,
+        )
+        self.max_btn.pack(side="left", padx=2)
 
         # Close Button (Red)
         self.close_btn = ctk.CTkButton(
             dots_frame,
-            text="",
-            width=12,
-            height=12,
+            text="×",
+            width=30,
+            height=26,
             corner_radius=6,
-            fg_color=theme.ACCENT_RED,
+            fg_color="transparent",
             hover_color=theme.ACCENT_RED_HOVER,
+            text_color=theme.TEXT_BODY,
             command=self._on_close
         )
-        self.close_btn.pack(side="left", padx=4)
+        self.close_btn.pack(side="left", padx=2)
 
         # Titlebar Bottom Hairline Border
         title_divider = ctk.CTkFrame(self, height=1, fg_color=theme.HAIRLINE_COLOR)
@@ -745,7 +875,7 @@ class MainWindow(ctk.CTk):
         # Big Title
         self.big_title_label = ctk.CTkLabel(
             header_frame,
-            text="방탈출 펭크로",
+            text=f"방탈출 펭크로 v{__version__}",
             font=(theme.FONT_FAMILY, 20, "bold"),
             text_color=theme.TEXT_PRIMARY
         )
@@ -788,27 +918,36 @@ class MainWindow(ctk.CTk):
         self.site_select_frame.columnconfigure(2, weight=0)
 
         # Load custom sites
-        self.custom_sites = {}
-        if os.path.exists("custom_sites.json"):
+        self.custom_sites = load_json("custom_sites.json", {})
+        if not isinstance(self.custom_sites, dict):
+            self.custom_sites = {}
+        self.custom_sites, custom_sites_migrated = migrate_custom_sites(self.custom_sites)
+        if custom_sites_migrated:
+            save_json("custom_sites.json", self.custom_sites)
+
+        self.catalog_service = CatalogService(default_providers())
+        self._catalog_refresh_running = False
+        self._catalog_applied_counts = {}
+        self.catalog_configs = builtin_site_configs()
+        for site_name, site_config in self.custom_sites.items():
+            if isinstance(site_config, dict):
+                site_config["name"] = site_name
+                self.catalog_configs[site_name] = site_config
+        for site_name, site_config in self.catalog_configs.items():
             try:
-                with open("custom_sites.json", "r", encoding="utf-8") as f:
-                    self.custom_sites = json.load(f)
+                self.catalog_service.seed_fallback(fallback_catalog(site_name, site_config))
             except Exception:
-                pass
+                continue
+        for site_name, site_config in self.catalog_configs.items():
+            cached = self.catalog_service.catalogs.get(site_config.get("catalog_key", ""))
+            if cached:
+                self._apply_catalog_to_runtime(site_name, cached, persist=False)
 
         # Load saved site config if exists, default to "제로월드 강남"
-        saved_site = "제로월드(신)"
-        if os.path.exists("config.json"):
-            try:
-                with open("config.json", "r", encoding="utf-8") as f:
-                    config = json.load(f)
-                    saved_site = config.get("site", "제로월드(신)")
-                    if saved_site in ["제로월드 강남", "제로월드 홍대"]:
-                        saved_site = "제로월드(구)"
-                    elif saved_site == "제로월드":
-                        saved_site = "제로월드(신)"
-            except Exception:
-                pass
+        saved_config = load_json("config.json", {})
+        saved_site = saved_config.get("site", "제로월드") if isinstance(saved_config, dict) else "제로월드"
+        if saved_site in {"제로월드(신)", "제로월드(구)", "제로월드 강남", "제로월드 홍대"}:
+            saved_site = "제로월드"
 
         self.site_var = ctk.StringVar(value=saved_site)
         self.last_logged_site = saved_site
@@ -817,12 +956,12 @@ class MainWindow(ctk.CTk):
         self.last_naver_site = None
         
         # Build options list
-        self.default_site_names = ["제로월드(신)", "제로월드(구)", "지구별방탈출", "키이스케이프", "둠이스케이프"]
+        self.default_site_names = ["제로월드", "지구별방탈출", "키이스케이프", "둠이스케이프"]
         site_options = self.default_site_names + list(self.custom_sites.keys())
         
         # Fallback if saved site is no longer in options
         if saved_site not in site_options:
-            saved_site = "제로월드(신)"
+            saved_site = "제로월드"
             self.site_var.set(saved_site)
 
         self.site_dropdown = ctk.CTkOptionMenu(
@@ -912,11 +1051,28 @@ class MainWindow(ctk.CTk):
         self.log_panel = LogPanel(self)
         self.log_panel.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
+        self.resize_grip = ctk.CTkLabel(
+            self,
+            text="◢",
+            width=20,
+            height=20,
+            text_color=theme.TEXT_DISABLED,
+            cursor="size_nw_se",
+        )
+        self.resize_grip.place(relx=1, rely=1, anchor="se")
+        self.resize_grip.bind("<Button-1>", self._start_resize)
+        self.resize_grip.bind("<B1-Motion>", self._resize_window)
+
+        self.bind("<Control-Return>", lambda _event: self._toggle_cta())
+        self.bind("<Control-l>", lambda _event: self.log_panel.clear_log())
+        self.bind("<Escape>", lambda _event: self._stop_booking() if self.current_status == "running" else None)
+        self.after(30, self._drain_engine_events)
+
         # Welcome message
         self.log_panel.append_log("프로그램이 준비되었습니다.", "info")
 
-        # Start background theme parser for Jigubyeol to fetch any new themes automatically
-        self._start_jigubyeol_theme_fetcher()
+        # Refresh all stale site catalogs after the UI is ready.
+        self.after(200, self._start_catalog_auto_refresh)
         self._update_delete_button_state(saved_site)
 
         # Show premium loading splash overlay
@@ -940,13 +1096,99 @@ class MainWindow(ctk.CTk):
         self.geometry(f"+{x}+{y}")
         self.update_idletasks()  # Force coordinate system refresh for child popup menus
 
+    def _start_resize(self, event):
+        self._resize_origin = (event.x_root, event.y_root, self.winfo_width(), self.winfo_height())
+
+    def _resize_window(self, event):
+        if self._is_maximized or not hasattr(self, "_resize_origin"):
+            return
+        start_x, start_y, width, height = self._resize_origin
+        new_width = max(480, width + event.x_root - start_x)
+        new_height = max(720, height + event.y_root - start_y)
+        self.geometry(f"{new_width}x{new_height}")
+
     def set_appwindow(self):
         self._apply_appwindow_style()
+        self._apply_native_window_icon()
         try:
             self.withdraw()
             self.after(10, self.deiconify)
+            self.after(20, self._apply_native_window_icon)
             self.after(20, self.update_idletasks)  # Refresh coordinates on startup
             self.after(50, self.bring_to_front)    # Force window to front/foreground on launch
+        except Exception:
+            pass
+
+    def _apply_native_window_icon(self):
+        """Apply the ICO to the real Win32 taskbar window used by this borderless UI."""
+        icon_path = getattr(self, "_icon_path", "")
+        if not icon_path or not os.path.exists(icon_path):
+            return
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype = wintypes.HWND
+            user32.LoadImageW.argtypes = [
+                wintypes.HINSTANCE,
+                wintypes.LPCWSTR,
+                wintypes.UINT,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.LoadImageW.restype = wintypes.HANDLE
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+
+            hwnd = user32.GetParent(self.winfo_id())
+            if not hwnd:
+                return
+
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+            SM_CXICON, SM_CYICON = 11, 12
+            SM_CXSMICON, SM_CYSMICON = 49, 50
+
+            big_icon = user32.LoadImageW(
+                None,
+                icon_path,
+                IMAGE_ICON,
+                user32.GetSystemMetrics(SM_CXICON),
+                user32.GetSystemMetrics(SM_CYICON),
+                LR_LOADFROMFILE,
+            )
+            small_icon = user32.LoadImageW(
+                None,
+                icon_path,
+                IMAGE_ICON,
+                user32.GetSystemMetrics(SM_CXSMICON),
+                user32.GetSystemMetrics(SM_CYSMICON),
+                LR_LOADFROMFILE,
+            )
+
+            if big_icon:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, big_icon)
+            if small_icon:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small_icon)
+
+            new_handles = [handle for handle in (big_icon, small_icon) if handle]
+            old_handles = getattr(self, "_native_icon_handles", [])
+            self._native_icon_handles = new_handles
+            for handle in old_handles:
+                if handle not in new_handles:
+                    user32.DestroyIcon(handle)
         except Exception:
             pass
 
@@ -1031,8 +1273,8 @@ class MainWindow(ctk.CTk):
             self.overrideredirect(True)
             
             # Restore to original size and center it
-            width = 480
-            height = 960
+            width = 520
+            height = 900
             screen_width = self.winfo_screenwidth()
             screen_height = self.winfo_screenheight()
             x = (screen_width - width) // 2
@@ -1052,7 +1294,7 @@ class MainWindow(ctk.CTk):
         
         # Track active site history based on the selected mode
         current_mode = self.form.engine_mode_btn.get()
-        if current_mode == "네이버 (Playwright)":
+        if current_mode == NAVER_MODE:
             self.last_naver_site = site_name
         else:
             self.last_standard_site = site_name
@@ -1068,6 +1310,26 @@ class MainWindow(ctk.CTk):
                 self.log_panel.append_log(f"사이트가 '{site_name}'으로 변경되었습니다.", "info")
             self.last_logged_site = site_name
         self._update_delete_button_state(site_name)
+        self._update_catalog_status(site_name)
+
+    def _update_catalog_status(self, site_name):
+        config = self.catalog_configs.get(site_name)
+        if not config or not hasattr(self.form, "catalog_refresh_status"):
+            return
+        catalog = self.catalog_service.catalogs.get(config.get("catalog_key", ""))
+        pending = len(self.catalog_service.pending_changes(config.get("catalog_key", "")))
+        changed = self._catalog_applied_counts.get(site_name, 0)
+        if catalog and catalog.last_success_at:
+            stamp = catalog.last_success_at.replace("T", " ")[:16]
+            text = f"최근 {stamp}"
+        else:
+            text = "갱신 기록 없음"
+        self.form.set_catalog_refresh_state(
+            text,
+            pending_count=pending,
+            changed_count=changed,
+            busy=self._catalog_refresh_running,
+        )
 
     def _update_server_time_sync_state(self):
         current_mode = self.form.engine_mode_btn.get()
@@ -1077,16 +1339,21 @@ class MainWindow(ctk.CTk):
         if hasattr(self, "form") and hasattr(self.form, "show_server_time_checkbox"):
             show_server_time = (self.form.show_server_time_checkbox.get() == 1)
             
-        is_supported_site = (current_mode == "네이버 (Playwright)" and site_name != "(네이버 예약을 등록하세요)") or (site_name == "키이스케이프")
+        is_supported_site = (current_mode == NAVER_MODE and site_name != "(네이버 예약을 등록하세요)") or (site_name == "키이스케이프")
         
+        self._server_sync_generation += 1
+        generation = self._server_sync_generation
         if show_server_time and is_supported_site:
-            if not self.is_sync_running:
-                self.is_sync_running = True
-                import threading
-                t = threading.Thread(target=self._sync_server_time, name="ServerTimeSyncThread")
-                t.daemon = True
-                t.start()
-                self._update_server_time_clock()
+            self.is_sync_running = True
+            import threading
+            self._server_sync_thread = threading.Thread(
+                target=self._sync_server_time,
+                args=(generation, site_name),
+                name="ServerTimeSyncThread",
+                daemon=True,
+            )
+            self._server_sync_thread.start()
+            self._update_server_time_clock()
         else:
             self.is_sync_running = False
             self.server_time_label.pack_forget()
@@ -1102,24 +1369,28 @@ class MainWindow(ctk.CTk):
         current_site = self.site_var.get()
         if current_site in self.custom_sites:
             if messagebox.askyesno("사이트 삭제", f"정말로 '{current_site}' 사이트를 삭제하시겠습니까?"):
+                catalog_key = self.custom_sites[current_site].get("catalog_key", "")
                 # Remove from dict
                 del self.custom_sites[current_site]
+                self.catalog_configs.pop(current_site, None)
+                if catalog_key:
+                    self.catalog_service.catalogs.pop(catalog_key, None)
+                    self.catalog_service.store.save(self.catalog_service.catalogs)
                 
                 # Save to JSON
                 try:
-                    with open("custom_sites.json", "w", encoding="utf-8") as f:
-                        json.dump(self.custom_sites, f, ensure_ascii=False, indent=2)
+                    save_json("custom_sites.json", self.custom_sites)
                 except Exception as e:
                     self.log_panel.append_log(f"설정 저장 중 오류: {e}", "error")
                 
                 # Refresh dropdown values with active filter
                 current_mode = self.form.engine_mode_btn.get()
-                if current_mode == "네이버 (Playwright)":
+                if current_mode == NAVER_MODE:
                     site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
                     fallback_site = site_options[0] if site_options else "(네이버 예약을 등록하세요)"
                 else:
                     site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
-                    fallback_site = "제로월드 강남"
+                    fallback_site = "제로월드"
 
                 if not site_options:
                     site_options = [fallback_site]
@@ -1134,19 +1405,24 @@ class MainWindow(ctk.CTk):
         AddSiteDialog(self, self._on_custom_site_added)
 
     def _on_custom_site_added(self, site_data):
+        discovered_catalog = site_data.pop("catalog", None)
         site_name = site_data["name"]
         self.custom_sites[site_name] = site_data
+        self.catalog_configs[site_name] = site_data
+        if discovered_catalog is not None:
+            self.catalog_service.catalogs[discovered_catalog.site_key] = discovered_catalog
+            self.catalog_service.store.save(self.catalog_service.catalogs)
+            self._apply_catalog_to_runtime(site_name, discovered_catalog, persist=False)
         
         # Save to custom_sites.json
         try:
-            with open("custom_sites.json", "w", encoding="utf-8") as f:
-                json.dump(self.custom_sites, f, ensure_ascii=False, indent=2)
+            save_json("custom_sites.json", self.custom_sites)
         except Exception as e:
             self.log_panel.append_log(f"설정 저장 중 오류: {e}", "error")
             
         # Refresh dropdown options with active mode filter
         current_mode = self.form.engine_mode_btn.get()
-        if current_mode == "네이버 (Playwright)":
+        if current_mode == NAVER_MODE:
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
         else:
             site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
@@ -1159,6 +1435,40 @@ class MainWindow(ctk.CTk):
         
         self.log_panel.append_log(f"커스텀 사이트 '{site_name}'이(가) 등록되었습니다. (엔진 유형: {site_data['style']})", "success")
 
+    def _apply_catalog_to_runtime(self, site_name, catalog, persist=True):
+        from data.themes import (
+            DOOMESCAPE_THEMES,
+            JIGUBYEOL_THEMES,
+            KEYESCAPE_THEMES,
+            SITES_CONFIG,
+            ZEROWORLD_THEMES,
+        )
+
+        projected = catalog_to_site_config(catalog, rich_keyescape=site_name == "키이스케이프")
+        if site_name in SITES_CONFIG:
+            SITES_CONFIG[site_name].update(projected)
+            SITES_CONFIG[site_name]["engine_id"] = catalog.engine_id
+            SITES_CONFIG[site_name]["engine_options"] = catalog.metadata.get("engine_options", {})
+            target = {
+                "제로월드": ZEROWORLD_THEMES,
+                "지구별방탈출": JIGUBYEOL_THEMES,
+                "키이스케이프": KEYESCAPE_THEMES,
+                "둠이스케이프": DOOMESCAPE_THEMES,
+            }.get(site_name)
+            if target is not None:
+                target.clear()
+                target.update(projected["themes"])
+            if site_name in self.catalog_configs:
+                self.catalog_configs[site_name].update(projected)
+                self.catalog_configs[site_name]["engine_options"] = catalog.metadata.get("engine_options", {})
+        elif site_name in self.custom_sites:
+            self.custom_sites[site_name].update(projected)
+            self.custom_sites[site_name]["engine_id"] = catalog.engine_id
+            self.custom_sites[site_name]["engine_options"] = catalog.metadata.get("engine_options", {})
+            self.catalog_configs[site_name] = self.custom_sites[site_name]
+            if persist:
+                save_json("custom_sites.json", self.custom_sites)
+
     def _on_engine_mode_change(self, mode):
         # Log mode change if not redundant
         if getattr(self, "last_logged_mode", None) != mode:
@@ -1168,7 +1478,7 @@ class MainWindow(ctk.CTk):
 
         self._suppress_site_log = True
 
-        if mode == "네이버 (Playwright)":
+        if mode == NAVER_MODE:
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
             if not site_options:
                 target_site = "(네이버 예약을 등록하세요)"
@@ -1195,17 +1505,14 @@ class MainWindow(ctk.CTk):
 
         self._suppress_site_log = False
 
-    def _sync_server_time(self):
+    def _sync_server_time(self, generation, site_name):
         import urllib.request
         import time
         from email.utils import parsedate_to_datetime
         
-        while self.is_sync_running:
+        while self.is_sync_running and generation == self._server_sync_generation:
             try:
-                if not self.winfo_exists():
-                    break
-                current_site = self.site_var.get()
-                target_url = "https://www.keyescape.com/reservation.php" if current_site == "키이스케이프" else "https://booking.naver.com"
+                target_url = "https://www.keyescape.com/reservation.php" if site_name == "키이스케이프" else "https://booking.naver.com"
                 req = urllib.request.Request(target_url, method="HEAD")
                 start = time.perf_counter()
                 with urllib.request.urlopen(req, timeout=3) as response:
@@ -1214,37 +1521,41 @@ class MainWindow(ctk.CTk):
                     if date_str:
                         gmt_dt = parsedate_to_datetime(date_str)
                         server_time = gmt_dt.timestamp() + latency
-                        self.naver_time_offset = server_time - time.time()
-                        
-                        # Keyescape server time validation
-                        if current_site == "키이스케이프" and not getattr(self, "_keyescape_time_verified", False):
-                            self._keyescape_time_verified = True
-                            offset_sec = abs(self.naver_time_offset)
-                            if offset_sec > 5:
-                                self.log_panel.append_log(
-                                    f"[경고] 키이스케이프 서버 시간과 로컬 PC 시간의 차이가 큽니다 ({offset_sec:.2f}초 차이). "
-                                    f"PC 시간 동기화(표준시 설정)를 확인해 주세요.", 
-                                    "warning"
-                                )
-                            else:
-                                self.log_panel.append_log(
-                                    f"[정보] 키이스케이프 실제 서버 시간 동기화 완료 (응답 오차: {latency*1000:.1f}ms, 로컬 편차: {self.naver_time_offset:.2f}초)", 
-                                    "success"
-                                )
-            except RuntimeError:
-                break
+                        offset = server_time - time.time()
+                        self.engine_event_queue.put(
+                            ("server_sync", generation, site_name, offset, latency, None)
+                        )
             except Exception as e:
-                try:
-                    if self.winfo_exists() and current_site == "키이스케이프":
-                        self.log_panel.append_log(f"[에러] 키이스케이프 서버 시간 동기화 실패: {e}", "error")
-                except Exception:
-                    pass
-            
+                self.engine_event_queue.put(
+                    ("server_sync", generation, site_name, 0.0, 0.0, str(e))
+                )
+
             # Re-sync every 30 seconds
             for _ in range(30):
-                if not self.is_sync_running:
+                if not self.is_sync_running or generation != self._server_sync_generation:
                     break
                 time.sleep(1)
+
+    def _apply_server_sync_result(self, generation, site_name, offset, latency, error):
+        if generation != self._server_sync_generation or not self.is_sync_running:
+            return
+        if error:
+            if site_name == "키이스케이프":
+                self.log_panel.append_log(f"[에러] 키이스케이프 서버 시간 동기화 실패: {error}", "error")
+            return
+        self.naver_time_offset = offset
+        if site_name == "키이스케이프" and not getattr(self, "_keyescape_time_verified", False):
+            self._keyescape_time_verified = True
+            if abs(offset) > 5:
+                self.log_panel.append_log(
+                    f"[경고] 키이스케이프 서버 시간과 로컬 PC 시간의 차이가 큽니다 ({abs(offset):.2f}초).",
+                    "warning",
+                )
+            else:
+                self.log_panel.append_log(
+                    f"[정보] 키이스케이프 서버 시간 동기화 완료 (응답 오차: {latency * 1000:.1f}ms)",
+                    "success",
+                )
 
     def _update_server_time_clock(self):
         if not self.is_sync_running:
@@ -1264,6 +1575,7 @@ class MainWindow(ctk.CTk):
         self.after(100, self._update_server_time_clock)
 
     def _on_close(self):
+        self._ui_polling = False
         self.is_sync_running = False
         try:
             if hasattr(self, 'active_engine') and self.active_engine and self.active_engine.is_running:
@@ -1300,17 +1612,31 @@ class MainWindow(ctk.CTk):
                         fg_color=theme.ACCENT_RED
                     )
                     return
+                if not messagebox.askyesno(
+                    "예약 정보 확인",
+                    f"{res_data.summary()}\n\n이 정보로 예약 감시를 시작할까요?",
+                    parent=self,
+                ):
+                    return
                 self._start_booking(res_data, threads, is_async)
                 
         animate_click(self.cta_btn, 38, callback=proceed)
 
-    def _start_booking(self, reservation_data, threads, is_async):
+    def _start_booking(self, reservation_data: ReservationRequest, threads, is_async):
+        if self._catalog_refresh_running:
+            messagebox.showinfo("예약 시작", "사이트 정보 갱신이 끝난 뒤 예약을 시작해주세요.", parent=self)
+            return
         selected_site = self.site_var.get()
         self.form.save_config(selected_site)
         self.log_panel.clear_log()
         self.attempt_count = 0
         self.current_status = "running"
+        self.booking_started_at = time.monotonic()
         self.log_panel.append_log(f"[{selected_site}] 예약을 시작합니다...", "info")
+        self.form.set_running_state(True)
+        self.site_dropdown.configure(state="disabled")
+        self.add_site_btn.configure(state="disabled")
+        self.delete_site_btn.configure(state="disabled")
 
         self.cta_btn.configure(
             text="예약 중지",
@@ -1325,88 +1651,67 @@ class MainWindow(ctk.CTk):
             fg_color=theme.ACCENT_YELLOW
         )
 
-        if self.form.engine_mode_btn.get() == "네이버 (Playwright)":
-            self.active_engine = NaverEngine(
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
-        elif selected_site in self.custom_sites:
-            site_info = self.custom_sites[selected_site]
-            if site_info["style"] == "jigubyeol":
-                self.active_engine = JigubyeolEngine(
-                    log_callback=self._on_engine_log,
-                    success_callback=self._on_booking_success,
-                    site_url=site_info["base_url"]
-                )
-            else:
-                self.active_engine = ZeroWorldGuEngine(
-                    site_url=site_info["url"],
-                    log_callback=self._on_engine_log,
-                    success_callback=self._on_booking_success
-                )
-        elif selected_site == "지구별방탈출":
-            self.active_engine = JigubyeolEngine(
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
-        elif selected_site == "키이스케이프":
-            self.active_engine = KeyescapeEngine(
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
-        elif selected_site == "둠이스케이프":
-            self.active_engine = DoomEscapeEngine(
-                site_url=reservation_data.get('site_url'),
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
-        elif selected_site == "제로월드(신)":
-            self.active_engine = ZeroWorldShinEngine(
-                site_url=reservation_data.get('site_url'),
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
-        elif selected_site == "제로월드(구)":
-            self.active_engine = ZeroWorldGuEngine(
-                site_url=reservation_data.get('site_url'),
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
-        else:
-            self.active_engine = ZeroWorldGuEngine(
-                site_url=reservation_data.get('site_url'),
-                log_callback=self._on_engine_log,
-                success_callback=self._on_booking_success
-            )
+        # Clear any stale engine events before starting a new run.
+        while True:
+            try:
+                self.engine_event_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        self.active_engine.status_callback = self._on_engine_status_update
-        self.active_engine.log_batch_callback = self._on_engine_log_batch
-
-        # Clear any leftover logs in the queue before starting
-        with self.log_queue_lock:
-            self.log_queue.clear()
-
-        # Inject server time offset into reservation_data for NaverEngine
-        if self.form.engine_mode_btn.get() == "네이버 (Playwright)":
-            reservation_data['naver_time_offset'] = getattr(self, 'naver_time_offset', 0.0)
-
-        self.active_engine.start_reservation(reservation_data, threads, is_async)
+        payload = reservation_data.to_engine_payload()
+        if self.form.engine_mode_btn.get() == NAVER_MODE:
+            payload["naver_time_offset"] = getattr(self, "naver_time_offset", 0.0)
+        try:
+            self.active_engine = EngineRegistry.create(
+                site_name=selected_site,
+                mode=self.form.engine_mode_btn.get(),
+                payload=payload,
+                custom_sites=self.custom_sites,
+                log_callback=self._on_engine_log,
+                success_callback=self._on_booking_success,
+                status_callback=self._on_engine_status_update,
+                log_batch_callback=self._on_engine_log_batch,
+            )
+            self._engine_completion_handled = False
+            self.active_engine.start_reservation(payload, threads, is_async)
+            self._update_booking_status()
+        except Exception as exc:
+            self._engine_completion_handled = True
+            self.active_engine = None
+            self.current_status = "error"
+            self.log_panel.append_log(f"예약 엔진 시작 실패: {exc}", "error")
+            self._reset_cta_state()
 
     def _stop_booking(self):
         if self.active_engine and self.active_engine.is_running:
-            self.current_status = "idle"
+            self.current_status = "stopping"
             self.active_engine.stop_reservation()
-            self._reset_cta_state()
+            self.cta_btn.configure(text="중지 중...", state="disabled")
+            self.status_badge.configure(text="● 중지 중", text_color=theme.TEXT_PRIMARY, fg_color=theme.CARD_COLOR)
         else:
             self.log_panel.append_log("실행 중인 예약 작업이 없습니다.", "warning")
 
     def _reset_cta_state(self):
+        if self._status_timer_id is not None:
+            try:
+                self.after_cancel(self._status_timer_id)
+            except Exception:
+                pass
+            self._status_timer_id = None
         self.cta_btn.configure(
             text="예약 시작",
+            state="normal",
             text_color=theme.TEXT_DARK,
             fg_color=theme.ACCENT_WHITE,
             hover_color=theme.TEXT_BODY
         )
+        self.form.set_running_state(False)
+        if self._catalog_refresh_running:
+            self.form.catalog_refresh_btn.configure(state="disabled")
+        self.site_dropdown.configure(state="normal")
+        self.add_site_btn.configure(state="normal")
+        self._update_delete_button_state(self.site_var.get())
+        self.booking_started_at = None
         
         if self.current_status == "error":
             self.status_badge.configure(
@@ -1423,74 +1728,290 @@ class MainWindow(ctk.CTk):
             )
 
     def _on_engine_log(self, message, log_type):
-        if log_type == "error" or log_type == "success":
-            self.attempt_count += 1
-            
-        with self.log_queue_lock:
-            self.log_queue.append((message, log_type))
-            
-        if not self.is_flusher_running:
-            self.is_flusher_running = True
-            self.after(0, self._flush_logs)
+        self.engine_event_queue.put(("log", message, log_type))
 
     def _on_engine_log_batch(self, batch):
-        with self.log_queue_lock:
-            self.log_queue.extend(batch)
-            
-        if not self.is_flusher_running:
-            self.is_flusher_running = True
-            self.after(0, self._flush_logs)
+        self.engine_event_queue.put(("log_batch", list(batch)))
 
     def _on_engine_status_update(self, attempt_count, last_error):
-        self.attempt_count = attempt_count
-        if self.current_status == "running":
-            self.after(0, lambda: self.status_badge.configure(
-                text="● 동작 중",
-                text_color=theme.TEXT_DARK,
-                fg_color=theme.ACCENT_YELLOW
-            ))
+        self.engine_event_queue.put(("status", attempt_count, last_error))
 
-    def _flush_logs(self):
-        batch = []
-        with self.log_queue_lock:
-            if self.log_queue:
-                batch = self.log_queue[:]
-                self.log_queue.clear()
-        
-        if batch:
-            self.log_panel.append_logs_batch(batch)
-            
-            # If there's an error log, set status to "에러 발생"
-            has_error = any(log_type == "error" for _, log_type in batch)
-            if has_error:
+    def _update_booking_status(self):
+        if self.current_status not in {"running", "stopping"}:
+            self._status_timer_id = None
+            return
+        if self.booking_started_at and self.current_status == "running":
+            elapsed = int(time.monotonic() - self.booking_started_at)
+            self.status_badge.configure(text=f"● 동작 중 · {self.attempt_count:,}회 · {elapsed // 60:02d}:{elapsed % 60:02d}")
+        self._status_timer_id = self.after(500, self._update_booking_status)
+
+    def _drain_engine_events(self):
+        logs = []
+        success = False
+        while True:
+            try:
+                event = self.engine_event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = event[0]
+            if kind == "log":
+                logs.append((event[1], event[2]))
+            elif kind == "log_batch":
+                logs.extend(event[1])
+            elif kind == "status":
+                self.attempt_count = event[1]
+            elif kind == "success":
+                success = True
+            elif kind == "refresh_themes":
+                self._refresh_themes_ui()
+            elif kind == "catalog_result":
+                self._handle_catalog_result(*event[1:])
+            elif kind == "catalog_done":
+                self._catalog_refresh_running = False
+                if self.current_status not in {"running", "stopping"}:
+                    self.form.catalog_refresh_btn.configure(state="normal")
+            elif kind == "server_sync":
+                self._apply_server_sync_result(*event[1:])
+
+        if logs:
+            self.log_panel.append_logs_batch(logs)
+            if any(log_type == "error" for _, log_type in logs):
                 self.current_status = "error"
                 self.status_badge.configure(
                     text="● 에러 발생",
                     text_color=theme.TEXT_PRIMARY,
-                    fg_color=theme.ACCENT_RED
+                    fg_color=theme.ACCENT_RED,
                 )
-        
-        self._check_engine_finished()
-        
-        if self.active_engine and self.active_engine.is_running:
-            self.after(30, self._flush_logs)
+        if success:
+            self.current_status = "idle"
+            self._trigger_success_notification()
         else:
-            self.is_flusher_running = False
-            # Check one last time if any new logs arrived between lock release and this check
-            with self.log_queue_lock:
-                if self.log_queue:
-                    self.is_flusher_running = True
-                    self.after(30, self._flush_logs)
+            self._check_engine_finished()
+
+        if self._ui_polling:
+            self.after(30, self._drain_engine_events)
 
     def _check_engine_finished(self):
-        if self.active_engine and not self.active_engine.is_running:
+        engine = self.active_engine
+        if not engine or engine.is_running:
+            return
+        if not self._engine_completion_handled:
+            self._engine_completion_handled = True
             self._reset_cta_state()
+        self.active_engine = None
 
     def _on_booking_success(self):
-        self.current_status = "idle"
-        self.after(0, self._trigger_success_notification)
+        self.engine_event_queue.put(("success",))
+
+    def _start_catalog_auto_refresh(self):
+        if not self.form.catalog_auto_refresh_var.get():
+            return
+        if self.current_status in {"running", "stopping"}:
+            self.after(5000, self._start_catalog_auto_refresh)
+            return
+        stale_sites = [
+            name
+            for name, config in self.catalog_configs.items()
+            if self.catalog_service.is_stale(config.get("catalog_key", ""))
+        ]
+        if stale_sites:
+            self._start_catalog_refresh(stale_sites, manual=False)
+
+    def _refresh_current_catalog(self):
+        site_name = self.site_var.get()
+        if self.current_status in {"running", "stopping"}:
+            messagebox.showinfo("사이트 정보 갱신", "예약 실행 중에는 사이트 정보를 갱신할 수 없습니다.", parent=self)
+            return
+        if site_name not in self.catalog_configs:
+            messagebox.showwarning("사이트 정보 갱신", "갱신할 수 있는 사이트가 아닙니다.", parent=self)
+            return
+        self._start_catalog_refresh([site_name], manual=True)
+
+    def _start_catalog_refresh(self, site_names, manual=False):
+        if self._catalog_refresh_running:
+            if manual:
+                messagebox.showinfo("사이트 정보 갱신", "이미 사이트 정보를 갱신하고 있습니다.", parent=self)
+            return
+        self._catalog_refresh_running = True
+        self.form.set_catalog_refresh_state("갱신 중...", busy=True)
+        target_date = self._catalog_target_date()
+
+        def worker():
+            for site_name in site_names:
+                config = self.catalog_configs.get(site_name)
+                if not config:
+                    continue
+                result = self.catalog_service.refresh(config, target_date, force=manual)
+                self.engine_event_queue.put(("catalog_result", site_name, result, manual))
+            self.engine_event_queue.put(("catalog_done", manual))
+
+        threading.Thread(target=worker, name="CatalogRefreshThread", daemon=True).start()
+
+    def _catalog_target_date(self):
+        today = datetime.now().date()
+        raw_value = self.form.date_entry.get().strip()
+        try:
+            selected = datetime.strptime(raw_value, "%Y-%m-%d").date()
+        except ValueError:
+            selected = today
+        return max(today, selected).isoformat()
+
+    def _handle_catalog_result(self, site_name, result, manual):
+        catalog = self.catalog_service.catalogs.get(result.site_key)
+        selection = None
+        if site_name == self.site_var.get():
+            selection = (
+                self.form._selected_branch_id(),
+                self.form._selected_theme_id(),
+            )
+        if catalog and result.status in {"changed", "unchanged"}:
+            self._apply_catalog_to_runtime(site_name, catalog)
+            self._refresh_current_catalog_ui(site_name, selection)
+
+        pending_count = len(self.catalog_service.pending_changes(result.site_key))
+        if result.status in {"changed", "unchanged"}:
+            self._catalog_applied_counts[site_name] = len(result.applied_changes)
+        changed_count = self._catalog_applied_counts.get(site_name, 0)
+        if site_name == self.site_var.get():
+            if result.status in {"changed", "unchanged"}:
+                stamp = (catalog.last_success_at if catalog else result.checked_at).replace("T", " ")[:16]
+                self.form.set_catalog_refresh_state(
+                    f"최근 {stamp}",
+                    pending_count=pending_count,
+                    changed_count=changed_count,
+                )
+            elif result.status == "deferred":
+                self.form.set_catalog_refresh_state(
+                    "갱신 보류 · 기존 정보 사용",
+                    pending_count=pending_count,
+                    changed_count=self._catalog_applied_counts.get(site_name, 0),
+                )
+            else:
+                self.form.set_catalog_refresh_state(
+                    "갱신 실패",
+                    pending_count=pending_count,
+                    changed_count=self._catalog_applied_counts.get(site_name, 0),
+                )
+
+        if result.error:
+            if result.status == "deferred":
+                refresh_kind = "수동" if manual else "자동"
+                self.log_panel.append_log(
+                    f"[{site_name}] {refresh_kind} 갱신 보류: {result.error}", "warning"
+                )
+            else:
+                self.log_panel.append_log(f"[{site_name}] 사이트 정보 갱신 실패: {result.error}", "warning")
+            if manual:
+                messagebox.showwarning("사이트 정보 갱신", result.error, parent=self)
+            return
+
+        added = sum(change.kind == "added" for change in result.applied_changes)
+        renamed = sum(change.kind == "renamed" for change in result.applied_changes)
+        if result.changed:
+            self.log_panel.append_log(
+                f"[{site_name}] 카탈로그 갱신 · 신규 {added} · 이름 변경 {renamed} · 확인 필요 {pending_count}",
+                "success" if not pending_count else "warning",
+            )
+        elif manual:
+            self.log_panel.append_log(f"[{site_name}] 사이트 정보가 이미 최신입니다.", "info")
+
+        if manual:
+            if pending_count:
+                self._show_catalog_pending(site_name)
+            else:
+                messagebox.showinfo(
+                    "사이트 정보 갱신",
+                    f"{site_name} 갱신 완료\n\n신규: {added}개\n이름 변경: {renamed}개\n확인 필요: 0개",
+                    parent=self,
+                )
+
+    def _refresh_current_catalog_ui(self, site_name, selection=None):
+        if site_name != self.site_var.get():
+            return
+        if selection is None:
+            selection = (
+                self.form._selected_branch_id(),
+                self.form._selected_theme_id(),
+            )
+        old_branch_id, old_theme_id = selection
+        self.form.custom_sites = self.custom_sites
+        self.form.set_site(site_name)
+        branch_name = next(
+            (
+                name
+                for name, branch_id in self.form.config.get("branch_ids", {}).items()
+                if str(branch_id) == str(old_branch_id)
+            ),
+            next(
+                (
+                    name
+                    for name, branch_id in self.form.config.get("branches", {}).items()
+                    if str(branch_id) == str(old_branch_id)
+                ),
+                "",
+            ),
+        )
+        if branch_name:
+            self.form.branch_var.set(branch_name)
+            self.form._update_theme_options()
+        if old_theme_id:
+            booking_branch_id = self.form.config.get("branches", {}).get(branch_name, "")
+            theme_name = next(
+                (
+                    name
+                    for name in self.form.theme_dropdown.cget("values")
+                    if self.form._theme_id_for_name(booking_branch_id, name) == str(old_theme_id)
+                ),
+                "",
+            )
+            if theme_name:
+                self.form.theme_var.set(theme_name)
+
+    def _show_catalog_pending(self, site_name=None):
+        site_name = site_name or self.site_var.get()
+        config = self.catalog_configs.get(site_name)
+        if not config:
+            return
+        site_key = config.get("catalog_key", "")
+        changes = self.catalog_service.pending_changes(site_key)
+        if not changes:
+            changed_count = self._catalog_applied_counts.get(site_name, 0)
+            if changed_count:
+                messagebox.showinfo(
+                    "사이트 변경 내역",
+                    f"안전 규칙에 따라 자동 반영된 변경이 {changed_count}개 있습니다.\n"
+                    "자세한 내용은 터미널 로그에서 확인할 수 있습니다.",
+                    parent=self,
+                )
+                self._catalog_applied_counts[site_name] = 0
+                self._update_catalog_status(site_name)
+            else:
+                messagebox.showinfo("사이트 변경 검토", "확인할 변경사항이 없습니다.", parent=self)
+            return
+
+        def apply_selected(selected):
+            selection = None
+            if site_name == self.site_var.get():
+                selection = (
+                    self.form._selected_branch_id(),
+                    self.form._selected_theme_id(),
+                )
+            catalog = self.catalog_service.apply_pending(site_key, selected)
+            if catalog:
+                self._apply_catalog_to_runtime(site_name, catalog)
+                self._refresh_current_catalog_ui(site_name, selection)
+                remaining = len(self.catalog_service.pending_changes(site_key))
+                if site_name == self.site_var.get():
+                    self.form.set_catalog_refresh_state("검토 반영 완료", pending_count=remaining)
+                self.log_panel.append_log(
+                    f"[{site_name}] 검토한 사이트 변경 {len(selected)}개를 반영했습니다.", "success"
+                )
+
+        CatalogChangesDialog(self, site_name, changes, apply_selected)
 
     def _trigger_success_notification(self):
+        self._engine_completion_handled = True
         self._reset_cta_state()
         try:
             winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS)
@@ -1555,7 +2076,7 @@ class MainWindow(ctk.CTk):
                                 JIGUBYEOL_THEMES[b_id] = {}
                             JIGUBYEOL_THEMES[b_id].update(themes)
                         
-                        self.after(0, self._refresh_themes_ui)
+                        self.engine_event_queue.put(("refresh_themes",))
             except Exception:
                 pass
 
@@ -1564,9 +2085,33 @@ class MainWindow(ctk.CTk):
         t.daemon = True
         t.start()
 
+    def _start_zeroworld_theme_fetcher(self):
+        reservation_date = self.form.date_entry.get().strip()
+
+        def fetch():
+            from data.themes import ZEROWORLD_THEMES
+            from engines.zeroworld_catalog import fetch_themes
+
+            changed = False
+            for branch_id in ("1", "2", "4", "5"):
+                try:
+                    themes = fetch_themes(branch_id, reservation_date)
+                except Exception:
+                    continue
+                if themes and themes != ZEROWORLD_THEMES.get(branch_id):
+                    ZEROWORLD_THEMES[branch_id] = themes
+                    changed = True
+            if changed:
+                self.engine_event_queue.put(("refresh_themes",))
+
+        import threading
+
+        thread = threading.Thread(target=fetch, name="ZeroWorldThemeFetcher", daemon=True)
+        thread.start()
+
     def _refresh_themes_ui(self):
         try:
-            if self.site_var.get() == "지구별방탈출":
+            if self.site_var.get() in {"지구별방탈출", "제로월드"}:
                 self.form._update_theme_options()
         except Exception:
             pass

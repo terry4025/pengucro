@@ -7,3 +7,10 @@ dist/
 .vscode/
 config.json
 custom_sites.json
+naver_cookies.json
+success_reservations.txt
+reservation_history.jsonl
+secrets.json
+*.tmp
+scratch/
+.pytest_cache/

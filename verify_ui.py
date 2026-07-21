@@ -1,7 +1,11 @@
 import os
 import sys
 import time
+import tempfile
 import unittest
+
+_TEST_DATA_DIR = tempfile.TemporaryDirectory(prefix="pengucro_ui_test_")
+os.environ["PENGUCRO_DATA_DIR"] = _TEST_DATA_DIR.name
 
 # Ensure the project root is in python path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -15,9 +19,12 @@ import ui.theme as theme
 from ui.main_window import MainWindow
 from ui.log_panel import LogPanel
 from ui.reservation_form import ReservationForm
+from pengucro.models import NAVER_MODE, STANDARD_MODE
 
 # Monkey-patch MainWindow to avoid start-up network fetch of themes in background
 MainWindow._start_jigubyeol_theme_fetcher = lambda self: None
+MainWindow._start_zeroworld_theme_fetcher = lambda self: None
+MainWindow._start_catalog_auto_refresh = lambda self: None
 
 class TestUIComponents(unittest.TestCase):
     @classmethod
@@ -33,9 +40,20 @@ class TestUIComponents(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.app.destroy()
+        _TEST_DATA_DIR.cleanup()
 
     def test_1_mainwindow_title_bar(self):
         print("\n--- Verifying MainWindow Title Bar Traffic Lights & Pin ---")
+
+        # Borderless Tk windows use a separate native parent for the taskbar.
+        # Verify that both icon sizes were loaded for that Win32 window.
+        self.assertEqual(
+            len(self.app._native_icon_handles),
+            2,
+            "The taskbar window must have both large and small native icons",
+        )
+        self.assertTrue(all(self.app._native_icon_handles))
+        print("[Pass] Native taskbar icon handles are applied to the borderless window.")
         
         # Verify title bar exists
         self.assertIsNotNone(self.app.title_bar, "Title bar should not be None")
@@ -55,39 +73,23 @@ class TestUIComponents(unittest.TestCase):
         # Let's verify that dots_frame is packed on the right of title_bar
         dots_frame_info = dots_frame.pack_info()
         self.assertEqual(dots_frame_info.get("side"), "right", "dots_frame must be packed on the right")
-        self.assertEqual(int(dots_frame_info.get("padx", 0)), 12, "dots_frame padx must be 12")
-        print("[Pass] macOS dots container frame is packed on the right with correct padding.")
+        self.assertEqual(int(dots_frame_info.get("padx", 0)), 8, "window controls padx must be 8")
+        print("[Pass] Window controls are packed on the right with correct padding.")
 
         # Get dots_frame children and check their order (only match CTkButton widgets)
         dots_children = [child for child in dots_frame.winfo_children() if isinstance(child, ctk.CTkButton)]
         self.assertEqual(len(dots_children), 3, "dots_frame must contain exactly 3 CTkButton children")
         
-        # Verify max_btn is first
-        self.assertEqual(dots_children[0], self.app.max_btn, "First dot must be the Maximize button")
-        self.assertEqual(self.app.max_btn.cget("fg_color"), theme.ACCENT_GREEN, "Maximize button color should be ACCENT_GREEN")
-        self.assertEqual(self.app.max_btn.cget("hover_color"), theme.ACCENT_GREEN_HOVER, "Maximize button hover color should be ACCENT_GREEN_HOVER")
-        self.assertEqual(self.app.max_btn.cget("width"), 12, "Maximize button width should be 12")
-        self.assertEqual(self.app.max_btn.cget("height"), 12, "Maximize button height should be 12")
-        self.assertEqual(self.app.max_btn.cget("corner_radius"), 6, "Maximize button corner_radius should be 6")
-        print("[Pass] Maximize (Green) traffic light is verified at index 0.")
-
-        # Verify min_btn is second
-        self.assertEqual(dots_children[1], self.app.min_btn, "Second dot must be the Minimize button")
-        self.assertEqual(self.app.min_btn.cget("fg_color"), theme.ACCENT_YELLOW, "Minimize button color should be ACCENT_YELLOW")
-        self.assertEqual(self.app.min_btn.cget("hover_color"), theme.ACCENT_YELLOW_HOVER, "Minimize button hover color should be ACCENT_YELLOW_HOVER")
-        self.assertEqual(self.app.min_btn.cget("width"), 12, "Minimize button width should be 12")
-        self.assertEqual(self.app.min_btn.cget("height"), 12, "Minimize button height should be 12")
-        self.assertEqual(self.app.min_btn.cget("corner_radius"), 6, "Minimize button corner_radius should be 6")
-        print("[Pass] Minimize (Yellow) traffic light is verified at index 1.")
-
-        # Verify close_btn is third
+        self.assertEqual(dots_children[0], self.app.min_btn, "First control must be Minimize")
+        self.assertEqual(dots_children[1], self.app.max_btn, "Second control must be Maximize")
         self.assertEqual(dots_children[2], self.app.close_btn, "Third dot must be the Close button")
-        self.assertEqual(self.app.close_btn.cget("fg_color"), theme.ACCENT_RED, "Close button color should be ACCENT_RED")
-        self.assertEqual(self.app.close_btn.cget("hover_color"), theme.ACCENT_RED_HOVER, "Close button hover color should be ACCENT_RED_HOVER")
-        self.assertEqual(self.app.close_btn.cget("width"), 12, "Close button width should be 12")
-        self.assertEqual(self.app.close_btn.cget("height"), 12, "Close button height should be 12")
-        self.assertEqual(self.app.close_btn.cget("corner_radius"), 6, "Close button corner_radius should be 6")
-        print("[Pass] Close (Red) traffic light is verified at index 2.")
+        self.assertEqual(self.app.min_btn.cget("text"), "—")
+        self.assertEqual(self.app.max_btn.cget("text"), "□")
+        self.assertEqual(self.app.close_btn.cget("text"), "×")
+        for control in dots_children:
+            self.assertEqual(control.cget("width"), 30)
+            self.assertEqual(control.cget("height"), 26)
+        print("[Pass] Accessible minimize, maximize and close controls are verified.")
 
         # Verify Pin button is packed on the left
         self.assertIsNotNone(self.app.pin_btn, "Pin button should not be None")
@@ -281,7 +283,7 @@ class TestUIComponents(unittest.TestCase):
         print("\n--- Verifying Engine Mode Change Filtering ---")
         
         # Test change to Naver (Playwright) mode
-        self.app._on_engine_mode_change("네이버 (Playwright)")
+        self.app._on_engine_mode_change(NAVER_MODE)
         self.app.update()
         
         # Site options should contain either Naver custom sites or the placeholder
@@ -294,13 +296,25 @@ class TestUIComponents(unittest.TestCase):
             print("[Pass] Correct Naver custom sites filtered.")
             
         # Test change to a Standard engine mode (e.g., 고속 (Async))
-        self.app._on_engine_mode_change("고속 (Async)")
+        self.app._on_engine_mode_change(STANDARD_MODE)
         self.app.update()
         
         std_options = self.app.site_dropdown.cget("values")
         self.assertTrue(len(std_options) >= len(self.app.default_site_names))
         self.assertTrue(any("제로월드" in opt for opt in std_options))
         print("[Pass] Standard engine mode restores default site options correctly.")
+
+        self.app.site_var.set("제로월드")
+        self.app._on_site_change("제로월드")
+        self.app.form.branch_var.set("다이브 건대점")
+        self.app.form._on_branch_change("다이브 건대점")
+        self.app.update()
+        self.assertIn("다이브 건대점", self.app.form.branch_dropdown.cget("values"))
+        self.assertEqual(
+            set(self.app.form.theme_dropdown.cget("values")),
+            {"인터뷰 (26.07.29 이전)", "인터뷰 (26.07.30 이후)", "오르골"},
+        )
+        print("[Pass] ZeroWorld Dive Konkuk branch and its three themes are selectable.")
 
     def test_5_add_site_dialog_parse_error_handling(self):
         print("\n--- Verifying AddSiteDialog Parse Error Exception Capture ---")
@@ -373,8 +387,8 @@ class TestUIComponents(unittest.TestCase):
         self.assertTrue(self.app.is_sync_running, "Sync thread should be running for Keyescape when checked")
         
         # 2. Switch to Zero World (unsupported site)
-        self.app.site_var.set("제로월드 강남")
-        self.app._on_site_change("제로월드 강남")
+        self.app.site_var.set("제로월드")
+        self.app._on_site_change("제로월드")
         self.app.update()
         
         # Check if server time checkbox is deselected and disabled
@@ -385,10 +399,68 @@ class TestUIComponents(unittest.TestCase):
         self.assertFalse(self.app.is_sync_running, "Sync thread should be stopped for Zero World")
         
         # Cleanup
-        self.app.site_var.set("제로월드 강남")
-        self.app._on_site_change("제로월드 강남")
+        self.app.site_var.set("제로월드")
+        self.app._on_site_change("제로월드")
         self.app.update()
         print("[Pass] Server time checkbox behaves correctly (deselected & disabled) on unsupported sites.")
+
+    def test_7_dynamic_advanced_layout_and_original_loading_reveal(self):
+        print("\n--- Verifying Dynamic Advanced Layout & Original Loading Reveal ---")
+
+        form = self.app.form
+        if form._advanced_visible:
+            form._toggle_advanced()
+            self.app.update()
+
+        root_size = (self.app.winfo_width(), self.app.winfo_height())
+        form_height = form.winfo_height()
+        log_height = self.app.log_panel.winfo_height()
+        self.assertIsInstance(form, ctk.CTkFrame)
+        self.assertNotIsInstance(form, ctk.CTkScrollableFrame)
+
+        form._toggle_advanced()
+        for _ in range(5):
+            self.app.update()
+            time.sleep(0.02)
+
+        self.assertGreater(
+            int(form.threads_frame.grid_info()["row"]),
+            int(form.advanced_toggle_btn.grid_info()["row"]),
+            "Concurrent attempts must appear below the advanced toggle",
+        )
+        self.assertTrue(form.catalog_auto_refresh_var.get())
+        self.assertTrue(form.catalog_auto_refresh_checkbox.winfo_ismapped())
+        self.assertTrue(form.catalog_refresh_btn.winfo_ismapped())
+        self.assertEqual(form.catalog_refresh_btn.cget("text"), "현재 사이트 갱신")
+        self.assertEqual((self.app.winfo_width(), self.app.winfo_height()), root_size)
+        self.assertGreater(form.winfo_height(), form_height)
+        self.assertLess(self.app.log_panel.winfo_height(), log_height)
+
+        form._toggle_advanced()
+        self.app.update()
+        self.assertEqual(form.winfo_height(), form_height)
+        self.assertEqual(self.app.log_panel.winfo_height(), log_height)
+
+        from ui.main_window import LoadingOverlay
+
+        completed = []
+        overlay = LoadingOverlay(
+            self.app,
+            lambda: completed.append(True),
+        )
+        overlay.place(x=0, y=36, relwidth=1, relheight=1)
+        self.app.update()
+        overlay._fade_out()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not completed:
+            self.app.update()
+            time.sleep(0.01)
+
+        self.assertTrue(completed, "Loading overlay reveal should complete")
+        self.assertEqual((self.app.winfo_width(), self.app.winfo_height()), root_size)
+        self.assertEqual(form.winfo_height(), form_height)
+        self.assertEqual(self.app.log_panel.winfo_height(), log_height)
+        print("[Pass] Advanced content expands without a scrollbar and the original curtain reveal completes.")
 
 if __name__ == "__main__":
     unittest.main()

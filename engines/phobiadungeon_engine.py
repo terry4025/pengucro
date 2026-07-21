@@ -44,7 +44,9 @@ class PhobiaDungeonEngine(BaseEngine):
         self.is_running = True
         self.stop_event.clear()
         self._attempt_count = 0
+        self._last_error = ""
         self._seen_errors = set()
+        self._success_fired = False
 
         self.log(f"비트포비아 던전 예약을 시작합니다. (병렬 인스턴스: {num_threads}개)", "info")
 
@@ -66,7 +68,8 @@ class PhobiaDungeonEngine(BaseEngine):
         if self.playwright_thread:
             self.playwright_thread.join()
         self.is_running = False
-        self.log("비트포비아 예약 작업이 종료되었습니다.", "info")
+        message = "비트포비아 예약 작업이 성공적으로 종료되었습니다." if self._success_fired else "비트포비아 예약 작업이 종료되었습니다."
+        self.log(message, "success" if self._success_fired else "info")
 
     def stop_reservation(self):
         if not self.is_running:
@@ -414,9 +417,7 @@ class PhobiaDungeonEngine(BaseEngine):
                 # DevMode: exit before final submission
                 if dev_mode:
                     self.log(f"✓ [{worker_id}번 기기] [개발자 테스트] 결제 최종 승인 직전 멈춤! (제출 우회)", "success")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
+                    self.notify_success()
                     while not self.stop_event.is_set():
                         await asyncio.sleep(0.5)
                     break
@@ -444,15 +445,11 @@ class PhobiaDungeonEngine(BaseEngine):
                 cur_url = page.url
                 if "rev.complete" in cur_url or "complete" in cur_url or "ok" in cur_url:
                     self.log(f"🎉 [{worker_id}번 기기] 예약 성공!! 완료 페이지: {cur_url}", "success")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
+                    self.notify_success()
                     break
                 else:
                     self.log(f"[{worker_id}번 기기] 완료 페이지 확인 중: {cur_url}", "info")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
+                    self.notify_success()
                     break
 
         except Exception as e:

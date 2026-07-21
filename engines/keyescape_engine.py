@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from datetime import datetime, timezone, timedelta
 from engines.base_engine import BaseEngine
+from pengucro.storage import SecretStore
 
 class KeyescapeEngine(BaseEngine):
     def __init__(self, log_callback, success_callback=None, site_url=None):
@@ -16,7 +17,9 @@ class KeyescapeEngine(BaseEngine):
         """
         super().__init__(log_callback, success_callback)
         self.browser_thread = None
-        self.site_url = site_url if site_url else 'https://www.keyescape.com'
+        self.site_url = (site_url or 'https://www.keyescape.com').rstrip('/')
+        self.api_url = f"{self.site_url}/controller/run_proc.php"
+        self.reservation_url = f"{self.site_url}/reservation2.php"
 
     def start_reservation(self, reservation_data, num_threads, is_async=False):
         self.log("키이스케이프는 구글 캡차 제한 및 세션 제약으로 인해 단일 브라우저 스레드로 동작합니다.", "info")
@@ -24,13 +27,10 @@ class KeyescapeEngine(BaseEngine):
         super().start_reservation(reservation_data, num_threads=1, is_async=False)
 
     def make_reservation_thread(self, reservation_data):
-        self.browser_thread = threading.Thread(
-            target=self._run_browser_booking,
-            args=(reservation_data,),
-            name="KeyescapeBrowserThread"
-        )
-        self.browser_thread.daemon = True
-        self.browser_thread.start()
+        # BaseEngine already owns the worker thread. Running the browser loop
+        # directly keeps `is_running` true until Playwright has really exited.
+        self.browser_thread = threading.current_thread()
+        self._run_browser_booking(reservation_data)
 
     def _run_browser_booking(self, reservation_data):
         import asyncio
@@ -46,8 +46,10 @@ class KeyescapeEngine(BaseEngine):
         
         # Look up correct themeNum and name from KEYESCAPE_THEMES mapping
         from data.themes import KEYESCAPE_THEMES
-        theme_num = ""
-        theme_name = ""
+        engine_metadata = reservation_data.get("engine_metadata", {})
+        theme_metadata = engine_metadata.get("theme", {}) if isinstance(engine_metadata, dict) else {}
+        theme_num = str(theme_metadata.get("theme_num", ""))
+        theme_name = reservation_data.get("themeLabel", "")
         
         for b_id, t_dict in KEYESCAPE_THEMES.items():
             if b_id == zizum_num:
@@ -67,7 +69,7 @@ class KeyescapeEngine(BaseEngine):
         # Step 0: Fetch 'doing' value (advance booking days) from theme info API
         doing_days = 0
         try:
-            r = requests.post("https://www.keyescape.com/controller/run_proc.php", data={
+            r = requests.post(self.api_url, data={
                 't': 'get_theme_info_list',
                 'zizum_num': zizum_num
             }, timeout=5)
@@ -99,13 +101,14 @@ class KeyescapeEngine(BaseEngine):
             '26': (10, 0),   # 에버랜드 (default)
             '29': (13, 30),  # 무비무드 전주
         }
-        open_hour, open_min = BRANCH_OPEN_TIMES.get(str(zizum_num), (10, 0))
+        known_open_time = BRANCH_OPEN_TIMES.get(str(zizum_num))
+        open_hour, open_min = known_open_time or (0, 0)
         branch_name = reservation_data.get("zizum_name", f"지점{zizum_num}")
 
         # Calculate the earliest datetime when booking becomes possible
         target_date_obj = datetime.strptime(target_date, "%Y-%m-%d").date()
         kst = timezone(timedelta(hours=9))
-        if doing_days > 0:
+        if doing_days > 0 and known_open_time:
             min_booking_date = target_date_obj - timedelta(days=doing_days - 1)
             min_booking_datetime = datetime(min_booking_date.year, min_booking_date.month, min_booking_date.day, open_hour, open_min, 0, tzinfo=kst)
             now_kst = datetime.now(kst)
@@ -121,8 +124,9 @@ class KeyescapeEngine(BaseEngine):
         else:
             min_booking_date = None
             min_booking_datetime = None
-            open_time_str = f"{open_hour:02d}:{open_min:02d}"
-            self.log(f"doing 값을 조회하지 못했습니다. 실시간 백엔드 감시로 전환합니다. (지점 오픈시간: {open_time_str})", "warning")
+            open_time_str = f"{open_hour:02d}:{open_min:02d}" if known_open_time else "미확인"
+            reason = "지점 오픈 시간을 확인하지 못했습니다" if not known_open_time else "doing 값을 조회하지 못했습니다"
+            self.log(f"{reason}. 임의 시간을 가정하지 않고 실시간 백엔드 감시로 전환합니다.", "warning")
 
         self.log("예약 1단계 우회용 Time Slot ID(themeTimeNum)를 조회 중...", "info")
 
@@ -131,7 +135,7 @@ class KeyescapeEngine(BaseEngine):
         available_slots = []
         date_is_open = False
         try:
-            r = requests.post("https://www.keyescape.com/controller/run_proc.php", data={
+            r = requests.post(self.api_url, data={
                 't': 'get_theme_time',
                 'date': target_date,
                 'zizumNum': zizum_num,
@@ -276,7 +280,7 @@ class KeyescapeEngine(BaseEngine):
                 # Only treat success completion as stop signal
                 if "완료" in msg and "예약" in msg and "오류" not in msg and "실패" not in msg:
                     self.log("예약 완료 메시지가 감지되었습니다!", "success")
-                    self.stop_event.set()
+                    self.notify_success()
                 # Booking-not-open errors → continue retrying (do NOT stop)
                 elif any(kw in msg for kw in ["날짜가 아닙니다", "예약 가능", "정원이"]):
                     self.log("예약 오픈 대기 중 - 백엔드 감시를 계속합니다...", "info")
@@ -307,7 +311,7 @@ class KeyescapeEngine(BaseEngine):
             html_content = f"""
             <html>
             <body>
-            <form id="f" action="https://www.keyescape.com/reservation2.php" method="POST">
+            <form id="f" action="{self.reservation_url}" method="POST">
                 <input type="hidden" name="zizumNum" value="{zizum_num}">
                 <input type="hidden" name="themeNum" value="{theme_num}">
                 <input type="hidden" name="themeInfoNum" value="{theme_info_num}">
@@ -388,12 +392,21 @@ class KeyescapeEngine(BaseEngine):
 
             # YesCaptcha API integration configuration
             yescaptcha_token = ""
-            yescaptcha_client_key = "3dae6d235caf5de1a4b368179556645b80e698d4127415"
+            yescaptcha_client_key = (
+                os.environ.get("PENGUCRO_YESCAPTCHA_API_KEY", "").strip()
+                or SecretStore().get("yescaptcha_api_key")
+            )
             website_key = "6Le0ObMqAAAAAF7j701m2aQsHLQFe_KDYpKvw3jQ"
-            website_url = "https://www.keyescape.com/reservation2.php"
+            website_url = self.reservation_url
 
             async def solve_captcha_via_api():
                 nonlocal yescaptcha_token
+                if not yescaptcha_client_key:
+                    self.log(
+                        "[YesCaptcha] API 키가 없어 자동 캡차 해결을 건너뜁니다. 고급 설정에서 키를 저장하거나 수동으로 인증해주세요.",
+                        "warning",
+                    )
+                    return
                 self.log("[YesCaptcha] 캡차 자동 해결 API 요청을 전송합니다...", "info")
                 loop = asyncio.get_running_loop()
 
@@ -584,7 +597,7 @@ class KeyescapeEngine(BaseEngine):
                                 # Only call API every 0.1s (skip every other tick)
                                 if backend_check_count % 2 == 0:
                                     try:
-                                        r = requests.post("https://www.keyescape.com/controller/run_proc.php", data={
+                                        r = requests.post(self.api_url, data={
                                             't': 'get_theme_time',
                                             'date': target_date,
                                             'zizumNum': zizum_num,
@@ -646,9 +659,7 @@ class KeyescapeEngine(BaseEngine):
                             except Exception as ex:
                                 self.log(f"예약번호 추출 중 오류 발생: {ex}", "warning")
 
-                            self.stop_event.set()
-                            if self.success_callback:
-                                self.success_callback()
+                            self.notify_success()
                             break
                         except Exception as e:
                             # Submit failed (alert error or timeout) - reset and keep trying

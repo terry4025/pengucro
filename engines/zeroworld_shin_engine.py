@@ -1,777 +1,371 @@
+from __future__ import annotations
+
 import asyncio
-import aiohttp
-import requests
-import json
 import re
 import time
 import urllib.parse
+import webbrowser
+from dataclasses import dataclass
+from typing import Any
+
+import aiohttp
 from bs4 import BeautifulSoup
+
 from engines.base_engine import BaseEngine
+from engines.zeroworld_catalog import (
+    calendar_contains_date,
+    decode_body,
+    parse_time_slots,
+    subject_for_branch,
+)
+from pengucro.models import BookingResult
+from pengucro.storage import append_history, data_path
+
+
+@dataclass(frozen=True)
+class ZeroWorldContext:
+    branch: str
+    subject: str
+    reservation_date: str
+    theme: str
+    target_time: str
+    name: str
+    phone: str
+    people: str
+
 
 class ZeroWorldShinEngine(BaseEngine):
-    def __init__(self, site_url, log_callback, success_callback=None):
-        """
-        ZeroWorld New (Sinbiweb-based) Booking Engine.
-        """
+    """Reservation adapter for the current Sinbiweb ZeroWorld site."""
+
+    SELECT_URL = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
+    ACTION_URL = "https://zeroworldkorea.com/core/res/rev.act.php"
+    PAYMENT_URL = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
+    HOME_URL = "https://zeroworldkorea.com/layout/res/home.php?go=main"
+    SUPPORTED_BRANCHES = {"1", "2", "4", "5"}
+
+    def __init__(self, site_url: str, log_callback, success_callback=None, engine_options=None):
         super().__init__(log_callback, success_callback)
-        self.site_url = site_url
-        
-        import threading
-        self._log_lock = threading.Lock()
-        self._notified_bypass = False
-        self._notified_found = False
-        self._last_err_msg = ""
-        self._last_err_time = 0
-        self._last_wait_time = 0
-
-    def make_reservation_thread(self, reservation_data):
-        session = requests.Session()
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        options = dict(engine_options or {})
+        self.site_url = site_url or options.get("home_url") or self.HOME_URL
+        parsed = urllib.parse.urlparse(self.site_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "https://zeroworldkorea.com"
+        self.home_url = options.get("home_url") or urllib.parse.urljoin(base_url, "/layout/res/home.php")
+        self.select_url = options.get("select_url") or urllib.parse.urljoin(base_url, "/core/res/rev.make.sel.php")
+        self.action_url = options.get("action_url") or urllib.parse.urljoin(base_url, "/core/res/rev.act.php")
+        self.payment_url = options.get("payment_url") or urllib.parse.urljoin(base_url, "/core/res/rev.make.mutong.php")
+        self.subject_by_branch = {
+            str(key): str(value) for key, value in options.get("subject_by_branch", {}).items()
         }
-        session.headers.update(headers)
+        self.supported_branches = set(self.subject_by_branch) or set(self.SUPPORTED_BRANCHES)
+        self._last_messages: dict[str, float] = {}
 
-        zizum_num = reservation_data.get("branch", "4")
-        rev_days = reservation_data.get("reservationDate")
-        theme_num = reservation_data.get("themePK")
-        target_time = reservation_data.get("reservationTime")[:5]
-        name = reservation_data.get("name")
-        phone_digits = "".join(c for c in reservation_data.get("phone", "") if c.isdigit())
-        if len(phone_digits) == 11:
-            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:7]}-{phone_digits[7:11]}"
-        elif len(phone_digits) == 10:
-            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:6]}-{phone_digits[6:10]}"
-        else:
-            phone_formatted = phone_digits
-        people = reservation_data.get("people", "2")
-        s_subj = "B" if zizum_num == "2" else "A"
+    @staticmethod
+    def _format_phone(phone: str) -> str:
+        digits = "".join(character for character in phone if character.isdigit())
+        if len(digits) == 11:
+            return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+        if len(digits) == 10:
+            return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+        return digits
 
-        sel_url = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
-        act_url = "https://zeroworldkorea.com/core/res/rev.act.php"
+    def _build_context(self, reservation_data: dict[str, Any]) -> ZeroWorldContext:
+        branch = str(reservation_data.get("branch", "1"))
+        if branch not in self.supported_branches:
+            raise ValueError("지원하지 않는 제로월드 지점입니다. 김포·강남·홍대·다이브 건대만 선택할 수 있습니다.")
+        return ZeroWorldContext(
+            branch=branch,
+            subject=self.subject_by_branch.get(branch, subject_for_branch(branch)),
+            reservation_date=str(reservation_data.get("reservationDate", "")),
+            theme=str(reservation_data.get("themePK", "")),
+            target_time=str(reservation_data.get("reservationTime", ""))[:5],
+            name=str(reservation_data.get("name", "")),
+            phone=self._format_phone(str(reservation_data.get("phone", ""))),
+            people=str(reservation_data.get("people", "2")),
+        )
 
-        post_headers = {
+    def _headers(self, context: ZeroWorldContext) -> dict[str, str]:
+        referer = (
+            f"{self.home_url}?go=rev.make"
+            f"&s_subj={context.subject}&zizum_num={context.branch}&rev_days={context.reservation_date}"
+        )
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
+            "Referer": referer,
         }
 
-        # 요일 확인 (0~4: 평일, 5~6: 주말)
-        is_weekend = False
+    def _log_throttled(self, key: str, message: str, log_type: str = "warning", interval: float = 2.0) -> None:
+        now = time.monotonic()
+        if now - self._last_messages.get(key, 0.0) >= interval:
+            self._last_messages[key] = now
+            self.log(message, log_type)
+
+    def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
+        asyncio.run(self.make_reservation_async_task(reservation_data, 0))
+
+    async def make_reservation_async_task(self, reservation_data: dict[str, Any], task_idx: int) -> None:
         try:
-            from datetime import datetime
-            dt = datetime.strptime(rev_days, "%Y-%m-%d")
-            if dt.weekday() in [5, 6]:
-                is_weekend = True
-        except Exception:
-            pass
+            context = self._build_context(reservation_data)
+        except ValueError as exc:
+            self.log(str(exc), "error")
+            self.stop_event.set()
+            return
 
-        weekday_map = {
-            "10:50": "694", "12:00": "698", "13:10": "701", "14:20": "16",
-            "15:30": "704", "16:40": "705", "17:50": "706", "19:00": "709",
-            "20:10": "710", "21:20": "711"
-        }
-        weekend_map = {
-            "10:50": "695", "12:00": "699", "13:10": "702", "14:20": "707",
-            "15:30": "712", "16:40": "713", "17:50": "17", "19:00": "714",
-            "20:10": "715", "21:20": "716"
-        }
-        fallback_map = weekend_map if is_weekend else weekday_map
-        mapped_slot = fallback_map.get(target_time)
+        worker_name = f"작업 {task_idx + 1}"
+        self.log(
+            f"[{worker_name}] 신 제로월드 감시 시작 · 지점 {context.branch} · {context.target_time}",
+            "info",
+        )
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(headers=self._headers(context), timeout=timeout) as session:
+            date_open = False
+            while not self.stop_event.is_set():
+                try:
+                    if not date_open:
+                        date_open = await self._wait_for_date(session, context)
+                        if not date_open:
+                            await asyncio.sleep(0.15)
+                            continue
 
-        self.log(f"신 제로월드 고속 감시 시작 (스레드): {target_time} (매핑 ID: {mapped_slot})", "info")
-
-        slot_id = None
-        is_date_opened = False
-        while not self.stop_event.is_set():
-            try:
-                # 0. Check calendar if date is opened
-                if not is_date_opened:
-                    dt_parts = rev_days.split("-")
-                    cal_payload = f"act=calendar&zizum_num={zizum_num}&rev_days={rev_days}&year={dt_parts[0]}&month={dt_parts[1]}&s_subj={s_subj}"
-                    cal_resp = session.post(sel_url, data=cal_payload, headers=post_headers, timeout=5)
-                    if cal_resp.status_code == 200 and f"fun_days_select('{rev_days}'" in cal_resp.text:
-                        is_date_opened = True
-                        self.log(f"📅 예약 날짜({rev_days}) 오픈 확인! 예약 진행합니다.", "info")
-                    else:
-                        now = time.time()
-                        show_wait = False
-                        with self._log_lock:
-                            if (now - getattr(self, "_last_wait_time", 0)) > 2.0:
-                                self._last_wait_time = now
-                                show_wait = True
-                        if show_wait:
-                            self.log(f"⏳ 아직 열리지 않은 날짜 ({rev_days}) 대기 중... 계속 시도 중", "info")
-                        self.silent_tick(f"아직 열리지 않은 날짜 ({rev_days}) 대기 중")
-                        time.sleep(0.1)
+                    slot_id = await self._find_slot(session, context)
+                    if not slot_id:
+                        self.silent_tick(f"{context.target_time} 슬롯 대기")
+                        self._log_throttled(
+                            f"slot:{context.target_time}",
+                            f"{context.target_time} 예약 오픈을 기다리는 중입니다.",
+                        )
+                        await asyncio.sleep(0.15)
                         continue
 
-                # 1. Fetch time slots
-                payload = f"act=theme_time_list&zizum_num={zizum_num}&rev_days={rev_days}&theme_num={theme_num}"
-                resp = session.post(sel_url, data=payload, headers=post_headers, timeout=5)
-                if resp.status_code != 200:
-                    self.silent_tick(f"시간 조회 오류 ({resp.status_code})")
-                    time.sleep(0.1)
-                    continue
-
-                html_text = resp.text
-                if "에러" in html_text or not html_text.strip():
-                    self.silent_tick(f"시간 데이터 없음")
-                    time.sleep(0.1)
-                    continue
-
-                soup = BeautifulSoup(html_text, 'html.parser')
-                found_slot = None
-                target_found_disabled = False
-                for a in soup.find_all('a'):
-                    if target_time in a.text:
-                        classes = a.get('class', [])
-                        if any(c in classes for c in ['disable', 'close', 'sold-out']):
-                            target_found_disabled = True
-                            continue
-                        
-                        href = a.get('href', '')
-                        match = re.search(r"fun_theme_time_select\('(\d+)'", href)
-                        if match:
-                            found_slot = match.group(1)
-                            break
-
-
-
-                if not found_slot:
-                    self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
-                    now = time.time()
-                    show_err = False
-                    with self._log_lock:
-                        if not hasattr(self, "_last_time_err_time") or (now - self._last_time_err_time) > 2.0:
-                            self._last_time_err_time = now
-                            show_err = True
-                    if show_err:
-                        self.log(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중", "warning")
-                    time.sleep(0.1)
-                    continue
-
-                slot_id = found_slot
-                show_found = False
-                with self._log_lock:
-                    if not self._notified_found:
-                        self._notified_found = True
-                        show_found = True
-                if show_found:
-                    self.log(f"⏰ {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 진행 중...", "info")
-
-                if self.stop_event.is_set():
-                    break
-
-                lock_acquired = False
-                if hasattr(self, "submission_lock"):
-                    lock_acquired = self.submission_lock.acquire(block=False)
-                
-                if hasattr(self, "submission_lock") and not lock_acquired:
-                    time.sleep(0.1)
-                    continue
-
-                try:
-                    if self.stop_event.is_set():
-                        break
-
-                    # 1.5 Select theme (registers selection in session)
-                    theme_payload = f"act=theme_select&theme_num={theme_num}&rev_days={rev_days}&theme_time_num="
-                    session.post(sel_url, data=theme_payload, headers=post_headers, timeout=5)
-
-                    if self.stop_event.is_set():
-                        break
-
-                    # 2. Select slot
-                    sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
-                    session.post(sel_url, data=sel_payload, headers=post_headers, timeout=5)
-
-                    if self.stop_event.is_set():
-                        break
-
-                    # 3. Finalize reservation
-                    act_data = {
-                        "name": name,
-                        "mobile": phone_formatted,
-                        "person": people,
-                        "zizum_num": zizum_num,
-                        "rev_days": rev_days,
-                        "theme_num": theme_num,
-                        "theme_time_num": slot_id,
-                        "act": "make",
-                        "s_subj": s_subj
-                    }
-
-                    act_resp = session.post(act_url, data=act_data, headers=post_headers, timeout=8)
-                    try:
-                        act_bytes = act_resp.content
-                        try:
-                            act_text = act_bytes.decode('utf-8')
-                        except UnicodeDecodeError:
-                            act_text = act_bytes.decode('cp949', errors='ignore')
-                    except Exception:
-                        act_text = act_resp.text
-
-                    try:
-                        import os
-                        os.makedirs("scratch", exist_ok=True)
-                        with open("scratch/last_act_response.html", "w", encoding="utf-8") as debug_f:
-                            debug_f.write(act_text)
-                    except Exception:
-                        pass
-
-                    history_urls = [str(h.url) for h in act_resp.history]
-                    final_url = str(act_resp.url)
-
-                    success = False
-                    combined_check = act_text + " " + final_url + " " + " ".join(history_urls)
-                    combined_lower = combined_check.lower()
-                    if "rev.pay" in combined_lower or "rev.kcp" in combined_lower:
-                        success = True
-                    elif "location.replace" in combined_lower or "location.href" in combined_lower:
-                        success = True
-                    elif "결제" in act_text or "예약확인" in act_text or "payment" in combined_lower:
-                        success = True
-                    elif "toss" in combined_lower or "vbank" in combined_lower:
-                        success = True
-
-                    if success:
+                    async with self.async_submission_lock:
                         if self.stop_event.is_set():
-                            break
-                        final_msg = "예약 선점 성공 (수동 확인 필요)"
-                        try:
-                            code_m = re.search(r"name=['\"]?code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
-                            ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
-                            rev_code = code_m.group(1) if code_m else ""
-                            ck_code_val = ck_m.group(1) if ck_m else ""
-                            if not rev_code:
-                                url_m = re.search(r"code=([a-zA-Z0-9]+)", combined_check)
-                                if url_m:
-                                    rev_code = url_m.group(1)
-                            if rev_code:
-                                if not ck_code_val:
-                                    kcp_url = f"https://zeroworldkorea.com/layout/res/home.php?go=rev.kcp&code={rev_code}"
-                                    kcp_resp = session.get(kcp_url, timeout=8)
-                                    kcp_text = kcp_resp.text
-                                    ck_m2 = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
-                                    if ck_m2:
-                                        ck_code_val = ck_m2.group(1)
-                                mutong_url = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
-                                mutong_params = {
-                                    "code": rev_code,
-                                    "ck_code": ck_code_val,
-                                    "layout_folder": "layout/res",
-                                    "payment": "A",
-                                    "privacy": "on",
-                                    "name": name,
-                                    "mobile": phone_formatted,
-                                    "tel": phone_formatted
-                                }
-                                mutong_resp = session.post(mutong_url, data=mutong_params, timeout=8)
-                                try:
-                                    mutong_bytes = mutong_resp.content
-                                    try:
-                                        mutong_text = mutong_bytes.decode('utf-8')
-                                    except UnicodeDecodeError:
-                                        mutong_text = mutong_bytes.decode('cp949', errors='ignore')
-                                except Exception:
-                                    mutong_text = mutong_resp.text
+                            return
+                        result = await self._submit(session, context, slot_id)
+                    if result:
+                        self.log(f"🎉 {result.message}", "success")
+                        self.notify_success(result)
+                        return
+                    await asyncio.sleep(0.4)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    self._log_throttled("network", f"제로월드 통신 오류: {exc}")
+                    await asyncio.sleep(0.5)
+                except Exception as exc:
+                    self._log_throttled("unexpected", f"제로월드 처리 오류: {exc}", "error")
+                    await asyncio.sleep(0.5)
 
-                                # mutong.php returns meta refresh -> rev.make.exe.php
-                                # rev.make.exe.php triggers KakaoTalk notification & returns meta refresh -> rev.make.end
-                                refresh_m = re.search(r"url=([^'\"\>]+)", mutong_text, re.I)
-                                if refresh_m:
-                                    next_url = refresh_m.group(1).strip()
-                                    if not next_url.startswith("http"):
-                                        next_url = urllib.parse.urljoin(mutong_url, next_url)
-                                    try:
-                                        exe_resp = session.get(next_url, timeout=8)
-                                        exe_text = exe_resp.content.decode('utf-8', errors='ignore')
-                                        mutong_text += exe_text
-                                    except Exception:
-                                        pass
-
-                                # Extract booking number from ck_code in URL (most reliable)
-                                bnum_m = re.search(r"ck_code=(\d+)", mutong_text)
-                                if not bnum_m:
-                                    bnum_m = re.search(r"예약번호[^0-9]*(\d+)", mutong_text)
-                                bnum = bnum_m.group(1) if bnum_m else ck_code_val
-
-                                if "rev.make.exe.php" in mutong_text or "rev.make.end" in mutong_text or "완료" in mutong_text or "접수" in mutong_text or "성공" in mutong_text:
-                                    final_msg = f"예약 최종 완료! 예약번호: {bnum}"
-                                    try:
-                                        import webbrowser
-                                        webbrowser.open(f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make.end&code={rev_code}")
-                                    except Exception:
-                                        pass
-                                    try:
-                                        time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                                        with open("success_reservations.txt", "a", encoding="utf-8") as sf:
-                                            sf.write(f"[{time_str}] 제로월드(신) | 날짜: {rev_days} | 시간: {target_time} | 이름: {name} | 예약번호: {bnum}\n")
-                                    except Exception:
-                                        pass
-                                else:
-                                    # Save response for debug
-                                    try:
-                                        import os
-                                        os.makedirs("scratch", exist_ok=True)
-                                        with open("scratch/last_mutong_response.html", "w", encoding="utf-8") as debug_mf:
-                                            debug_mf.write(mutong_text)
-                                    except Exception:
-                                        pass
-                                    final_msg = f"예약 선점 성공! 예약번호: {bnum} / 코드: {rev_code} (결제확인 응답 재확인 필요)"
-                            else:
-                                final_msg = "예약 선점 성공! (코드 추출 실패 - 수동 확인 필요)"
-                        except Exception as e:
-                            final_msg = f"예약 선점 성공! (자동확인 오류: {e})"
-                        self.log(f"🎉 {final_msg}", "success")
-                        self.stop_event.set()
-                        if self.success_callback:
-                            self.success_callback()
-                        break
-                    else:
-                        err_msg = "선점 실패"
-                        alert_match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", act_text)
-                        if alert_match:
-                            err_msg = alert_match.group(1)
-                        else:
-                            err_soup = BeautifulSoup(act_text, 'html.parser')
-                            for s in err_soup.find_all('script'):
-                                if "alert" in s.text:
-                                    inner_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
-                                    if inner_match:
-                                        err_msg = inner_match.group(1)
-                                        break
-                        
-                        show_err = False
-                        now = time.time()
-                        with self._log_lock:
-                            if err_msg != self._last_err_msg or (now - self._last_err_time) > 2.0:
-                                self._last_err_msg = err_msg
-                                self._last_err_time = now
-                                show_err = True
-                        if show_err:
-                            self.log(f"제출 대기 중: {err_msg}", "warning")
-                        
-                        time.sleep(0.5)
-                finally:
-                    if lock_acquired and hasattr(self, "submission_lock"):
-                        try:
-                            self.submission_lock.release()
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                now = time.time()
-                show_conn_err = False
-                with self._log_lock:
-                    if "connection_error" != self._last_err_msg or (now - self._last_err_time) > 2.0:
-                        self._last_err_msg = "connection_error"
-                        self._last_err_time = now
-                        show_conn_err = True
-                if show_conn_err:
-                    self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
-                try:
-                    session.close()
-                except Exception:
-                    pass
-                session = requests.Session()
-                session.headers.update(headers)
-                time.sleep(0.5)
-
-    async def make_reservation_async_task(self, reservation_data, task_idx):
-        session = None
-        if hasattr(self, "session_pool") and len(self.session_pool) > 0:
-            local_idx = task_idx % len(self.session_pool)
-            session, _ = self.session_pool[local_idx]
-            
-        if not session:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-            session = aiohttp.ClientSession(headers=headers)
-            
-        zizum_num = reservation_data.get("branch", "4")
-        rev_days = reservation_data.get("reservationDate")
-        theme_num = reservation_data.get("themePK")
-        target_time = reservation_data.get("reservationTime")[:5]
-        name = reservation_data.get("name")
-        phone_digits = "".join(c for c in reservation_data.get("phone", "") if c.isdigit())
-        if len(phone_digits) == 11:
-            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:7]}-{phone_digits[7:11]}"
-        elif len(phone_digits) == 10:
-            phone_formatted = f"{phone_digits[0:3]}-{phone_digits[3:6]}-{phone_digits[6:10]}"
-        else:
-            phone_formatted = phone_digits
-        people = reservation_data.get("people", "2")
-        s_subj = "B" if zizum_num == "2" else "A"
-        
-        sel_url = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
-        act_url = "https://zeroworldkorea.com/core/res/rev.act.php"
-        
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
+    async def _wait_for_date(self, session: aiohttp.ClientSession, context: ZeroWorldContext) -> bool:
+        year, month, _ = context.reservation_date.split("-")
+        payload = {
+            "act": "calendar",
+            "zizum_num": context.branch,
+            "rev_days": context.reservation_date,
+            "year": year,
+            "month": month,
+            "s_subj": context.subject,
         }
-        
-        is_weekend = False
-        try:
-            from datetime import datetime
-            dt = datetime.strptime(rev_days, "%Y-%m-%d")
-            if dt.weekday() in [5, 6]:
-                is_weekend = True
-        except Exception:
-            pass
+        async with session.post(self.select_url, data=payload) as response:
+            body = decode_body(await response.read())
+        if calendar_contains_date(body, context.reservation_date):
+            self.log(f"📅 {context.reservation_date} 예약일 오픈을 확인했습니다.", "info")
+            return True
+        self.silent_tick(f"{context.reservation_date} 날짜 대기")
+        self._log_throttled(
+            f"date:{context.reservation_date}",
+            f"{context.reservation_date} 예약일 오픈을 기다리는 중입니다.",
+            "info",
+        )
+        return False
 
-        weekday_map = {
-            "10:50": "694", "12:00": "698", "13:10": "701", "14:20": "16",
-            "15:30": "704", "16:40": "705", "17:50": "706", "19:00": "709",
-            "20:10": "710", "21:20": "711"
+    async def _find_slot(self, session: aiohttp.ClientSession, context: ZeroWorldContext) -> str:
+        payload = {
+            "act": "theme_time_list",
+            "zizum_num": context.branch,
+            "rev_days": context.reservation_date,
+            "theme_num": context.theme,
         }
-        weekend_map = {
-            "10:50": "695", "12:00": "699", "13:10": "702", "14:20": "707",
-            "15:30": "712", "16:40": "713", "17:50": "17", "19:00": "714",
-            "20:10": "715", "21:20": "716"
+        async with session.post(self.select_url, data=payload) as response:
+            if response.status != 200:
+                return ""
+            body = decode_body(await response.read())
+        for slot in parse_time_slots(body):
+            if slot.time == context.target_time and slot.available:
+                self.log(f"⏰ {context.target_time} 슬롯 발견 · ID {slot.slot_id}", "info")
+                return slot.slot_id
+        return ""
+
+    async def _submit(
+        self,
+        session: aiohttp.ClientSession,
+        context: ZeroWorldContext,
+        slot_id: str,
+    ) -> BookingResult | None:
+        await self._post_and_discard(
+            session,
+            {
+                "act": "theme_list",
+                "zizum_num": context.branch,
+                "rev_days": context.reservation_date,
+                "theme_num": "",
+                "s_subj": context.subject,
+            },
+        )
+        await self._post_and_discard(
+            session,
+            {
+                "act": "theme_select",
+                "theme_num": context.theme,
+                "rev_days": context.reservation_date,
+                "theme_time_num": "",
+            },
+        )
+        await self._post_and_discard(
+            session,
+            {"act": "theme_time_select", "theme_time_num": slot_id},
+        )
+        action_data = {
+            "name": context.name,
+            "mobile": context.phone,
+            "person": context.people,
+            "zizum_num": context.branch,
+            "rev_days": context.reservation_date,
+            "theme_num": context.theme,
+            "theme_time_num": slot_id,
+            "act": "make",
+            "s_subj": context.subject,
         }
-        fallback_map = weekend_map if is_weekend else weekday_map
-        mapped_slot = fallback_map.get(target_time)
-        
-        self.log(f"[태스크 {task_idx+1}] 신 제로월드 고속 감시 시작: {target_time} (매핑 ID: {mapped_slot})", "info")
-        
-        slot_id = None
-        is_date_opened = False
-        while not self.stop_event.is_set():
-            try:
-                # 0. Check calendar if date is opened
-                if not is_date_opened:
-                    dt_parts = rev_days.split("-")
-                    cal_payload = f"act=calendar&zizum_num={zizum_num}&rev_days={rev_days}&year={dt_parts[0]}&month={dt_parts[1]}&s_subj={s_subj}"
-                    async with session.post(sel_url, data=cal_payload, headers=headers, timeout=5) as cal_resp:
-                        if cal_resp.status == 200:
-                            cal_text = await cal_resp.text()
-                            if f"fun_days_select('{rev_days}'" in cal_text:
-                                is_date_opened = True
-                                self.log(f"[태스크 {task_idx+1}] 📅 예약 날짜({rev_days}) 오픈 확인! 예약 진행합니다.", "info")
-                            else:
-                                now = time.time()
-                                show_wait = False
-                                with self._log_lock:
-                                    if (now - getattr(self, "_last_wait_time", 0)) > 2.0:
-                                        self._last_wait_time = now
-                                        show_wait = True
-                                if show_wait:
-                                    self.log(f"⏳ [태스크 {task_idx+1}] 아직 열리지 않은 날짜 ({rev_days}) 대기 중... 계속 시도 중", "info")
-                                self.silent_tick(f"아직 열리지 않은 날짜 ({rev_days}) 대기 중")
-                                await asyncio.sleep(0.1)
-                                continue
-                        else:
-                            self.silent_tick("캘린더 조회 API 에러")
-                            await asyncio.sleep(0.1)
-                            continue
+        async with session.post(self.action_url, data=action_data) as response:
+            body = decode_body(await response.read())
+            final_url = str(response.url)
+            history_urls = [str(item.url) for item in response.history]
 
-                # 1. Fetch time slots
-                payload = f"act=theme_time_list&zizum_num={zizum_num}&rev_days={rev_days}&theme_num={theme_num}"
-                async with session.post(sel_url, data=payload, headers=headers, timeout=5) as resp:
-                    if resp.status != 200:
-                        self.silent_tick(f"시간 조회 오류 ({resp.status})")
-                        await asyncio.sleep(0.1)
-                        continue
-                        
-                    html_text = await resp.text()
-                    if "에러" in html_text or not html_text.strip():
-                        self.silent_tick(f"시간 데이터 없음")
-                        await asyncio.sleep(0.1)
-                        continue
-                        
-                    soup = BeautifulSoup(html_text, 'html.parser')
-                    found_slot = None
-                    target_found_disabled = False
-                    for a in soup.find_all('a'):
-                        if target_time in a.text:
-                            classes = a.get('class', [])
-                            if any(c in classes for c in ['disable', 'close', 'sold-out']):
-                                target_found_disabled = True
-                                continue
-                            
-                            href = a.get('href', '')
-                            match = re.search(r"fun_theme_time_select\('(\d+)'", href)
-                            if match:
-                                found_slot = match.group(1)
-                                break
+        if not self._submission_accepted(body, final_url, history_urls):
+            error = self._extract_alert(body) or "예약 제출이 아직 승인되지 않았습니다."
+            self._log_throttled(f"submit:{error}", f"제출 대기 중: {error}")
+            return None
 
-                    if not found_slot:
-                        self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
-                        now = time.time()
-                        show_err = False
-                        with self._log_lock:
-                            if not hasattr(self, "_last_time_err_time") or (now - self._last_time_err_time) > 2.0:
-                                self._last_time_err_time = now
-                                show_err = True
-                        if show_err:
-                            self.log(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중", "warning")
-                        await asyncio.sleep(0.1)
-                        continue
-                        
-                    slot_id = found_slot
-                    show_found = False
-                    with self._log_lock:
-                        if not self._notified_found:
-                            self._notified_found = True
-                            show_found = True
-                    if show_found:
-                        self.log(f"⏰ {target_time} 슬롯 발견! ID: {slot_id}. 예약 제출 진행 중...", "info")
-                    
-                if self.stop_event.is_set():
-                    break
+        return await self._complete_payment(session, body, final_url, history_urls, context)
 
-                # Try to acquire submission lock so only one task per process submits at a time
-                lock_acquired = False
-                if hasattr(self, "submission_lock"):
-                    # multiprocess Lock acquire
-                    lock_acquired = self.submission_lock.acquire(block=False)
-                
-                if hasattr(self, "submission_lock") and not lock_acquired:
-                    # Another process is submitting, just wait
-                    await asyncio.sleep(0.1)
-                    continue
+    async def _post_and_discard(self, session: aiohttp.ClientSession, data: dict[str, str]) -> None:
+        async with session.post(self.select_url, data=data) as response:
+            await response.read()
 
-                try:
-                    # 1.5 Select theme (registers selection in session)
-                    theme_payload = f"act=theme_select&theme_num={theme_num}&rev_days={rev_days}&theme_time_num="
-                    async with session.post(sel_url, data=theme_payload, headers=headers, timeout=5):
-                        pass
+    @staticmethod
+    def _submission_accepted(body: str, final_url: str, history_urls: list[str]) -> bool:
+        combined = " ".join([body, final_url, *history_urls]).lower()
+        failure_alert = ZeroWorldShinEngine._extract_alert(body)
+        if failure_alert and not any(word in failure_alert for word in ("완료", "성공")):
+            return False
+        markers = ("rev.pay", "rev.kcp", "rev.make.mutong", "toss", "vbank")
+        return any(marker in combined for marker in markers) or (
+            "code=" in combined and any(word in combined for word in ("결제", "payment", "예약확인"))
+        )
 
-                    if self.stop_event.is_set():
-                        break
+    @staticmethod
+    def _extract_alert(body: str) -> str:
+        match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", body, re.S)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1)).strip()
+        soup = BeautifulSoup(body, "html.parser")
+        for script in soup.find_all("script"):
+            match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", script.get_text(), re.S)
+            if match:
+                return re.sub(r"\s+", " ", match.group(1)).strip()
+        return ""
 
-                    # 2. Select slot
-                    sel_payload = f"act=theme_time_select&theme_time_num={slot_id}"
-                    async with session.post(sel_url, data=sel_payload, headers=headers, timeout=5):
-                        pass
-                    
-                    if self.stop_event.is_set():
-                        break
+    async def _complete_payment(
+        self,
+        session: aiohttp.ClientSession,
+        body: str,
+        final_url: str,
+        history_urls: list[str],
+        context: ZeroWorldContext,
+    ) -> BookingResult:
+        combined = " ".join([body, final_url, *history_urls])
+        reservation_code = self._extract_value(body, "code")
+        check_code = self._extract_value(body, "ck_code")
+        if not reservation_code:
+            match = re.search(r"[?&]code=([A-Za-z0-9_-]+)", combined)
+            reservation_code = match.group(1) if match else ""
+        if not reservation_code:
+            self._save_debug("zeroworld_submit_debug.html", body)
+            return BookingResult(True, "예약 선점 성공 · 사이트에서 예약 내역을 확인해주세요.")
 
-                    # 3. Finalize reservation
-                    act_data = {
-                        "name": name,
-                        "mobile": phone_formatted,
-                        "person": people,
-                        "zizum_num": zizum_num,
-                        "rev_days": rev_days,
-                        "theme_num": theme_num,
-                        "theme_time_num": slot_id,
-                        "act": "make",
-                        "s_subj": s_subj
-                    }
-                    
-                    async with session.post(act_url, data=act_data, headers=headers, timeout=8) as act_resp:
-                        try:
-                            act_bytes = await act_resp.read()
-                            try:
-                                act_text = act_bytes.decode('utf-8')
-                            except UnicodeDecodeError:
-                                act_text = act_bytes.decode('cp949', errors='ignore')
-                        except Exception:
-                            act_text = await act_resp.text()
+        if not check_code:
+            kcp_url = f"{self.home_url}?go=rev.kcp&code={urllib.parse.quote(reservation_code)}"
+            async with session.get(kcp_url) as response:
+                check_code = self._extract_value(decode_body(await response.read()), "ck_code")
 
-                        try:
-                            import os
-                            os.makedirs("scratch", exist_ok=True)
-                            with open("scratch/last_act_response.html", "w", encoding="utf-8") as debug_f:
-                                debug_f.write(act_text)
-                        except Exception:
-                            pass
-                        
-                        history_urls = [str(h.url) for h in act_resp.history]
-                        final_url = str(act_resp.url)
-                        
-                        success = False
-                        combined_check = act_text + " " + final_url + " " + " ".join(history_urls)
-                        combined_lower = combined_check.lower()
-                        if "rev.pay" in combined_lower or "rev.kcp" in combined_lower:
-                            success = True
-                        elif "location.replace" in combined_lower or "location.href" in combined_lower:
-                            success = True
-                        elif "결제" in act_text or "예약확인" in act_text or "payment" in combined_lower:
-                            success = True
-                        elif "toss" in combined_lower or "vbank" in combined_lower:
-                            success = True
-                            
-                        if success:
-                            if self.stop_event.is_set():
-                                break
-                            final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공 (수동 확인 필요)"
-                            try:
-                                code_m = re.search(r"name=['\"]?code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
-                                ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", act_text)
-                                rev_code = code_m.group(1) if code_m else ""
-                                ck_code_val = ck_m.group(1) if ck_m else ""
-                                if not rev_code:
-                                    url_m = re.search(r"code=([a-zA-Z0-9]+)", combined_check)
-                                    if url_m:
-                                        rev_code = url_m.group(1)
-                                if rev_code:
-                                    if not ck_code_val:
-                                        kcp_url = f"https://zeroworldkorea.com/layout/res/home.php?go=rev.kcp&code={rev_code}"
-                                        async with session.get(kcp_url, timeout=8) as kcp_resp:
-                                            kcp_text = await kcp_resp.text()
-                                            ck_m2 = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
-                                            if ck_m2:
-                                                ck_code_val = ck_m2.group(1)
-                                    mutong_url = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
-                                    mutong_params = {
-                                        "code": rev_code,
-                                        "ck_code": ck_code_val,
-                                        "layout_folder": "layout/res",
-                                        "payment": "A",
-                                        "privacy": "on",
-                                        "name": name,
-                                        "mobile": phone_formatted,
-                                        "tel": phone_formatted
-                                    }
-                                    
-                                    # The original code used POST. Let's stick to POST with dict to ensure proper UTF-8 urlencoding
-                                    async with session.post(mutong_url, data=mutong_params, headers=headers, timeout=8) as mutong_resp:
-                                        try:
-                                            mutong_bytes = await mutong_resp.read()
-                                            try:
-                                                mutong_text = mutong_bytes.decode('utf-8')
-                                            except UnicodeDecodeError:
-                                                mutong_text = mutong_bytes.decode('cp949', errors='ignore')
-                                        except Exception:
-                                            mutong_text = await mutong_resp.text()
-    
-                                        # mutong.php returns a meta refresh to rev.make.exe.php
-                                        refresh_m = re.search(r"url=([^'\">]+)", mutong_text, re.I)
-                                        if refresh_m:
-                                            next_url = refresh_m.group(1).strip()
-                                            # e.g., next_url = rev.make.exe.php?code=...&ck_code=...
-                                            if not next_url.startswith("http"):
-                                                next_url = urllib.parse.urljoin(mutong_url, next_url)
-                                            # GET request to rev.make.exe.php
-                                            async with session.get(next_url, headers=headers, timeout=8) as exe_resp:
-                                                try:
-                                                    exe_bytes = await exe_resp.read()
-                                                    exe_text = exe_bytes.decode('utf-8', errors='ignore')
-                                                    mutong_text += exe_text
-                                                except Exception:
-                                                    pass
+        payment_data = {
+            "code": reservation_code,
+            "ck_code": check_code,
+            "layout_folder": "layout/res",
+            "payment": "A",
+            "privacy": "on",
+            "name": context.name,
+            "mobile": context.phone,
+            "tel": context.phone,
+        }
+        async with session.post(self.payment_url, data=payment_data) as response:
+            payment_body = decode_body(await response.read())
 
-                                        bnum_m = re.search(r"ck_code=([0-9]+)", mutong_text)
-                                        if not bnum_m:
-                                            bnum_m = re.search(r"예약번호[^0-9]*(\d+)", mutong_text)
-                                        
-                                        bnum = bnum_m.group(1) if bnum_m else ck_code_val
-                                        if "rev.make.exe.php" in mutong_text or "rev.make.end" in mutong_text or "완료" in mutong_text or "접수" in mutong_text or "성공" in mutong_text:
-                                            final_msg = f"[태스크 {task_idx+1}] 예약 최종 완료! 예약번호: {bnum}"
-                                            try:
-                                                import webbrowser
-                                                webbrowser.open(f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make.end&code={rev_code}")
-                                            except Exception:
-                                                pass
-                                            try:
-                                                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                                                with open("success_reservations.txt", "a", encoding="utf-8") as sf:
-                                                    sf.write(f"[{time_str}] 제로월드(신) | 날짜: {rev_days} | 시간: {target_time} | 이름: {name} | 예약번호: {bnum}\n")
-                                            except Exception:
-                                                pass
-                                        else:
-                                            # Save response for debug
-                                            try:
-                                                import os
-                                                os.makedirs("scratch", exist_ok=True)
-                                                with open("scratch/last_mutong_response.html", "w", encoding="utf-8") as debug_mf:
-                                                    debug_mf.write(mutong_text)
-                                            except Exception:
-                                                pass
-                                            final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! 예약번호: {bnum} / 코드: {rev_code} (결제확인 응답 재확인 필요)"
-                                else:
-                                    final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! (코드 추출 실패 - 수동 확인 필요)"
-                            except Exception as e:
-                                final_msg = f"[태스크 {task_idx+1}] 예약 선점 성공! (자동확인 오류: {e})"
-                            self.log(f"🎉 {final_msg}", "success")
-                            self.stop_event.set()
-                            if self.success_callback:
-                                self.success_callback()
-                            break
-                        else:
-                            err_msg = "선점 실패"
-                            alert_match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", act_text)
-                            if alert_match:
-                                err_msg = alert_match.group(1)
-                            else:
-                                err_soup = BeautifulSoup(act_text, 'html.parser')
-                                for s in err_soup.find_all('script'):
-                                    if "alert" in s.text:
-                                        inner_match = re.search(r"alert\(['\"](.*?)['\"]\)", s.text)
-                                        if inner_match:
-                                            err_msg = inner_match.group(1)
-                                            break
-                                        
-                            show_err = False
-                            now = time.time()
-                            with self._log_lock:
-                                if err_msg != self._last_err_msg or (now - self._last_err_time) > 2.0:
-                                    self._last_err_msg = err_msg
-                                    self._last_err_time = now
-                                    show_err = True
-                            if show_err and not self.stop_event.is_set():
-                                self.log(f"제출 대기 중: {err_msg}", "warning")
-                                
-                            if self.stop_event.is_set():
-                                break
-                            await asyncio.sleep(0.5)
-                finally:
-                    if lock_acquired and hasattr(self, "submission_lock"):
-                        try:
-                            self.submission_lock.release()
-                        except Exception:
-                            pass
-                        
-            except Exception as e:
-                if self.stop_event.is_set():
-                    break
-                now = time.time()
-                show_conn_err = False
-                with self._log_lock:
-                    if "connection_error" != self._last_err_msg or (now - self._last_err_time) > 2.0:
-                        self._last_err_msg = "connection_error"
-                        self._last_err_time = now
-                        show_conn_err = True
-                if show_conn_err and not self.stop_event.is_set():
-                    self.log(f"통신 에러 발생: {e} - 세션 재연결 시도", "warning")
-                try:
-                    await session.close()
-                except Exception:
-                    pass
-                
-                headers_re = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": f"https://zeroworldkorea.com/layout/res/home.php?go=rev.make&s_subj={s_subj}&zizum_num={zizum_num}&rev_days={rev_days}"
+        refresh = re.search(r"url=([^'\">]+)", payment_body, re.I)
+        if refresh:
+            next_url = urllib.parse.urljoin(self.payment_url, refresh.group(1).strip())
+            async with session.get(next_url) as response:
+                payment_body += decode_body(await response.read())
+
+        number_match = re.search(r"ck_code=(\d+)", payment_body)
+        if not number_match:
+            number_match = re.search(r"예약번호[^0-9]*(\d+)", payment_body)
+        booking_number = number_match.group(1) if number_match else check_code
+        completed = any(
+            marker in payment_body
+            for marker in ("rev.make.exe.php", "rev.make.end", "완료", "접수", "성공")
+        )
+        if completed:
+            append_history(
+                {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "site": "제로월드",
+                    "branch": context.branch,
+                    "date": context.reservation_date,
+                    "time": context.target_time,
+                    "booking_number": booking_number,
                 }
-                session = aiohttp.ClientSession(headers=headers_re)
-                if hasattr(self, "session_pool") and len(self.session_pool) > 0:
-                    local_idx = task_idx % len(self.session_pool)
-                    self.session_pool[local_idx] = (session, self.session_pool[local_idx][1])
-                if self.stop_event.is_set():
-                    break
-                await asyncio.sleep(0.5)
-                
-        is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
-        if not is_pooled:
-            await session.close()
-
-    async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
-        self.session_pool = []
-        self.log(f"Pre-fetching {num_sessions} sessions for Sinbiweb API...", "info")
-        home_url = "https://zeroworldkorea.com/layout/res/home.php"
-        for _ in range(num_sessions):
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-            session = aiohttp.ClientSession(headers=headers)
+            )
             try:
-                await session.get(home_url, timeout=5)
-            except Exception:
+                webbrowser.open(
+                    f"{self.home_url}?go=rev.make.end&code={urllib.parse.quote(reservation_code)}"
+                )
+            except OSError:
                 pass
-            self.session_pool.append((session, None))
+            return BookingResult(
+                True,
+                f"예약 최종 완료 · 예약번호 {booking_number or '확인 필요'}",
+                booking_number=booking_number,
+                details={"reservation_code": reservation_code},
+            )
+
+        self._save_debug("zeroworld_payment_debug.html", payment_body)
+        return BookingResult(
+            True,
+            f"예약 선점 성공 · 예약번호 {booking_number or '확인 필요'} · 사이트 확인 필요",
+            booking_number=booking_number,
+            details={"reservation_code": reservation_code},
+        )
+
+    @staticmethod
+    def _extract_value(body: str, name: str) -> str:
+        pattern = rf"name=['\"]?{re.escape(name)}['\"]?\s*value=['\"]?([^'\"'>\s]+)"
+        match = re.search(pattern, body, re.I)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _save_debug(filename: str, body: str) -> None:
+        try:
+            data_path(filename).write_text(body, encoding="utf-8")
+        except OSError:
+            pass

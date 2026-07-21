@@ -62,9 +62,7 @@ class ZeroWorldGuEngine(BaseEngine):
                     except Exception:
                         success_info = resp.text
                     self.log(f"🎉 예약 성공: {str(success_info)[:200]}", "success")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
+                    self.notify_success()
                     break
                 else:
                     try:
@@ -144,9 +142,7 @@ class ZeroWorldGuEngine(BaseEngine):
                             success_info = await resp.text()
                             
                         self.log(f"🎉 [태스크 {task_idx+1}] 예약 성공: {success_info[:200]}", "success")
-                        self.stop_event.set()
-                        if self.success_callback:
-                            self.success_callback()
+                        self.notify_success()
                         break
                     else:
                         try:

@@ -155,9 +155,7 @@ class JigubyeolEngine(BaseEngine):
                         except Exception as e:
                             self.log(f"예약 성공! (상세 정보 파싱 실패: {e})", "success")
                             
-                        self.stop_event.set()
-                        if self.success_callback:
-                            self.success_callback()
+                        self.notify_success()
                         break
                     else:
                         self.handle_error(step2_response, reservation_data, '최종예약')
@@ -304,9 +302,7 @@ class JigubyeolEngine(BaseEngine):
                             except Exception as e:
                                 self.log(f"예약 성공! (상세 정보 파싱 실패: {e})", "success")
                                 
-                            self.stop_event.set()
-                            if self.success_callback:
-                                self.success_callback()
+                            self.notify_success()
                             break
                         else:
                             await self.handle_error_async(step2_response, reservation_data, '최종예약')

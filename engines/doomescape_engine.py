@@ -7,6 +7,7 @@ import time
 import urllib.parse
 from bs4 import BeautifulSoup
 from engines.base_engine import BaseEngine
+from pengucro.storage import append_history
 
 class DoomEscapeEngine(BaseEngine):
     THEME_ID_TO_NAME = {
@@ -36,7 +37,9 @@ class DoomEscapeEngine(BaseEngine):
         Doom Escape (Sinbiweb-based) Booking Engine.
         """
         super().__init__(log_callback, success_callback)
-        self.site_url = site_url
+        self.site_url = site_url or "https://doomescape.com"
+        parsed = urllib.parse.urlparse(self.site_url)
+        self.base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else self.site_url.rstrip("/")
         
         import threading
         self._log_lock = threading.Lock()
@@ -76,10 +79,10 @@ class DoomEscapeEngine(BaseEngine):
             mobile2 = "1234"
             mobile3 = "5678"
 
-        theme_name = self.THEME_ID_TO_NAME.get(theme_num, "")
+        theme_name = reservation_data.get("themeLabel") or self.THEME_ID_TO_NAME.get(theme_num, "")
 
-        list_url = f"https://doomescape.com/layout/res/home.php?go=rev.make&s_zizum={zizum_num}&rev_days={rev_days}"
-        act_url = "https://doomescape.com/core/res/rev.act.php"
+        list_url = f"{self.base_url}/layout/res/home.php?go=rev.make&s_zizum={zizum_num}&rev_days={rev_days}"
+        act_url = f"{self.base_url}/core/res/rev.act.php"
 
         self.log(f"🚀 둠이스케이프 동기 스레드 시작 (지점: {zizum_num}, 테마: {theme_name}({theme_num}), 날짜: {rev_days}, 시간: {target_time})", "info")
 
@@ -163,7 +166,7 @@ class DoomEscapeEngine(BaseEngine):
                         break
 
                     # 2. Visit input page to extract prices dynamically
-                    input_url = f"https://doomescape.com/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
+                    input_url = f"{self.base_url}/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
                     resp_input = session.get(input_url, timeout=5)
                     input_html = resp_input.content.decode('utf-8', errors='ignore')
 
@@ -216,7 +219,7 @@ class DoomEscapeEngine(BaseEngine):
                     post_headers = {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Referer": input_url,
-                        "Origin": "https://doomescape.com"
+                        "Origin": self.base_url
                     }
 
                     act_resp = session.post(act_url, data=post_data, headers=post_headers, timeout=8)
@@ -226,7 +229,7 @@ class DoomEscapeEngine(BaseEngine):
                     num_m = re.search(r"num=(\d+)", act_text)
                     if num_m:
                         num = num_m.group(1)
-                        kcp_url = f"https://doomescape.com/layout/res/home.php?go=rev.kcp&num={num}"
+                        kcp_url = f"{self.base_url}/layout/res/home.php?go=rev.kcp&num={num}"
                         
                         # 4. Fetch KCP page to extract ck_code
                         kcp_resp = session.get(kcp_url, timeout=8)
@@ -236,7 +239,7 @@ class DoomEscapeEngine(BaseEngine):
                         ck_code_val = ck_m.group(1) if ck_m else ""
 
                         # 5. Submit mutong.php (using GET or POST - GET is browser default)
-                        mutong_url = "https://doomescape.com/core/res/rev.make.mutong.php"
+                        mutong_url = f"{self.base_url}/core/res/rev.make.mutong.php"
                         mutong_params = {
                             "num": num,
                             "ck_code": ck_code_val,
@@ -271,13 +274,17 @@ class DoomEscapeEngine(BaseEngine):
                             final_msg = f"예약 최종 완료! 예약번호: {bnum}"
                             try:
                                 import webbrowser
-                                webbrowser.open(f"https://doomescape.com/layout/res/home.php?go=rev.make.end&num={num}&ck_code={bnum}")
+                                webbrowser.open(f"{self.base_url}/layout/res/home.php?go=rev.make.end&num={num}&ck_code={bnum}")
                             except Exception:
                                 pass
                             try:
-                                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                                with open("success_reservations.txt", "a", encoding="utf-8") as sf:
-                                    sf.write(f"[{time_str}] 둠이스케이프 | 날짜: {rev_days} | 시간: {target_time} | 이름: {name} | 예약번호: {bnum}\n")
+                                append_history({
+                                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                    "site": "둠이스케이프",
+                                    "date": rev_days,
+                                    "time": target_time,
+                                    "booking_number": bnum,
+                                })
                             except Exception:
                                 pass
                         else:
@@ -298,9 +305,7 @@ class DoomEscapeEngine(BaseEngine):
                         raise Exception(err_msg)
 
                     self.log(f"🎉 {final_msg}", "success")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
+                    self.notify_success()
                     break
 
                 finally:
@@ -356,10 +361,10 @@ class DoomEscapeEngine(BaseEngine):
             mobile2 = "1234"
             mobile3 = "5678"
 
-        theme_name = self.THEME_ID_TO_NAME.get(theme_num, "")
+        theme_name = reservation_data.get("themeLabel") or self.THEME_ID_TO_NAME.get(theme_num, "")
         
-        list_url = f"https://doomescape.com/layout/res/home.php?go=rev.make&s_zizum={zizum_num}&rev_days={rev_days}"
-        act_url = "https://doomescape.com/core/res/rev.act.php"
+        list_url = f"{self.base_url}/layout/res/home.php?go=rev.make&s_zizum={zizum_num}&rev_days={rev_days}"
+        act_url = f"{self.base_url}/core/res/rev.act.php"
 
         session = None
         if hasattr(self, "session_pool") and len(self.session_pool) > 0:
@@ -451,7 +456,7 @@ class DoomEscapeEngine(BaseEngine):
                         break
 
                     # 2. Visit input page to extract prices dynamically
-                    input_url = f"https://doomescape.com/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
+                    input_url = f"{self.base_url}/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
                     async with session.get(input_url, timeout=5) as resp_input:
                         input_bytes = await resp_input.read()
                         input_html = input_bytes.decode('utf-8', errors='ignore')
@@ -505,7 +510,7 @@ class DoomEscapeEngine(BaseEngine):
                     post_headers = {
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Referer": input_url,
-                        "Origin": "https://doomescape.com",
+                        "Origin": self.base_url,
                         "User-Agent": headers["User-Agent"]
                     }
 
@@ -517,7 +522,7 @@ class DoomEscapeEngine(BaseEngine):
                     num_m = re.search(r"num=(\d+)", act_text)
                     if num_m:
                         num = num_m.group(1)
-                        kcp_url = f"https://doomescape.com/layout/res/home.php?go=rev.kcp&num={num}"
+                        kcp_url = f"{self.base_url}/layout/res/home.php?go=rev.kcp&num={num}"
                         
                         # 4. Fetch KCP page to extract ck_code
                         async with session.get(kcp_url, headers=headers, timeout=8) as kcp_resp:
@@ -527,7 +532,7 @@ class DoomEscapeEngine(BaseEngine):
                         ck_code_val = ck_m.group(1) if ck_m else ""
 
                         # 5. Submit mutong.php (using GET or POST - GET is browser default)
-                        mutong_url = "https://doomescape.com/core/res/rev.make.mutong.php"
+                        mutong_url = f"{self.base_url}/core/res/rev.make.mutong.php"
                         mutong_params = {
                             "num": num,
                             "ck_code": ck_code_val,
@@ -564,13 +569,17 @@ class DoomEscapeEngine(BaseEngine):
                             final_msg = f"[태스크 {task_idx+1}] 예약 최종 완료! 예약번호: {bnum}"
                             try:
                                 import webbrowser
-                                webbrowser.open(f"https://doomescape.com/layout/res/home.php?go=rev.make.end&num={num}&ck_code={bnum}")
+                                webbrowser.open(f"{self.base_url}/layout/res/home.php?go=rev.make.end&num={num}&ck_code={bnum}")
                             except Exception:
                                 pass
                             try:
-                                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-                                with open("success_reservations.txt", "a", encoding="utf-8") as sf:
-                                    sf.write(f"[{time_str}] 둠이스케이프 | 날짜: {rev_days} | 시간: {target_time} | 이름: {name} | 예약번호: {bnum}\n")
+                                append_history({
+                                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+                                    "site": "둠이스케이프",
+                                    "date": rev_days,
+                                    "time": target_time,
+                                    "booking_number": bnum,
+                                })
                             except Exception:
                                 pass
                         else:
@@ -591,9 +600,7 @@ class DoomEscapeEngine(BaseEngine):
                         raise Exception(err_msg)
 
                     self.log(f"🎉 {final_msg}", "success")
-                    self.stop_event.set()
-                    if self.success_callback:
-                        self.success_callback()
+                    self.notify_success()
                     break
 
                 finally:
@@ -645,7 +652,7 @@ class DoomEscapeEngine(BaseEngine):
         import aiohttp
         self.session_pool = []
         self.log(f"Pre-fetching {num_sessions} sessions for Doom Escape...", "info")
-        home_url = "https://doomescape.com/layout/res/home.php?go=main"
+        home_url = f"{self.base_url}/layout/res/home.php?go=main"
         for _ in range(num_sessions):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
