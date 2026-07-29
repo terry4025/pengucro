@@ -224,3 +224,100 @@ def test_repeated_dns_failure_defers_and_preserves_catalog(tmp_path, monkeypatch
     assert result.status == "deferred"
     assert "기존 정상 카탈로그" in result.error
     assert "100" not in service.catalogs["test:site"].branches["1"].themes
+
+
+def test_validate_catalog_allows_empty_themes():
+    # themes가 비어있는 branch 생성
+    catalog = SiteCatalog(
+        site_key="test:empty_themes",
+        name="테스트 사이트",
+        engine_id="fake",
+        url="https://example.com",
+        branches={"1": CatalogBranch("1", "테마없는 지점", "1", themes={})},
+    )
+    result = CatalogService.validate_catalog(catalog)
+    # 완화되었으므로 에러 없이 정상(True) 통과해야 함
+    assert result.valid is True
+    assert not result.errors
+
+
+def test_analyze_booking_site_allows_zero_confidence_engine(monkeypatch):
+    import engines.catalog_providers as cp
+
+    # 1. 신뢰도 0인 가짜 Provider와 candidate 정의
+    class ZeroConfidenceProvider:
+        engine_id = "zero_conf"
+        def detect(self, url, html):
+            return cp.DetectionResult(self.engine_id, 0, ["가짜 증거"])
+
+        def discover(self, site_config, target_date):
+            return SiteCatalog(
+                site_key="test:zero_conf",
+                name="신뢰도0테스트",
+                engine_id=self.engine_id,
+                url=site_config["url"],
+                branches={"1": CatalogBranch("1", "본점", "1", themes={})},
+            )
+
+        def validate(self, candidate):
+            return ValidationResult(True, [])
+
+    # 2. monkeypatch를 사용해 default_providers가 ZeroConfidenceProvider를 반환하게 모킹
+    fake_providers = {"zero_conf": ZeroConfidenceProvider()}
+    monkeypatch.setattr(cp, "default_providers", lambda: fake_providers)
+
+    # 3. requests.get 도 모킹하여 HTML을 리턴하게 함
+    class FakeResponse:
+        status_code = 200
+        text = "<html>fake</html>"
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(cp.requests, "get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(cp, "crawl_all_subpages", lambda url, **kwargs: "<html>fake</html>")
+
+    # 4. analyze_booking_site 호출
+    result = cp.analyze_booking_site("https://zero-confidence-site.com", "신뢰도0테스트")
+
+    # 5. 신뢰도가 0이지만 에러 없이 정상적으로 파싱/등록 완료되어야 함
+    assert result["engine_id"] == "zero_conf"
+    assert result["detection"]["confidence"] == 0
+
+
+def test_crawl_all_subpages_scrapes_recursively(monkeypatch):
+    import engines.catalog_providers as cp
+
+    url_responses = {
+        "https://mysite.com": '<html><body><a href="/sub1">Sub 1</a><a href="https://mysite.com/sub2">Sub 2</a></body></html>',
+        "https://mysite.com/sub1": '<html><body><h1>Sub 1 Page</h1><a href="/sub2">Go to Sub 2</a></body></html>',
+        "https://mysite.com/sub2": '<html><body><h1>Sub 2 Page</h1><a href="https://external.com">External Link</a></body></html>',
+    }
+
+    called_urls = []
+
+    class MockResponse:
+        def __init__(self, url):
+            self.url = url
+            self.status_code = 200
+            self.text = url_responses.get(url, "<html><body>External Page Content</body></html>")
+
+    def mock_get(url, *args, **kwargs):
+        called_urls.append(url)
+        normalized = url.rstrip("/")
+        if normalized in url_responses:
+            return MockResponse(normalized)
+        return MockResponse(url)
+
+    monkeypatch.setattr(cp.requests, "get", mock_get)
+
+    # crawl_all_subpages 실행 (최대 3개 페이지 수집하도록 제한)
+    merged_html = cp.crawl_all_subpages("https://mysite.com", max_pages=3)
+
+    # 수집 결과 검증 (각 내부 페이지 콘텐츠가 다 포함되어 있어야 함)
+    assert "Sub 1 Page" in merged_html
+    assert "Sub 2 Page" in merged_html
+    
+    # 외부 도메인은 크롤링 범위에서 제외되므로 요청(GET)이 발생하면 안 됨
+    assert "https://external.com" not in called_urls
+    # 외부 도메인의 전용 텍스트도 수집되지 않아야 함
+    assert "External Page Content" not in merged_html

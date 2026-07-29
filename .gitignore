@@ -13,4 +13,12 @@ reservation_history.jsonl
 secrets.json
 *.tmp
 scratch/
+archive/
+build_log.txt
 .pytest_cache/
+# Local runtime output and environments
+*.log
+logs/
+.env
+venv/
+.venv/

@@ -4,15 +4,26 @@ import json
 from engines.base_engine import BaseEngine
 
 class JigubyeolEngine(BaseEngine):
+    # Every HTTP call must be bounded. Without a timeout a worker that hits a
+    # stalled connection blocks forever, BaseEngine._monitor_threads never
+    # finishes joining it, is_running stays True and the GUI's stop button
+    # locks up permanently.
+    LOOKUP_TIMEOUT = 5
+    SUBMIT_TIMEOUT = 8
+
     def __init__(self, log_callback, success_callback=None, site_url=None):
         super().__init__(log_callback, success_callback)
         self.base_url = site_url if site_url else 'https://www.xn--2e0b040a4xj.com'
 
     def get_csrf_token(self, session):
-        response = session.get(f'{self.base_url}/reservation')
+        response = session.get(f'{self.base_url}/reservation', timeout=self.LOOKUP_TIMEOUT)
         soup = BeautifulSoup(response.text, 'html.parser')
-        csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
-        return csrf_token
+        meta = soup.find('meta', {'name': 'csrf-token'})
+        if meta is None or not meta.get('content'):
+            # Previously this raised TypeError from a subscript on None and was
+            # swallowed by the generic handler as a "connection error".
+            raise ValueError('CSRF 토큰을 찾지 못했습니다. 사이트 구조가 변경되었을 수 있습니다.')
+        return meta['content']
 
     def submit_time_selection(self, session, csrf_token, reservation_data):
         headers = {
@@ -32,7 +43,12 @@ class JigubyeolEngine(BaseEngine):
             'time': time_val,
             '_token': csrf_token,
         }
-        response = session.post(f'{self.base_url}/reservation/create', data=form_data, headers=headers)
+        response = session.post(
+            f'{self.base_url}/reservation/create',
+            data=form_data,
+            headers=headers,
+            timeout=self.LOOKUP_TIMEOUT,
+        )
         return response
 
     def submit_reservation(self, session, csrf_token, reservation_data, payment_method):
@@ -65,7 +81,9 @@ class JigubyeolEngine(BaseEngine):
         if payment_method != '1':
             endpoint = f'{self.base_url}/reservation/payment'
             
-        response = session.post(endpoint, data=form_data, headers=headers)
+        response = session.post(
+            endpoint, data=form_data, headers=headers, timeout=self.SUBMIT_TIMEOUT
+        )
         return response
 
     def make_reservation_thread(self, reservation_data):
@@ -111,7 +129,7 @@ class JigubyeolEngine(BaseEngine):
                     if step2_response.status_code in (200, 201):
                         try:
                             done_url = f"{self.base_url}/reservation/done"
-                            done_res = session.get(done_url)
+                            done_res = session.get(done_url, timeout=self.LOOKUP_TIMEOUT)
                             done_res.encoding = 'utf-8'
                             done_soup = BeautifulSoup(done_res.text, 'html.parser')
                             
@@ -214,7 +232,12 @@ class JigubyeolEngine(BaseEngine):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            session = aiohttp.ClientSession(headers=headers)
+            # A session-level ClientTimeout bounds every request made through it,
+            # so no individual call site can hang indefinitely.
+            session = aiohttp.ClientSession(
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT),
+            )
             
         try:
             while not self.stop_event.is_set():
@@ -322,8 +345,10 @@ class JigubyeolEngine(BaseEngine):
             text = await resp.text()
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(text, 'html.parser')
-            csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
-            return csrf_token
+            meta = soup.find('meta', {'name': 'csrf-token'})
+            if meta is None or not meta.get('content'):
+                raise ValueError('CSRF 토큰을 찾지 못했습니다. 사이트 구조가 변경되었을 수 있습니다.')
+            return meta['content']
 
     async def submit_time_selection_async(self, session, csrf_token, reservation_data):
         time_val = reservation_data['reservationTime']
@@ -427,7 +452,10 @@ class JigubyeolEngine(BaseEngine):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            session = aiohttp.ClientSession(headers=headers)
+            session = aiohttp.ClientSession(
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT),
+            )
             try:
                 csrf = await self.get_csrf_token_async(session)
                 return session, csrf

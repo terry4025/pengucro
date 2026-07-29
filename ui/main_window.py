@@ -1,7 +1,10 @@
 import customtkinter as ctk
 import ui.theme as theme
+from ui.loading_overlay import LoadingOverlay
 from ui.reservation_form import ReservationForm
 from ui.log_panel import LogPanel
+from ui.repaint import install_scroll_repaint_guard
+from ui.scrollable import SafeScrollableFrame
 from engines.registry import EngineRegistry
 from engines.catalog_providers import (
     builtin_site_configs,
@@ -14,7 +17,7 @@ from pengucro.catalog import CatalogService
 from pengucro.models import LEGACY_MODE_MAP, NAVER_MODE, STANDARD_MODE, ReservationRequest
 from pengucro.storage import load_json, save_json
 from pengucro import __version__
-from PIL import Image
+import logging
 import os
 import queue
 import threading
@@ -53,274 +56,6 @@ def animate_click(btn, original_height, original_width=None, callback=None):
             
     btn.after(80, restore)
 
-class LoadingOverlay(ctk.CTkFrame):
-    def __init__(self, parent, on_complete):
-        super().__init__(parent, fg_color=theme.CANVAS_COLOR, corner_radius=0)
-        self.parent = parent
-        self.on_complete = on_complete
-        
-        # Load local animation helpers
-        import random
-        import math
-        from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageFilter
-        
-        # Background animation Canvas
-        self.canvas = ctk.CTkCanvas(self, bg=theme.CANVAS_COLOR, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        
-        # Load local assets
-        self.orig_img = None
-        try:
-            img_path = resource_path("app_icon.png")
-            if os.path.exists(img_path):
-                self.orig_img = Image.open(img_path).convert("RGBA")
-                self.orig_img = self.orig_img.resize((100, 100), Image.Resampling.LANCZOS)
-        except Exception:
-            pass
-            
-        if self.orig_img is None:
-            # Fallback drawing of 🐧 emoji on a transparent background
-            try:
-                # seguiemj is Windows standard color emoji font
-                font = ImageFont.truetype("seguiemj.ttf", 64)
-            except Exception:
-                font = ImageFont.load_default()
-            
-            fallback = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(fallback)
-            draw.text((50, 50), "🐧", fill="#ffffff", font=font, anchor="mm")
-            self.orig_img = fallback
-            
-        self.time_counter = 0.0
-        
-        # UI controls placed relative to frame over canvas
-        # 3. Slide in animation start positions
-        self.subtitle_y = 0.65
-        
-        self.subtitle_label = ctk.CTkLabel(
-            self,
-            text="로딩 중...",
-            font=(theme.FONT_FAMILY, 14),
-            text_color=theme.TEXT_MUTE,
-            fg_color="transparent"
-        )
-        self.subtitle_label.place(relx=0.5, rely=self.subtitle_y, anchor="center")
-        
-        # 1. Custom progress bar state
-        self.progress_val = 0.0
-        self.shine_x = 0.0
-        
-        # Generate 12 ambient particles
-        self.particles = []
-        for _ in range(12):
-            self.particles.append(self._create_particle(random_y=True))
-            
-        # Start animations
-        self.after(16, self._update_animation)
-        self.after(100, self._animate_progress, 0)
-        
-    def _create_particle(self, random_y=False):
-        import random
-        import math
-        glyphs = ["❄️", "✨", "•", "*"]
-        glyph = random.choice(glyphs)
-        
-        x = random.randint(10, 470)
-        if random_y:
-            y = random.randint(50, 750)
-        else:
-            y = random.randint(750, 840)
-            
-        # 2. 3D Parallax Depth parameter
-        depth = random.uniform(0.3, 1.0)
-            
-        speed_y = random.uniform(0.6, 2.2) * depth * 1.5
-        speed_x = random.uniform(-0.5, 0.5) * depth
-        size = random.randint(8, 14) if glyph in ("❄️", "✨") else random.randint(3, 6)
-        size = max(2, int(size * depth))
-        
-        alpha = random.uniform(0.3, 0.9) * depth
-        decay = random.uniform(0.005, 0.015)
-        phase = random.uniform(0, math.pi * 2)
-        
-        return {
-            'x': x,
-            'y': y,
-            'speed_y': speed_y,
-            'speed_x': speed_x,
-            'size': size,
-            'alpha': alpha,
-            'decay': decay,
-            'glyph': glyph,
-            'phase': phase,
-            'depth': depth
-        }
-        
-    def _update_animation(self):
-        if not self.winfo_exists():
-            return
-            
-        import math
-        import random
-        from PIL import Image, ImageTk, ImageDraw, ImageFilter
-        
-        self.canvas.delete("all")
-        w = self.winfo_width()
-        h = self.winfo_height()
-        if w <= 1 or h <= 1:
-            w, h = 480, 960
-            
-        self.time_counter += 0.026
-        
-        # 3. Smooth slide-in interpolation for text labels
-        self.subtitle_y = self.subtitle_y + (0.62 - self.subtitle_y) * 0.08
-        self.subtitle_label.place(relx=0.5, rely=self.subtitle_y, anchor="center")
-        
-        # Update & Draw particles
-        for i in range(len(self.particles)):
-            p = self.particles[i]
-            p['y'] -= p['speed_y'] * 0.52
-            p['x'] += (p['speed_x'] + 0.3 * math.sin(self.time_counter + p['phase'])) * 0.52
-            p['alpha'] -= p['decay'] * 0.52
-            
-            # Re-spawn
-            if p['y'] < 40 or p['alpha'] <= 0 or p['x'] < 0 or p['x'] > w:
-                self.particles[i] = self._create_particle(random_y=False)
-                p = self.particles[i]
-                
-            # Render to canvas (blend with black bg)
-            intensity = int(p['alpha'] * 255)
-            intensity = max(0, min(255, intensity))
-            
-            if p['glyph'] in ("❄️", "✨"):
-                color = f"#{intensity:02x}{intensity:02x}{intensity:02x}"
-                self.canvas.create_text(
-                    p['x'], p['y'],
-                    text=p['glyph'],
-                    font=("Segoe UI", p['size']),
-                    fill=color
-                )
-            else:
-                # Accent blue shade: (87, 193, 255)
-                r_val = int(p['alpha'] * 87)
-                g_val = int(p['alpha'] * 193)
-                b_val = int(p['alpha'] * 255)
-                color = f"#{r_val:02x}{g_val:02x}{b_val:02x}"
-                
-                radius = p['size'] / 2
-                self.canvas.create_oval(
-                    p['x'] - radius, p['y'] - radius,
-                    p['x'] + radius, p['y'] + radius,
-                    fill=color, outline=""
-                )
-                
-        # Draw Soft Glow & Pinned/Tilted Logo
-        center_x = w / 2
-        center_y = h / 2 - 80
-        
-        if self.orig_img:
-            pulse = math.sin(self.time_counter)
-            glow_radius = int(55 + 15 * pulse)
-            glow_alpha = int(45 + 20 * pulse)
-            
-            # Alpha compositing canvas
-            glow_canvas = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(glow_canvas)
-            
-            # Draw fuzzy circular gradient
-            for r in range(glow_radius, 10, -5):
-                alpha = int(glow_alpha * (1.0 - r / glow_radius))
-                draw.ellipse(
-                    (80 - r, 80 - r, 80 + r, 80 + r),
-                    fill=(87, 193, 255, alpha)
-                )
-            glow_canvas = glow_canvas.filter(ImageFilter.GaussianBlur(8))
-            
-            # Tilting (Rotation)
-            angle = 8 * math.sin(self.time_counter * 0.7)
-            rotated_penguin = self.orig_img.rotate(angle, resample=Image.Resampling.BICUBIC)
-            
-            # Scale penguin slightly
-            peng_size = int(84 + 8 * pulse)
-            scaled_penguin = rotated_penguin.resize((peng_size, peng_size), Image.Resampling.LANCZOS)
-            
-            offset = (160 - peng_size) // 2
-            glow_canvas.alpha_composite(scaled_penguin, (offset, offset))
-            
-            # Render to canvas
-            self.tk_logo_img = ImageTk.PhotoImage(glow_canvas)
-            self.canvas.create_image(center_x, center_y, image=self.tk_logo_img)
-            
-        # 1. Custom Progress Bar & Shine Sweep Drawing on Canvas
-        progress_y = h * 0.7
-        bar_start = center_x - 100
-        bar_end = center_x + 100
-        bar_width = 200
-        
-        # Draw background bar
-        self.canvas.create_rectangle(
-            bar_start, progress_y - 2,
-            bar_end, progress_y + 2,
-            fill=theme.ELEVATED_COLOR, outline=""
-        )
-        
-        # Draw filled progress bar
-        fill_end = bar_start + (bar_width * self.progress_val)
-        if self.progress_val > 0.0:
-            self.canvas.create_rectangle(
-                bar_start, progress_y - 2,
-                fill_end, progress_y + 2,
-                fill=theme.ACCENT_BLUE, outline=""
-            )
-            
-            # Update shine position sweep
-            self.shine_x += 4.5
-            if self.shine_x > bar_end + 50:
-                self.shine_x = bar_start - 50
-                
-            # Draw glow shine overlay line
-            for offset, color_val in [(-12, "#74c2ff"), (-6, "#bfe3ff"), (0, "#ffffff"), (6, "#bfe3ff"), (12, "#74c2ff")]:
-                sx = self.shine_x + offset
-                if bar_start <= sx <= fill_end:
-                    self.canvas.create_line(
-                        sx, progress_y - 2,
-                        sx, progress_y + 2,
-                        fill=color_val, width=2
-                    )
-            
-        self.after(16, self._update_animation)
-        
-    def _animate_progress(self, val):
-        if not self.winfo_exists():
-            return
-        if val < 1.0:
-            val += 0.038 # 1.3x slower (was 0.05)
-            self.progress_val = val
-            delay = int(30 + (val * 90))
-            self.after(delay, self._animate_progress, val)
-        else:
-            self.progress_val = 1.0
-            self.after(100, self._fade_out)
-            
-    def _fade_out(self):
-        if not self.winfo_exists():
-            return
-        # Smoothly slide the overlay up
-        h = self.winfo_height()
-        step = max(5, int(h / 12))
-
-        def slide():
-            if not self.winfo_exists():
-                return
-            y = self.winfo_y()
-            if abs(y) < h:
-                self.place(y=y - step)
-                self.after(12, slide)
-            else:
-                self.destroy()
-                self.on_complete()
-        slide()
-
 class SuccessDialog(ctk.CTkToplevel):
     def __init__(self, parent, title="예약 성공", message="축하합니다! 방탈출 예약에 성공하였습니다."):
         super().__init__(parent)
@@ -345,31 +80,31 @@ class SuccessDialog(ctk.CTkToplevel):
         
         # Content frame
         content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        content_frame.pack(fill="both", expand=True, padx=20, pady=15)
-        
+        content_frame.pack(fill="both", expand=True, padx=theme.SPACE_5, pady=theme.SPACE_4)
+
         # Checkmark Icon / Emblem
         icon_label = ctk.CTkLabel(
             content_frame,
             text="✓",
-            font=(theme.FONT_FAMILY, 32, "bold"),
-            text_color=theme.ACCENT_GREEN,
-            width=50,
-            height=50,
-            fg_color=theme.SURFACE_COLOR,
-            corner_radius=25
+            font=(theme.FONT_FAMILY, 28, "bold"),
+            text_color=theme.TINT_SUCCESS_FG,
+            width=48,
+            height=48,
+            fg_color=theme.TINT_SUCCESS_BG,
+            corner_radius=24
         )
-        icon_label.pack(pady=(5, 10))
-        
+        icon_label.pack(pady=(theme.SPACE_1, theme.SPACE_3))
+
         # Message Label
         msg_label = ctk.CTkLabel(
             content_frame,
             text=message,
-            font=(theme.FONT_FAMILY, 12),
-            text_color=theme.TEXT_PRIMARY,
-            wraplength=340
+            font=theme.FONT_BODY_MD,
+            text_color=theme.TEXT_BODY,
+            wraplength=330
         )
-        msg_label.pack(pady=(0, 15))
-        
+        msg_label.pack(pady=(0, theme.SPACE_4))
+
         # OK Button
         self.ok_btn = ctk.CTkButton(
             content_frame,
@@ -380,8 +115,8 @@ class SuccessDialog(ctk.CTkToplevel):
             hover_color=theme.TEXT_BODY,
             corner_radius=theme.ROUNDED_MD,
             command=self._on_ok,
-            height=30,
-            width=100
+            height=theme.H_BUTTON,
+            width=104
         )
         self.ok_btn.pack()
         
@@ -430,8 +165,8 @@ class AddSiteDialog(ctk.CTkToplevel):
         
         # Content frame
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.content_frame.pack(fill="both", expand=True, padx=20, pady=15)
-        
+        self.content_frame.pack(fill="both", expand=True, padx=theme.SPACE_5, pady=theme.SPACE_4)
+
         # Label & Entry for Site Name
         self.name_label = ctk.CTkLabel(
             self.content_frame,
@@ -439,20 +174,21 @@ class AddSiteDialog(ctk.CTkToplevel):
             font=theme.FONT_BODY_SM,
             text_color=theme.TEXT_MUTE
         )
-        self.name_label.pack(anchor="w", pady=(5, 1))
-        
+        self.name_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
+
         self.name_entry = ctk.CTkEntry(
             self.content_frame,
             placeholder_text="사이트 이름을 입력하세요",
+            font=theme.FONT_BODY_MD,
             fg_color=theme.ELEVATED_COLOR,
             border_color=theme.HAIRLINE_COLOR,
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
-        self.name_entry.pack(fill="x", pady=(0, 10))
-        
+        self.name_entry.pack(fill="x", pady=(0, theme.SPACE_3))
+
         # Label & Entry for URL
         self.url_label = ctk.CTkLabel(
             self.content_frame,
@@ -460,38 +196,41 @@ class AddSiteDialog(ctk.CTkToplevel):
             font=theme.FONT_BODY_SM,
             text_color=theme.TEXT_MUTE
         )
-        self.url_label.pack(anchor="w", pady=(0, 1))
-        
+        self.url_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
+
         self.url_entry = ctk.CTkEntry(
             self.content_frame,
             placeholder_text="https://example.com/reservation",
+            font=theme.FONT_BODY_MD,
             fg_color=theme.ELEVATED_COLOR,
             border_color=theme.HAIRLINE_COLOR,
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
-        self.url_entry.pack(fill="x", pady=(0, 15))
-        
+        self.url_entry.pack(fill="x", pady=(0, theme.SPACE_4))
+
         # Action Buttons frame
         self.btn_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
         self.btn_frame.pack(fill="x", side="bottom")
-        
+
         self.cancel_btn = ctk.CTkButton(
             self.btn_frame,
             text="취소",
             font=(theme.FONT_FAMILY, 12, "bold"),
             text_color=theme.TEXT_BODY,
-            fg_color=theme.SURFACE_COLOR,
-            hover_color=theme.CARD_COLOR,
+            fg_color=theme.CONTROL_COLOR,
+            hover_color=theme.CONTROL_HOVER,
+            border_width=1,
+            border_color=theme.CONTROL_BORDER,
             corner_radius=theme.ROUNDED_MD,
             command=self._on_cancel,
-            height=30,
-            width=100
+            height=theme.H_BUTTON,
+            width=104
         )
         self.cancel_btn.pack(side="left")
-        
+
         self.add_btn = ctk.CTkButton(
             self.btn_frame,
             text="등록",
@@ -501,19 +240,21 @@ class AddSiteDialog(ctk.CTkToplevel):
             hover_color=theme.TEXT_BODY,
             corner_radius=theme.ROUNDED_MD,
             command=self._on_add,
-            height=30,
-            width=100
+            height=theme.H_BUTTON,
+            width=104
         )
         self.add_btn.pack(side="right")
-        
+
         # Status/Loading indicator
         self.status_label = ctk.CTkLabel(
             self.content_frame,
             text="",
-            font=theme.FONT_BODY_SM,
-            text_color=theme.ACCENT_YELLOW
+            font=theme.FONT_LABEL,
+            text_color=theme.ACCENT_YELLOW,
+            wraplength=330,
+            justify="left"
         )
-        self.status_label.pack(side="bottom", pady=(0, 10))
+        self.status_label.pack(side="bottom", fill="x", pady=(0, theme.SPACE_3))
         
         self.after(50, self._grab_focus)
         
@@ -536,10 +277,10 @@ class AddSiteDialog(ctk.CTkToplevel):
         url = self.url_entry.get().strip()
         
         if not site_name:
-            self.status_label.configure(text="⚠️ 사이트 이름을 입력해주세요.", text_color=theme.ACCENT_RED)
+            self.status_label.configure(text="⚠️ 사이트 이름을 입력해주세요.", text_color=theme.TINT_ERROR_FG)
             return
         if not url:
-            self.status_label.configure(text="⚠️ 예약 페이지 URL을 입력해주세요.", text_color=theme.ACCENT_RED)
+            self.status_label.configure(text="⚠️ 예약 페이지 URL을 입력해주세요.", text_color=theme.TINT_ERROR_FG)
             return
 
         # URL Validation based on Engine Mode
@@ -548,14 +289,14 @@ class AddSiteDialog(ctk.CTkToplevel):
             from engines.site_parser import normalize_naver_url
             normalized_url = normalize_naver_url(url)
             if not normalized_url:
-                self.status_label.configure(text="⚠️ 올바른 네이버 예약 또는 지도 URL이 아닙니다.", text_color=theme.ACCENT_RED)
+                self.status_label.configure(text="⚠️ 올바른 네이버 예약 또는 지도 URL이 아닙니다.", text_color=theme.TINT_ERROR_FG)
                 return
             url = normalized_url
             self.url_entry.delete(0, "end")
             self.url_entry.insert(0, url)
         else:
             if any(p in url for p in ["booking.naver.com", "naver.me", "map.naver.com", "place.naver.com"]):
-                self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 예약' 유형에서 등록해주세요.", text_color=theme.ACCENT_RED)
+                self.status_label.configure(text="⚠️ 네이버 예약은 '네이버 예약' 유형에서 등록해주세요.", text_color=theme.TINT_ERROR_FG)
                 return
             
         def proceed():
@@ -581,7 +322,7 @@ class AddSiteDialog(ctk.CTkToplevel):
             t.start()
             self.after(50, self._poll_parse_result)
             
-        animate_click(self.add_btn, 30, 100, proceed)
+        animate_click(self.add_btn, theme.H_BUTTON, 104, proceed)
 
     def _poll_parse_result(self):
         if not self.winfo_exists():
@@ -634,7 +375,7 @@ class AddSiteDialog(ctk.CTkToplevel):
         
     def _on_parse_error(self, error_msg):
         self._parsing_in_progress = False
-        self.status_label.configure(text=f"⚠️ {error_msg}", text_color=theme.ACCENT_RED)
+        self.status_label.configure(text=f"⚠️ {error_msg}", text_color=theme.TINT_ERROR_FG)
         self.add_btn.configure(state="normal")
         self.cancel_btn.configure(state="normal")
 
@@ -653,9 +394,9 @@ class CatalogChangesDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text=f"{site_name} · 확인 필요한 변경",
-            font=(theme.FONT_FAMILY, 14, "bold"),
+            font=theme.FONT_TITLE,
             text_color=theme.TEXT_PRIMARY,
-        ).pack(anchor="w", padx=18, pady=(16, 4))
+        ).pack(anchor="w", padx=theme.SPACE_4, pady=(theme.SPACE_4, theme.SPACE_1))
         ctk.CTkLabel(
             self,
             text="선택한 삭제 또는 ID 교체만 반영됩니다. 선택하지 않은 항목은 기존 설정을 유지합니다.",
@@ -663,16 +404,32 @@ class CatalogChangesDialog(ctk.CTkToplevel):
             text_color=theme.TEXT_MUTE,
             wraplength=455,
             justify="left",
-        ).pack(anchor="w", padx=18, pady=(0, 10))
+        ).pack(anchor="w", padx=theme.SPACE_4, pady=(0, theme.SPACE_3))
 
-        scroll = ctk.CTkScrollableFrame(
+        # SafeScrollableFrame releases the global <MouseWheel> handler that
+        # upstream CTkScrollableFrame leaks on destroy, and scrolls with
+        # yview_moveto so the embedded child widgets repaint cleanly.
+        #
+        # corner_radius/border_width are deliberately 0 here: CTkScrollableFrame
+        # derives its inner canvas padding from corner_radius + border_width, so
+        # a rounded bordered variant insets the canvas and lets scrolled rows
+        # bleed under the rounded corners. A separate hairline gives the same
+        # visual separation without the artifact.
+        shell = ctk.CTkFrame(
             self,
             fg_color=theme.SURFACE_COLOR,
             border_color=theme.HAIRLINE_COLOR,
             border_width=1,
             corner_radius=theme.ROUNDED_MD,
         )
-        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        shell.pack(fill="both", expand=True, padx=theme.SPACE_4, pady=(0, theme.SPACE_3))
+        scroll = SafeScrollableFrame(
+            shell,
+            fg_color=theme.SURFACE_COLOR,
+            border_width=0,
+            corner_radius=0,
+        )
+        scroll.pack(fill="both", expand=True, padx=1, pady=1)
         for change in changes:
             variable = ctk.BooleanVar(value=False)
             action = "삭제" if change.kind == "removed" else "ID 교체"
@@ -690,23 +447,30 @@ class CatalogChangesDialog(ctk.CTkToplevel):
                 checkbox_width=16,
                 checkbox_height=16,
             )
-            checkbox.pack(fill="x", anchor="w", padx=10, pady=7)
+            checkbox.pack(fill="x", anchor="w", padx=theme.SPACE_3, pady=theme.SPACE_2)
             self.rows.append((variable, change))
 
         buttons = ctk.CTkFrame(self, fg_color="transparent")
-        buttons.pack(fill="x", padx=18, pady=(0, 14))
+        buttons.pack(fill="x", padx=theme.SPACE_4, pady=(0, theme.SPACE_4))
         ctk.CTkButton(
             buttons,
             text="보류 유지",
             width=105,
-            fg_color=theme.SURFACE_COLOR,
-            hover_color=theme.CARD_COLOR,
+            height=theme.H_BUTTON,
+            corner_radius=theme.ROUNDED_MD,
+            fg_color=theme.CONTROL_COLOR,
+            hover_color=theme.CONTROL_HOVER,
+            border_width=1,
+            border_color=theme.CONTROL_BORDER,
+            text_color=theme.TEXT_BODY,
             command=self.destroy,
         ).pack(side="left")
         ctk.CTkButton(
             buttons,
             text="선택 항목 반영",
             width=125,
+            height=theme.H_BUTTON,
+            corner_radius=theme.ROUNDED_MD,
             text_color=theme.TEXT_DARK,
             fg_color=theme.ACCENT_WHITE,
             hover_color=theme.TEXT_BODY,
@@ -720,22 +484,22 @@ class CatalogChangesDialog(ctk.CTkToplevel):
         self.destroy()
 
 class MainWindow(ctk.CTk):
+    # Logical (unscaled) window geometry. CTk.geometry() multiplies width and
+    # height by the window scaling factor but passes x/y through untouched, so
+    # these must never be mixed with winfo_* results, which are physical pixels.
+    DEFAULT_WIDTH = 520
+    DEFAULT_HEIGHT = 900
+    MIN_WIDTH = 480
+    MIN_HEIGHT = 720
+
     def __init__(self):
         super().__init__()
 
         # Window Config
         self.title(f"방탈출 펭크로 v{__version__}")
-        
-        # Center the window on startup
-        width = 520
-        height = 900
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        x = (screen_width - width) // 2
-        y = (screen_height - height) // 2
-        self.geometry(f"{width}x{height}+{x}+{y}")
-        
-        self.minsize(480, 720)
+
+        self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
+        self.geometry(self._centered_geometry(self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT))
         self.resizable(True, True)
         self.configure(fg_color=theme.CANVAS_COLOR)
 
@@ -757,11 +521,16 @@ class MainWindow(ctk.CTk):
         self._server_sync_generation = 0
         self._server_sync_thread = None
 
-        # Attempt counter & status tracking
+        # Attempt counter & status tracking.
+        # current_status is the lifecycle state; has_recent_error is a separate
+        # flag so a recoverable error cannot masquerade as a terminal state.
         self.attempt_count = 0
         self.current_status = "idle"
+        self.has_recent_error = False
+        self.last_error_message = ""
         self.booking_started_at = None
         self._status_timer_id = None
+        self._clock_timer_id = None
 
         # Worker threads only write to this queue. Tk widgets are touched by
         # the main-thread polling loop below.
@@ -784,7 +553,9 @@ class MainWindow(ctk.CTk):
         # -------------------------------------------------------------
         # 1. Draggable Custom Title Bar (Mac Style)
         # -------------------------------------------------------------
-        self.title_bar = ctk.CTkFrame(self, fg_color=theme.SURFACE_COLOR, height=36, corner_radius=0)
+        self.title_bar = ctk.CTkFrame(
+            self, fg_color=theme.SURFACE_COLOR, height=theme.H_TITLEBAR, corner_radius=0
+        )
         self.title_bar.pack(fill="x", side="top")
         self.title_bar.pack_propagate(False)
 
@@ -816,11 +587,11 @@ class MainWindow(ctk.CTk):
             text_color=theme.TEXT_MUTE,
             command=self._toggle_pin
         )
-        self.pin_btn.pack(side="left", padx=(10, 0))
+        self.pin_btn.pack(side="left", padx=(theme.SPACE_3, 0))
 
         # Accessible window controls
         dots_frame = ctk.CTkFrame(self.title_bar, fg_color="transparent")
-        dots_frame.pack(side="right", padx=8, pady=4)
+        dots_frame.pack(side="right", padx=theme.SPACE_2, pady=theme.SPACE_1)
 
         self.min_btn = ctk.CTkButton(
             dots_frame,
@@ -870,49 +641,88 @@ class MainWindow(ctk.CTk):
         # 2. Main Title Header Block (Tighter Padding)
         # -------------------------------------------------------------
         header_frame = ctk.CTkFrame(self, fg_color="transparent")
-        header_frame.pack(fill="x", padx=20, pady=(15, 6))
+        header_frame.pack(fill="x", padx=theme.GUTTER, pady=(theme.SPACE_3, theme.SPACE_1))
 
         # Big Title
         self.big_title_label = ctk.CTkLabel(
             header_frame,
             text=f"방탈출 펭크로 v{__version__}",
-            font=(theme.FONT_FAMILY, 20, "bold"),
+            font=theme.FONT_DISPLAY,
             text_color=theme.TEXT_PRIMARY
         )
-        self.big_title_label.pack(anchor="center", pady=(0, 6))
+        self.big_title_label.pack(anchor="center", pady=(0, theme.SPACE_1))
 
-        # Status Pill Badge
+        # Status Pill Badge. Colours come from _set_status_badge so that every
+        # state uses a tinted surface with a readable foreground instead of a
+        # saturated fill (white on ACCENT_RED is only ~3.4:1).
         self.status_badge = ctk.CTkLabel(
             header_frame,
             text="● 대기 중",
-            font=(theme.FONT_FAMILY, 11, "bold"),
-            text_color=theme.TEXT_PRIMARY,
-            fg_color=theme.ELEVATED_COLOR,
-            corner_radius=11,
-            padx=12,
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TINT_NEUTRAL_FG,
+            fg_color=theme.TINT_NEUTRAL_BG,
+            corner_radius=theme.ROUNDED_PILL,
+            padx=theme.SPACE_3,
             pady=3,
-            height=22
+            height=theme.H_BADGE
         )
         self.status_badge.pack(anchor="center")
 
-        # Naver Server Time Label (initially hidden)
-        self.server_time_label = ctk.CTkLabel(
+        # Digital server time card (initially hidden). A hairline border reads
+        # calmer than the previous saturated blue outline.
+        self.server_time_card = ctk.CTkFrame(
             header_frame,
-            text="네이버 서버 시간: 동기화 중...",
-            font=(theme.FONT_FAMILY, 12, "bold"),
-            text_color=theme.ACCENT_YELLOW,
-            fg_color="transparent"
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
+            corner_radius=theme.ROUNDED_MD
         )
+
+        self.server_time_title_label = ctk.CTkLabel(
+            self.server_time_card,
+            text="서버 시간 동기화 중...",
+            font=theme.FONT_CAPTION,
+            text_color=theme.TEXT_MUTE
+        )
+        self.server_time_title_label.pack(anchor="center", pady=(theme.SPACE_2, 0))
+
+        self.server_time_clock_frame = ctk.CTkFrame(self.server_time_card, fg_color="transparent")
+        self.server_time_clock_frame.pack(anchor="center", pady=(2, 0))
+
+        # Fixed-width digits keep the readout from shifting as the value ticks.
+        self.server_time_hms_label = ctk.CTkLabel(
+            self.server_time_clock_frame,
+            text="00:00:00",
+            font=theme.FONT_CLOCK,
+            text_color=theme.TEXT_PRIMARY
+        )
+        self.server_time_hms_label.pack(side="left")
+
+        self.server_time_ms_label = ctk.CTkLabel(
+            self.server_time_clock_frame,
+            text=".000",
+            font=theme.FONT_CLOCK_MS,
+            text_color=theme.ACCENT_GREEN
+        )
+        self.server_time_ms_label.pack(side="left", padx=(2, 0), pady=(theme.SPACE_1, 0))
+
+        self.server_time_latency_label = ctk.CTkLabel(
+            self.server_time_card,
+            text="응답 오차 -- ms",
+            font=theme.FONT_CAPTION,
+            text_color=theme.TEXT_TERTIARY
+        )
+        self.server_time_latency_label.pack(anchor="center", pady=(0, theme.SPACE_2))
 
         # Divider
         divider = ctk.CTkFrame(self, height=1, fg_color=theme.HAIRLINE_COLOR)
-        divider.pack(fill="x", padx=20, pady=(3, 8))
+        divider.pack(fill="x", padx=theme.GUTTER, pady=(theme.SPACE_1, theme.SPACE_2))
 
         # -------------------------------------------------------------
         # 3. Site Selection OptionMenu & Add Button
         # -------------------------------------------------------------
         self.site_select_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.site_select_frame.pack(fill="x", padx=20, pady=(0, 6))
+        self.site_select_frame.pack(fill="x", padx=theme.GUTTER, pady=(0, theme.SPACE_2))
         self.site_select_frame.columnconfigure(0, weight=1)
         self.site_select_frame.columnconfigure(1, weight=0)
         self.site_select_frame.columnconfigure(2, weight=0)
@@ -964,49 +774,67 @@ class MainWindow(ctk.CTk):
             saved_site = "제로월드"
             self.site_var.set(saved_site)
 
-        self.site_dropdown = ctk.CTkOptionMenu(
+        # These three controls sit directly on CANVAS_COLOR. The previous
+        # SURFACE_COLOR fill gave only ~1.35:1 contrast against the canvas, so
+        # the dropdown and the +/- buttons had no visible boundary at all.
+        # CONTROL_COLOR plus a CONTROL_BORDER hairline clears the 3:1 minimum
+        # for non-text UI components.
+        # CTkOptionMenu has no border option, so a 1px shell frame supplies the
+        # outline that separates it from the canvas.
+        self.site_dropdown_shell = ctk.CTkFrame(
             self.site_select_frame,
+            fg_color=theme.CONTROL_BORDER,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.site_dropdown_shell.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_2))
+
+        self.site_dropdown = ctk.CTkOptionMenu(
+            self.site_dropdown_shell,
             variable=self.site_var,
             values=site_options,
             command=self._on_site_change,
-            fg_color=theme.SURFACE_COLOR,
-            button_color=theme.SURFACE_COLOR,
-            button_hover_color=theme.CARD_COLOR,
+            fg_color=theme.CONTROL_COLOR,
+            button_color=theme.CONTROL_COLOR,
+            button_hover_color=theme.CONTROL_HOVER,
             dropdown_fg_color=theme.SURFACE_COLOR,
             dropdown_text_color=theme.TEXT_PRIMARY,
             dropdown_hover_color=theme.CARD_COLOR,
             text_color=theme.TEXT_PRIMARY,
-            font=(theme.FONT_FAMILY, 11, "bold"),
-            dropdown_font=(theme.FONT_FAMILY, 11, "bold"),
+            font=theme.FONT_BODY_SM,
+            dropdown_font=theme.FONT_BODY_MD,
             corner_radius=theme.ROUNDED_MD,
-            height=30,
+            height=theme.H_CONTROL,
             anchor="w"
         )
-        self.site_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.site_dropdown.pack(fill="x", padx=1, pady=1)
 
         self.add_site_btn = ctk.CTkButton(
             self.site_select_frame,
-            text="+",
-            width=30,
-            height=30,
-            font=(theme.FONT_FAMILY, 14, "bold"),
-            text_color=theme.TEXT_PRIMARY,
-            fg_color=theme.SURFACE_COLOR,
-            hover_color=theme.CARD_COLOR,
+            text="＋",
+            width=theme.H_CONTROL,
+            height=theme.H_CONTROL,
+            font=theme.FONT_BODY_MD,
+            text_color=theme.TEXT_BODY,
+            fg_color=theme.CONTROL_COLOR,
+            hover_color=theme.CONTROL_HOVER,
+            border_width=1,
+            border_color=theme.CONTROL_BORDER,
             corner_radius=theme.ROUNDED_MD,
             command=self._open_add_site_dialog
         )
-        self.add_site_btn.grid(row=0, column=1, sticky="e", padx=(0, 6))
+        self.add_site_btn.grid(row=0, column=1, sticky="e", padx=(0, theme.SPACE_1))
 
         self.delete_site_btn = ctk.CTkButton(
             self.site_select_frame,
-            text="-",
-            width=30,
-            height=30,
-            font=(theme.FONT_FAMILY, 14, "bold"),
-            text_color=theme.TEXT_PRIMARY,
-            fg_color=theme.SURFACE_COLOR,
-            hover_color=theme.CARD_COLOR,
+            text="－",
+            width=theme.H_CONTROL,
+            height=theme.H_CONTROL,
+            font=theme.FONT_BODY_MD,
+            text_color=theme.TEXT_BODY,
+            fg_color=theme.CONTROL_COLOR,
+            hover_color=theme.CONTROL_HOVER,
+            border_width=1,
+            border_color=theme.CONTROL_BORDER,
             corner_radius=theme.ROUNDED_MD,
             command=self._delete_current_site,
             state="disabled"
@@ -1023,7 +851,7 @@ class MainWindow(ctk.CTk):
             mode_callback=self._on_engine_mode_change
         )
         self.form.custom_sites = self.custom_sites
-        self.form.pack(fill="x", padx=20, pady=(0, 6))
+        self.form.pack(fill="x", padx=theme.GUTTER, pady=(0, theme.SPACE_2))
         self.form._is_initializing = True
         self.form.set_site(saved_site)
         self.form.load_config()
@@ -1035,33 +863,48 @@ class MainWindow(ctk.CTk):
         self.cta_btn = ctk.CTkButton(
             self,
             text="예약 시작",
-            font=(theme.FONT_FAMILY, 14, "bold"),
+            font=theme.FONT_TITLE,
             text_color=theme.TEXT_DARK,
             fg_color=theme.ACCENT_WHITE,
             hover_color=theme.TEXT_BODY,
             corner_radius=theme.ROUNDED_MD,
             command=self._toggle_cta,
-            height=38
+            height=theme.H_CTA
         )
-        self.cta_btn.pack(fill="x", padx=20, pady=(0, 8))
+        self.cta_btn.pack(fill="x", padx=theme.GUTTER, pady=(0, theme.SPACE_2))
 
         # -------------------------------------------------------------
         # 6. Terminal Logs Card Component
         # -------------------------------------------------------------
         self.log_panel = LogPanel(self)
-        self.log_panel.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.log_panel.pack(fill="both", expand=True, padx=theme.GUTTER, pady=(0, theme.SPACE_3))
 
+        # TEXT_DISABLED on the canvas is ~2.6:1, which made the grip invisible.
         self.resize_grip = ctk.CTkLabel(
             self,
             text="◢",
             width=20,
             height=20,
-            text_color=theme.TEXT_DISABLED,
+            font=theme.FONT_CAPTION,
+            text_color=theme.TEXT_MUTE,
             cursor="size_nw_se",
         )
         self.resize_grip.place(relx=1, rely=1, anchor="se")
         self.resize_grip.bind("<Button-1>", self._start_resize)
         self.resize_grip.bind("<B1-Motion>", self._resize_window)
+
+        # Clears leftover pixels while and after scrolling any surface.
+        # config.json switches:
+        #   "force_scroll_repaint": false  -> off entirely
+        #   "scroll_repaint_strong": true  -> synchronous repaint, stronger but
+        #                                     may flicker; only if soft is not
+        #                                     enough on a given machine
+        _cfg = saved_config if isinstance(saved_config, dict) else {}
+        self.scroll_repaint_guard = install_scroll_repaint_guard(
+            self,
+            enabled=bool(_cfg.get("force_scroll_repaint", True)),
+            strong=bool(_cfg.get("scroll_repaint_strong", False)),
+        )
 
         self.bind("<Control-Return>", lambda _event: self._toggle_cta())
         self.bind("<Control-l>", lambda _event: self.log_panel.clear_log())
@@ -1070,18 +913,65 @@ class MainWindow(ctk.CTk):
 
         # Welcome message
         self.log_panel.append_log("프로그램이 준비되었습니다.", "info")
+        self.log_panel.append_log(
+            "단축키 · Ctrl+Enter 시작/중지 · Esc 중지 · Ctrl+L 로그 지우기", "info"
+        )
 
         # Refresh all stale site catalogs after the UI is ready.
         self.after(200, self._start_catalog_auto_refresh)
         self._update_delete_button_state(saved_site)
 
-        # Show premium loading splash overlay
+        # Loading splash. Construction of the window is finished at this point,
+        # so the overlay is told immediately that start-up is done; it eases the
+        # progress bar to 100% and exits instead of padding out a fixed
+        # two-second animation.
         self.loading_overlay = LoadingOverlay(self, self._on_loading_complete)
-        self.loading_overlay.place(x=0, y=36, relwidth=1, relheight=1)
+        self.loading_overlay.place(x=0, y=theme.H_TITLEBAR, relwidth=1, relheight=1)
+        # The overlay drives its own stage captions from the progress value; it
+        # only needs to be told that construction is done.
+        self.after_idle(self._release_loading_overlay)
+
+    def _release_loading_overlay(self):
+        overlay = getattr(self, "loading_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.finish()
+            except Exception:
+                pass
 
     def _on_loading_complete(self):
         # Refresh theme UI once loading is completely done
+        self.loading_overlay = None
         self._refresh_themes_ui()
+
+    # -------------------------------------------------------------
+    # Geometry helpers
+    # -------------------------------------------------------------
+    def _to_physical(self, value):
+        """Logical (geometry/place) units -> physical pixels (winfo_*)."""
+        try:
+            return int(self._apply_window_scaling(value))
+        except Exception:
+            return int(value)
+
+    def _to_logical(self, value):
+        """Physical pixels (winfo_*) -> logical units accepted by geometry()."""
+        try:
+            return int(self._reverse_window_scaling(value))
+        except Exception:
+            return int(value)
+
+    def _centered_geometry(self, width, height):
+        """Build a geometry string that is actually centred on any DPI scale.
+
+        CTk.geometry() scales width/height but leaves x/y untouched, so the
+        offsets have to be computed from the *physical* window size.
+        """
+        physical_width = self._to_physical(width)
+        physical_height = self._to_physical(height)
+        x = max(0, (self.winfo_screenwidth() - physical_width) // 2)
+        y = max(0, (self.winfo_screenheight() - physical_height) // 2)
+        return f"{width}x{height}+{x}+{y}"
 
     # -------------------------------------------------------------
     # Dragging Functionality for Borderless Window
@@ -1097,14 +987,21 @@ class MainWindow(ctk.CTk):
         self.update_idletasks()  # Force coordinate system refresh for child popup menus
 
     def _start_resize(self, event):
+        # winfo_width/height and event.x_root are physical pixels.
         self._resize_origin = (event.x_root, event.y_root, self.winfo_width(), self.winfo_height())
 
     def _resize_window(self, event):
         if self._is_maximized or not hasattr(self, "_resize_origin"):
             return
         start_x, start_y, width, height = self._resize_origin
-        new_width = max(480, width + event.x_root - start_x)
-        new_height = max(720, height + event.y_root - start_y)
+
+        # The physical delta has to be converted back into logical units before
+        # being handed to geometry(), which multiplies by the window scaling
+        # factor. Feeding physical pixels straight in multiplied the size again
+        # on every motion event, so on a 125%/150% display the window grew
+        # explosively as soon as the grip was dragged.
+        new_width = max(self.MIN_WIDTH, self._to_logical(width + event.x_root - start_x))
+        new_height = max(self.MIN_HEIGHT, self._to_logical(height + event.y_root - start_y))
         self.geometry(f"{new_width}x{new_height}")
 
     def set_appwindow(self):
@@ -1271,15 +1168,9 @@ class MainWindow(ctk.CTk):
             self._is_maximized = False
             self.state("normal")
             self.overrideredirect(True)
-            
-            # Restore to original size and center it
-            width = 520
-            height = 900
-            screen_width = self.winfo_screenwidth()
-            screen_height = self.winfo_screenheight()
-            x = (screen_width - width) // 2
-            y = (screen_height - height) // 2
-            self.geometry(f"{width}x{height}+{x}+{y}")
+
+            # Restore to the default size, centred correctly at any DPI scale.
+            self.geometry(self._centered_geometry(self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT))
             self._apply_appwindow_style()
             self.update_idletasks()
         else:
@@ -1343,9 +1234,16 @@ class MainWindow(ctk.CTk):
         
         self._server_sync_generation += 1
         generation = self._server_sync_generation
+
+        # This method runs on every site change, mode change and checkbox
+        # toggle. Without cancelling the previous after() chain each call
+        # started an additional clock loop, so switching sites a few times
+        # multiplied the refresh rate (3 chains at 50 ms meant 60 label
+        # reconfigurations per second).
+        self._cancel_clock_timer()
+
         if show_server_time and is_supported_site:
             self.is_sync_running = True
-            import threading
             self._server_sync_thread = threading.Thread(
                 target=self._sync_server_time,
                 args=(generation, site_name),
@@ -1356,14 +1254,23 @@ class MainWindow(ctk.CTk):
             self._update_server_time_clock()
         else:
             self.is_sync_running = False
-            self.server_time_label.pack_forget()
-            self.server_time_label.configure(text="")
+            if hasattr(self, "server_time_card"):
+                self.server_time_card.pack_forget()
+
+    def _cancel_clock_timer(self):
+        timer_id = getattr(self, "_clock_timer_id", None)
+        if timer_id is not None:
+            try:
+                self.after_cancel(timer_id)
+            except Exception:
+                pass
+        self._clock_timer_id = None
 
     def _update_delete_button_state(self, site_name):
         if site_name in self.custom_sites:
-            self.delete_site_btn.configure(state="normal", text_color=theme.ACCENT_RED)
+            self.delete_site_btn.configure(state="normal", text_color=theme.TINT_ERROR_FG)
         else:
-            self.delete_site_btn.configure(state="disabled", text_color=theme.TEXT_PRIMARY)
+            self.delete_site_btn.configure(state="disabled", text_color=theme.TEXT_DISABLED)
 
     def _delete_current_site(self):
         current_site = self.site_var.get()
@@ -1544,6 +1451,8 @@ class MainWindow(ctk.CTk):
                 self.log_panel.append_log(f"[에러] 키이스케이프 서버 시간 동기화 실패: {error}", "error")
             return
         self.naver_time_offset = offset
+        if hasattr(self, "server_time_latency_label"):
+            self.server_time_latency_label.configure(text=f"응답 오차 {latency * 1000:.1f} ms")
         if site_name == "키이스케이프" and not getattr(self, "_keyescape_time_verified", False):
             self._keyescape_time_verified = True
             if abs(offset) > 5:
@@ -1557,26 +1466,44 @@ class MainWindow(ctk.CTk):
                     "success",
                 )
 
+    # 100 ms is still a live millisecond readout to the eye and halves the
+    # widget churn of the old 50 ms loop. The engines derive their own timing
+    # from naver_time_offset, so this interval only affects the display.
+    CLOCK_INTERVAL_MS = 100
+
     def _update_server_time_clock(self):
+        self._clock_timer_id = None
         if not self.is_sync_running:
             return
-            
-        if not self.server_time_label.winfo_ismapped():
-            self.server_time_label.pack(anchor="center", pady=(5, 0))
-        
+
+        if hasattr(self, "server_time_card") and not self.server_time_card.winfo_ismapped():
+            self.server_time_card.pack(anchor="center", pady=(theme.SPACE_2, theme.SPACE_1))
+
         now = time.time() + self.naver_time_offset
         now_dt = datetime.fromtimestamp(now)
         current_site = self.site_var.get()
-        prefix = "키이스케이프 서버 시간" if current_site == "키이스케이프" else "네이버 서버 시간"
-        time_str = now_dt.strftime(f"{prefix}: %H:%M:%S.%f")[:-4] # keep milliseconds to 2 decimals
-        self.server_time_label.configure(text=time_str)
-        
-        # Refresh every 100ms
-        self.after(100, self._update_server_time_clock)
+        prefix = "키이스케이프" if current_site == "키이스케이프" else "네이버"
+
+        if hasattr(self, "server_time_title_label"):
+            self.server_time_title_label.configure(text=f"{prefix} 서버 시간 · 동기화됨")
+
+        hms_str = now_dt.strftime("%H:%M:%S")
+        ms_str = f".{now_dt.microsecond // 1000:03d}"
+
+        if hasattr(self, "server_time_hms_label"):
+            self.server_time_hms_label.configure(text=hms_str)
+        if hasattr(self, "server_time_ms_label"):
+            self.server_time_ms_label.configure(text=ms_str)
+
+        self._clock_timer_id = self.after(self.CLOCK_INTERVAL_MS, self._update_server_time_clock)
 
     def _on_close(self):
         self._ui_polling = False
         self.is_sync_running = False
+        self._cancel_clock_timer()
+        guard = getattr(self, "scroll_repaint_guard", None)
+        if guard is not None:
+            guard.uninstall()
         try:
             if hasattr(self, 'active_engine') and self.active_engine and self.active_engine.is_running:
                 self.active_engine.stop_reservation()
@@ -1597,6 +1524,29 @@ class MainWindow(ctk.CTk):
         else:
             self.pin_btn.configure(fg_color="transparent", text_color=theme.TEXT_MUTE)
 
+    # Every status shares one styling table so the badge can never end up with
+    # an unreadable colour pair, and so a new state cannot be introduced
+    # without also giving it a colour.
+    STATUS_STYLES = {
+        "idle": (theme.TINT_NEUTRAL_BG, theme.TINT_NEUTRAL_FG),
+        "running": (theme.TINT_RUNNING_BG, theme.TINT_RUNNING_FG),
+        "stopping": (theme.TINT_NEUTRAL_BG, theme.TINT_NEUTRAL_FG),
+        "success": (theme.TINT_SUCCESS_BG, theme.TINT_SUCCESS_FG),
+        "error": (theme.TINT_ERROR_BG, theme.TINT_ERROR_FG),
+        "info": (theme.TINT_INFO_BG, theme.TINT_INFO_FG),
+    }
+
+    def _set_status_badge(self, kind, text):
+        background, foreground = self.STATUS_STYLES.get(kind, self.STATUS_STYLES["idle"])
+        try:
+            self.status_badge.configure(text=text, text_color=foreground, fg_color=background)
+        except Exception:
+            pass
+
+    def _engine_is_active(self):
+        engine = getattr(self, "active_engine", None)
+        return bool(engine is not None and engine.is_running)
+
     def _toggle_cta(self):
         def proceed():
             if self.active_engine and self.active_engine.is_running:
@@ -1606,11 +1556,7 @@ class MainWindow(ctk.CTk):
                 if error_msg:
                     self.log_panel.append_log(f"입력 오류: {error_msg}", "error")
                     self.current_status = "error"
-                    self.status_badge.configure(
-                        text="● 에러 발생",
-                        text_color=theme.TEXT_PRIMARY,
-                        fg_color=theme.ACCENT_RED
-                    )
+                    self._set_status_badge("error", "● 입력 확인 필요")
                     return
                 if not messagebox.askyesno(
                     "예약 정보 확인",
@@ -1619,8 +1565,8 @@ class MainWindow(ctk.CTk):
                 ):
                     return
                 self._start_booking(res_data, threads, is_async)
-                
-        animate_click(self.cta_btn, 38, callback=proceed)
+
+        animate_click(self.cta_btn, theme.H_CTA, callback=proceed)
 
     def _start_booking(self, reservation_data: ReservationRequest, threads, is_async):
         if self._catalog_refresh_running:
@@ -1631,6 +1577,8 @@ class MainWindow(ctk.CTk):
         self.log_panel.clear_log()
         self.attempt_count = 0
         self.current_status = "running"
+        self.has_recent_error = False
+        self.last_error_message = ""
         self.booking_started_at = time.monotonic()
         self.log_panel.append_log(f"[{selected_site}] 예약을 시작합니다...", "info")
         self.form.set_running_state(True)
@@ -1642,14 +1590,10 @@ class MainWindow(ctk.CTk):
             text="예약 중지",
             text_color=theme.TEXT_PRIMARY,
             fg_color=theme.ACCENT_RED,
-            hover_color="#d64b4b"
+            hover_color=theme.ACCENT_RED_HOVER
         )
-        
-        self.status_badge.configure(
-            text="● 동작 중",
-            text_color=theme.TEXT_DARK,
-            fg_color=theme.ACCENT_YELLOW
-        )
+
+        self._set_status_badge("running", "● 동작 중")
 
         # Clear any stale engine events before starting a new run.
         while True:
@@ -1687,7 +1631,7 @@ class MainWindow(ctk.CTk):
             self.current_status = "stopping"
             self.active_engine.stop_reservation()
             self.cta_btn.configure(text="중지 중...", state="disabled")
-            self.status_badge.configure(text="● 중지 중", text_color=theme.TEXT_PRIMARY, fg_color=theme.CARD_COLOR)
+            self._set_status_badge("stopping", "● 중지 중")
         else:
             self.log_panel.append_log("실행 중인 예약 작업이 없습니다.", "warning")
 
@@ -1712,20 +1656,18 @@ class MainWindow(ctk.CTk):
         self.add_site_btn.configure(state="normal")
         self._update_delete_button_state(self.site_var.get())
         self.booking_started_at = None
-        
+
         if self.current_status == "error":
-            self.status_badge.configure(
-                text="● 에러 발생",
-                text_color=theme.TEXT_PRIMARY,
-                fg_color=theme.ACCENT_RED
-            )
+            self._set_status_badge("error", "● 시작 실패")
+        elif getattr(self, "has_recent_error", False):
+            # The run ended, and at least one error was logged along the way.
+            # Surfacing that here is honest without pretending the whole run
+            # failed while it was still going.
+            self._set_status_badge("error", "● 종료 · 오류 있음")
+            self.current_status = "idle"
         else:
             self.current_status = "idle"
-            self.status_badge.configure(
-                text="● 대기 중",
-                text_color=theme.TEXT_PRIMARY,
-                fg_color=theme.ELEVATED_COLOR
-            )
+            self._set_status_badge("idle", "● 대기 중")
 
     def _on_engine_log(self, message, log_type):
         self.engine_event_queue.put(("log", message, log_type))
@@ -1737,12 +1679,27 @@ class MainWindow(ctk.CTk):
         self.engine_event_queue.put(("status", attempt_count, last_error))
 
     def _update_booking_status(self):
-        if self.current_status not in {"running", "stopping"}:
+        # Driven by whether the engine is actually running, not by
+        # current_status. Previously a single transient error log flipped
+        # current_status to "error", this method returned early and the attempt
+        # counter and elapsed timer froze for the rest of the run -- so a
+        # perfectly healthy run looked dead.
+        if self.current_status == "stopping":
+            self._status_timer_id = self.after(500, self._update_booking_status)
+            return
+        if self.current_status != "running" and not self._engine_is_active():
             self._status_timer_id = None
             return
-        if self.booking_started_at and self.current_status == "running":
+
+        if self.booking_started_at:
             elapsed = int(time.monotonic() - self.booking_started_at)
-            self.status_badge.configure(text=f"● 동작 중 · {self.attempt_count:,}회 · {elapsed // 60:02d}:{elapsed % 60:02d}")
+            text = (
+                f"● 동작 중 · {self.attempt_count:,}회 · "
+                f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+            )
+            if getattr(self, "has_recent_error", False):
+                text += " · 오류 있음"
+            self._set_status_badge("running", text)
         self._status_timer_id = self.after(500, self._update_booking_status)
 
     def _drain_engine_events(self):
@@ -1776,13 +1733,17 @@ class MainWindow(ctk.CTk):
 
         if logs:
             self.log_panel.append_logs_batch(logs)
-            if any(log_type == "error" for _, log_type in logs):
-                self.current_status = "error"
-                self.status_badge.configure(
-                    text="● 에러 발생",
-                    text_color=theme.TEXT_PRIMARY,
-                    fg_color=theme.ACCENT_RED,
-                )
+            errors = [message for message, log_type in logs if log_type == "error"]
+            if errors:
+                # Record the error, but do not declare the whole run failed:
+                # engines log recoverable network errors while they keep
+                # retrying. Escalate to a fatal badge only when nothing is
+                # running any more.
+                self.has_recent_error = True
+                self.last_error_message = errors[-1]
+                if not self._engine_is_active() and self.current_status != "stopping":
+                    self.current_status = "error"
+                    self._set_status_badge("error", "● 오류 발생")
         if success:
             self.current_status = "idle"
             self._trigger_success_notification()
@@ -2012,15 +1973,24 @@ class MainWindow(ctk.CTk):
 
     def _trigger_success_notification(self):
         self._engine_completion_handled = True
+        self.has_recent_error = False
         self._reset_cta_state()
+        self._set_status_badge("success", "● 예약 성공")
         try:
-            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS)
+            # SND_ASYNC matters: without it PlaySound blocks the Tk main thread
+            # until the sound finishes, freezing the UI at the exact moment the
+            # user is being told the booking succeeded.
+            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
         except Exception:
             try:
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
             except Exception:
                 pass
-        dialog = SuccessDialog(self, title="예약 성공", message="축하합니다! 방탈출 예약에 성공하였습니다. 웹사이트 또는 예약 내역을 확인해주세요.")
+        SuccessDialog(
+            self,
+            title="예약 성공",
+            message="축하합니다! 방탈출 예약에 성공하였습니다. 웹사이트 또는 예약 내역을 확인해주세요.",
+        )
 
     def _start_jigubyeol_theme_fetcher(self):
         def fetch():

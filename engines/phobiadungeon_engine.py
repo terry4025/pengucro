@@ -3,8 +3,17 @@ import os
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from PIL import Image
 from engines.base_engine import BaseEngine
+
+
+def _scratch_dir() -> Path:
+    """Working directory for captcha screenshots, created on demand."""
+    directory = Path.cwd() / "scratch"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
 
 async def ocr_image_winsdk(img_path):
     from winsdk.windows.storage import StorageFile
@@ -255,14 +264,22 @@ class PhobiaDungeonEngine(BaseEngine):
                         await captcha_elem.wait_for(state="visible", timeout=3000)
                         old_src = await captcha_elem.get_attribute("src")
 
-                        temp_raw = f"scratch/temp_phobia_raw_{worker_id}.png"
-                        temp_proc = f"scratch/temp_phobia_proc_{worker_id}.png"
-                        
+                        # scratch/ is in .gitignore, so on a fresh clone the
+                        # directory does not exist and every screenshot raised,
+                        # burning all 15 captcha attempts without a usable error.
+                        temp_dir = _scratch_dir()
+                        temp_raw = str(temp_dir / f"temp_phobia_raw_{worker_id}.png")
+                        temp_proc = str(temp_dir / f"temp_phobia_proc_{worker_id}.png")
+
                         await captcha_elem.screenshot(path=temp_raw)
 
-                        img = Image.open(temp_raw)
-                        gray = img.convert("L")
-                        scaled = gray.resize((img.size[0] * 4, img.size[1] * 4), Image.Resampling.LANCZOS)
+                        # Explicit close so the file is not held open by PIL's
+                        # lazy loader while the next iteration overwrites it.
+                        with Image.open(temp_raw) as img:
+                            gray = img.convert("L")
+                            scaled = gray.resize(
+                                (img.size[0] * 4, img.size[1] * 4), Image.Resampling.LANCZOS
+                            )
                         binarized = scaled.point(lambda p: 255 if p > 130 else 0)
                         binarized.save(temp_proc)
 

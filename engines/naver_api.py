@@ -1,0 +1,569 @@
+"""Read-only client for Naver Booking's GraphQL API.
+
+Why this exists
+---------------
+The engine used to learn everything by scraping the rendered React page: it swept
+``document.querySelectorAll('button, a, li')`` on every loop turn and matched time
+strings with a regex. That is slow, it breaks whenever Naver ships a new build, and
+it cannot see a slot that has not been rendered yet.
+
+Everything the engine actually needs is served by the same GraphQL endpoint the
+page itself calls, and it answers *without a login*:
+
+``hourlySchedule``
+    Per-slot ``slotId`` / ``scheduleId`` / ``stock`` / sale flags for a date range.
+    This is the availability signal the polling loop watches.
+
+``bizItem``
+    ``currentDateTime`` -- the server's own clock, with real millisecond precision
+    (measured: ``...:18.812Z``, ``...:19.310Z``, ``...:20.271Z`` across successive
+    calls) -- plus ``bookableSettingJson`` describing the open schedule.
+
+Measured facts behind the design
+--------------------------------
+* The old REST path ``api.booking.naver.com/v3.0/.../schedules`` is dead. It answers
+  ``403 {"errorCode":"NotAccessibleUrl"}`` with or without ``Referer``/``Origin``,
+  which is why ``fetch_naver_slots`` had been silently returning nothing.
+* GraphQL introspection is disabled, so ``ScheduleParams`` was confirmed by calling
+  it: ``businessId``, ``bizItemId``, ``startDateTime``, ``endDateTime`` is accepted.
+* ``stock`` is total capacity and ``bookingCount`` is how many are booked, so a
+  slot is free when ``bookingCount < stock``. This was established by lining the
+  API up against the rendered page for every slot on two dates, 18 in all, and the
+  correlation is exact:
+
+      page 매진  ->  stock 1, bookingCount 1
+      page 가능  ->  stock 1, bookingCount 0
+
+  Reading ``stock`` alone as "remaining" is the trap here, and it is easy to fall
+  into: sample a range while everything happens to be booked and every slot reads
+  ``stock: 1``, which looks like "one seat free" but means "capacity one, and it is
+  taken". An engine built on that submits into 매진 slots forever.
+* ``stock: 0`` appears separately, for a slot the owner has blocked outright
+  (2026-08-08 18:00 on the sample item). Subtracting ``bookingCount`` covers that
+  case too, so no special handling is needed.
+* ``occupiedBookingCount`` read 0 on every slot observed; it is subtracted as well,
+  which can only be more conservative.
+* Dates outside the open window simply have no entries. The sample item returned
+  slots through 2026-08-01 and nothing for 08-02..08-07. A date appearing in the
+  response *is* the signal that it opened.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable
+
+import requests
+
+
+logger = logging.getLogger(__name__)
+
+KST = timezone(timedelta(hours=9))
+
+GRAPHQL_URL = "https://m.booking.naver.com/graphql"
+DEFAULT_SERVICE_ID = "12"
+REQUEST_TIMEOUT = 8.0
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+)
+
+# Only the fields the engine reads. Asking for `prices`/`seatGroups` as the page
+# does would roughly double the response for data we never look at.
+HOURLY_SCHEDULE_QUERY = """query hourlySchedule($scheduleParams: ScheduleParams) {
+  schedule(input: $scheduleParams) {
+    bizItemSchedule {
+      hourly {
+        id
+        slotId
+        scheduleId
+        detailScheduleId
+        unitStartDateTime
+        unitStartTime
+        stock
+        bookingCount
+        occupiedBookingCount
+        unitStock
+        unitBookingCount
+        isBusinessDay
+        isSaleDay
+        isUnitSaleDay
+        isUnitBusinessDay
+        isHoliday
+        minBookingCount
+        maxBookingCount
+        saleStartDateTime
+        saleEndDateTime
+      }
+    }
+  }
+}"""
+
+# bookableSettingJson and friends are JSON scalars: selecting subfields on them is
+# a hard GraphQL error ("must not have a selection since type JSON has no
+# subfields"), so they are requested bare.
+BIZ_ITEM_QUERY = """query bizItem($input: BizItemParams) {
+  bizItem(input: $input) {
+    bizItemId
+    name
+    currentDateTime
+    stock
+    isClosedBooking
+    isClosedBookingUser
+    isImp
+    bookableSettingJson
+    bookingCountSettingJson
+    customFormJson
+  }
+}"""
+
+BUSINESS_QUERY = """query business($input: BusinessParams) {
+  business(input: $input) {
+    businessId
+    name
+    serviceName
+    isImp
+    isPhoneAuthenticationRequired
+    customFormJson
+    bookingConfirmCode
+  }
+}"""
+
+ACCOUNT_QUERY = """query account {
+  account {
+    userId
+    isLoggedIn
+    nickname
+  }
+}"""
+
+
+class NaverApiError(RuntimeError):
+    """A GraphQL call failed in a way the caller cannot paper over."""
+
+
+def parse_ids(url: str) -> tuple[str, str, str] | None:
+    """Pull (service_id, business_id, biz_item_id) out of a booking URL."""
+    if not url:
+        return None
+    match = re.search(
+        r"booking\.naver\.com/booking/(?P<service>\d+)/bizes/(?P<business>\d+)"
+        r"(?:/items/(?P<item>\d+))?",
+        url,
+    )
+    if not match:
+        return None
+    item = match.group("item")
+    if not item:
+        # Without a bizItemId there is no schedule to poll; the caller has to
+        # resolve the theme first.
+        return None
+    return match.group("service") or DEFAULT_SERVICE_ID, match.group("business"), item
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    """Parse the several shapes Naver uses, always returning KST-aware."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text[:-1]).replace(
+                tzinfo=timezone.utc).astimezone(KST)
+        parsed = datetime.fromisoformat(text.replace(" ", "T"))
+    except ValueError:
+        return None
+    return parsed.astimezone(KST) if parsed.tzinfo else parsed.replace(tzinfo=KST)
+
+
+def _as_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+@dataclass(frozen=True)
+class NaverSlot:
+    """One bookable time on one date."""
+
+    slot_id: str
+    schedule_id: str
+    detail_schedule_id: str
+    composite_id: str
+    start: datetime
+    stock: int
+    booking_count: int
+    occupied: int
+    is_business_day: bool
+    is_sale_day: bool
+    is_unit_business_day: bool
+    is_unit_sale_day: bool
+    is_holiday: bool
+    min_booking_count: int
+    max_booking_count: int
+    sale_start: datetime | None
+    sale_end: datetime | None
+
+    @property
+    def date_str(self) -> str:
+        return self.start.strftime("%Y-%m-%d")
+
+    @property
+    def time_str(self) -> str:
+        return self.start.strftime("%H:%M")
+
+    @property
+    def remaining(self) -> int:
+        """Seats still free: capacity minus what is booked or held.
+
+        Verified against the rendered page for 18 slots across two dates. A 매진
+        slot reports ``stock 1 / bookingCount 1`` and a free one ``stock 1 /
+        bookingCount 0``, so ``stock`` on its own says nothing about availability.
+        """
+        return max(0, self.stock - max(0, self.booking_count) - max(0, self.occupied))
+
+    def blocked_reason(self, now: datetime | None = None) -> str | None:
+        """Why this slot cannot be booked, or None when it can."""
+        if self.remaining <= 0:
+            return "정원 마감"
+        if not (self.is_business_day and self.is_unit_business_day):
+            return "휴무일"
+        if not (self.is_sale_day and self.is_unit_sale_day):
+            return "판매 중지"
+        moment = now or datetime.now(KST)
+        if self.sale_start and moment < self.sale_start:
+            return f"판매 시작 전 ({self.sale_start:%Y-%m-%d %H:%M})"
+        if self.sale_end and moment > self.sale_end:
+            return "판매 종료"
+        return None
+
+    def is_open(self, now: datetime | None = None) -> bool:
+        return self.blocked_reason(now) is None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "NaverSlot | None":
+        start = _parse_dt(payload.get("unitStartTime")) or _parse_dt(
+            payload.get("unitStartDateTime"))
+        if start is None:
+            return None
+        return cls(
+            slot_id=str(payload.get("slotId") or ""),
+            schedule_id=str(payload.get("scheduleId") or ""),
+            detail_schedule_id=str(payload.get("detailScheduleId") or ""),
+            composite_id=str(payload.get("id") or ""),
+            start=start,
+            stock=_as_int(payload.get("stock")),
+            booking_count=_as_int(payload.get("bookingCount")),
+            occupied=_as_int(payload.get("occupiedBookingCount")),
+            is_business_day=bool(payload.get("isBusinessDay", True)),
+            is_sale_day=bool(payload.get("isSaleDay", True)),
+            is_unit_business_day=bool(payload.get("isUnitBusinessDay", True)),
+            is_unit_sale_day=bool(payload.get("isUnitSaleDay", True)),
+            is_holiday=bool(payload.get("isHoliday", False)),
+            min_booking_count=_as_int(payload.get("minBookingCount"), 1),
+            max_booking_count=_as_int(payload.get("maxBookingCount"), 1),
+            sale_start=_parse_dt(payload.get("saleStartDateTime")),
+            sale_end=_parse_dt(payload.get("saleEndDateTime")),
+        )
+
+
+@dataclass(frozen=True)
+class NaverItemMeta:
+    """The item-level facts worth checking before we start polling."""
+
+    name: str
+    server_time: datetime | None
+    is_closed_booking: bool
+    is_closed_for_user: bool
+    open_at: datetime | None
+    is_opened: bool
+    uses_open_schedule: bool
+    is_paused: bool
+    custom_form: list[dict[str, Any]]
+
+    def hard_block(self) -> str | None:
+        """A reason polling is pointless, or None."""
+        if self.is_closed_booking or self.is_closed_for_user:
+            return "이 상품은 현재 예약이 닫혀 있습니다."
+        if self.is_paused:
+            return "판매가 일시 중지된 상품입니다."
+        return None
+
+
+class NaverBookingApi:
+    """Thin GraphQL client. Every method is a read; nothing here books anything."""
+
+    def __init__(
+        self,
+        business_id: str,
+        biz_item_id: str,
+        service_id: str = DEFAULT_SERVICE_ID,
+        session: requests.Session | None = None,
+        log=None,
+        timeout: float = REQUEST_TIMEOUT,
+    ) -> None:
+        self.business_id = str(business_id)
+        self.biz_item_id = str(biz_item_id)
+        self.service_id = str(service_id or DEFAULT_SERVICE_ID)
+        self.log = log
+        # Every call is bounded. An unbounded POST here would park a worker
+        # thread forever and keep the engine's is_running flag stuck on.
+        self.timeout = float(timeout) if timeout else REQUEST_TIMEOUT
+        self._owns_session = session is None
+        self.session = session or requests.Session()
+        self.session.headers.setdefault("User-Agent", USER_AGENT)
+        self.session.headers.setdefault("Accept-Language", "ko")
+        self.last_rtt: float | None = None
+
+    # -- plumbing -----------------------------------------------------------
+    @property
+    def item_url(self) -> str:
+        return (f"https://m.booking.naver.com/booking/{self.service_id}"
+                f"/bizes/{self.business_id}/items/{self.biz_item_id}")
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Origin": "https://m.booking.naver.com",
+            "Referer": self.item_url,
+        }
+
+    def _post(self, operation: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        payload = {"operationName": operation, "query": query, "variables": variables}
+        before = time.monotonic()
+        try:
+            response = self.session.post(
+                GRAPHQL_URL, json=payload, headers=self._headers(),
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise NaverApiError(f"네이버 API 연결 실패: {exc}") from exc
+        after = time.monotonic()
+        self.last_rtt = after - before
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise NaverApiError(
+                f"네이버 API 응답을 해석하지 못했습니다 (HTTP {response.status_code})"
+            ) from exc
+
+        errors = body.get("errors")
+        if errors:
+            message = str((errors[0] or {}).get("message", ""))[:200]
+            raise NaverApiError(f"네이버 API 오류: {message}")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise NaverApiError("네이버 API가 빈 응답을 반환했습니다.")
+        # Anchoring the clock needs the midpoint of the request window, so it is
+        # carried alongside the payload rather than re-measured by the caller.
+        data["__rtt_window__"] = (before, after)
+        return data
+
+    def close(self) -> None:
+        if self._owns_session:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+
+    # -- reads --------------------------------------------------------------
+    def fetch_slots(self, date_from: str, date_to: str | None = None) -> list[NaverSlot]:
+        """Slots between two ``YYYY-MM-DD`` dates, inclusive."""
+        end = date_to or date_from
+        data = self._post("hourlySchedule", HOURLY_SCHEDULE_QUERY, {
+            "scheduleParams": {
+                "businessId": self.business_id,
+                "bizItemId": self.biz_item_id,
+                "startDateTime": f"{date_from}T00:00:00",
+                "endDateTime": f"{end}T23:59:59",
+            },
+        })
+        schedule = (data.get("schedule") or {}).get("bizItemSchedule") or {}
+        hourly = schedule.get("hourly") or []
+        slots = [NaverSlot.from_payload(entry) for entry in hourly if entry]
+        return sorted((slot for slot in slots if slot), key=lambda item: item.start)
+
+    def find_slot(self, date_str: str, time_str: str) -> NaverSlot | None:
+        """The slot for one date and ``HH:MM``, or None when it does not exist yet."""
+        wanted = (time_str or "")[:5]
+        for slot in self.fetch_slots(date_str):
+            if slot.time_str == wanted:
+                return slot
+        return None
+
+    def fetch_item_meta(self) -> NaverItemMeta:
+        data = self._post("bizItem", BIZ_ITEM_QUERY, {
+            "input": {
+                "businessId": self.business_id,
+                "bizItemId": self.biz_item_id,
+                "lang": "ko",
+            },
+        })
+        item = data.get("bizItem") or {}
+        bookable = _as_json(item.get("bookableSettingJson"))
+        custom_form = item.get("customFormJson")
+        return NaverItemMeta(
+            name=str(item.get("name") or ""),
+            server_time=_parse_dt(item.get("currentDateTime")),
+            is_closed_booking=bool(item.get("isClosedBooking")),
+            is_closed_for_user=bool(item.get("isClosedBookingUser")),
+            open_at=_parse_dt(bookable.get("openDateTime")),
+            is_opened=bool(bookable.get("isOpened", True)),
+            uses_open_schedule=bool(bookable.get("isUseOpen")),
+            is_paused=bool(bookable.get("isPaused")),
+            custom_form=custom_form if isinstance(custom_form, list) else [],
+        )
+
+    def fetch_business_form(self) -> list[dict[str, Any]]:
+        """The extra questions asked on the request page.
+
+        The participant-count dropdown lives here, not on the bizItem, for the
+        sample business. Knowing the exact option strings up front removes the
+        selector guessing the engine used to do.
+        """
+        try:
+            data = self._post("business", BUSINESS_QUERY, {
+                "input": {
+                    "businessId": self.business_id,
+                    "lang": "ko",
+                    "isOwner": False,
+                },
+            })
+        except NaverApiError:
+            return []
+        business = data.get("business") or {}
+        form = business.get("customFormJson")
+        return form if isinstance(form, list) else []
+
+    def is_logged_in(self) -> bool | None:
+        """True/False when the endpoint answers, None when it cannot be told."""
+        try:
+            data = self._post("account", ACCOUNT_QUERY, {})
+        except NaverApiError:
+            return None
+        account = data.get("account")
+        if not isinstance(account, dict):
+            return None
+        return bool(account.get("isLoggedIn"))
+
+
+class NaverServerClock:
+    """Naver's clock, anchored to ``time.monotonic()``.
+
+    Unlike keyescape -- where only a whole-second ``Date`` header is available and
+    the second boundary has to be caught by polling -- ``bizItem.currentDateTime``
+    carries milliseconds, so one request is enough. Accuracy is then bounded by
+    half the round trip (measured 71-97 ms, so roughly +/-45 ms).
+
+    The anchor is monotonic on purpose: an NTP correction part-way through a run
+    cannot shift what the engine believes the server time to be.
+    """
+
+    def __init__(self, api: NaverBookingApi, log=None) -> None:
+        self.api = api
+        self.log = log
+        self._anchor_monotonic: float | None = None
+        self._anchor_server: float | None = None
+        self.last_offset: float | None = None
+        self.last_precision: float | None = None
+
+    @property
+    def synced(self) -> bool:
+        return self._anchor_server is not None
+
+    def now(self) -> float:
+        if self._anchor_server is None or self._anchor_monotonic is None:
+            return time.time()
+        return self._anchor_server + (time.monotonic() - self._anchor_monotonic)
+
+    def now_kst(self) -> datetime:
+        return datetime.fromtimestamp(self.now(), KST)
+
+    def seconds_until(self, target_epoch: float) -> float:
+        return target_epoch - self.now()
+
+    def sync(self, announce: bool = False) -> bool:
+        before = time.monotonic()
+        try:
+            meta = self.api.fetch_item_meta()
+        except NaverApiError as exc:
+            if announce and self.log:
+                self.log(f"[경고] 네이버 서버 시간을 읽지 못했습니다. 로컬 시계로 진행합니다. ({exc})",
+                         "warning")
+            return False
+        after = time.monotonic()
+        if meta.server_time is None:
+            if announce and self.log:
+                self.log("[경고] 서버 시간 필드가 비어 있습니다. 로컬 시계로 진행합니다.", "warning")
+            return False
+
+        midpoint = (before + after) / 2
+        self._anchor_server = meta.server_time.timestamp()
+        self._anchor_monotonic = midpoint
+        self.last_precision = (after - before) / 2
+        self.last_offset = self._anchor_server - (
+            time.time() - (time.monotonic() - midpoint)
+        )
+        if announce and self.log:
+            self.log(
+                f"서버 시간 동기화 완료 · 로컬 시계와 차이 {self.last_offset:+.2f}초 · "
+                f"정밀도 약 {self.last_precision * 1000:.0f}ms",
+                "success",
+            )
+            if abs(self.last_offset) > 5:
+                self.log(
+                    f"[경고] 이 PC의 시계가 서버보다 {abs(self.last_offset):.0f}초 "
+                    f"{'느립니다' if self.last_offset > 0 else '빠릅니다'}. "
+                    "이후 시각 표시는 서버 시간을 기준으로 합니다.",
+                    "warning",
+                )
+        return True
+
+
+def participant_option(form: Iterable[dict[str, Any]], people: str) -> tuple[str, str] | None:
+    """Match a people count against a custom form's SELECT options.
+
+    Returns ``(question_title, option_value)`` so the caller can target the exact
+    control and the exact option text instead of guessing at ``"{n}인"``.
+    """
+    wanted = str(people or "").strip()
+    if not wanted:
+        return None
+    digits = re.sub(r"\D", "", wanted)
+    for question in form or []:
+        if not isinstance(question, dict):
+            continue
+        if str(question.get("type", "")).upper() != "SELECT":
+            continue
+        options = question.get("options")
+        if not isinstance(options, list):
+            continue
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            value = str(option.get("value") or "")
+            if not value:
+                continue
+            if value == wanted or (digits and re.sub(r"\D", "", value) == digits):
+                return str(question.get("title") or ""), value
+    return None

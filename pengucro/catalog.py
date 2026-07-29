@@ -281,7 +281,8 @@ class CatalogService:
                 errors.append(f"중복 지점 ID가 있습니다: {identity}")
             seen_branch_values.add(identity)
             if not branch.themes:
-                errors.append(f"'{branch.name}' 지점의 테마가 비어 있습니다.")
+                import logging
+                logging.warning(f"'{branch.name}' 지점의 테마가 비어 있습니다. (갱신은 중단하지 않고 계속 진행합니다.)")
             seen_theme_values: set[str] = set()
             for theme in branch.themes.values():
                 if not theme.id or not theme.name or not theme.booking_value:

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
 from datetime import datetime
 from typing import Any, Callable
 
 from pengucro.models import BookingEvent, BookingEventType, BookingResult
+
+
+logger = logging.getLogger(__name__)
 
 
 LogCallback = Callable[[str, str], None]
@@ -270,12 +275,52 @@ class BaseEngine:
         if hasattr(self, "session_pool"):
             self.session_pool = []
 
+    # How long workers get to wind down *after* stop_event has been set. This is
+    # not a limit on how long a run may take: a booking that opens tomorrow waits
+    # for a day and that is normal. Without any bound, though, a worker stuck on
+    # a socket kept is_running True forever, so MainWindow never ran its
+    # completion handler and the CTA button stayed disabled on "중지 중...".
+    SHUTDOWN_GRACE_SECONDS = 15.0
+
     def _monitor_threads(self) -> None:
-        for worker in self.threads:
-            worker.join()
+        # The grace period applies only *after* a stop has been requested.
+        #
+        # An earlier version computed the deadline the moment this monitor
+        # started, which is when the engine starts -- so any run that legitimately
+        # waited longer than the grace period (a booking that opens tomorrow, for
+        # instance) was declared stalled after 15 seconds and had its state torn
+        # down while the worker was still doing its job.
+        stragglers: list[str] = []
+        stop_deadline: float | None = None
+        while True:
+            alive = [worker for worker in self.threads if worker.is_alive()]
+            if not alive:
+                break
+            if self.stop_event.is_set():
+                if stop_deadline is None:
+                    stop_deadline = time.monotonic() + self.SHUTDOWN_GRACE_SECONDS
+                elif time.monotonic() >= stop_deadline:
+                    stragglers = [worker.name for worker in alive]
+                    break
+            for worker in alive:
+                worker.join(timeout=0.2)
+                if self.stop_event.is_set() and stop_deadline is not None \
+                        and time.monotonic() >= stop_deadline:
+                    break
+
+        # The state is released either way. A daemon thread that outlives this
+        # point cannot block interpreter shutdown, and leaving the GUI wedged is
+        # a worse failure than reporting an unclean stop.
         self.is_running = False
         self.listener_stop.set()
         self.emit_event(BookingEventType.STATE, "stopped")
+        if stragglers:
+            self.log(
+                f"일부 작업 스레드가 제한 시간 내에 종료되지 않았습니다 "
+                f"({len(stragglers)}개). 상태를 초기화합니다.",
+                "warning",
+            )
+            logger.warning("Workers did not exit within grace period: %s", ", ".join(stragglers))
         self.log("예약 작업이 종료되었습니다.", "info")
 
     def stop_reservation(self) -> None:

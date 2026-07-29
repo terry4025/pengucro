@@ -10,6 +10,21 @@ from pengucro.storage import SecretStore, load_json, save_json
 from datetime import datetime, timedelta
 import calendar
 
+# Keys stored in config.json that no widget in this form owns. save_config()
+# replaces the whole file, so these must survive the round trip.
+PRESERVED_CONFIG_KEYS = (
+    "force_scroll_repaint",
+    "scroll_repaint_strong",
+    "keyescape_use_real_chrome",
+    "keyescape_close_chrome_on_exit",
+    "keyescape_agree_all",
+    "naver_use_real_chrome",
+    "naver_close_chrome_on_exit",
+    "naver_poll_interval",
+    "naver_poll_burst_interval",
+    "naver_poll_relax_after",
+)
+
 
 class DatePickerDialog(ctk.CTkToplevel):
     def __init__(self, parent, initial_date, on_select):
@@ -29,14 +44,28 @@ class DatePickerDialog(ctk.CTkToplevel):
         self.grab_set()
 
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=16, pady=(14, 8))
-        ctk.CTkButton(header, text="‹", width=36, command=lambda: self._move(-1)).pack(side="left")
-        self.month_label = ctk.CTkLabel(header, font=theme.FONT_HEADING)
+        header.pack(fill="x", padx=theme.SPACE_4, pady=(theme.SPACE_4, theme.SPACE_2))
+        nav_style = {
+            "width": theme.H_CONTROL,
+            "height": theme.H_CONTROL,
+            "corner_radius": theme.ROUNDED_SM,
+            "fg_color": theme.CONTROL_COLOR,
+            "hover_color": theme.CONTROL_HOVER,
+            "border_width": 1,
+            "border_color": theme.CONTROL_BORDER,
+            "text_color": theme.TEXT_BODY,
+        }
+        ctk.CTkButton(header, text="‹", command=lambda: self._move(-1), **nav_style).pack(side="left")
+        self.month_label = ctk.CTkLabel(
+            header, font=theme.FONT_HEADING, text_color=theme.TEXT_PRIMARY
+        )
         self.month_label.pack(side="left", expand=True)
-        ctk.CTkButton(header, text="›", width=36, command=lambda: self._move(1)).pack(side="right")
+        ctk.CTkButton(header, text="›", command=lambda: self._move(1), **nav_style).pack(side="right")
 
         self.days_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.days_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.days_frame.pack(
+            fill="both", expand=True, padx=theme.SPACE_4, pady=(0, theme.SPACE_4)
+        )
         self._render()
 
     def _move(self, delta):
@@ -55,9 +84,13 @@ class DatePickerDialog(ctk.CTkToplevel):
             child.destroy()
         self.month_label.configure(text=f"{self.year}년 {self.month}월")
         for column, label in enumerate(("월", "화", "수", "목", "금", "토", "일")):
-            ctk.CTkLabel(self.days_frame, text=label, text_color=theme.TEXT_MUTE).grid(
-                row=0, column=column, padx=2, pady=2, sticky="nsew"
-            )
+            weekend = column >= 5
+            ctk.CTkLabel(
+                self.days_frame,
+                text=label,
+                font=theme.FONT_CAPTION,
+                text_color=theme.TEXT_TERTIARY if weekend else theme.TEXT_MUTE,
+            ).grid(row=0, column=column, padx=2, pady=(0, theme.SPACE_1), sticky="nsew")
             self.days_frame.columnconfigure(column, weight=1)
         today = datetime.now().date()
         for row, week in enumerate(calendar.monthcalendar(self.year, self.month), start=1):
@@ -70,12 +103,19 @@ class DatePickerDialog(ctk.CTkToplevel):
                     text=str(day),
                     width=36,
                     height=32,
+                    font=theme.FONT_BODY_MD,
                     fg_color=theme.ELEVATED_COLOR,
                     hover_color=theme.ACCENT_BLUE,
+                    text_color=theme.TEXT_PRIMARY,
+                    text_color_disabled=theme.TEXT_DISABLED,
+                    corner_radius=theme.ROUNDED_SM,
                     command=lambda chosen=value: self._choose(chosen),
                 )
                 if value < today:
-                    button.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                    button.configure(state="disabled")
+                elif value == today:
+                    # Mark today so the grid has an orientation point.
+                    button.configure(border_width=1, border_color=theme.ACCENT_BLUE)
                 button.grid(row=row, column=column, padx=2, pady=2, sticky="nsew")
 
     def _choose(self, value):
@@ -84,21 +124,56 @@ class DatePickerDialog(ctk.CTkToplevel):
 
 
 class TimePickerDialog(ctk.CTkToplevel):
+    """Time slot picker.
+
+    Deliberately does *not* use CTkScrollableFrame for the common case. A
+    booking day exposes roughly 6-20 slots, which fit in a compact grid, and
+    CTkScrollableFrame embeds real child windows in a Tk canvas that scrolls
+    with ``yscrollincrement=1`` -- a combination that leaves repaint artifacts
+    (ghosting) on Windows. Laying the slots out as a fixed grid removes the
+    scroll path entirely. Only an unusually long list falls back to the
+    scrolling variant, and that one is the leak-free SafeScrollableFrame.
+    """
+
+    COLUMNS = 3
+    MAX_GRID_ROWS = 8            # Beyond this the dialog scrolls instead
+    ROW_HEIGHT = 38
+    CHROME_HEIGHT = 132          # Title bar + status line + padding
+
     def __init__(self, parent, loader, on_select):
         super().__init__(parent)
         self.loader = loader
         self.on_select = on_select
         self._load_result = None
+        self._list_host = None
         self.title("예약 시간 조회")
-        self.geometry("360x420")
+        self.geometry("360x220")
+        self.minsize(340, 200)
         self.resizable(False, False)
         self.configure(fg_color=theme.CANVAS_COLOR)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
-        self.status = ctk.CTkLabel(self, text="예약 가능한 시간을 조회하고 있습니다...", text_color=theme.TEXT_MUTE)
-        self.status.pack(padx=16, pady=16)
-        self.list_frame = ctk.CTkScrollableFrame(self, fg_color=theme.SURFACE_COLOR)
-        self.list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self.status = ctk.CTkLabel(
+            self,
+            text="예약 가능한 시간을 조회하고 있습니다...",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_MUTE,
+            wraplength=310,
+            justify="left",
+        )
+        self.status.pack(fill="x", padx=theme.SPACE_4, pady=(theme.SPACE_4, theme.SPACE_2))
+
+        self.list_container = ctk.CTkFrame(
+            self,
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.list_container.pack(
+            fill="both", expand=True, padx=theme.SPACE_4, pady=(0, theme.SPACE_4)
+        )
 
         import threading
 
@@ -124,29 +199,94 @@ class TimePickerDialog(ctk.CTkToplevel):
 
     def _render(self, slots, error):
         if error:
-            self.status.configure(text=f"시간 조회 실패: {error}", text_color=theme.ACCENT_RED)
+            self.status.configure(text=f"시간 조회 실패: {error}", text_color=theme.TINT_ERROR_FG)
+            self._show_empty("조회에 실패했습니다.")
             return
-        available = [slot for slot in slots if slot.available]
         if not slots:
             self.status.configure(
                 text="사이트가 아직 시간 버튼을 제공하지 않았습니다.",
                 text_color=theme.ACCENT_YELLOW,
             )
+            self._show_empty("표시할 시간이 없습니다.")
             return
+
+        available = [slot for slot in slots if slot.available]
         self.status.configure(
-            text=f"전체 {len(slots)}개 · 예약 가능 {len(available)}개 · 마감/미오픈 {len(slots) - len(available)}개",
-            text_color=theme.ACCENT_GREEN if available else theme.ACCENT_YELLOW,
+            text=(
+                f"예약 가능 {len(available)}개 · 마감/미오픈 {len(slots) - len(available)}개 "
+                f"(전체 {len(slots)}개) · 마감은 ✕ 표시"
+            ),
+            text_color=theme.TINT_SUCCESS_FG if available else theme.ACCENT_YELLOW,
         )
-        for slot in slots:
+
+        rows = (len(slots) + self.COLUMNS - 1) // self.COLUMNS
+        host = self._build_host(rows)
+        for column in range(self.COLUMNS):
+            host.columnconfigure(column, weight=1, uniform="slot")
+
+        for index, slot in enumerate(slots):
+            row, column = divmod(index, self.COLUMNS)
+            # A glyph suffix carries the state as well as the colour does, so
+            # availability is not conveyed by colour alone.
+            label = slot.time if slot.available else f"{slot.time} ✕"
             button = ctk.CTkButton(
-                self.list_frame,
-                text=f"{slot.time}  {'예약 가능' if slot.available else '마감'}",
+                host,
+                text=label,
+                font=theme.FONT_BODY_MD,
                 state="normal" if slot.available else "disabled",
-                fg_color=theme.ACCENT_BLUE if slot.available else theme.ELEVATED_COLOR,
+                fg_color=theme.ELEVATED_COLOR if slot.available else theme.SURFACE_COLOR,
+                hover_color=theme.ACCENT_BLUE,
+                border_width=1,
+                border_color=theme.CONTROL_BORDER if slot.available else theme.HAIRLINE_COLOR,
+                text_color=theme.TEXT_PRIMARY if slot.available else theme.TEXT_DISABLED,
+                text_color_disabled=theme.TEXT_DISABLED,
+                corner_radius=theme.ROUNDED_SM,
                 command=lambda value=slot.time: self._choose(value),
-                height=34,
+                height=theme.H_CONTROL,
             )
-            button.pack(fill="x", padx=4, pady=3)
+            button.grid(
+                row=row,
+                column=column,
+                sticky="ew",
+                padx=theme.SPACE_1,
+                pady=theme.SPACE_1,
+            )
+
+        self._fit_to_rows(min(rows, self.MAX_GRID_ROWS))
+
+    def _build_host(self, rows):
+        """Plain frame for a normal list, scrolling frame only when required."""
+        if self._list_host is not None:
+            self._list_host.destroy()
+        if rows <= self.MAX_GRID_ROWS:
+            host = ctk.CTkFrame(self.list_container, fg_color="transparent")
+        else:
+            from ui.scrollable import SafeScrollableFrame
+
+            host = SafeScrollableFrame(
+                self.list_container,
+                fg_color=theme.SURFACE_COLOR,
+                border_width=0,
+                corner_radius=0,
+            )
+            self.resizable(False, True)
+        host.pack(fill="both", expand=True, padx=theme.SPACE_2, pady=theme.SPACE_2)
+        self._list_host = host
+        return host
+
+    def _show_empty(self, message):
+        host = self._build_host(1)
+        ctk.CTkLabel(
+            host,
+            text=message,
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_TERTIARY,
+        ).pack(expand=True)
+        self._fit_to_rows(1)
+
+    def _fit_to_rows(self, rows):
+        height = self.CHROME_HEIGHT + max(1, rows) * self.ROW_HEIGHT
+        self.geometry(f"360x{min(height, 560)}")
 
     def _choose(self, value):
         self.on_select(value)
@@ -172,9 +312,13 @@ class ReservationForm(ctk.CTkFrame):
         self._save_after_id = None
         self.secret_store = SecretStore()
         
-        # Thread memory states
+        # Thread memory states.
+        #
+        # Naver defaults to 1: a single account can hold a single booking, so extra
+        # workers only duplicate the same request from the same session. The engine
+        # clamps anything higher anyway, and this keeps the slider honest about it.
         self.standard_threads = 30
-        self.naver_threads = 5
+        self.naver_threads = 1
         self.last_mode = STANDARD_MODE
 
         # Grid configuration for 2 columns
@@ -185,7 +329,7 @@ class ReservationForm(ctk.CTkFrame):
         # -------------------------------------------------------------
         self.branch_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.branch_label = ctk.CTkLabel(self.branch_frame, text="지점", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.branch_label.pack(anchor="w", pady=(0, 1))
+        self.branch_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         self.branch_var = ctk.StringVar()
         self.branch_dropdown = ctk.CTkOptionMenu(
@@ -202,14 +346,14 @@ class ReservationForm(ctk.CTkFrame):
             font=theme.FONT_BODY_MD,
             dropdown_font=theme.FONT_BODY_MD,
             corner_radius=theme.ROUNDED_MD,
-            height=28,
+            height=theme.H_CONTROL,
             anchor="w"
         )
         self.branch_dropdown.pack(fill="x")
 
         self.day_type_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.day_type_label = ctk.CTkLabel(self.day_type_frame, text="요일 구분", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.day_type_label.pack(anchor="w", pady=(0, 1))
+        self.day_type_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         self.day_type_var = ctk.StringVar(value="평일")
         self.day_type_segmented = ctk.CTkSegmentedButton(
             self.day_type_frame,
@@ -221,7 +365,7 @@ class ReservationForm(ctk.CTkFrame):
             unselected_color=theme.ELEVATED_COLOR,
             text_color=theme.TEXT_PRIMARY,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
         self.day_type_segmented.pack(fill="x")
 
@@ -229,10 +373,10 @@ class ReservationForm(ctk.CTkFrame):
         # Row 1: Theme Selection (Full Width OptionMenu)
         # -------------------------------------------------------------
         self.theme_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+        self.theme_frame.grid(row=1, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
         
         self.theme_label = ctk.CTkLabel(self.theme_frame, text="테마 선택", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.theme_label.pack(anchor="w", pady=(0, 1))
+        self.theme_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         self.theme_var = ctk.StringVar()
         self.theme_dropdown = ctk.CTkOptionMenu(
@@ -249,7 +393,7 @@ class ReservationForm(ctk.CTkFrame):
             font=theme.FONT_BODY_MD,
             dropdown_font=theme.FONT_BODY_MD,
             corner_radius=theme.ROUNDED_MD,
-            height=28,
+            height=theme.H_CONTROL,
             anchor="w"
         )
         self.theme_dropdown.pack(fill="x")
@@ -258,11 +402,11 @@ class ReservationForm(ctk.CTkFrame):
         # Row 2: Custom Theme Entry (Full Width)
         # -------------------------------------------------------------
         self.custom_theme_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+        self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
         
         # Container to align checkboxes horizontally
         self.checkbox_container = ctk.CTkFrame(self.custom_theme_frame, fg_color="transparent")
-        self.checkbox_container.pack(fill="x", anchor="w", pady=(0, 1))
+        self.checkbox_container.pack(fill="x", anchor="w", pady=(0, theme.LABEL_GAP))
 
         self.custom_theme_checkbox = ctk.CTkCheckBox(
             self.checkbox_container,
@@ -277,7 +421,7 @@ class ReservationForm(ctk.CTkFrame):
             border_color=theme.HAIRLINE_COLOR,
             command=self._toggle_custom_theme
         )
-        self.custom_theme_checkbox.pack(side="left", padx=(0, 15))
+        self.custom_theme_checkbox.pack(side="left", padx=(0, theme.SPACE_4))
 
         self.show_server_time_checkbox = ctk.CTkCheckBox(
             self.checkbox_container,
@@ -302,7 +446,7 @@ class ReservationForm(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=26
+            height=theme.H_CONTROL
         )
         self.theme_pk_entry.pack(fill="x")
         self.theme_pk_entry.pack_forget()
@@ -311,9 +455,9 @@ class ReservationForm(ctk.CTkFrame):
         # Row 3: Date & Time (Split row)
         # -------------------------------------------------------------
         self.date_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.date_frame.grid(row=3, column=0, padx=(12, 4), pady=4, sticky="ew")
+        self.date_frame.grid(row=3, column=0, padx=(theme.CARD_PAD, theme.SPACE_1), pady=theme.ROW_GAP, sticky="ew")
         self.date_label = ctk.CTkLabel(self.date_frame, text="날짜 (YYYY-MM-DD)", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.date_label.pack(anchor="w", pady=(0, 1))
+        self.date_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         self.date_entry = ctk.CTkEntry(
@@ -324,14 +468,14 @@ class ReservationForm(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
         self.date_entry.insert(0, tomorrow)
         self.date_picker_btn = ctk.CTkButton(
             self.date_frame,
             text="📅",
             width=34,
-            height=28,
+            height=theme.H_CONTROL,
             fg_color=theme.ELEVATED_COLOR,
             hover_color=theme.CARD_COLOR,
             command=self._open_date_picker,
@@ -342,9 +486,9 @@ class ReservationForm(ctk.CTkFrame):
         self.date_entry.bind("<FocusOut>", self._on_date_change)
 
         self.time_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.time_frame.grid(row=3, column=1, padx=(4, 12), pady=4, sticky="ew")
+        self.time_frame.grid(row=3, column=1, padx=(theme.SPACE_1, theme.CARD_PAD), pady=theme.ROW_GAP, sticky="ew")
         self.time_label = ctk.CTkLabel(self.time_frame, text="시간 (HH:MM)", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.time_label.pack(anchor="w", pady=(0, 1))
+        self.time_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         self.time_entry = ctk.CTkEntry(
             self.time_frame,
@@ -354,13 +498,13 @@ class ReservationForm(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
         self.time_picker_btn = ctk.CTkButton(
             self.time_frame,
             text="조회",
             width=42,
-            height=28,
+            height=theme.H_CONTROL,
             fg_color=theme.ELEVATED_COLOR,
             hover_color=theme.CARD_COLOR,
             command=self._open_time_picker,
@@ -373,9 +517,9 @@ class ReservationForm(ctk.CTkFrame):
         # Row 4: Name & People (Split row)
         # -------------------------------------------------------------
         self.name_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.name_frame.grid(row=4, column=0, padx=(12, 4), pady=4, sticky="ew")
+        self.name_frame.grid(row=4, column=0, padx=(theme.CARD_PAD, theme.SPACE_1), pady=theme.ROW_GAP, sticky="ew")
         self.name_label = ctk.CTkLabel(self.name_frame, text="이름", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.name_label.pack(anchor="w", pady=(0, 1))
+        self.name_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         self.name_entry = ctk.CTkEntry(
             self.name_frame,
@@ -385,14 +529,14 @@ class ReservationForm(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
         self.name_entry.pack(fill="x")
 
         self.people_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.people_frame.grid(row=4, column=1, padx=(4, 12), pady=4, sticky="ew")
+        self.people_frame.grid(row=4, column=1, padx=(theme.SPACE_1, theme.CARD_PAD), pady=theme.ROW_GAP, sticky="ew")
         self.people_label = ctk.CTkLabel(self.people_frame, text="인원 수", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.people_label.pack(anchor="w", pady=(0, 1))
+        self.people_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         self.people_entry = ctk.CTkEntry(
             self.people_frame,
@@ -402,7 +546,7 @@ class ReservationForm(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
         self.people_entry.insert(0, "2")
         self.people_entry.pack(fill="x")
@@ -411,9 +555,9 @@ class ReservationForm(ctk.CTkFrame):
         # Row 5: Phone Number (Full Width)
         # -------------------------------------------------------------
         self.phone_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.phone_frame.grid(row=5, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+        self.phone_frame.grid(row=5, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
         self.phone_label = ctk.CTkLabel(self.phone_frame, text="전화번호", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
-        self.phone_label.pack(anchor="w", pady=(0, 1))
+        self.phone_label.pack(anchor="w", pady=(0, theme.LABEL_GAP))
         
         self.phone_entry = ctk.CTkEntry(
             self.phone_frame,
@@ -423,7 +567,7 @@ class ReservationForm(ctk.CTkFrame):
             text_color=theme.TEXT_PRIMARY,
             placeholder_text_color=theme.TEXT_DISABLED,
             corner_radius=theme.ROUNDED_MD,
-            height=28
+            height=theme.H_CONTROL
         )
         self.phone_entry.pack(fill="x")
         self.phone_entry.bind("<KeyRelease>", self._format_phone)
@@ -432,7 +576,7 @@ class ReservationForm(ctk.CTkFrame):
         # Advanced: concurrent attempts (shown below the advanced toggle)
         # -------------------------------------------------------------
         self.threads_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.threads_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 8), sticky="ew")
+        self.threads_frame.grid(row=8, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
 
         # Labels container (to pack title and value side-by-side)
         self.threads_label_frame = ctk.CTkFrame(self.threads_frame, fg_color="transparent")
@@ -481,13 +625,13 @@ class ReservationForm(ctk.CTkFrame):
             button_corner_radius=7
         )
         self.threads_slider.set(30)
-        self.threads_slider.pack(side="right", fill="x", expand=True, padx=(12, 0))
+        self.threads_slider.pack(side="right", fill="x", expand=True, padx=(theme.SPACE_3, 0))
 
         # -------------------------------------------------------------
         # Row 6: Booking Method
         # -------------------------------------------------------------
         self.engine_mode_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
+        self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
 
         self.engine_mode_label = ctk.CTkLabel(
             self.engine_mode_frame,
@@ -506,7 +650,7 @@ class ReservationForm(ctk.CTkFrame):
             selected_hover_color=theme.ACCENT_BLUE,
             text_color=theme.TEXT_PRIMARY,
             corner_radius=theme.ROUNDED_MD,
-            height=28,
+            height=theme.H_CONTROL,
             command=self._on_mode_change
         )
         self.engine_mode_btn.set(STANDARD_MODE)
@@ -523,10 +667,18 @@ class ReservationForm(ctk.CTkFrame):
             fg_color="transparent",
             hover_color=theme.ELEVATED_COLOR,
             anchor="w",
-            height=26,
+            height=theme.H_GHOST,
+            corner_radius=theme.ROUNDED_SM,
             command=self._toggle_advanced,
         )
-        self.advanced_toggle_btn.grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
+        self.advanced_toggle_btn.grid(
+            row=7,
+            column=0,
+            columnspan=2,
+            padx=theme.CARD_PAD,
+            pady=(0, theme.SPACE_1),
+            sticky="ew",
+        )
 
         self.advanced_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.advanced_frame.columnconfigure(0, weight=1)
@@ -542,21 +694,20 @@ class ReservationForm(ctk.CTkFrame):
             checkbox_height=14,
             command=self.auto_save,
         )
-        self.remember_personal_checkbox.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.remember_personal_checkbox.grid(row=0, column=0, sticky="w", pady=(0, theme.SPACE_2))
 
-        self.api_key_entry = ctk.CTkEntry(
+        # The third-party captcha solving key used to live here. Keyescape now
+        # relies on the user solving the challenge in the browser, so there is
+        # nothing to configure.
+        self.captcha_notice_label = ctk.CTkLabel(
             self.advanced_frame,
-            placeholder_text="YesCaptcha API 키 (선택 사항)",
-            show="•",
-            fg_color=theme.ELEVATED_COLOR,
-            border_color=theme.HAIRLINE_COLOR,
-            text_color=theme.TEXT_PRIMARY,
-            placeholder_text_color=theme.TEXT_DISABLED,
-            corner_radius=theme.ROUNDED_MD,
-            height=28,
+            text="키이스케이프는 브라우저에서 직접 캡차를 인증합니다.",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_TERTIARY,
+            anchor="w",
+            justify="left",
         )
-        self.api_key_entry.grid(row=1, column=0, sticky="ew")
-        self.api_key_entry.bind("<FocusOut>", self._save_secret_settings)
+        self.captcha_notice_label.grid(row=1, column=0, sticky="ew")
 
         self.catalog_auto_refresh_var = ctk.BooleanVar(value=True)
         self.catalog_auto_refresh_checkbox = ctk.CTkCheckBox(
@@ -569,7 +720,9 @@ class ReservationForm(ctk.CTkFrame):
             checkbox_height=14,
             command=self.auto_save,
         )
-        self.catalog_auto_refresh_checkbox.grid(row=2, column=0, sticky="w", pady=(8, 6))
+        self.catalog_auto_refresh_checkbox.grid(
+            row=2, column=0, sticky="w", pady=(theme.SPACE_2, theme.SPACE_2)
+        )
 
         self.catalog_refresh_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
         self.catalog_refresh_frame.grid(row=3, column=0, sticky="ew")
@@ -578,50 +731,64 @@ class ReservationForm(ctk.CTkFrame):
             self.catalog_refresh_frame,
             text="현재 사이트 갱신",
             width=118,
-            height=28,
+            height=theme.H_CONTROL,
             font=theme.FONT_BODY_SM,
             fg_color=theme.ELEVATED_COLOR,
             hover_color=theme.CARD_COLOR,
             command=self._request_catalog_refresh,
         )
         self.catalog_refresh_btn.grid(row=0, column=0, sticky="w")
+        # This label carries real information ("최근 2026-07-26 ..."), so it must
+        # not use TEXT_DISABLED, which is only ~1.9:1 against the card and was
+        # effectively unreadable.
         self.catalog_refresh_status = ctk.CTkLabel(
             self.catalog_refresh_frame,
             text="갱신 기록 없음",
-            font=theme.FONT_BODY_SM,
-            text_color=theme.TEXT_DISABLED,
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_TERTIARY,
             anchor="e",
         )
-        self.catalog_refresh_status.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.catalog_refresh_status.grid(row=0, column=1, sticky="e", padx=(theme.SPACE_2, 0))
         self.catalog_change_badge = ctk.CTkLabel(
             self.catalog_refresh_frame,
             text="",
             width=0,
             font=(theme.FONT_FAMILY, 10, "bold"),
             text_color=theme.ACCENT_YELLOW,
+            cursor="hand2",
         )
-        self.catalog_change_badge.grid(row=0, column=2, sticky="e", padx=(6, 0))
+        self.catalog_change_badge.grid(row=0, column=2, sticky="e", padx=(theme.SPACE_2, 0))
         self.catalog_change_badge.bind("<Button-1>", lambda _event: self._show_catalog_pending())
-        self._advanced_visible = False
 
-        # Row 9: Developer Test Mode (Naver only)
-        # -------------------------------------------------------------
-        self.dev_mode_frame = ctk.CTkFrame(self, fg_color="transparent")
-        # Frame placement is handled by _update_widgets_state dynamically
-        
+        # Developer test mode lives inside 고급 설정.
+        #
+        # It used to be gridded onto the form itself at row 10 and shown only in
+        # Naver mode, which put it below the advanced panel and outside it -- so it
+        # read as a stray checkbox and was invisible for Keyescape, whose engine
+        # supports the same flag.
+        # One line, not a checkbox plus a hint label: the advanced panel expands by
+        # stealing height from the log panel, and the log panel has a floor. A
+        # second line pushed past it, so the panel would have been clipped.
+        self.dev_mode_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
+        self.dev_mode_frame.grid(row=4, column=0, sticky="ew", pady=(theme.SPACE_2, 0))
+        self.dev_mode_frame.columnconfigure(0, weight=1)
+
         self.dev_mode_var = ctk.BooleanVar(value=False)
         self.dev_mode_checkbox = ctk.CTkCheckBox(
             self.dev_mode_frame,
-            text="개발자 테스트 모드 (화면 표시 & 최종 예약 안함)",
+            text=self.DEV_MODE_TEXT_ON,
             variable=self.dev_mode_var,
             font=theme.FONT_BODY_SM,
             fg_color=theme.ACCENT_BLUE,
             hover_color=theme.ACCENT_BLUE,
-            text_color=theme.TEXT_PRIMARY,
+            text_color=theme.TEXT_MUTE,
+            checkbox_width=14,
+            checkbox_height=14,
             corner_radius=theme.ROUNDED_SM,
-            command=self.auto_save
+            command=self.auto_save,
         )
-        self.dev_mode_checkbox.pack(side="left", anchor="w")
+        self.dev_mode_checkbox.grid(row=0, column=0, sticky="w")
+        self._advanced_visible = False
 
         # Setup focus effects for entries
         self._setup_entry_focus(self.theme_pk_entry)
@@ -630,7 +797,6 @@ class ReservationForm(ctk.CTkFrame):
         self._setup_entry_focus(self.name_entry)
         self._setup_entry_focus(self.people_entry)
         self._setup_entry_focus(self.phone_entry)
-        self._setup_entry_focus(self.api_key_entry)
 
         # Initialize layout
         self.set_site(self.current_site)
@@ -654,13 +820,8 @@ class ReservationForm(ctk.CTkFrame):
         self._on_date_change()
 
     def _open_time_picker(self):
-        if self.current_site != "제로월드":
-            from tkinter import messagebox
-
-            messagebox.showinfo("시간 조회", "현재는 제로월드의 실시간 시간 조회를 지원합니다.", parent=self)
-            return
         branch_id = self.config.get("branches", {}).get(self.branch_var.get(), "")
-        theme_id = ZEROWORLD_THEMES.get(branch_id, {}).get(self.theme_var.get(), "")
+        theme_id = self._theme_id_for_name(branch_id, self.theme_var.get())
         reservation_date = self.date_entry.get().strip()
         if not branch_id or not theme_id or len(reservation_date) != 10:
             from tkinter import messagebox
@@ -669,9 +830,9 @@ class ReservationForm(ctk.CTkFrame):
             return
 
         def loader():
-            from engines.zeroworld_catalog import fetch_time_slots
+            from engines.time_slot_fetchers import fetch_any_time_slots
 
-            return fetch_time_slots(branch_id, reservation_date, theme_id)
+            return fetch_any_time_slots(self.config, branch_id, theme_id, reservation_date)
 
         TimePickerDialog(self, loader, self._set_selected_time)
 
@@ -683,7 +844,14 @@ class ReservationForm(ctk.CTkFrame):
     def _toggle_advanced(self):
         self._advanced_visible = not self._advanced_visible
         if self._advanced_visible:
-            self.advanced_frame.grid(row=9, column=0, columnspan=2, padx=12, pady=(0, 8), sticky="ew")
+            self.advanced_frame.grid(
+                row=9,
+                column=0,
+                columnspan=2,
+                padx=theme.CARD_PAD,
+                pady=(0, theme.SPACE_2),
+                sticky="ew",
+            )
             self.advanced_toggle_btn.configure(text="고급 설정  ▴")
         else:
             self.advanced_frame.grid_forget()
@@ -691,8 +859,10 @@ class ReservationForm(ctk.CTkFrame):
         self._update_widgets_state()
 
     def _save_secret_settings(self, event=None):
+        # Retained as a no-op hook: the third-party captcha key it used to store
+        # was removed together with the automatic solving path.
         try:
-            self.secret_store.set("yescaptcha_api_key", self.api_key_entry.get().strip())
+            self.secret_store.delete("yescaptcha_api_key")
         except RuntimeError as exc:
             if hasattr(self.master, "log_panel"):
                 self.master.log_panel.append_log(str(exc), "error")
@@ -725,16 +895,23 @@ class ReservationForm(ctk.CTkFrame):
                 self.standard_threads = int(self.threads_slider.get())
 
         if mode == NAVER_MODE:
-            # Restrict threads slider to maximum of 8 and load cached value
-            self.threads_slider.configure(to=8, number_of_steps=7)
-            self.threads_slider.set(self.naver_threads)
-            self.threads_value_label.configure(text=str(self.naver_threads))
+            # Locked at 1, and the control says so. The slider used to run to 8
+            # while the engine clamped the value to 1 anyway -- one Naver account
+            # can hold one booking, so a second worker only repeats the same
+            # request from the same session. Leaving the slider movable made the
+            # UI claim something the engine does not do.
+            self.naver_threads = 1
+            self.threads_slider.configure(to=8, number_of_steps=7, state="disabled")
+            self.threads_slider.set(1)
+            self.threads_value_label.configure(text="1")
+            self.threads_title_label.configure(text="동시 시도 수 (네이버는 1개 고정)")
         else:
             self.set_site(self.current_site)
             self.standard_threads = max(1, min(self.standard_threads, 50))
-            self.threads_slider.configure(to=50, number_of_steps=49)
+            self.threads_slider.configure(to=50, number_of_steps=49, state="normal")
             self.threads_slider.set(self.standard_threads)
             self.threads_value_label.configure(text=str(self.standard_threads))
+            self.threads_title_label.configure(text="동시 시도 수")
             
         self._update_widgets_state()
             
@@ -742,13 +919,46 @@ class ReservationForm(ctk.CTkFrame):
         if self.mode_callback:
             self.mode_callback(mode)
 
+    # Engines that actually honour reservation_data["devMode"]: they drive a real
+    # browser, so stopping short of the final click leaves something to inspect.
+    # The HTTP engines post a form and have no such halfway point.
+    DEV_MODE_ENGINE_IDS = ("naver", "keyescape")
+    DEV_MODE_TEXT_ON = "개발자 테스트 모드 (제출 직전에 멈추고 화면 유지)"
+    DEV_MODE_TEXT_OFF = "개발자 테스트 모드 (네이버·키이스케이프 전용)"
+
+    def _dev_mode_supported(self) -> bool:
+        """Only the browser-driven engines have a halfway point to stop at."""
+        if self.engine_mode_btn.get() == NAVER_MODE:
+            return True
+        if self.current_site == "키이스케이프":
+            return True
+        site = self.custom_sites.get(self.current_site) or {}
+        engine_id = site.get("engine_id") or site.get("style")
+        return engine_id in self.DEV_MODE_ENGINE_IDS
+
+    def _update_dev_mode_state(self) -> None:
+        if self._dev_mode_supported():
+            self.dev_mode_checkbox.configure(
+                state="normal", text=self.DEV_MODE_TEXT_ON, text_color=theme.TEXT_MUTE
+            )
+            return
+        # The row stays in place so the panel does not jump, but the flag is
+        # cleared: a stale checkmark would silently suppress a real booking on a
+        # site whose engine ignores it.
+        if self.dev_mode_var.get():
+            self.dev_mode_var.set(False)
+        self.dev_mode_checkbox.configure(
+            state="disabled", text=self.DEV_MODE_TEXT_OFF,
+            text_color=theme.TEXT_DISABLED,
+        )
+
     def _update_widgets_state(self):
         if getattr(self, "_booking_running", False):
             return
         is_naver = (self.engine_mode_btn.get() == NAVER_MODE)
         
         if getattr(self, "_advanced_visible", False):
-            self.threads_frame.grid(row=8, column=0, columnspan=2, padx=12, pady=(4, 8), sticky="ew")
+            self.threads_frame.grid(row=8, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
         else:
             self.threads_frame.grid_forget()
         if self.current_site == "키이스케이프":
@@ -791,10 +1001,7 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
             
-            # Show frame and enable Developer Mode checkbox
-            self.dev_mode_frame.grid(row=10, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
-            self.dev_mode_checkbox.configure(state="normal", text_color=theme.TEXT_PRIMARY)
-            self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+            self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
@@ -810,11 +1017,10 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             self.phone_label.configure(text_color=theme.TEXT_MUTE)
             
-            # Hide and uncheck Developer Mode checkbox
-            self.dev_mode_frame.grid_forget()
-            self.dev_mode_var.set(False)
             self._toggle_custom_theme()
-            self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=12, pady=(4, 10), sticky="ew")
+            self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
+
+        self._update_dev_mode_state()
 
         # Update Server Time Checkbox state
         current_mode = self.engine_mode_btn.get()
@@ -851,7 +1057,6 @@ class ReservationForm(ctk.CTkFrame):
             self.dev_mode_checkbox,
             self.advanced_toggle_btn,
             self.remember_personal_checkbox,
-            self.api_key_entry,
             self.catalog_auto_refresh_checkbox,
             self.catalog_refresh_btn,
         )
@@ -893,18 +1098,30 @@ class ReservationForm(ctk.CTkFrame):
             themes_dict = self.config.get("themes", {}).get("1", {})
             has_themes = len(themes_dict) > 0 and not (len(themes_dict) == 1 and list(themes_dict.keys())[0] == "기본테마")
             if has_themes:
-                self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+                self.theme_frame.grid(row=1, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
             else:
                 self.theme_frame.grid_forget()
         else:
             # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
-            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
-            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=4, sticky="ew")
+            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
+            self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
 
             if has_weekday_weekend:
                 # Show both branch and day type selection side by side
-                self.branch_frame.grid(row=0, column=0, padx=(12, 4), pady=(10, 4), sticky="ew")
-                self.day_type_frame.grid(row=0, column=1, padx=(4, 12), pady=(10, 4), sticky="ew")
+                self.branch_frame.grid(
+                    row=0,
+                    column=0,
+                    padx=(theme.CARD_PAD, theme.SPACE_1),
+                    pady=(theme.SPACE_2, theme.ROW_GAP),
+                    sticky="ew",
+                )
+                self.day_type_frame.grid(
+                    row=0,
+                    column=1,
+                    padx=(theme.SPACE_1, theme.CARD_PAD),
+                    pady=(theme.SPACE_2, theme.ROW_GAP),
+                    sticky="ew",
+                )
                 branch_options = list(self.config["branches"].keys())
                 self.branch_dropdown.configure(values=branch_options)
                 if branch_options:
@@ -914,7 +1131,14 @@ class ReservationForm(ctk.CTkFrame):
                     else:
                         self.branch_var.set(branch_options[0])
             else:
-                self.branch_frame.grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="ew")
+                self.branch_frame.grid(
+                    row=0,
+                    column=0,
+                    columnspan=2,
+                    padx=theme.CARD_PAD,
+                    pady=(theme.SPACE_2, theme.ROW_GAP),
+                    sticky="ew",
+                )
                 branch_options = list(self.config["branches"].keys())
                 self.branch_dropdown.configure(values=branch_options)
                 if branch_options:
@@ -1195,12 +1419,15 @@ class ReservationForm(ctk.CTkFrame):
 
     def load_config(self):
         config = load_json("config.json", {})
-        api_key = self.secret_store.get("yescaptcha_api_key")
         stored_name = self.secret_store.get("reservation_name")
         stored_phone = self.secret_store.get("reservation_phone")
-        if api_key:
-            self.api_key_entry.delete(0, "end")
-            self.api_key_entry.insert(0, api_key)
+        # Drop any captcha key left over from an earlier version so the secret
+        # store does not keep a credential nothing uses.
+        try:
+            if self.secret_store.get("yescaptcha_api_key"):
+                self.secret_store.delete("yescaptcha_api_key")
+        except RuntimeError:
+            pass
         if not config:
             if stored_name:
                 self.name_entry.insert(0, stored_name)
@@ -1389,6 +1616,15 @@ class ReservationForm(ctk.CTkFrame):
                 "selected_branch_id": self._selected_branch_id(),
                 "selected_theme_id": self._selected_theme_id(),
             }
+            # save_config rewrites config.json wholesale, so settings that are
+            # not surfaced in this form (currently the scroll repaint switch)
+            # have to be carried over or they would be silently reset on the
+            # next auto-save.
+            existing = load_json("config.json", {})
+            if isinstance(existing, dict):
+                for key in PRESERVED_CONFIG_KEYS:
+                    if key in existing and key not in config:
+                        config[key] = existing[key]
             save_json("config.json", config)
         except (OSError, RuntimeError, ValueError) as exc:
             if hasattr(self.master, "log_panel"):

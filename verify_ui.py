@@ -462,5 +462,69 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(self.app.log_panel.winfo_height(), log_height)
         print("[Pass] Advanced content expands without a scrollbar and the original curtain reveal completes.")
 
+    def test_8_developer_mode_lives_in_advanced_settings(self):
+        """It went missing from the UI once; this pins it down.
+
+        The checkbox used to be gridded onto the form below the advanced panel and
+        only in Naver mode, so it read as a stray control and was unreachable for
+        Keyescape, whose engine honours the same flag.
+        """
+        print("\n--- Verifying Developer Test Mode in Advanced Settings ---")
+        form = self.app.form
+
+        self.assertIs(
+            form.dev_mode_checkbox.master, form.dev_mode_frame,
+            "checkbox should sit in its own row frame",
+        )
+        self.assertIs(
+            form.dev_mode_frame.master, form.advanced_frame,
+            "the row must live inside the advanced panel, not on the form",
+        )
+
+        if not form._advanced_visible:
+            form._toggle_advanced()
+        self.app.update()
+        self.assertTrue(
+            form.dev_mode_checkbox.winfo_ismapped(),
+            "checkbox must be visible while 고급 설정 is open",
+        )
+
+        def choose_mode(mode):
+            # Mirror a real click: the segmented button carries the state and its
+            # command runs afterwards.
+            form.engine_mode_btn.set(mode)
+            form._on_mode_change(mode)
+            self.app.update()
+
+        choose_mode(NAVER_MODE)
+        self.assertEqual(form.dev_mode_checkbox.cget("state"), "normal")
+        form.dev_mode_var.set(True)
+        self.assertTrue(form.dev_mode_var.get())
+
+        # Switching to an engine that ignores devMode must clear it, or a stale
+        # checkmark would suppress a real booking attempt.
+        choose_mode(STANDARD_MODE)
+        self.app.site_var.set("제로월드")
+        self.app._on_site_change("제로월드")
+        self.app.update()
+        self.assertEqual(form.dev_mode_checkbox.cget("state"), "disabled")
+        self.assertFalse(form.dev_mode_var.get(), "flag must not survive the switch")
+
+        self.app.site_var.set("키이스케이프")
+        self.app._on_site_change("키이스케이프")
+        self.app.update()
+        self.assertEqual(
+            form.dev_mode_checkbox.cget("state"), "normal",
+            "Keyescape drives a real browser, so it supports dev mode",
+        )
+
+        self.app.site_var.set("제로월드")
+        self.app._on_site_change("제로월드")
+        if form._advanced_visible:
+            form._toggle_advanced()
+        self.app.update()
+        print("[Pass] Developer test mode sits inside 고급 설정, enables only for "
+              "browser-driven engines, and clears itself elsewhere.")
+
 if __name__ == "__main__":
     unittest.main()

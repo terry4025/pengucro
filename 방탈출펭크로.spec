@@ -1,11 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
-
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
     datas=[('icon.ico', '.'), ('app_icon.png', '.')],
-    hiddenimports=['engines.zeroworld_shin_engine', 'engines.doomescape_engine', 'engines.zeroworld_gu_engine', 'engines.jigubyeol_engine', 'engines.keyescape_engine', 'engines.naver_engine', 'playwright.async_api', 'win32crypt'],
+    hiddenimports=[
+        # Engines are selected by name at runtime in engines/registry.py, so
+        # static analysis cannot see them.
+        'engines.zeroworld_shin_engine',
+        'engines.doomescape_engine',
+        'engines.zeroworld_gu_engine',
+        'engines.jigubyeol_engine',
+        'engines.keyescape_engine',
+        'engines.naver_engine',
+        'playwright.async_api',
+        'win32crypt',
+        # Modules added in the 5.32/5.4 reworks. They are imported normally, so
+        # PyInstaller finds them on its own; listed here so a future import
+        # being made lazy cannot silently drop them from the bundle.
+        'ui.loading_overlay',
+        'ui.repaint',
+        'ui.scrollable',
+        'pengucro.logging_setup',
+        'engines.browser_session',
+        'engines.server_clock',
+        'engines.naver_api',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -14,14 +34,13 @@ a = Analysis(
     optimize=0,
 )
 pyz = PYZ(a.pure)
-
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로v5.27',
+    name='방탈출펭크로v5.41',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -436,13 +436,86 @@ def default_providers() -> dict[str, BaseProvider]:
     ]
     return {provider.engine_id: provider for provider in providers}
 
+def crawl_all_subpages(start_url: str, max_pages: int = 15) -> str:
+    """
+    start_url의 도메인을 기준으로 내부의 모든 서브페이지를 탐색하여 HTML 소스를 수집합니다.
+    """
+    import urllib.parse
+    from bs4 import BeautifulSoup
+    import logging
+
+    parsed_start = urllib.parse.urlparse(start_url)
+    start_domain = parsed_start.netloc.lower()
+    if not start_domain:
+        return ""
+
+    visited = set()
+    to_visit = [start_url]
+    html_contents = []
+
+    # 제외할 확장자 목록
+    exclude_exts = {".png", ".jpg", ".jpeg", ".gif", ".css", ".js", ".pdf", ".zip", ".ico", ".svg", ".woff", ".woff2", ".ttf"}
+
+    logging.info(f"[스파이더링 시작] {start_url} (최대 {max_pages} 페이지 탐색)")
+
+    while to_visit and len(visited) < max_pages:
+        current_url = to_visit.pop(0)
+        # 쿼리 파라미터 제외하고 정규화된 URL 기준 중복 처리
+        normalized_url = current_url.split("#")[0].rstrip("/")
+        if normalized_url in visited:
+            continue
+
+        visited.add(normalized_url)
+
+        # 확장자 체크
+        parsed_current = urllib.parse.urlparse(current_url)
+        path = parsed_current.path.lower()
+        if any(path.endswith(ext) for ext in exclude_exts):
+            continue
+
+        # 동일 도메인 체크 (subdomain 포함 여부 등 유연하게 체크)
+        current_domain = parsed_current.netloc.lower()
+        if start_domain not in current_domain and current_domain not in start_domain:
+            continue
+
+        try:
+            # 3초 타임아웃으로 지연 최소화
+            response = requests.get(current_url, headers={"User-Agent": USER_AGENT}, timeout=3)
+            if response.status_code != 200:
+                continue
+
+            html = response.text
+            html_contents.append(f"<!-- Source: {current_url} -->\n" + html)
+
+            # 서브페이지 파싱 및 수집
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if not href or href.startswith("javascript:") or href.startswith("mailto:") or href.startswith("tel:"):
+                    continue
+
+                # 절대 경로로 변환
+                full_url = urllib.parse.urljoin(current_url, href)
+                parsed_full = urllib.parse.urlparse(full_url)
+
+                # 동일 도메인이고 아직 방문하지 않은 경우에만 큐에 추가
+                full_domain = parsed_full.netloc.lower()
+                if (start_domain in full_domain or full_domain in start_domain) and full_url.split("#")[0].rstrip("/") not in visited:
+                    to_visit.append(full_url)
+
+        except Exception as e:
+            logging.debug(f"[스파이더링 오류] {current_url}: {e}")
+
+    logging.info(f"[스파이더링 완료] 총 {len(html_contents)}개 페이지 수집 완료")
+    return "\n".join(html_contents)
+
 
 def rank_engine_candidates(url: str, html: str = "") -> list[DetectionResult]:
     providers = default_providers()
     if not html and not normalize_naver_url(url):
-        response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
-        response.raise_for_status()
-        html = response.text
+        html = crawl_all_subpages(url)
+    elif html and not normalize_naver_url(url):
+        html = html + "\n" + crawl_all_subpages(url)
     return sorted(
         (provider.detect(url, html) for provider in providers.values()),
         key=lambda item: item.confidence,
@@ -471,8 +544,6 @@ def analyze_booking_site(url: str, site_name: str, target_date: str | None = Non
     catalog = None
     validation_errors: list[str] = []
     for candidate in candidates:
-        if candidate.confidence <= 0:
-            continue
         provider = providers[candidate.engine_id]
         config = {**base_config, "engine_id": candidate.engine_id}
         try:

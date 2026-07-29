@@ -27,13 +27,43 @@ def test_keyescape_running_state_tracks_real_browser_worker(monkeypatch):
 
 
 def test_naver_new_run_resets_success_latch(monkeypatch):
+    """The Naver engine now runs on BaseEngine's async loop.
+
+    It used to own a bespoke thread plus a monitor that did an unbounded
+    ``join()``: a wedged Playwright thread left ``is_running`` True forever and
+    the GUI's start button disabled.
+    """
     engine = NaverEngine(lambda *_args: None)
     engine._success_fired = True
-    monkeypatch.setattr(engine, "_run_playwright_loop", lambda *_args: None)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(engine, "run_async_tasks", noop)
 
     engine.start_reservation({}, 1)
     assert wait_until(lambda: not engine.is_running)
     assert not engine._success_fired
+
+
+def test_naver_clamps_worker_count_to_one(monkeypatch):
+    """One account can hold one booking, so extra workers only duplicate work."""
+    from engines.base_engine import BaseEngine
+
+    messages = []
+    engine = NaverEngine(lambda message, level="info": messages.append(message))
+
+    started = {}
+
+    def capture(self, data, num_threads, is_async=False):
+        started["num_threads"] = num_threads
+        started["is_async"] = is_async
+
+    monkeypatch.setattr(BaseEngine, "start_reservation", capture)
+    engine.start_reservation({}, 5)
+
+    assert started == {"num_threads": 1, "is_async": True}
+    assert any("1로 조정" in message for message in messages)
 
 
 class FinishedEngine:

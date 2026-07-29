@@ -7,6 +7,12 @@ from bs4 import BeautifulSoup
 from engines.base_engine import BaseEngine
 
 class ZeroWorldGuEngine(BaseEngine):
+    # The reservation POSTs already passed timeout=8; the CSRF lookups did not,
+    # so a stalled connection there left the worker unjoinable and locked the
+    # GUI's stop button.
+    LOOKUP_TIMEOUT = 5
+    SUBMIT_TIMEOUT = 8
+
     def __init__(self, site_url, log_callback, success_callback=None):
         """
         ZeroWorld Old (Laravel-based) Booking Engine.
@@ -15,10 +21,12 @@ class ZeroWorldGuEngine(BaseEngine):
         self.site_url = site_url
 
     def get_csrf_token(self, session):
-        response = session.get(self.site_url)
+        response = session.get(self.site_url, timeout=self.LOOKUP_TIMEOUT)
         soup = BeautifulSoup(response.text, 'html.parser')
-        csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
-        return csrf_token
+        meta = soup.find('meta', {'name': 'csrf-token'})
+        if meta is None or not meta.get('content'):
+            raise ValueError('CSRF 토큰을 찾지 못했습니다. 사이트 구조가 변경되었을 수 있습니다.')
+        return meta['content']
 
     def make_reservation_thread(self, reservation_data):
         session = requests.Session()
@@ -101,7 +109,10 @@ class ZeroWorldGuEngine(BaseEngine):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            session = aiohttp.ClientSession(headers=headers)
+            session = aiohttp.ClientSession(
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT),
+            )
             
         target_time = reservation_data.get("reservationTime")[:5]
         
@@ -179,8 +190,10 @@ class ZeroWorldGuEngine(BaseEngine):
         async with session.get(self.site_url) as resp:
             text = await resp.text()
             soup = BeautifulSoup(text, 'html.parser')
-            csrf_token = soup.find('meta', {'name': 'csrf-token'})['content']
-            return csrf_token
+            meta = soup.find('meta', {'name': 'csrf-token'})
+            if meta is None or not meta.get('content'):
+                raise ValueError('CSRF 토큰을 찾지 못했습니다. 사이트 구조가 변경되었을 수 있습니다.')
+            return meta['content']
 
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
         self.session_pool = []
@@ -189,7 +202,10 @@ class ZeroWorldGuEngine(BaseEngine):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            session = aiohttp.ClientSession(headers=headers)
+            session = aiohttp.ClientSession(
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT),
+            )
             try:
                 csrf = await self.get_csrf_token_async(session)
                 return session, csrf
