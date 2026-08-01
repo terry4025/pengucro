@@ -1,11 +1,21 @@
-"""Naver Booking engine: poll the API, submit through the page.
+"""Naver Booking engine: poll and submit through Naver's GraphQL API.
 
 Shape of this engine
 --------------------
-It keeps trying until the slot is bookable. There is no clock trigger and no
-"wait for the top of the hour" -- the same shape as the other HTTP engines in this
-project: a loop that asks the server "can I book this yet?" and acts the moment
-the answer changes.
+It keeps trying until the slot is bookable. The loop asks the server "can I book
+this yet?" and acts the moment the answer changes. When the product publishes an
+explicit opening time, that moment gets a turn of its own: the engine waits on
+Naver's synchronized server clock and sends a prepared ``submitBooking`` request
+inside the logged-in page context. Supported products therefore avoid the React
+render/click round trip; unsupported or rejected API paths retain the browser flow
+as a fallback.
+
+That last part is the point. The schedule API reports the slot free before the
+opening moment while the page renders no timetable for a date the server has not
+opened, so a submit in that window cannot land -- it just burns a full page cycle
+(~7 s measured) and comes back "notready", blind the whole time. A run against an
+00:00:00 opening spent 23:59:48 and 23:59:56 doing exactly that and so first
+looked at the timetable at 00:00:05, by which point the single seat was gone.
 
 The question is asked over GraphQL (see ``engines/naver_api.py``), not by reading
 the rendered page. ``hourlySchedule`` answers without a login, returns each slot's
@@ -14,11 +24,13 @@ appearing in the response is therefore the open signal, and it shows up
 immediately rather than whenever a page reload happens to land at the right
 moment.
 
-Submission still goes through the page. Naver's own bundle ships no booking
-mutation (all 21 it contains are account/coupon/visitor operations), so the
-booking request is not something that can be reconstructed with any confidence.
-Letting the browser walk the real flow means Naver validates it exactly as it
-would for a person.
+The mutation was recovered from a lazily loaded booking-page chunk. The engine
+recreates the page's current input for the supported non-seat, non-period,
+non-Naver-Pay EPISODE shape and calls same-origin ``fetch("/graphql")`` so the
+browser retains its cookies, origin and request identity. See
+``reference/naver/submit_booking.md`` for the verified schema boundary and the
+remaining authenticated end-to-end uncertainty (chiefly ``RT98``, Naver's own
+"unusual booking" judgement).
 
 What this replaces
 ------------------
@@ -49,13 +61,21 @@ from typing import Any
 
 from engines.base_engine import BaseEngine
 from engines.naver_api import (
+    NaverAccount,
     NaverApiError,
     NaverBookingApi,
     NaverServerClock,
     NaverSlot,
+    SubmitOutcome,
     parse_ids,
     participant_option,
 )
+from engines.naver_submit import (
+    NaverBrowserSubmitter,
+    NaverSubmitPayloadBuilder,
+    NaverSubmitPreparation,
+)
+from pengucro.models import parse_bool_flag
 from pengucro.storage import SecretStore, data_path, load_json
 
 
@@ -311,6 +331,25 @@ class NaverEngine(BaseEngine):
     # expects is not there.
     REWARM_INTERVAL_SECONDS = 1800.0
     REWARM_MIN_GAP_SECONDS = 15.0
+    # No page reload is started inside this window before the opening moment. A
+    # reload blocks the loop for a couple of seconds and cannot produce a
+    # timetable for a date that has not opened, so one landing across the boundary
+    # would delay the only reload that matters.
+    OPEN_BLACKOUT_SECONDS = 20.0
+    # How early the loop hands the turn over to the strike routine, which then
+    # waits on the server clock itself. Wide enough to absorb one API round trip
+    # plus the clock's own ~±45 ms uncertainty.
+    OPEN_ARM_SECONDS = 5.0
+    # The date only starts rendering once the server has opened it, so the reload
+    # is fired at the boundary and retried if React comes back with nothing.
+    OPEN_RELOAD_ATTEMPTS = 3
+    OPEN_RELOAD_TIMEOUT_MS = 7000
+    API_SUBMIT_MAX_ATTEMPTS = 3
+    API_NOT_OPEN_WINDOW_SECONDS = 0.35
+    API_NOT_OPEN_RETRY_SECONDS = 0.01
+    # After the page reports it has nothing to click, wait this long before
+    # driving it again. API polling is unaffected.
+    NOTREADY_BACKOFF_SECONDS = 1.5
 
     SUBMIT_MAX_ATTEMPTS = 10
     PAGE_TIMEOUT_MS = 15000
@@ -384,8 +423,18 @@ class NaverEngine(BaseEngine):
         self._log_marks: dict[str, float] = {}
         self._dialog_state: dict[str, str] = {"message": ""}
         self._open_at_epoch: float | None = None
+        self._open_strike_pending = False
+        self._notready_until = 0.0
         self._last_warm = 0.0
         self._warmed_for_date = False
+        self._api_submitter: NaverBrowserSubmitter | None = None
+        self._api_preparation: NaverSubmitPreparation | None = None
+        self._api_submit_enabled = False
+        self._api_submit_blocked = False
+        self._api_prepare_pending = False
+        self._api_account: NaverAccount | None = None
+        self._api_business: dict[str, Any] | None = None
+        self._api_biz_item: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -430,6 +479,14 @@ class NaverEngine(BaseEngine):
     # ------------------------------------------------------------------
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
         self.session_pool = []
+        self._api_submitter = None
+        self._api_preparation = None
+        self._api_submit_enabled = False
+        self._api_submit_blocked = False
+        self._api_prepare_pending = False
+        self._api_account = None
+        self._api_business = None
+        self._api_biz_item = None
         booking_url = self._resolve_url(reservation_data)
         if not booking_url:
             raise NaverApiError(
@@ -464,19 +521,24 @@ class NaverEngine(BaseEngine):
         if blocked:
             raise NaverApiError(blocked)
 
-        # Open-time information is reported, never waited on: this engine polls.
-        # It is only used to decide when to poll harder.
+        # The engine never sleeps until this time: API polling continues. The
+        # synchronized server clock also drives the strike turn at the opening
+        # boundary, which owns the reload and the submit together so the page is
+        # driven the instant the date starts rendering -- and, just as important,
+        # is not being driven for a doomed submit in the seconds before it.
         self._open_at_epoch = (
             meta.open_at.timestamp()
             if (meta.uses_open_schedule and meta.open_at) else None
         )
+        self._open_strike_pending = False
         if meta.uses_open_schedule and meta.open_at:
             remaining = self.clock.seconds_until(meta.open_at.timestamp())
             if remaining > 0:
+                self._open_strike_pending = True
                 self.log(
                     f"[정보] 예약 오픈 예정 {meta.open_at:%Y-%m-%d %H:%M} · "
                     f"서버 시간 기준 {self._format_remaining(remaining)} 남음 · "
-                    "오픈을 기다리지 않고 계속 확인합니다.",
+                    "오픈 직전까지 대기하다가 오픈 시각에 새로고침 후 즉시 제출합니다.",
                     "info",
                 )
             else:
@@ -539,6 +601,100 @@ class NaverEngine(BaseEngine):
         self._last_signature = self._slot_signature(slot, reason)
 
         await self._open_browser(reservation_data)
+        await self._prepare_api_submit(
+            reservation_data,
+            dev_mode=parse_bool_flag(reservation_data.get("devMode", False)),
+        )
+
+    async def _prepare_api_submit(self, reservation_data, dev_mode: bool) -> None:
+        """Prepare the supported direct mutation without exposing its secrets."""
+        if self._api_submit_blocked:
+            return
+        self._api_submit_enabled = False
+        self._api_preparation = None
+        self._api_prepare_pending = False
+        if self.api is None or self._page is None:
+            self.log(
+                "[경고] API 직접 제출 준비 실패 · 브라우저 제출로 진행합니다.",
+                "warning",
+            )
+            return
+
+        submitter = self._api_submitter or NaverBrowserSubmitter(self._page)
+        self._api_submitter = submitter
+        if self._api_account is None:
+            self._api_account = await submitter.fetch_account()
+        target_date = str(reservation_data.get("reservationDate") or "")
+        target_time = str(reservation_data.get("reservationTime") or "")[:5]
+        try:
+            # ``requests.Session`` is not a concurrent client. These reads happen
+            # well before opening, so keep them sequential and leave ``last_rtt``
+            # describing the final slot request used by the send-time estimate.
+            if self._api_business is None:
+                self._api_business = await asyncio.to_thread(
+                    self.api.fetch_business
+                )
+            if self._api_biz_item is None:
+                self._api_biz_item = await asyncio.to_thread(
+                    self.api.fetch_biz_item_raw
+                )
+            slot = await asyncio.to_thread(
+                self.api.fetch_slot_raw, target_date, target_time
+            )
+        except Exception as exc:
+            self.log(
+                f"[경고] API 직접 제출 준비 실패 ({type(exc).__name__}) · "
+                "브라우저 제출로 진행합니다.",
+                "warning",
+            )
+            return
+
+        if slot is None:
+            self._api_prepare_pending = True
+            self._api_preparation = NaverSubmitPreparation(
+                False,
+                reason="대상 슬롯 상세 정보가 아직 공개되지 않았습니다",
+            )
+            self.log(
+                "[정보] API 직접 제출 준비 대기 · 대상 슬롯이 공개되면 "
+                "다시 준비합니다.",
+                "info",
+            )
+            return
+
+        preparation = NaverSubmitPayloadBuilder().prepare(
+            business=self._api_business or {},
+            biz_item=self._api_biz_item or {},
+            slot=slot,
+            account=self._api_account,
+            reservation=reservation_data,
+        )
+        self._api_preparation = preparation
+        if not preparation.ready:
+            self._api_submit_blocked = True
+            self.log(
+                f"[정보] API 직접 제출 준비 안 됨 · {preparation.reason} · "
+                "브라우저 제출로 진행합니다.",
+                "info",
+            )
+            return
+        if dev_mode:
+            field_names = ", ".join(sorted(preparation.payload))
+            self.log(
+                f"[정보] 개발자 테스트 · API 페이로드 검증 완료 · "
+                f"slotId={preparation.slot_id} · "
+                f"필드 {len(preparation.payload)}개: {field_names} · "
+                "실제 제출하지 않습니다.",
+                "info",
+            )
+            return
+
+        self._api_submit_enabled = True
+        self.log(
+            f"[정보] API 직접 제출 준비 완료 · slotId={preparation.slot_id} · "
+            "오픈 순간 페이지 새로고침 없이 제출합니다.",
+            "success",
+        )
 
     # ------------------------------------------------------------------
     # The loop
@@ -546,7 +702,7 @@ class NaverEngine(BaseEngine):
     async def make_reservation_async_task(self, reservation_data, task_idx):
         target_date = str(reservation_data.get("reservationDate") or "")
         target_time = str(reservation_data.get("reservationTime") or "")[:5]
-        dev_mode = bool(reservation_data.get("devMode", False))
+        dev_mode = parse_bool_flag(reservation_data.get("devMode", False))
         assert self.api is not None and self.clock is not None
 
         last_resync = time.monotonic()
@@ -559,88 +715,168 @@ class NaverEngine(BaseEngine):
                 last_resync = time.monotonic()
                 await asyncio.to_thread(self.clock.sync, False)
 
-            try:
-                slot = await asyncio.to_thread(
-                    self.api.find_slot, target_date, target_time
-                )
-            except NaverApiError as exc:
-                self.silent_tick(f"{target_time} 조회 실패")
-                self._log_throttled("poll_error", f"[경고] 조회 실패: {exc}", "warning", 15.0)
-                # Back off on transport trouble instead of hammering a sore spot.
-                await asyncio.sleep(max(self._poll_base, 1.0))
-                continue
+            # Seconds of server time until the published opening moment. None when
+            # the item publishes none, in which case nothing below gates on it.
+            until_open = self._seconds_until_open()
 
-            reason = (
-                "아직 예약 창이 열리지 않았습니다"
-                if slot is None
-                else slot.blocked_reason(self.clock.now_kst())
-            )
-
-            signature = self._slot_signature(slot, reason)
-            if signature != last_signature:
-                last_signature = signature
-                last_change = time.monotonic()
-                if slot is None:
-                    self.log(f"[정보] {target_time} · 슬롯 미개설", "info")
-                else:
-                    self.log(
-                        f"[정보] {target_time} 상태 변화 · slotId={slot.slot_id} "
-                        f"잔여 {slot.remaining}/{slot.stock} · "
-                        f"{'예약 가능' if reason is None else reason}",
-                        "info",
+            # The opening boundary is handled by one dedicated turn that owns both
+            # the reload and the submit. Everything else -- API polling included --
+            # steps aside for it, because the run is decided in the second or two
+            # after the boundary and any other work in flight is time spent blind.
+            if self._claim_open_strike(until_open):
+                if not self.submission_lock.acquire(blocking=False):
+                    # Give the claim back. Nothing ran, and the boundary turn is
+                    # the one thing in this engine that must not be dropped
+                    # because a lock happened to be held for an instant.
+                    self._open_strike_pending = True
+                    await asyncio.sleep(0.01)
+                    continue
+                try:
+                    outcome, detail = await self._strike_at_open(
+                        target_date, target_time, reservation_data, dev_mode
                     )
-
-            if slot is None or reason is not None:
-                # Keep the parked tab useful. A date that has not opened renders no
-                # timetable at all, so the warm-click path has nothing to click
-                # until the page is reloaded *after* the date appears. Reload once
-                # on that transition, and periodically so a tab left for hours is
-                # not stale when it finally matters.
-                await self._rewarm_if_needed(target_date, slot is not None)
-                delay, tier = self._poll_delay(slot, last_change)
-                self.silent_tick(f"{target_time} {reason}")
-                self._log_throttled(
-                    "waiting",
-                    f"[정보] {target_date} {target_time} · {reason} · "
-                    f"계속 확인 중 ({tier} {1 / delay:.1f}회/초)",
-                    "info",
-                    30.0,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # ---- bookable ------------------------------------------------
-            if submit_attempts >= self.SUBMIT_MAX_ATTEMPTS:
-                self.log(
-                    f"[에러] 제출을 {submit_attempts}회 시도했지만 완료되지 못했습니다. "
-                    "브라우저에서 직접 확인해주세요.",
-                    "error",
-                )
-                return
-
-            if not self.submission_lock.acquire(blocking=False):
-                await asyncio.sleep(0.05)
-                continue
-            try:
-                self.log(
-                    f"{target_time} 예약 가능 확인 (잔여 {slot.remaining}) · 제출을 시작합니다.",
-                    "warning",
-                )
-                outcome, detail = await self._submit(slot, reservation_data, dev_mode)
-                # Only our own breakage counts against the budget.
-                #
-                # "notready" means the page had not rendered, and "taken" means the
-                # page says 매진 -- neither is a failed booking attempt, and neither
-                # should end a watch that is meant to run for hours. Counting them
-                # made the engine give up after fifteen seconds whenever the
-                # schedule API ran briefly ahead of the rendered page.
+                finally:
+                    try:
+                        self.submission_lock.release()
+                    except RuntimeError:
+                        pass
                 if outcome == "retry":
                     submit_attempts += 1
-            finally:
+            else:
                 try:
-                    self.submission_lock.release()
-                except RuntimeError:
-                    pass
+                    slot = await asyncio.to_thread(
+                        self.api.find_slot, target_date, target_time
+                    )
+                except NaverApiError as exc:
+                    self.silent_tick(f"{target_time} 조회 실패")
+                    self._log_throttled(
+                        "poll_error", f"[경고] 조회 실패: {exc}", "warning", 15.0
+                    )
+                    # Back off on transport trouble instead of hammering a sore spot.
+                    await asyncio.sleep(max(self._poll_base, 1.0))
+                    continue
+
+                reason = (
+                    "아직 예약 창이 열리지 않았습니다"
+                    if slot is None
+                    else slot.blocked_reason(self.clock.now_kst())
+                )
+
+                signature = self._slot_signature(slot, reason)
+                if signature != last_signature:
+                    last_signature = signature
+                    last_change = time.monotonic()
+                    if slot is None:
+                        self.log(f"[정보] {target_time} · 슬롯 미개설", "info")
+                    else:
+                        self.log(
+                            f"[정보] {target_time} 상태 변화 · slotId={slot.slot_id} "
+                            f"잔여 {slot.remaining}/{slot.stock} · "
+                            f"{'예약 가능' if reason is None else reason}",
+                            "info",
+                        )
+
+                if self._api_prepare_pending and slot is not None:
+                    await self._prepare_api_submit(reservation_data, dev_mode)
+
+                if slot is None or reason is not None:
+                    # Keep the parked tab useful. A date that has not opened renders
+                    # no timetable at all, so the warm-click path has nothing to
+                    # click until the page is reloaded *after* the date appears.
+                    # Reload once on that transition, and periodically so a tab left
+                    # for hours is not stale when it finally matters.
+                    await self._rewarm_if_needed(
+                        target_date, slot is not None, until_open
+                    )
+                    delay, tier = self._poll_delay(slot, last_change)
+                    self.silent_tick(f"{target_time} {reason}")
+                    self._log_throttled(
+                        "waiting",
+                        f"[정보] {target_date} {target_time} · {reason} · "
+                        f"계속 확인 중 ({tier} {1 / delay:.1f}회/초)",
+                        "info",
+                        30.0,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # ---- bookable per the API, but the page may not agree yet ----
+                #
+                # Before the opening moment the schedule API happily reports the
+                # slot free while the page renders no timetable at all, so a submit
+                # cannot possibly land: it burns a full page cycle (~7 s measured)
+                # and returns "notready". Two of those either side of midnight is
+                # what made the engine reach an 00:00:00 opening at 00:00:05, by
+                # which time the single seat was gone. So wait on the server clock
+                # and let the strike turn above do the work.
+                if until_open is not None and until_open > 0:
+                    self.silent_tick(f"{target_time} 오픈 대기")
+                    self._log_throttled(
+                        "preopen",
+                        f"[정보] {target_date} {target_time} 예약 가능 표시 · "
+                        f"오픈까지 {self._format_remaining(until_open)} 남아 화면이 "
+                        "아직 열리지 않았습니다 · 오픈 시각에 바로 제출합니다.",
+                        "info",
+                        30.0,
+                    )
+                    await asyncio.sleep(
+                        min(self._poll_base,
+                            max(0.05, until_open - self.OPEN_ARM_SECONDS))
+                    )
+                    continue
+
+                # The page just told us it has nothing to click. Retrying instantly
+                # costs another page cycle for the same answer, so keep polling the
+                # API -- which is free and faster -- until the backoff expires.
+                if time.monotonic() < self._notready_until:
+                    self.silent_tick(f"{target_time} 화면 준비 대기")
+                    await asyncio.sleep(self._poll_burst)
+                    continue
+
+                if submit_attempts >= self.SUBMIT_MAX_ATTEMPTS:
+                    self.log(
+                        f"[에러] 제출을 {submit_attempts}회 시도했지만 완료되지 못했습니다. "
+                        "브라우저에서 직접 확인해주세요.",
+                        "error",
+                    )
+                    return
+
+                if not self.submission_lock.acquire(blocking=False):
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    self.log(
+                        f"{target_time} 예약 가능 확인 (잔여 {slot.remaining}) · "
+                        "제출을 시작합니다.",
+                        "warning",
+                    )
+                    if self._api_submit_enabled and not dev_mode:
+                        outcome, detail = await self._submit_api_first()
+                        if outcome == "fallback":
+                            outcome, detail = await self._submit(
+                                target_date,
+                                target_time,
+                                reservation_data,
+                                dev_mode,
+                            )
+                    else:
+                        outcome, detail = await self._submit(
+                            target_date, target_time, reservation_data, dev_mode
+                        )
+                    # Only our own breakage counts against the budget.
+                    #
+                    # "notready" means the page had not rendered, and "taken" means
+                    # the page says 매진 -- neither is a failed booking attempt, and
+                    # neither should end a watch that is meant to run for hours.
+                    # Counting them made the engine give up after fifteen seconds
+                    # whenever the schedule API ran briefly ahead of the page.
+                    if outcome == "retry":
+                        submit_attempts += 1
+                finally:
+                    try:
+                        self.submission_lock.release()
+                    except RuntimeError:
+                        pass
 
             if outcome == "success":
                 self.log(f"🎉 네이버 예약 성공! {detail}", "success")
@@ -651,6 +887,9 @@ class NaverEngine(BaseEngine):
                     await asyncio.sleep(0.5)
                 return
             if outcome == "notready":
+                # Hold the page off for a moment: the API poll keeps running at
+                # full speed and will tell us as much as another reload would.
+                self._notready_until = time.monotonic() + self.NOTREADY_BACKOFF_SECONDS
                 self._record_attempt(f"{target_time} 화면 준비 대기")
                 self._log_throttled(
                     "notready", f"[경고] {detail} · 화면을 다시 불러옵니다.",
@@ -697,7 +936,7 @@ class NaverEngine(BaseEngine):
     async def _open_browser(self, reservation_data) -> None:
         from playwright.async_api import async_playwright
 
-        dev_mode = bool(reservation_data.get("devMode", False))
+        dev_mode = parse_bool_flag(reservation_data.get("devMode", False))
         self._playwright = await async_playwright().start()
 
         if self._use_real_chrome:
@@ -870,9 +1109,17 @@ class NaverEngine(BaseEngine):
         except Exception:
             return False
 
-    async def _rewarm_if_needed(self, target_date: str, date_exists: bool) -> None:
+    async def _rewarm_if_needed(
+        self, target_date: str, date_exists: bool, until_open: float | None = None
+    ) -> None:
         """Reload the parked tab when it would otherwise be useless or stale."""
         if self._page is None:
+            return
+        # Never reload across the opening boundary. The reload takes a couple of
+        # seconds during which nothing else runs, it cannot render a date the
+        # server has not opened yet, and one landing here would push the strike's
+        # own reload past the moment that decides the run.
+        if until_open is not None and 0 < until_open <= self.OPEN_BLACKOUT_SECONDS:
             return
         now = time.monotonic()
         warm = await self._timetable_present()
@@ -905,6 +1152,213 @@ class NaverEngine(BaseEngine):
             self._log_throttled(
                 "rewarm", "[정보] 대기 화면을 새로 불러왔습니다.", "info", 120.0
             )
+
+    def _seconds_until_open(self) -> float | None:
+        """Server-clock seconds until the published opening moment.
+
+        None when the item publishes no opening time, which is the signal for
+        every caller to behave exactly as it did before this existed.
+        """
+        if self._open_at_epoch is None or self.clock is None:
+            return None
+        return self.clock.seconds_until(self._open_at_epoch)
+
+    def _claim_open_strike(self, until_open: float | None) -> bool:
+        """Claim the one-shot opening turn once the boundary is within reach."""
+        if not self._open_strike_pending or self._page is None:
+            return False
+        if until_open is None or until_open > self.OPEN_ARM_SECONDS:
+            return False
+        # Claim before yielding so a slow reload cannot let a second turn in.
+        self._open_strike_pending = False
+        return True
+
+    async def _wait_for_open(self) -> None:
+        """Hold until the server clock reaches the opening moment.
+
+        Coarse sleeps while there is time, then a tight spin for the last half
+        second. Being a few hundred milliseconds late is the whole failure mode
+        this exists to remove, and the spin costs a handful of wake-ups.
+        """
+        while not self.stop_event.is_set():
+            remaining = self._seconds_until_open()
+            if remaining is None or remaining <= 0:
+                return
+            await asyncio.sleep(0.05 if remaining > 0.5 else 0.005)
+
+    def _api_one_way_seconds(self) -> float:
+        rtt = getattr(self.api, "last_rtt", None) if self.api is not None else None
+        try:
+            estimate = float(rtt) / 2 if rtt else 0.05
+        except (TypeError, ValueError):
+            estimate = 0.05
+        return min(0.1, max(0.01, estimate))
+
+    async def _wait_for_api_send(self) -> None:
+        """Start the fetch early enough for it to reach Naver near the boundary."""
+        lead = self._api_one_way_seconds()
+        while not self.stop_event.is_set():
+            remaining = self._seconds_until_open()
+            if remaining is None or remaining <= lead:
+                return
+            await asyncio.sleep(0.05 if remaining - lead > 0.5 else 0.005)
+
+    def _disable_api_submit(self, reason: str) -> None:
+        self._api_submit_enabled = False
+        self._api_submit_blocked = True
+        self.log(
+            f"[경고] API 직접 제출 비활성화 · {reason[:120]} · "
+            "브라우저 제출로 전환합니다.",
+            "warning",
+        )
+
+    async def _submit_api_first(self) -> tuple[str, str]:
+        """Send the prepared mutation, retrying only the server's not-open reply."""
+        if (
+            not self._api_submit_enabled
+            or self._api_submitter is None
+            or self._api_preparation is None
+            or not self._api_preparation.ready
+        ):
+            return "fallback", "API 직접 제출이 준비되지 않았습니다"
+
+        deadline = time.monotonic() + self.API_NOT_OPEN_WINDOW_SECONDS
+        for attempt in range(1, self.API_SUBMIT_MAX_ATTEMPTS + 1):
+            sent_at = time.monotonic()
+            offset = self._seconds_until_open()
+            offset_text = (
+                f"{-offset:+.3f}초"
+                if offset is not None
+                else "오픈 시각 정보 없음"
+            )
+            self.log(
+                f"[정보] API 직접 제출 전송 · {attempt}/"
+                f"{self.API_SUBMIT_MAX_ATTEMPTS} · 오픈 대비 {offset_text}",
+                "warning",
+            )
+            result = await self._api_submitter.submit(
+                self._api_preparation.payload
+            )
+            elapsed_ms = (time.monotonic() - sent_at) * 1000
+            self.log(
+                f"[정보] API 직접 제출 응답 · {result.outcome} · "
+                f"RTT {elapsed_ms:.0f}ms",
+                "success" if result.outcome == SubmitOutcome.SUCCESS else "info",
+            )
+
+            if result.outcome == SubmitOutcome.SUCCESS:
+                return (
+                    "success",
+                    f"예약번호 {result.booking_id}"
+                    + (f" · {result.url}" if result.url else ""),
+                )
+            if result.outcome == SubmitOutcome.REFUSED:
+                return "taken", result.detail
+            if result.outcome == SubmitOutcome.NOT_OPEN:
+                if (
+                    attempt < self.API_SUBMIT_MAX_ATTEMPTS
+                    and time.monotonic() < deadline
+                ):
+                    await asyncio.sleep(self.API_NOT_OPEN_RETRY_SECONDS)
+                    continue
+                return "fallback", result.detail
+
+            self._disable_api_submit(result.detail)
+            return "fallback", result.detail
+
+        return "fallback", "API 직접 제출 제한 시간 초과"
+
+    async def _strike_at_open(
+        self, target_date: str, target_time: str, reservation_data, dev_mode: bool
+    ) -> tuple[str, str]:
+        """Own the opening moment: direct mutation first, browser fallback second."""
+        remaining = self._seconds_until_open()
+        if self._api_prepare_pending and not dev_mode:
+            if remaining is not None and remaining > 0 and self.clock is not None:
+                await asyncio.to_thread(self.clock.sync, False)
+                remaining = self._seconds_until_open()
+            if remaining is not None and remaining > 0:
+                self.log(
+                    f"[정보] 오픈 {remaining * 1000:.0f}ms 전 · "
+                    "슬롯 상세 공개 시각까지 대기합니다.",
+                    "warning",
+                )
+                await self._wait_for_open()
+            if self.stop_event.is_set():
+                return "error", "중지됨"
+            await self._prepare_api_submit(reservation_data, dev_mode=False)
+            remaining = self._seconds_until_open()
+
+        if self._api_submit_enabled and not dev_mode:
+            if remaining is not None and remaining > 0 and self.clock is not None:
+                await asyncio.to_thread(self.clock.sync, False)
+                remaining = self._seconds_until_open()
+            if remaining is not None and remaining > 0:
+                self.log(
+                    f"[정보] 오픈 {remaining * 1000:.0f}ms 전 · "
+                    "API 직접 제출 시각까지 대기합니다.",
+                    "warning",
+                )
+                await self._wait_for_api_send()
+            if self.stop_event.is_set():
+                return "error", "중지됨"
+
+            outcome, detail = await self._submit_api_first()
+            if outcome != "fallback":
+                return outcome, detail
+            remaining = self._seconds_until_open()
+
+        if remaining is not None and remaining > 0:
+            self.log(
+                f"[정보] 오픈 {remaining * 1000:.0f}ms 전 · 서버 시각에 맞춰 대기합니다.",
+                "warning",
+            )
+            await self._wait_for_open()
+        if self.stop_event.is_set():
+            return "error", "중지됨"
+
+        self.log(
+            f"[정보] 네이버 서버 오픈 시각 도달 · {target_date} 예약 화면을 "
+            "새로고침하고 즉시 제출합니다.",
+            "warning",
+        )
+        started = time.monotonic()
+        rendered = False
+        attempt = 0
+        for attempt in range(1, self.OPEN_RELOAD_ATTEMPTS + 1):
+            if self.stop_event.is_set():
+                return "error", "중지됨"
+            try:
+                rendered = await self._goto_item(
+                    target_date, timeout_ms=self.OPEN_RELOAD_TIMEOUT_MS
+                )
+            except Exception as exc:
+                rendered = False
+                self.log(
+                    f"[경고] 오픈 시각 새로고침 실패 ({type(exc).__name__}) · "
+                    f"{attempt}/{self.OPEN_RELOAD_ATTEMPTS}회",
+                    "warning",
+                )
+            self._last_warm = time.monotonic()
+            self._warmed_for_date = rendered
+            if rendered:
+                break
+
+        elapsed = (time.monotonic() - started) * 1000
+        since_open = self._seconds_until_open()
+        offset = f"+{-since_open:.2f}초" if since_open is not None else "-"
+        self.log(
+            f"[정보] 오픈 {offset} · 시간표 "
+            f"{'렌더링 완료' if rendered else '표시되지 않음'} "
+            f"(새로고침 {attempt}회 {elapsed:.0f}ms)",
+            "success" if rendered else "warning",
+        )
+        if not rendered:
+            return "notready", (
+                f"{target_date} 시간표가 오픈 직후에도 렌더링되지 않았습니다 "
+                f"(li.time_item 0개)"
+            )
+        return await self._submit(target_date, target_time, reservation_data, dev_mode)
 
     async def _wait_for_loading(self) -> None:
         # The spinner is gone from the DOM entirely once content arrives, so its
@@ -1068,15 +1522,15 @@ class NaverEngine(BaseEngine):
             await asyncio.sleep(interval)
 
     async def _submit(
-        self, slot: NaverSlot, reservation_data, dev_mode: bool
+        self, target_date: str, target_time: str, reservation_data, dev_mode: bool
     ) -> tuple[str, str]:
         page = self._page
         if page is None:
             return "error", "브라우저가 준비되지 않았습니다"
 
         self._dialog_state["message"] = ""
-        target_date = slot.date_str
-        target_minutes = slot.start.hour * 60 + slot.start.minute
+        hour, _, minute = target_time.partition(":")
+        target_minutes = int(hour) * 60 + int(minute or 0)
 
         try:
             # Fast path: the page was parked on this date during setup, so if the
@@ -1102,14 +1556,14 @@ class NaverEngine(BaseEngine):
                         f"(li.time_item 0개)"
                     )
                 return "notready", (
-                    f"{slot.time_str} 버튼이 화면에 없습니다 "
+                    f"{target_time} 버튼이 화면에 없습니다 "
                     f"(시간표 {rendered}개는 렌더링됨)"
                 )
             if not match.get("clickable"):
                 # The page is the authority here: the schedule API can report
                 # stock while the rendered slot already says 매진.
                 return "taken", (
-                    f"{slot.time_str} 선택할 수 없는 상태입니다 · "
+                    f"{target_time} 선택할 수 없는 상태입니다 · "
                     f"화면 표시 {match.get('text', '')!r}"
                 )
 
@@ -1126,7 +1580,7 @@ class NaverEngine(BaseEngine):
                 lambda: page.evaluate(SLOT_SELECTED_SCRIPT), timeout=2.0, interval=0.025
             )
             if not selected:
-                return "retry", f"{slot.time_str} 클릭이 반영되지 않았습니다"
+                return "retry", f"{target_time} 클릭이 반영되지 않았습니다"
             timing.mark("슬롯선택")
 
             if not await self._click_next():
@@ -1226,8 +1680,14 @@ class NaverEngine(BaseEngine):
                 target_date, timeout_ms=self.TIMETABLE_RETRY_TIMEOUT_MS
             ):
                 return {"rendered": 0, "pool": 0, "match": None}
-        elif not await self._wait_for_timetable(timeout_ms=1200):
-            return None
+        else:
+            # Only a page believed to be warm is worth waiting on. When the last
+            # load produced no timetable, this wait is a second of the critical
+            # path spent confirming what is already known, so it is cut to a
+            # glance that still absorbs a render finishing mid-turn.
+            budget = 1200 if self._warmed_for_date else 200
+            if not await self._wait_for_timetable(timeout_ms=budget):
+                return None
         try:
             return await self._page.evaluate(SLOT_TAG_SCRIPT, target_minutes)
         except Exception:

@@ -1,2 +1,2 @@
 """Core application services for Pengucro."""
-__version__ = "5.41"
+__version__ = "5.43"

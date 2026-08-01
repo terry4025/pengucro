@@ -1603,6 +1603,19 @@ class MainWindow(ctk.CTk):
                 break
 
         payload = reservation_data.to_engine_payload()
+        # Re-read the visible checkbox at the last possible moment. The
+        # ReservationRequest was created before the confirmation dialog, so it
+        # must not be allowed to carry a stale developer-mode flag into an actual
+        # booking run.
+        payload["devMode"] = self.form.developer_mode_enabled()
+        self.log_panel.append_log(
+            (
+                "[주의] 개발자 테스트 모드 · 최종 예약 버튼을 누르지 않습니다."
+                if payload["devMode"]
+                else "[정보] 실제 예약 제출 모드 · 예약 가능 시 최종 버튼까지 누릅니다."
+            ),
+            "warning" if payload["devMode"] else "info",
+        )
         if self.form.engine_mode_btn.get() == NAVER_MODE:
             payload["naver_time_offset"] = getattr(self, "naver_time_offset", 0.0)
         try:

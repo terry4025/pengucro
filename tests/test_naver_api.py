@@ -189,6 +189,32 @@ def test_fetch_slots_sorts_and_maps(monkeypatch):
     assert params["endDateTime"] == "2026-07-26T23:59:59"
 
 
+def test_fetch_slot_raw_keeps_page_booking_fields(monkeypatch):
+    body = {"data": {"schedule": {"bizItemSchedule": {"hourly": [
+        slot_payload(
+            name="",
+            unitStartTime="2026-08-08 14:30:00",
+            unitStartDateTime="2026-08-08T05:30:00Z",
+            slotId="1331382668",
+            duration=None,
+            desc="",
+            prices=[{
+                "priceId": "8895079",
+                "price": 33000,
+                "name": "1인",
+                "isImp": True,
+            }],
+        ),
+    ]}}}}
+    api, _ = api_with(monkeypatch, body)
+
+    slot = api.fetch_slot_raw("2026-08-08", "14:30")
+
+    assert slot["slotId"] == "1331382668"
+    assert slot["unitStartDateTime"] == "2026-08-08T05:30:00Z"
+    assert slot["prices"][0]["price"] == 33000
+
+
 def test_find_slot_matches_on_hhmm(monkeypatch):
     body = {"data": {"schedule": {"bizItemSchedule": {"hourly": [
         slot_payload(unitStartTime="2026-07-26 09:50:00", slotId="a"),
@@ -323,3 +349,89 @@ def test_clock_reports_failure_without_raising(monkeypatch):
     # Falls back to the local clock rather than blocking the run.
     assert clock.now() > 0
     assert any("서버 시간" in message for message in messages)
+
+
+# -- direct submit_booking tests ------------------------------------------
+def test_submit_booking_success(monkeypatch):
+    from engines.naver_api import SubmitOutcome
+
+    body = {"data": {"submitBooking": {"bookingId": "999888", "url": "https://m.booking.naver.com"}}}
+    api, _ = api_with(monkeypatch, body)
+    res = api.submit_booking({"businessId": "1498729"})
+
+    assert res.outcome == SubmitOutcome.SUCCESS
+    assert res.booking_id == "999888"
+
+
+def test_submit_booking_refusal_rt77(monkeypatch):
+    from engines.naver_api import SubmitOutcome
+
+    body = {
+        "errors": [
+            {
+                "message": "RT77",
+                "extensions": {"code": "RT77", "reason": "이미 마감된 일정입니다."},
+            }
+        ]
+    }
+    api, _ = api_with(monkeypatch, body)
+    res = api.submit_booking({"businessId": "1498729"})
+
+    assert res.outcome == SubmitOutcome.REFUSED
+    assert res.code == "RT77"
+    assert "마감된 일정" in res.message
+
+
+def test_submit_booking_not_open(monkeypatch):
+    from engines.naver_api import SubmitOutcome
+
+    body = {"errors": [{"message": "BizItem is not opened."}]}
+    api, _ = api_with(monkeypatch, body)
+    res = api.submit_booking({"businessId": "1498729"})
+
+    assert res.outcome == SubmitOutcome.NOT_OPEN
+
+
+def test_submit_booking_abuse_rt98(monkeypatch):
+    from engines.naver_api import SubmitOutcome
+
+    body = {
+        "errors": [
+            {
+                "message": "RT98",
+                "extensions": {"code": "RT98", "reason": "비정상 요청 탐지"},
+            }
+        ]
+    }
+    api, _ = api_with(monkeypatch, body)
+    res = api.submit_booking({"businessId": "1498729"})
+
+    assert res.outcome == SubmitOutcome.ABUSE
+
+
+def test_specific_submit_reason_beats_generic_graphql_code():
+    from engines.naver_api import SubmitOutcome, classify_submit_error
+
+    assert (
+        classify_submit_error("BAD_USER_INPUT", "RT98")
+        == SubmitOutcome.ABUSE
+    )
+    assert (
+        classify_submit_error(
+            "BAD_USER_INPUT",
+            "BizItem is not opened.",
+        )
+        == SubmitOutcome.NOT_OPEN
+    )
+
+
+def test_attach_cookies():
+    api = NaverBookingApi("1498729", "7094790", "12")
+    cookies = [
+        {"name": "NID_AUT", "value": "secret_aut", "domain": ".naver.com"},
+        {"name": "NID_SES", "value": "secret_ses", "domain": ".naver.com"},
+        {"name": "OTHER", "value": "val", "domain": "example.com"},
+    ]
+    added = api.attach_cookies(cookies)
+    assert added == 2
+    assert api.session.cookies.get("NID_AUT") == "secret_aut"

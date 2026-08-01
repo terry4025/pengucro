@@ -41,9 +41,8 @@ Python `requests` 기반 `submit_booking()`은 서버 응답 분류와 진단용
 
 - `NaverSubmitPreparation`: 제출 가능 여부, 완성된 입력, 실패 사유를 담는다.
 - `NaverSubmitPayloadBuilder`: business, bizItem, 전체 slot 레코드, account,
-  사용자 예약 데이터를 `SubmitBookingParams`로 변환한다.
-- `validate_submit_payload()`: ID, slot 시간, CSRF, custom form, 예약 인원 및
-  즉시확정/비결제 상품 조건을 검증한다.
+  사용자 예약 데이터를 `SubmitBookingParams`로 변환하면서 ID, slot 시간,
+  CSRF, custom form, 예약 인원 및 즉시확정/비결제 상품 조건을 검증한다.
 
 현재 최소 조회용 `hourlySchedule` 쿼리는 제출에 필요한 슬롯 이름, 종료 시각,
 가격 및 옵션 필드를 포함하는 별도 상세 쿼리로 확장한다. 사업장과 상품 쿼리도
@@ -62,7 +61,7 @@ Python `requests` 기반 `submit_booking()`은 서버 응답 분류와 진단용
 
 `NaverBrowserSubmitter`는 다음 인터페이스를 제공한다.
 
-- `prepare(...) -> NaverSubmitPreparation`
+- `fetch_account() -> NaverAccount`
 - `submit(prepared_input) -> SubmitResult`
 
 `submit()`은 페이지 컨텍스트의 `fetch("/graphql", {credentials: "include"})`를
@@ -104,10 +103,10 @@ API 요청을 먼저 사용한다. API 경로가 비활성화된 경우에만 �
 
 CSRF, 쿠키, 사용자 개인정보 및 각 필드의 실제 값은 출력하지 않는다.
 
-정확한 페이지 페이로드를 비교해야 할 때 사용할 캡처 도구는
-`submitBooking` 요청을 Playwright route에서 가로채 JSON을 메모리에서
-정규화한 뒤 반드시 `abort()`한다. 이 도구는 테스트/개발자 모드에서만 활성화되며
-원격 서버로 mutation을 전달하지 않는다.
+정확한 페이지 페이로드를 추가 비교해야 할 때는 별도 진단 도구에서
+`submitBooking` 요청을 Playwright route로 가로채 메모리에서 정규화하고
+반드시 `abort()`해야 한다. 운영 엔진에는 요청 캡처나 페이로드 저장 기능을
+넣지 않는다.
 
 ## 오류 처리
 
@@ -126,11 +125,10 @@ Mutation은 일반 가용성 폴링처럼 반복하지 않는다. `NOT_OPEN` 이
 
 ## 시각 동기화
 
-기존 5분 주기 동기화는 유지하되 오픈 5초 전 추가 동기화를 수행한다. 여러 번
-측정할 경우 RTT가 가장 짧은 정상 표본을 채택한다. 편도 지연 보정은 최근 RTT의
-절반을 사용하되 10~100ms 범위로 제한한다. 로컬 이벤트 루프 지연과 실제 네트워크
-편차는 각 로그에 `전송 시작`, `응답 수신`, `서버 오픈 대비 오프셋`, `RTT`로
-남기되 인증 데이터는 기록하지 않는다.
+기존 5분 주기 동기화는 유지하되 오픈 5초 전 정상 표본으로 한 번 더 동기화한다.
+편도 지연 보정은 최근 RTT의 절반을 사용하되 10~100ms 범위로 제한한다. 로컬
+이벤트 루프 지연과 실제 네트워크 편차는 각 로그에 `전송 시작`, `응답 수신`,
+`서버 오픈 대비 오프셋`, `RTT`로 남기되 인증 데이터는 기록하지 않는다.
 
 ## 테스트 전략
 

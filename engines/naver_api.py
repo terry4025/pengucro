@@ -81,6 +81,7 @@ HOURLY_SCHEDULE_QUERY = """query hourlySchedule($scheduleParams: ScheduleParams)
     bizItemSchedule {
       hourly {
         id
+        name
         slotId
         scheduleId
         detailScheduleId
@@ -100,6 +101,33 @@ HOURLY_SCHEDULE_QUERY = """query hourlySchedule($scheduleParams: ScheduleParams)
         maxBookingCount
         saleStartDateTime
         saleEndDateTime
+        duration
+        desc
+        seatGroups {
+          color
+          maxPrice
+          name
+          remainStock
+        }
+        prices {
+          groupName
+          isDefault
+          price
+          priceId
+          scheduleId
+          priceTypeCode
+          name
+          normalPrice
+          desc
+          order
+          groupOrder
+          slotId
+          agencyKey
+          bookingCount
+          isImp
+          saleStartDateTime
+          saleEndDateTime
+        }
       }
     }
   }
@@ -120,6 +148,13 @@ BIZ_ITEM_QUERY = """query bizItem($input: BizItemParams) {
     bookableSettingJson
     bookingCountSettingJson
     customFormJson
+    isNPayUsed
+    isPeriodFixed
+    isSeatUsed
+    addressJson
+    bookingConfirmCode
+    paymentSettingJson
+    resources { resourceUrl }
   }
 }"""
 
@@ -132,6 +167,17 @@ BUSINESS_QUERY = """query business($input: BusinessParams) {
     isPhoneAuthenticationRequired
     customFormJson
     bookingConfirmCode
+    businessTypeId
+    bookingTimeUnitCode
+    addressJson
+    translationStatusJson
+    nPayRegStatusCode
+    uncompletedBookingProcessCode
+    uncompletedBookingRefundRate
+    refundPolicy
+    businessResources { resourceUrl }
+    agencies { agencyId }
+    rawNames { name serviceName }
   }
 }"""
 
@@ -140,8 +186,43 @@ ACCOUNT_QUERY = """query account {
     userId
     isLoggedIn
     nickname
+    csrfToken
+    isSmsAlarm
   }
 }"""
+
+# The booking request itself. Recovered from the page's own lazily loaded chunk
+# (``...bizItem_EntranceTimeAlert...chunk.js``); see
+# ``reference/naver/submit_booking.md`` for how, and for the probe results that
+# establish what the server checks and in which order.
+SUBMIT_BOOKING_MUTATION = """mutation submitBooking($input: SubmitBookingParams) {
+  submitBooking(input: $input) {
+    bookingId
+    provider
+    url
+  }
+}"""
+
+# Refusal codes handled by Naver's current booking-page bundle, grouped by what
+# the engine should do next. The complete generated payload has passed live
+# GraphQL schema validation without login; authenticated resolver behavior has
+# deliberately not been probed because even a "safe" target could create a
+# booking if its state changed.
+SUBMIT_REFUSED_CODES = frozenset({
+    "RT25", "RT37", "RT47", "RT71", "RT77", "BOOKING_NOT_AVAILABLE", "Duplicated",
+    "STALE_DATA",
+})
+SUBMIT_NOT_OPEN_CODES = frozenset({"BizItem is not opened."})
+SUBMIT_AUTH_CODES = frozenset({"UNAUTHENTICATED", "Authentication failed"})
+# Naver's own "this looks automated" judgement. Treated as a hard stop for the API
+# path: retrying it is the one thing that could turn a missed booking into a
+# flagged account.
+SUBMIT_ABUSE_CODES = frozenset({"RT98"})
+SUBMIT_PAYLOAD_CODES = frozenset({
+    "INVALID_CUSTOM_FORM_INPUT", "BAD_USER_INPUT", "BAD_REQUEST",
+    "GRAPHQL_VALIDATION_FAILED",
+})
+
 
 
 class NaverApiError(RuntimeError):
@@ -309,8 +390,79 @@ class NaverItemMeta:
         return None
 
 
+@dataclass(frozen=True)
+class NaverAccount:
+    """Who the browser session belongs to, and the token the mutation needs."""
+
+    is_logged_in: bool
+    csrf_token: str
+    is_sms_alarm: bool
+    user_id: str = ""
+    nickname: str = ""
+
+
+class SubmitOutcome:
+    """How a direct ``submitBooking`` attempt ended.
+
+    The engine branches on these rather than on message text: ``NOT_OPEN`` means
+    fire again in a moment, ``REFUSED`` means someone else got there, and
+    ``ABUSE``/``PAYLOAD`` mean stop using the API path and let the page do it.
+    """
+
+    SUCCESS = "success"
+    NOT_OPEN = "notopen"
+    REFUSED = "refused"
+    AUTH = "auth"
+    ABUSE = "abuse"
+    PAYLOAD = "payload"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class SubmitResult:
+    outcome: str
+    code: str = ""
+    message: str = ""
+    booking_id: str = ""
+    url: Any = None
+
+    @property
+    def detail(self) -> str:
+        parts = [part for part in (self.code, self.message) if part]
+        return " · ".join(dict.fromkeys(parts)) or self.outcome
+
+
+def classify_submit_error(code: str, message: str) -> str:
+    """Map a server refusal onto one of the ``SubmitOutcome`` values."""
+    # Resolver-specific reasons are more informative than GraphQL's generic
+    # BAD_USER_INPUT/BAD_REQUEST wrapper. Inspect the message first and do not let
+    # that wrapper hide RT98 or the exact not-open refusal.
+    for token in (message, code):
+        text = (token or "").strip()
+        if not text:
+            continue
+        if text in SUBMIT_ABUSE_CODES:
+            return SubmitOutcome.ABUSE
+        if text in SUBMIT_NOT_OPEN_CODES:
+            return SubmitOutcome.NOT_OPEN
+        if text in SUBMIT_AUTH_CODES:
+            return SubmitOutcome.AUTH
+        if text in SUBMIT_REFUSED_CODES:
+            return SubmitOutcome.REFUSED
+    for token in (code, message):
+        text = (token or "").strip()
+        if text in SUBMIT_PAYLOAD_CODES:
+            return SubmitOutcome.PAYLOAD
+    haystack = f"{code} {message}"
+    if "not opened" in haystack:
+        return SubmitOutcome.NOT_OPEN
+    if "Authentication" in haystack or "UNAUTHENTICATED" in haystack:
+        return SubmitOutcome.AUTH
+    return SubmitOutcome.ERROR
+
+
 class NaverBookingApi:
-    """Thin GraphQL client. Every method is a read; nothing here books anything."""
+    """Thin GraphQL client for public reads and classified booking responses."""
 
     def __init__(
         self,
@@ -379,6 +531,55 @@ class NaverBookingApi:
         data["__rtt_window__"] = (before, after)
         return data
 
+    def _post_body(
+        self, operation: str, query: str, variables: dict[str, Any]
+    ) -> dict[str, Any]:
+        """POST and hand back the whole GraphQL body, errors included.
+
+        ``_post`` turns an ``errors`` array into an exception, which is right for
+        reads but wrong for the booking mutation: the refusal *code* is the useful
+        part and it only exists in ``extensions``.
+        """
+        payload = {"operationName": operation, "query": query, "variables": variables}
+        before = time.monotonic()
+        try:
+            response = self.session.post(
+                GRAPHQL_URL, json=payload, headers=self._headers(),
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise NaverApiError(f"네이버 API 연결 실패: {exc}") from exc
+        self.last_rtt = time.monotonic() - before
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise NaverApiError(
+                f"네이버 API 응답을 해석하지 못했습니다 (HTTP {response.status_code})"
+            ) from exc
+        return body if isinstance(body, dict) else {}
+
+    def attach_cookies(self, cookies) -> int:
+        """Copy a browser's Naver cookies onto this session.
+
+        The mutation needs the login the browser holds. Only naver.com cookies are
+        taken, and their values are never logged.
+        """
+        added = 0
+        for cookie in cookies or []:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            domain = cookie.get("domain") or ""
+            if not name or value is None or "naver" not in domain:
+                continue
+            try:
+                self.session.cookies.set(
+                    name, value, domain=domain, path=cookie.get("path") or "/"
+                )
+                added += 1
+            except Exception:
+                continue
+        return added
+
     def close(self) -> None:
         if self._owns_session:
             try:
@@ -387,8 +588,10 @@ class NaverBookingApi:
                 pass
 
     # -- reads --------------------------------------------------------------
-    def fetch_slots(self, date_from: str, date_to: str | None = None) -> list[NaverSlot]:
-        """Slots between two ``YYYY-MM-DD`` dates, inclusive."""
+    def fetch_slots_raw(
+        self, date_from: str, date_to: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Raw hourly records between two ``YYYY-MM-DD`` dates, inclusive."""
         end = date_to or date_from
         data = self._post("hourlySchedule", HOURLY_SCHEDULE_QUERY, {
             "scheduleParams": {
@@ -400,8 +603,22 @@ class NaverBookingApi:
         })
         schedule = (data.get("schedule") or {}).get("bizItemSchedule") or {}
         hourly = schedule.get("hourly") or []
+        return [entry for entry in hourly if isinstance(entry, dict)]
+
+    def fetch_slots(self, date_from: str, date_to: str | None = None) -> list[NaverSlot]:
+        """Slots between two ``YYYY-MM-DD`` dates, inclusive."""
+        hourly = self.fetch_slots_raw(date_from, date_to)
         slots = [NaverSlot.from_payload(entry) for entry in hourly if entry]
         return sorted((slot for slot in slots if slot), key=lambda item: item.start)
+
+    def fetch_slot_raw(self, date_str: str, time_str: str) -> dict[str, Any] | None:
+        """The page's complete hourly record for one date and ``HH:MM``."""
+        wanted = (time_str or "")[:5]
+        for entry in self.fetch_slots_raw(date_str):
+            slot = NaverSlot.from_payload(entry)
+            if slot is not None and slot.time_str == wanted:
+                return entry
+        return None
 
     def find_slot(self, date_str: str, time_str: str) -> NaverSlot | None:
         """The slot for one date and ``HH:MM``, or None when it does not exist yet."""
@@ -441,6 +658,12 @@ class NaverBookingApi:
         sample business. Knowing the exact option strings up front removes the
         selector guessing the engine used to do.
         """
+        business = self.fetch_business()
+        form = business.get("customFormJson")
+        return form if isinstance(form, list) else []
+
+    def fetch_business(self) -> dict[str, Any]:
+        """The raw business record, which is most of the booking payload."""
         try:
             data = self._post("business", BUSINESS_QUERY, {
                 "input": {
@@ -450,10 +673,77 @@ class NaverBookingApi:
                 },
             })
         except NaverApiError:
-            return []
-        business = data.get("business") or {}
-        form = business.get("customFormJson")
-        return form if isinstance(form, list) else []
+            return {}
+        business = data.get("business")
+        return business if isinstance(business, dict) else {}
+
+    def fetch_biz_item_raw(self) -> dict[str, Any]:
+        """The raw bizItem record, for the fields the payload needs verbatim."""
+        try:
+            data = self._post("bizItem", BIZ_ITEM_QUERY, {
+                "input": {
+                    "businessId": self.business_id,
+                    "bizItemId": self.biz_item_id,
+                    "lang": "ko",
+                },
+            })
+        except NaverApiError:
+            return {}
+        item = data.get("bizItem")
+        return item if isinstance(item, dict) else {}
+
+    def fetch_account(self) -> NaverAccount:
+        """Login state plus the ``csrfToken`` the booking mutation carries."""
+        try:
+            data = self._post("account", ACCOUNT_QUERY, {})
+        except NaverApiError:
+            return NaverAccount(False, "", False)
+        account = data.get("account")
+        if not isinstance(account, dict):
+            return NaverAccount(False, "", False)
+        return NaverAccount(
+            is_logged_in=bool(account.get("isLoggedIn")),
+            csrf_token=str(account.get("csrfToken") or ""),
+            is_sms_alarm=bool(account.get("isSmsAlarm")),
+            user_id=str(account.get("userId") or ""),
+            nickname=str(account.get("nickname") or ""),
+        )
+
+    # -- the booking request ------------------------------------------------
+    def submit_booking(self, params: dict[str, Any]) -> SubmitResult:
+        """Send one booking request and classify the answer.
+
+        This is the only write in the file. It is a single POST, so everything
+        expensive -- business and item metadata, the answered custom form, the
+        account token -- can be assembled before the opening moment and the moment
+        itself costs one round trip (measured 86-97 ms) instead of a page load.
+        """
+        try:
+            body = self._post_body("submitBooking", SUBMIT_BOOKING_MUTATION,
+                                   {"input": params})
+        except NaverApiError as exc:
+            return SubmitResult(SubmitOutcome.ERROR, message=str(exc)[:160])
+
+        errors = body.get("errors") or []
+        if errors:
+            first = errors[0] if isinstance(errors[0], dict) else {}
+            extensions = first.get("extensions") or {}
+            code = str(extensions.get("code") or "")
+            message = str(first.get("message") or "")
+            reason = str(extensions.get("reason") or "")
+            return SubmitResult(
+                classify_submit_error(code, message),
+                code=code or message,
+                message=reason or message,
+            )
+
+        booking = ((body.get("data") or {}).get("submitBooking")) or {}
+        booking_id = str(booking.get("bookingId") or "")
+        if booking_id:
+            return SubmitResult(
+                SubmitOutcome.SUCCESS, booking_id=booking_id, url=booking.get("url")
+            )
+        return SubmitResult(SubmitOutcome.ERROR, message="예약번호가 비어 있습니다")
 
     def is_logged_in(self) -> bool | None:
         """True/False when the endpoint answers, None when it cannot be told."""

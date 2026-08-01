@@ -498,8 +498,14 @@ class TestUIComponents(unittest.TestCase):
 
         choose_mode(NAVER_MODE)
         self.assertEqual(form.dev_mode_checkbox.cget("state"), "normal")
-        form.dev_mode_var.set(True)
-        self.assertTrue(form.dev_mode_var.get())
+        form.dev_mode_checkbox.select()
+        self.assertTrue(form.developer_mode_enabled())
+        form.dev_mode_checkbox.deselect()
+        self.assertFalse(
+            form.developer_mode_enabled(),
+            "the visible unchecked state must always mean a real submission",
+        )
+        form.dev_mode_checkbox.select()
 
         # Switching to an engine that ignores devMode must clear it, or a stale
         # checkmark would suppress a real booking attempt.

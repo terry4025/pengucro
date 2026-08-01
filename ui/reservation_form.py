@@ -936,6 +936,12 @@ class ReservationForm(ctk.CTkFrame):
         engine_id = site.get("engine_id") or site.get("style")
         return engine_id in self.DEV_MODE_ENGINE_IDS
 
+    def developer_mode_enabled(self) -> bool:
+        """Return the checkbox's visible state, which is authoritative."""
+        if not self._dev_mode_supported():
+            return False
+        return bool(self.dev_mode_checkbox.get())
+
     def _update_dev_mode_state(self) -> None:
         if self._dev_mode_supported():
             self.dev_mode_checkbox.configure(
@@ -945,8 +951,8 @@ class ReservationForm(ctk.CTkFrame):
         # The row stays in place so the panel does not jump, but the flag is
         # cleared: a stale checkmark would silently suppress a real booking on a
         # site whose engine ignores it.
-        if self.dev_mode_var.get():
-            self.dev_mode_var.set(False)
+        if self.dev_mode_checkbox.get():
+            self.dev_mode_checkbox.deselect()
         self.dev_mode_checkbox.configure(
             state="disabled", text=self.DEV_MODE_TEXT_OFF,
             text_color=theme.TEXT_DISABLED,
@@ -1308,7 +1314,10 @@ class ReservationForm(ctk.CTkFrame):
             "reservationTime": self.time_entry.get().strip(),
             "paymentType": "1",
             "policy": "true",
-            "devMode": self.dev_mode_var.get(),
+            # Read the checkbox itself, not only its backing Tk variable. This
+            # prevents a stale variable value from suppressing a real booking
+            # after the user visibly turned developer mode off.
+            "devMode": self.developer_mode_enabled(),
             "site_url": self.config.get("url", ""),
             "engine_metadata": {
                 "branch": self.config.get("branch_metadata", {}).get(branch_id, {}),

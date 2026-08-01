@@ -15,6 +15,21 @@ LEGACY_MODE_MAP = {
 }
 
 
+def parse_bool_flag(value: Any, default: bool = False) -> bool:
+    """Parse UI/config flags without treating the string ``"false"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "n", ""}:
+            return False
+    return default
+
+
 class BookingEventType(str, Enum):
     INFO = "info"
     ATTEMPT = "attempt"
@@ -79,7 +94,7 @@ class ReservationRequest:
             theme_label=str(values.get("themeLabel", "")).strip(),
             payment_type=str(values.get("paymentType", "1")),
             policy=str(values.get("policy", "true")).lower() == "true",
-            developer_mode=bool(values.get("devMode", False)),
+            developer_mode=parse_bool_flag(values.get("devMode", False)),
             site_url=str(values.get("site_url", "")).strip(),
             naver_time_offset=float(values.get("naver_time_offset", 0.0) or 0.0),
             engine_metadata=dict(values.get("engine_metadata", {})),
@@ -137,5 +152,11 @@ class ReservationRequest:
             f"날짜: {self.reservation_date}\n"
             f"시간: {self.reservation_time[:5]}\n"
             f"인원: {self.people}명\n"
-            f"예약자: {self.name}"
+            f"예약자: {self.name}\n"
+            f"실행 방식: "
+            + (
+                "개발자 테스트 (실제 제출 안 함)"
+                if self.developer_mode
+                else "실제 예약 제출"
+            )
         )
