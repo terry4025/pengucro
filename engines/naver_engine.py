@@ -347,6 +347,8 @@ class NaverEngine(BaseEngine):
     API_SUBMIT_MAX_ATTEMPTS = 3
     API_NOT_OPEN_WINDOW_SECONDS = 0.35
     API_NOT_OPEN_RETRY_SECONDS = 0.01
+    API_PREFLIGHT_MIN_SECONDS = 2.0
+    API_PREFLIGHT_SLOT_TIMEOUT_SECONDS = 0.75
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -432,6 +434,7 @@ class NaverEngine(BaseEngine):
         self._api_submit_enabled = False
         self._api_submit_blocked = False
         self._api_prepare_pending = False
+        self._api_refused_signature: tuple[Any, ...] | None = None
         self._api_account: NaverAccount | None = None
         self._api_business: dict[str, Any] | None = None
         self._api_biz_item: dict[str, Any] | None = None
@@ -484,6 +487,7 @@ class NaverEngine(BaseEngine):
         self._api_submit_enabled = False
         self._api_submit_blocked = False
         self._api_prepare_pending = False
+        self._api_refused_signature = None
         self._api_account = None
         self._api_business = None
         self._api_biz_item = None
@@ -622,8 +626,14 @@ class NaverEngine(BaseEngine):
 
         submitter = self._api_submitter or NaverBrowserSubmitter(self._page)
         self._api_submitter = submitter
-        if self._api_account is None:
-            self._api_account = await submitter.fetch_account()
+        if (
+            self._api_account is None
+            or not self._api_account.is_logged_in
+            or not self._api_account.csrf_token
+        ):
+            account = await submitter.fetch_account()
+            if account.is_logged_in and account.csrf_token:
+                self._api_account = account
         target_date = str(reservation_data.get("reservationDate") or "")
         target_time = str(reservation_data.get("reservationTime") or "")[:5]
         try:
@@ -631,13 +641,17 @@ class NaverEngine(BaseEngine):
             # well before opening, so keep them sequential and leave ``last_rtt``
             # describing the final slot request used by the send-time estimate.
             if self._api_business is None:
-                self._api_business = await asyncio.to_thread(
+                business = await asyncio.to_thread(
                     self.api.fetch_business
                 )
+                if business:
+                    self._api_business = business
             if self._api_biz_item is None:
-                self._api_biz_item = await asyncio.to_thread(
+                biz_item = await asyncio.to_thread(
                     self.api.fetch_biz_item_raw
                 )
+                if biz_item:
+                    self._api_biz_item = biz_item
             slot = await asyncio.to_thread(
                 self.api.fetch_slot_raw, target_date, target_time
             )
@@ -646,6 +660,25 @@ class NaverEngine(BaseEngine):
                 f"[경고] API 직접 제출 준비 실패 ({type(exc).__name__}) · "
                 "브라우저 제출로 진행합니다.",
                 "warning",
+            )
+            return
+
+        if (
+            self._api_account is None
+            or not self._api_account.is_logged_in
+            or not self._api_account.csrf_token
+            or self._api_business is None
+            or self._api_biz_item is None
+        ):
+            self._api_prepare_pending = True
+            self._api_preparation = NaverSubmitPreparation(
+                False,
+                reason="로그인 또는 상품 상세 조회가 일시적으로 완료되지 않았습니다",
+            )
+            self.log(
+                "[정보] API 직접 제출 준비 대기 · 로그인·상품 정보를 "
+                "다시 확인합니다.",
+                "info",
             )
             return
 
@@ -696,6 +729,80 @@ class NaverEngine(BaseEngine):
             "success",
         )
 
+    async def _refresh_api_submit(self, reservation_data) -> bool:
+        """Refresh volatile account/slot data without discarding a ready payload."""
+        if (
+            self.api is None
+            or self._api_submitter is None
+            or self._api_preparation is None
+            or not self._api_preparation.ready
+            or self._api_business is None
+            or self._api_biz_item is None
+        ):
+            return False
+
+        target_date = str(reservation_data.get("reservationDate") or "")
+        target_time = str(reservation_data.get("reservationTime") or "")[:5]
+
+        async def fetch_slot():
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.api.fetch_slot_raw, target_date, target_time
+                ),
+                timeout=self.API_PREFLIGHT_SLOT_TIMEOUT_SECONDS,
+            )
+
+        account_result, slot_result = await asyncio.gather(
+            self._api_submitter.fetch_account(),
+            fetch_slot(),
+            return_exceptions=True,
+        )
+        account = (
+            account_result
+            if isinstance(account_result, NaverAccount)
+            and account_result.is_logged_in
+            and account_result.csrf_token
+            else self._api_account
+        )
+        slot = slot_result if isinstance(slot_result, dict) else None
+        if account is None or slot is None:
+            self.log(
+                "[정보] API 오픈 직전 갱신이 지연되어 기존 검증값을 사용합니다.",
+                "info",
+            )
+            return False
+
+        preparation = NaverSubmitPayloadBuilder().prepare(
+            business=self._api_business,
+            biz_item=self._api_biz_item,
+            slot=slot,
+            account=account,
+            reservation=reservation_data,
+        )
+        if not preparation.ready:
+            self.log(
+                "[정보] API 오픈 직전 갱신값을 사용할 수 없어 기존 검증값을 "
+                "유지합니다.",
+                "info",
+            )
+            return False
+
+        changed = (
+            preparation.slot_id != self._api_preparation.slot_id
+            or preparation.payload.get("csrfToken")
+            != self._api_preparation.payload.get("csrfToken")
+            or preparation.payload.get("price")
+            != self._api_preparation.payload.get("price")
+        )
+        self._api_account = account
+        self._api_preparation = preparation
+        if changed:
+            self.log(
+                f"[정보] API 오픈 직전 갱신 완료 · slotId={preparation.slot_id}",
+                "success",
+            )
+        return True
+
     # ------------------------------------------------------------------
     # The loop
     # ------------------------------------------------------------------
@@ -711,7 +818,16 @@ class NaverEngine(BaseEngine):
         last_change = time.monotonic()
 
         while not self.stop_event.is_set():
-            if time.monotonic() - last_resync >= self.CLOCK_RESYNC_SECONDS:
+            until_open = self._seconds_until_open()
+            outside_blackout = (
+                until_open is None
+                or until_open > self.OPEN_BLACKOUT_SECONDS
+                or until_open < -self.OPEN_BLACKOUT_SECONDS
+            )
+            if (
+                outside_blackout
+                and time.monotonic() - last_resync >= self.CLOCK_RESYNC_SECONDS
+            ):
                 last_resync = time.monotonic()
                 await asyncio.to_thread(self.clock.sync, False)
 
@@ -764,6 +880,11 @@ class NaverEngine(BaseEngine):
 
                 signature = self._slot_signature(slot, reason)
                 if signature != last_signature:
+                    if (
+                        self._api_refused_signature is not None
+                        and signature != self._api_refused_signature
+                    ):
+                        self._api_refused_signature = None
                     last_signature = signature
                     last_change = time.monotonic()
                     if slot is None:
@@ -775,6 +896,7 @@ class NaverEngine(BaseEngine):
                             f"{'예약 가능' if reason is None else reason}",
                             "info",
                         )
+                self._last_signature = signature
 
                 if self._api_prepare_pending and slot is not None:
                     await self._prepare_api_submit(reservation_data, dev_mode)
@@ -825,6 +947,11 @@ class NaverEngine(BaseEngine):
                     )
                     continue
 
+                if self._api_refused_signature == signature:
+                    self.silent_tick(f"{target_time} 서버 거절 상태 확인 중")
+                    await asyncio.sleep(self._poll_burst)
+                    continue
+
                 # The page just told us it has nothing to click. Retrying instantly
                 # costs another page cycle for the same answer, so keep polling the
                 # API -- which is free and faster -- until the backoff expires.
@@ -851,7 +978,7 @@ class NaverEngine(BaseEngine):
                         "warning",
                     )
                     if self._api_submit_enabled and not dev_mode:
-                        outcome, detail = await self._submit_api_first()
+                        outcome, detail = await self._submit_api_first(signature)
                         if outcome == "fallback":
                             outcome, detail = await self._submit(
                                 target_date,
@@ -885,6 +1012,13 @@ class NaverEngine(BaseEngine):
             if outcome == "dev":
                 while not self.stop_event.is_set():
                     await asyncio.sleep(0.5)
+                return
+            if outcome == "unknown":
+                self.log(
+                    f"[경고] 제출 결과를 확인할 수 없습니다. {detail} "
+                    "중복 제출을 막기 위해 자동 시도를 중지합니다.",
+                    "warning",
+                )
                 return
             if outcome == "notready":
                 # Hold the page off for a moment: the API poll keeps running at
@@ -1187,12 +1321,18 @@ class NaverEngine(BaseEngine):
             await asyncio.sleep(0.05 if remaining > 0.5 else 0.005)
 
     def _api_one_way_seconds(self) -> float:
-        rtt = getattr(self.api, "last_rtt", None) if self.api is not None else None
+        rtt = (
+            getattr(self._api_submitter, "last_rtt", None)
+            if self._api_submitter is not None
+            else None
+        )
+        if not rtt:
+            rtt = getattr(self.api, "last_rtt", None) if self.api is not None else None
         try:
             estimate = float(rtt) / 2 if rtt else 0.05
         except (TypeError, ValueError):
             estimate = 0.05
-        return min(0.1, max(0.01, estimate))
+        return min(0.25, max(0.01, estimate))
 
     async def _wait_for_api_send(self) -> None:
         """Start the fetch early enough for it to reach Naver near the boundary."""
@@ -1212,7 +1352,9 @@ class NaverEngine(BaseEngine):
             "warning",
         )
 
-    async def _submit_api_first(self) -> tuple[str, str]:
+    async def _submit_api_first(
+        self, signature: tuple[Any, ...] | None = None
+    ) -> tuple[str, str]:
         """Send the prepared mutation, retrying only the server's not-open reply."""
         if (
             not self._api_submit_enabled
@@ -1253,6 +1395,11 @@ class NaverEngine(BaseEngine):
                     + (f" · {result.url}" if result.url else ""),
                 )
             if result.outcome == SubmitOutcome.REFUSED:
+                self._api_refused_signature = (
+                    signature
+                    if signature is not None
+                    else getattr(self, "_last_signature", None)
+                )
                 return "taken", result.detail
             if result.outcome == SubmitOutcome.NOT_OPEN:
                 if (
@@ -1262,6 +1409,11 @@ class NaverEngine(BaseEngine):
                     await asyncio.sleep(self.API_NOT_OPEN_RETRY_SECONDS)
                     continue
                 return "fallback", result.detail
+
+            if result.outcome == SubmitOutcome.UNKNOWN:
+                self._api_submit_enabled = False
+                self._api_submit_blocked = True
+                return "unknown", result.detail
 
             self._disable_api_submit(result.detail)
             return "fallback", result.detail
@@ -1274,9 +1426,6 @@ class NaverEngine(BaseEngine):
         """Own the opening moment: direct mutation first, browser fallback second."""
         remaining = self._seconds_until_open()
         if self._api_prepare_pending and not dev_mode:
-            if remaining is not None and remaining > 0 and self.clock is not None:
-                await asyncio.to_thread(self.clock.sync, False)
-                remaining = self._seconds_until_open()
             if remaining is not None and remaining > 0:
                 self.log(
                     f"[정보] 오픈 {remaining * 1000:.0f}ms 전 · "
@@ -1290,8 +1439,11 @@ class NaverEngine(BaseEngine):
             remaining = self._seconds_until_open()
 
         if self._api_submit_enabled and not dev_mode:
-            if remaining is not None and remaining > 0 and self.clock is not None:
-                await asyncio.to_thread(self.clock.sync, False)
+            if (
+                remaining is not None
+                and remaining >= self.API_PREFLIGHT_MIN_SECONDS
+            ):
+                await self._refresh_api_submit(reservation_data)
                 remaining = self._seconds_until_open()
             if remaining is not None and remaining > 0:
                 self.log(

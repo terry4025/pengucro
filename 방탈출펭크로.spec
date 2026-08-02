@@ -40,7 +40,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로v5.43',
+    name='방탈출펭크로v5.44',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

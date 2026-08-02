@@ -8,8 +8,10 @@ flow instead of guessing at a payment or seating payload.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -319,32 +321,63 @@ BROWSER_GRAPHQL_SCRIPT = r"""async request => {
     if (request.operationName === "submitBooking" &&
             variables.input && variables.input.userAgentJson) {
         const ua = navigator.userAgent || "";
-        const platform = (navigator.userAgentData &&
+        let os = (navigator.userAgentData &&
             navigator.userAgentData.platform) || navigator.platform || "";
+        let osVersion = "";
+        let device = "none";
+        const windows = ua.match(/Windows NT ([0-9.]+)/i);
+        const android = ua.match(/Android\s+([0-9.]+)/i);
+        const ios = ua.match(/(?:iPhone OS|CPU OS)\s+([0-9_]+)/i);
+        const mac = ua.match(/Mac OS X\s+([0-9_]+)/i);
+        if (windows) {
+            os = "Windows";
+            osVersion = windows[1] === "10.0" ? "10" : windows[1];
+        } else if (android) {
+            os = "Android";
+            osVersion = android[1];
+        } else if (ios) {
+            os = "iOS";
+            osVersion = ios[1].replace(/_/g, ".");
+            device = /iPad/i.test(ua) ? "iPad" : "iPhone";
+        } else if (mac) {
+            os = "Mac OS";
+            osVersion = mac[1].replace(/_/g, ".");
+        }
         variables.input.userAgentJson = {
             ...variables.input.userAgentJson,
             raw: ua,
-            os: platform,
-            device: /Mobi|Android/i.test(ua) ? "MOBILE" : "PC",
+            os,
+            os_version: osVersion,
+            device,
         };
     }
-    const response = await fetch("/graphql", {
-        method: "POST",
-        credentials: "include",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-            operationName: request.operationName,
-            query: request.query,
-            variables,
-        }),
-    });
-    let body = null;
+    const controller = new AbortController();
+    const timeoutMs = Math.max(100, Number(request.timeoutMs) || 3000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        body = await response.json();
-    } catch (_) {
-        body = null;
+        const endpoint = "/graphql?opName=" +
+            encodeURIComponent(request.operationName || "");
+        const response = await fetch(endpoint, {
+            method: "POST",
+            credentials: "include",
+            signal: controller.signal,
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                operationName: request.operationName,
+                query: request.query,
+                variables,
+            }),
+        });
+        let body = null;
+        try {
+            body = await response.json();
+        } catch (_) {
+            body = null;
+        }
+        return {status: response.status, body};
+    } finally {
+        clearTimeout(timeout);
     }
-    return {status: response.status, body};
 }"""
 
 
@@ -383,6 +416,10 @@ def _redact_payload_values(text: str, payload: Mapping[str, Any]) -> str:
     clean = text
     for secret in sorted(secrets, key=len, reverse=True):
         clean = clean.replace(secret, "[redacted]")
+        digits = re.sub(r"\D", "", secret)
+        if len(digits) >= 8:
+            separated = r"[-.\s]*".join(re.escape(char) for char in digits)
+            clean = re.sub(separated, "[redacted]", clean)
     return clean
 
 
@@ -409,7 +446,7 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
         message = str(first.get("message") or "")
         reason = str(extensions.get("reason") or "")
         return SubmitResult(
-            classify_submit_error(code, message),
+            classify_submit_error(code, message, reason),
             code=code or message,
             message=reason or message,
         )
@@ -430,20 +467,30 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
 class NaverBrowserSubmitter:
     """Execute GraphQL inside the already-authenticated Naver page."""
 
-    def __init__(self, page) -> None:
+    def __init__(self, page, timeout_seconds: float = 3.0) -> None:
         self.page = page
+        self.timeout_seconds = max(0.01, float(timeout_seconds))
+        self.last_rtt: float | None = None
 
     async def _graphql(
         self, operation_name: str, query: str, variables: dict[str, Any]
     ) -> Any:
-        return await self.page.evaluate(
-            BROWSER_GRAPHQL_SCRIPT,
-            {
-                "operationName": operation_name,
-                "query": query,
-                "variables": variables,
-            },
-        )
+        started = time.monotonic()
+        try:
+            return await asyncio.wait_for(
+                self.page.evaluate(
+                    BROWSER_GRAPHQL_SCRIPT,
+                    {
+                        "operationName": operation_name,
+                        "query": query,
+                        "variables": variables,
+                        "timeoutMs": round(self.timeout_seconds * 1000),
+                    },
+                ),
+                timeout=self.timeout_seconds + 0.25,
+            )
+        finally:
+            self.last_rtt = time.monotonic() - started
 
     async def fetch_account(self) -> NaverAccount:
         try:
@@ -470,10 +517,18 @@ class NaverBrowserSubmitter:
                 SUBMIT_BOOKING_MUTATION,
                 {"input": copy.deepcopy(payload)},
             )
+        except (asyncio.TimeoutError, TimeoutError):
+            return SubmitResult(
+                SubmitOutcome.UNKNOWN,
+                message="전송 결과가 불명확합니다. 네이버 예약 내역을 확인해주세요.",
+            )
         except Exception as exc:
             return SubmitResult(
-                SubmitOutcome.ERROR,
-                message=f"브라우저 GraphQL 전송 실패 ({type(exc).__name__})",
+                SubmitOutcome.UNKNOWN,
+                message=(
+                    "브라우저 GraphQL 전송 결과가 불명확합니다. "
+                    f"예약 내역을 확인해주세요. ({type(exc).__name__})"
+                ),
             )
         result = _submit_result_from_response(response)
         return SubmitResult(

@@ -210,7 +210,7 @@ SUBMIT_BOOKING_MUTATION = """mutation submitBooking($input: SubmitBookingParams)
 # booking if its state changed.
 SUBMIT_REFUSED_CODES = frozenset({
     "RT25", "RT37", "RT47", "RT71", "RT77", "BOOKING_NOT_AVAILABLE", "Duplicated",
-    "STALE_DATA",
+    "STALE_DATA", "EXCEEDED_AGENCY_BOOKING_LIMIT",
 })
 SUBMIT_NOT_OPEN_CODES = frozenset({"BizItem is not opened."})
 SUBMIT_AUTH_CODES = frozenset({"UNAUTHENTICATED", "Authentication failed"})
@@ -415,6 +415,7 @@ class SubmitOutcome:
     AUTH = "auth"
     ABUSE = "abuse"
     PAYLOAD = "payload"
+    UNKNOWN = "unknown"
     ERROR = "error"
 
 
@@ -432,12 +433,12 @@ class SubmitResult:
         return " · ".join(dict.fromkeys(parts)) or self.outcome
 
 
-def classify_submit_error(code: str, message: str) -> str:
+def classify_submit_error(code: str, message: str, reason: str = "") -> str:
     """Map a server refusal onto one of the ``SubmitOutcome`` values."""
     # Resolver-specific reasons are more informative than GraphQL's generic
     # BAD_USER_INPUT/BAD_REQUEST wrapper. Inspect the message first and do not let
     # that wrapper hide RT98 or the exact not-open refusal.
-    for token in (message, code):
+    for token in (reason, message, code):
         text = (token or "").strip()
         if not text:
             continue
@@ -449,11 +450,11 @@ def classify_submit_error(code: str, message: str) -> str:
             return SubmitOutcome.AUTH
         if text in SUBMIT_REFUSED_CODES:
             return SubmitOutcome.REFUSED
-    for token in (code, message):
+    for token in (code, message, reason):
         text = (token or "").strip()
         if text in SUBMIT_PAYLOAD_CODES:
             return SubmitOutcome.PAYLOAD
-    haystack = f"{code} {message}"
+    haystack = f"{code} {message} {reason}"
     if "not opened" in haystack:
         return SubmitOutcome.NOT_OPEN
     if "Authentication" in haystack or "UNAUTHENTICATED" in haystack:
@@ -732,7 +733,7 @@ class NaverBookingApi:
             message = str(first.get("message") or "")
             reason = str(extensions.get("reason") or "")
             return SubmitResult(
-                classify_submit_error(code, message),
+                classify_submit_error(code, message, reason),
                 code=code or message,
                 message=reason or message,
             )

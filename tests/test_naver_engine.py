@@ -131,6 +131,29 @@ class DelayedSlotPreparationApi(FakePreparationApi):
         return super().fetch_slot_raw(date, time_str)
 
 
+class RotatingSlotPreparationApi(FakePreparationApi):
+    def __init__(self):
+        self.slot_id = "slot-old"
+        self.price = 33000
+
+    def fetch_slot_raw(self, date, time_str):
+        slot = super().fetch_slot_raw(date, time_str)
+        slot["slotId"] = self.slot_id
+        slot["prices"][0]["price"] = self.price
+        return slot
+
+
+class TransientPreparationApi(FakePreparationApi):
+    def __init__(self):
+        self.business_calls = 0
+
+    def fetch_business(self):
+        self.business_calls += 1
+        if self.business_calls == 1:
+            return {}
+        return super().fetch_business()
+
+
 class AccountPage:
     async def evaluate(self, _script, argument=None):
         assert argument["operationName"] == "account"
@@ -139,6 +162,45 @@ class AccountPage:
             "csrfToken": "csrf-secret",
             "isSmsAlarm": False,
         }}}}
+
+
+class RotatingGraphQLPage:
+    def __init__(self):
+        self.tokens = ["csrf-old", "csrf-new"]
+        self.submitted_payload = None
+
+    async def evaluate(self, _script, argument=None):
+        if argument["operationName"] == "account":
+            token = self.tokens.pop(0)
+            return {"status": 200, "body": {"data": {"account": {
+                "isLoggedIn": True,
+                "csrfToken": token,
+                "isSmsAlarm": False,
+            }}}}
+        if argument["operationName"] == "submitBooking":
+            self.submitted_payload = argument["variables"]["input"]
+            return {"status": 200, "body": {"data": {"submitBooking": {
+                "bookingId": "999888",
+                "url": "/my/bookings/999888",
+            }}}}
+        raise AssertionError(argument["operationName"])
+
+
+class SequenceClock(FakeClock):
+    def __init__(self, remaining, *, fail_sync=False):
+        super().__init__(remaining[0])
+        self.remaining_values = list(remaining)
+        self.fail_sync = fail_sync
+
+    def seconds_until(self, _target):
+        if len(self.remaining_values) > 1:
+            return self.remaining_values.pop(0)
+        return self.remaining_values[0]
+
+    def sync(self, _announce=False):
+        if self.fail_sync:
+            raise AssertionError("오픈 임계구간에서 clock.sync를 기다리면 안 됩니다")
+        return True
 
 
 PREPARATION_RESERVATION = {
@@ -242,6 +304,26 @@ def test_api_prepare_reuses_static_data_when_delayed_slot_appears():
     assert engine.api.slot_calls == 2
 
 
+def test_transient_static_read_does_not_permanently_block_direct_submit():
+    engine = NaverEngine(lambda *_args: None)
+    engine.api = TransientPreparationApi()
+    engine._page = AccountPage()
+
+    asyncio.run(
+        engine._prepare_api_submit(PREPARATION_RESERVATION, dev_mode=False)
+    )
+
+    assert engine._api_prepare_pending is True
+    assert engine._api_submit_blocked is False
+
+    asyncio.run(
+        engine._prepare_api_submit(PREPARATION_RESERVATION, dev_mode=False)
+    )
+
+    assert engine._api_submit_enabled is True
+    assert engine.api.business_calls == 2
+
+
 # -- the opening moment ----------------------------------------------------
 def test_open_strike_is_claimed_once_inside_the_arming_window():
     engine = make_engine()
@@ -339,6 +421,104 @@ def test_api_ready_strike_submits_without_page_reload():
     assert outcome == "success"
     assert "999888" in detail
     assert engine._api_submitter.calls == 1
+
+
+def test_open_strike_never_waits_for_clock_sync_inside_the_blackout():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = SequenceClock([0.2, -0.01], fail_sync=True)
+    arm_direct_submit(engine, [
+        SubmitResult(SubmitOutcome.SUCCESS, booking_id="999888"),
+    ])
+
+    outcome, detail = asyncio.run(
+        engine._strike_at_open(
+            "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+        )
+    )
+
+    assert outcome == "success"
+    assert "999888" in detail
+
+
+def test_loop_skips_periodic_clock_sync_inside_the_open_blackout():
+    engine = make_engine()
+    engine.CLOCK_RESYNC_SECONDS = 0.0
+    engine._open_at_epoch = 1.0
+    engine._open_strike_pending = True
+    engine.clock = SequenceClock([0.2, -0.01], fail_sync=True)
+    engine.api = FakeApi(make_slot())
+    engine._page = object()
+    arm_direct_submit(engine, [
+        SubmitResult(SubmitOutcome.SUCCESS, booking_id="999888"),
+    ])
+    engine.notify_success = lambda *_args, **_kwargs: True
+
+    run_loop(engine, date="2026-08-08", time_str="14:30")
+
+    assert engine._api_submitter.calls == 1
+
+
+def test_open_strike_refreshes_slot_and_csrf_before_direct_submit():
+    engine = make_engine()
+    engine.api = RotatingSlotPreparationApi()
+    page = RotatingGraphQLPage()
+    engine._page = page
+
+    asyncio.run(
+        engine._prepare_api_submit(PREPARATION_RESERVATION, dev_mode=False)
+    )
+    assert engine._api_preparation.slot_id == "slot-old"
+    assert engine._api_preparation.payload["csrfToken"] == "csrf-old"
+
+    engine.api.slot_id = "slot-new"
+    engine.api.price = 35000
+    engine._open_at_epoch = 1.0
+    engine.clock = SequenceClock([4.0, -0.01])
+
+    outcome, detail = asyncio.run(
+        engine._strike_at_open(
+            "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+        )
+    )
+
+    assert outcome == "success"
+    assert "999888" in detail
+    assert page.submitted_payload["slotId"] == "slot-new"
+    assert page.submitted_payload["csrfToken"] == "csrf-new"
+    assert page.submitted_payload["price"] == 35000
+
+
+def test_ambiguous_api_result_never_falls_back_to_a_second_submission():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(-0.01)
+    arm_direct_submit(engine, [
+        SubmitResult(SubmitOutcome.UNKNOWN, message="결과 확인 필요"),
+    ])
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("불명확한 전송 뒤에는 중복 제출하면 안 됩니다")
+
+    engine._goto_item = forbidden
+    engine._submit = forbidden
+
+    outcome, detail = asyncio.run(
+        engine._strike_at_open(
+            "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+        )
+    )
+
+    assert outcome == "unknown"
+    assert "확인" in detail
+
+
+def test_api_send_lead_uses_the_browser_transport_round_trip():
+    engine = make_engine()
+    engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
+    engine._api_submitter = type("BrowserTransport", (), {"last_rtt": 0.4})()
+
+    assert engine._api_one_way_seconds() == pytest.approx(0.2)
 
 
 def test_pending_api_strike_refreshes_slot_before_page_reload():
@@ -638,6 +818,38 @@ def test_loop_uses_prepared_api_for_a_later_cancellation():
 
     engine._submit = forbidden
     engine.notify_success = lambda *_args, **_kwargs: True
+
+    run_loop(engine)
+
+    assert engine._api_submitter.calls == 1
+
+
+def test_loop_does_not_replay_the_same_authoritative_refusal():
+    engine = make_engine()
+    engine._poll_base = 0.01
+    engine._poll_burst = 0.01
+    engine.TAKEN_BACKOFF_SECONDS = 0.0
+    engine.clock = FakeClock(-30.0)
+    slot = make_slot()
+
+    class StoppingApi(FakeApi):
+        def find_slot(self, date, time_str):
+            result = super().find_slot(date, time_str)
+            if self.calls >= 4:
+                engine.stop_event.set()
+            return result
+
+    engine.api = StoppingApi(slot)
+    engine._page = object()
+    arm_direct_submit(engine, [
+        SubmitResult(SubmitOutcome.REFUSED, code="RT47", message="정원 마감")
+        for _ in range(4)
+    ])
+
+    async def forbidden(*_args):
+        raise AssertionError("직접 거절 뒤 화면 제출로 전환하면 안 됩니다")
+
+    engine._submit = forbidden
 
     run_loop(engine)
 

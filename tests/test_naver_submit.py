@@ -212,6 +212,17 @@ class RaisingPage:
         raise RuntimeError("csrf-secret 01012345678")
 
 
+class HangingPage:
+    async def evaluate(self, _script, _argument=None):
+        await asyncio.Event().wait()
+
+
+class DelayedPage(FakePage):
+    async def evaluate(self, script, argument=None):
+        await asyncio.sleep(0.02)
+        return await super().evaluate(script, argument)
+
+
 def test_browser_submitter_classifies_success():
     from engines.naver_submit import NaverBrowserSubmitter
 
@@ -263,10 +274,78 @@ def test_browser_submitter_redacts_payload_from_transport_errors():
         "phone": "01012345678",
     }))
 
-    assert result.outcome == SubmitOutcome.ERROR
+    assert result.outcome == SubmitOutcome.UNKNOWN
     assert "csrf-secret" not in result.detail
     assert "01012345678" not in result.detail
     assert "RuntimeError" in result.detail
+
+
+def test_browser_submitter_bounds_an_ambiguous_submit_timeout():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    submitter = NaverBrowserSubmitter(HangingPage(), timeout_seconds=0.01)
+    result = asyncio.run(submitter.submit({"slotId": "1331382668"}))
+
+    assert result.outcome == SubmitOutcome.UNKNOWN
+    assert "확인" in result.detail
+
+
+def test_browser_submitter_measures_the_actual_browser_round_trip():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = DelayedPage({"data": {"account": {
+        "isLoggedIn": True,
+        "csrfToken": "csrf-secret",
+        "isSmsAlarm": False,
+    }}})
+    submitter = NaverBrowserSubmitter(page)
+
+    account = asyncio.run(submitter.fetch_account())
+
+    assert account.is_logged_in is True
+    assert submitter.last_rtt >= 0.015
+
+
+def test_browser_submitter_classifies_the_resolver_reason():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = FakePage({
+        "errors": [{
+            "message": "예약 요청을 처리하지 못했습니다.",
+            "extensions": {
+                "code": "BAD_USER_INPUT",
+                "reason": "BOOKING_NOT_AVAILABLE",
+            },
+        }],
+    })
+
+    result = asyncio.run(
+        NaverBrowserSubmitter(page).submit({"slotId": "1331382668"})
+    )
+
+    assert result.outcome == SubmitOutcome.REFUSED
+
+
+def test_browser_submitter_redacts_formatted_versions_of_phone_numbers():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = FakePage({
+        "errors": [{
+            "message": "BAD_USER_INPUT",
+            "extensions": {
+                "code": "BAD_USER_INPUT",
+                "reason": "연락처 010-1234-5678 확인 필요",
+            },
+        }],
+    })
+
+    result = asyncio.run(NaverBrowserSubmitter(page).submit({
+        "phone": "01012345678",
+    }))
+
+    assert "01012345678" not in result.detail
+    assert "010-1234-5678" not in result.detail
+    assert "[redacted]" in result.detail
 
 
 def test_browser_submitter_redacts_secrets_echoed_by_server_errors():

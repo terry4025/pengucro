@@ -423,6 +423,14 @@ def test_specific_submit_reason_beats_generic_graphql_code():
         )
         == SubmitOutcome.NOT_OPEN
     )
+    assert (
+        classify_submit_error(
+            "BAD_USER_INPUT",
+            "예약 요청을 처리하지 못했습니다.",
+            "BOOKING_NOT_AVAILABLE",
+        )
+        == SubmitOutcome.REFUSED
+    )
 
 
 def test_attach_cookies():
