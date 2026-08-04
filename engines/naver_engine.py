@@ -1581,9 +1581,6 @@ class NaverEngine(BaseEngine):
                         booking_id=result.booking_id,
                         payment_url=self._normalize_payment_url(result.url),
                         dev_mode=dev_mode,
-                        auto_pay=parse_bool_flag(
-                            (reservation_data or {}).get("npayAutoPay", False)
-                        ),
                         navigate_immediately=True,
                     )
                 return (
@@ -2026,9 +2023,6 @@ class NaverEngine(BaseEngine):
                 return await self._submit_npay(
                     submit,
                     dev_mode=dev_mode,
-                    auto_pay=parse_bool_flag(
-                        reservation_data.get("npayAutoPay", False)
-                    ),
                 )
 
             await submit.click()
@@ -2112,7 +2106,7 @@ class NaverEngine(BaseEngine):
         return host == "pay.naver.com" or host.endswith(".pay.naver.com")
 
     async def _submit_npay(
-        self, submit, *, dev_mode: bool, auto_pay: bool
+        self, submit, *, dev_mode: bool
     ) -> tuple[str, str]:
         """Create the temporary booking, then drive the official Npay order page."""
         page = self._page
@@ -2159,7 +2153,6 @@ class NaverEngine(BaseEngine):
             booking_id=booking_id,
             payment_url=payment_url,
             dev_mode=dev_mode,
-            auto_pay=auto_pay,
             navigate_immediately=False,
             capture_error=capture_error,
         )
@@ -2170,7 +2163,6 @@ class NaverEngine(BaseEngine):
         booking_id: str,
         payment_url: str,
         dev_mode: bool,
-        auto_pay: bool,
         navigate_immediately: bool,
         capture_error: str = "",
     ) -> tuple[str, str]:
@@ -2244,13 +2236,6 @@ class NaverEngine(BaseEngine):
                 "success",
             )
             return "dev", ""
-
-        if not auto_pay:
-            return (
-                "payment",
-                f"예약번호 {booking_id or '확인 필요'} 임시 선점 완료 · "
-                f"Npay 자동결제가 꺼져 있어 '{button_text}' 직전에 대기합니다.",
-            )
 
         try:
             await pay_button.scroll_into_view_if_needed()

@@ -580,6 +580,10 @@ class TestUIComponents(unittest.TestCase):
             self.app.update()
 
         choose_mode(NAVER_MODE)
+        self.assertFalse(
+            hasattr(form, "npay_auto_pay_checkbox"),
+            "Npay auto-payment must not have a separate checkbox",
+        )
         self.assertEqual(form.dev_mode_checkbox.cget("state"), "normal")
         form.dev_mode_checkbox.select()
         self.assertTrue(form.developer_mode_enabled())

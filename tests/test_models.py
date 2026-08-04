@@ -103,7 +103,7 @@ def test_summary_makes_developer_mode_unmistakable():
     assert "Npay 선결제는 임시 예약 후 결제 직전 정지" in request.summary()
 
 
-def test_npay_auto_pay_is_explicit_and_round_trips_to_engine_payload():
+def test_npay_actual_mode_is_automatic_without_a_separate_payload_flag():
     request = ReservationRequest.from_mapping(
         "네이버 예약",
         {
@@ -113,13 +113,14 @@ def test_npay_auto_pay_is_explicit_and_round_trips_to_engine_payload():
             "name": "홍길동",
             "people": "2",
             "themePK": "https://booking.naver.com/items/1",
+            # Legacy saved values are intentionally ignored. Developer mode is
+            # now the only switch that can stop before final payment.
             "npayAutoPay": True,
         },
     )
 
-    assert request.npay_auto_pay is True
-    assert request.to_engine_payload()["npayAutoPay"] is True
-    assert "Npay 머니 자동결제: 사용" in request.summary()
+    assert "npayAutoPay" not in request.to_engine_payload()
+    assert "Npay 선결제는 최종 결제까지 자동 진행" in request.summary()
 
 
 def test_engine_payload_carries_yescaptcha_settings():

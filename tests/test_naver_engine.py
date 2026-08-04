@@ -1273,15 +1273,16 @@ def test_direct_npay_api_hold_continues_to_checkout_without_page_submission():
     )
 
     outcome, detail = asyncio.run(engine._submit_api_first(
+        # A legacy opt-out value must no longer suppress final payment.
         reservation_data={"npayAutoPay": False},
         dev_mode=False,
     ))
 
     assert outcome == "payment"
-    assert "자동결제가 꺼져" in detail
+    assert "결제 요청" in detail
     assert engine._api_submitter.calls == 1
     assert engine._npay_booking_id == "1310923519"
-    assert pay_button.clicks == 0
+    assert pay_button.clicks == 1
 
 
 def test_direct_npay_developer_mode_creates_hold_but_never_pays():
@@ -1304,7 +1305,7 @@ def test_direct_npay_developer_mode_creates_hold_but_never_pays():
 
     assert engine._api_may_submit(dev_mode=True) is True
     outcome, _detail = asyncio.run(engine._submit_api_first(
-        reservation_data={"npayAutoPay": True},
+        reservation_data={"npayAutoPay": False},
         dev_mode=True,
     ))
 
@@ -1355,7 +1356,7 @@ def test_npay_developer_mode_stops_before_final_payment_click():
     configure_fake_npay_checkout(engine, pay_button)
 
     outcome, _detail = asyncio.run(engine._submit_npay(
-        booking_button, dev_mode=True, auto_pay=True
+        booking_button, dev_mode=True
     ))
 
     assert outcome == "dev"
@@ -1364,7 +1365,7 @@ def test_npay_developer_mode_stops_before_final_payment_click():
     assert engine._npay_booking_id == "1310923519"
 
 
-def test_npay_auto_pay_clicks_final_button_exactly_once():
+def test_npay_actual_mode_clicks_final_button_exactly_once():
     engine = make_engine()
     engine._page = FakeNpayBookingPage()
     booking_button = FakeClickButton()
@@ -1372,7 +1373,7 @@ def test_npay_auto_pay_clicks_final_button_exactly_once():
     configure_fake_npay_checkout(engine, pay_button)
 
     outcome, detail = asyncio.run(engine._submit_npay(
-        booking_button, dev_mode=False, auto_pay=True
+        booking_button, dev_mode=False
     ))
 
     assert outcome == "payment"
@@ -1380,24 +1381,6 @@ def test_npay_auto_pay_clicks_final_button_exactly_once():
     assert booking_button.clicks == 1
     assert pay_button.clicks == 1
     assert pay_button.scrolls == 1
-
-
-def test_npay_auto_pay_opt_out_leaves_button_for_manual_payment():
-    engine = make_engine()
-    engine._page = FakeNpayBookingPage()
-    booking_button = FakeClickButton()
-    pay_button = FakeClickButton()
-    configure_fake_npay_checkout(engine, pay_button)
-
-    outcome, detail = asyncio.run(engine._submit_npay(
-        booking_button, dev_mode=False, auto_pay=False
-    ))
-
-    assert outcome == "payment"
-    assert "자동결제가 꺼져" in detail
-    assert booking_button.clicks == 1
-    assert pay_button.clicks == 0
-
 
 def test_npay_checkout_stops_before_control_scan_when_stop_is_requested():
     engine = make_engine()
@@ -1417,7 +1400,6 @@ def test_npay_checkout_stops_before_control_scan_when_stop_is_requested():
         booking_id="1311029802",
         payment_url="https://order.pay.naver.com/orderSheet/test",
         dev_mode=False,
-        auto_pay=False,
         navigate_immediately=True,
     ))
 

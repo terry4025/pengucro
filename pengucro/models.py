@@ -92,7 +92,6 @@ class ReservationRequest:
     yescaptcha_client_key: str = ""
     yescaptcha_soft_id: str = "26273"
     engine_metadata: Mapping[str, Any] = field(default_factory=dict)
-    npay_auto_pay: bool = False
 
     @classmethod
     def from_mapping(cls, site: str, values: Mapping[str, Any]) -> "ReservationRequest":
@@ -122,7 +121,6 @@ class ReservationRequest:
             yescaptcha_client_key=str(values.get("yescaptcha_client_key", "")).strip(),
             yescaptcha_soft_id=str(values.get("yescaptcha_soft_id", "26273")).strip() or "26273",
             engine_metadata=dict(values.get("engine_metadata", {})),
-            npay_auto_pay=parse_bool_flag(values.get("npayAutoPay", False)),
         )
 
     def validate(self, *, phone_required: bool = True) -> list[str]:
@@ -162,7 +160,6 @@ class ReservationRequest:
             "paymentType": self.payment_type,
             "policy": "true" if self.policy else "false",
             "devMode": self.developer_mode,
-            "npayAutoPay": self.npay_auto_pay,
             "site_url": self.site_url,
             "naver_time_offset": self.naver_time_offset,
             "branchLabel": self.branch_label,
@@ -191,11 +188,10 @@ class ReservationRequest:
             + (
                 "개발자 테스트 (Npay 선결제는 임시 예약 후 결제 직전 정지)"
                 if self.developer_mode
-                else "실제 예약 제출"
-            )
-            + (
-                "\nNpay 머니 자동결제: 사용"
-                if self.npay_auto_pay and not self.developer_mode
-                else ""
+                else (
+                    "실제 예약 제출 (Npay 선결제는 최종 결제까지 자동 진행)"
+                    if self.site == "네이버 예약"
+                    else "실제 예약 제출"
+                )
             )
         )

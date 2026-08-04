@@ -823,21 +823,6 @@ class ReservationForm(ctk.CTkFrame):
         self._setup_entry_focus(self.yescaptcha_client_key_entry)
         self._setup_entry_focus(self.yescaptcha_soft_id_entry)
 
-        self.npay_auto_pay_var = ctk.BooleanVar(value=False)
-        self.npay_auto_pay_checkbox = ctk.CTkCheckBox(
-            self.advanced_frame,
-            text="Npay 머니 자동결제 (실제 결제)",
-            variable=self.npay_auto_pay_var,
-            font=theme.FONT_BODY_SM,
-            fg_color=theme.ACCENT_BLUE,
-            hover_color=theme.ACCENT_BLUE,
-            text_color=theme.TEXT_MUTE,
-            checkbox_width=14,
-            checkbox_height=14,
-            corner_radius=theme.ROUNDED_SM,
-            command=self.auto_save,
-        )
-
         self.catalog_auto_refresh_var = ctk.BooleanVar(value=True)
         self.catalog_auto_refresh_checkbox = ctk.CTkCheckBox(
             self.advanced_frame,
@@ -1146,12 +1131,6 @@ class ReservationForm(ctk.CTkFrame):
             return False
         return bool(self.dev_mode_checkbox.get())
 
-    def npay_auto_pay_enabled(self) -> bool:
-        """Final Npay payment is opt-in and only meaningful in Naver mode."""
-        if self.engine_mode_btn.get() != NAVER_MODE:
-            return False
-        return bool(self.npay_auto_pay_checkbox.get())
-
     def _update_dev_mode_state(self) -> None:
         if self._dev_mode_supported():
             self.dev_mode_checkbox.configure(
@@ -1219,10 +1198,6 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
 
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
-            self.npay_auto_pay_checkbox.grid(row=1, column=0, sticky="w")
-            self.npay_auto_pay_checkbox.configure(
-                state="normal", text_color=theme.TEXT_MUTE
-            )
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
@@ -1240,7 +1215,6 @@ class ReservationForm(ctk.CTkFrame):
             
             self._toggle_custom_theme()
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
-            self.npay_auto_pay_checkbox.grid_forget()
 
         self._update_dev_mode_state()
 
@@ -1277,7 +1251,6 @@ class ReservationForm(ctk.CTkFrame):
             self.engine_mode_btn,
             self.show_server_time_checkbox,
             self.dev_mode_checkbox,
-            self.npay_auto_pay_checkbox,
             self.advanced_toggle_btn,
             self.remember_personal_checkbox,
             self.catalog_auto_refresh_checkbox,
@@ -1573,7 +1546,6 @@ class ReservationForm(ctk.CTkFrame):
             # prevents a stale variable value from suppressing a real booking
             # after the user visibly turned developer mode off.
             "devMode": self.developer_mode_enabled(),
-            "npayAutoPay": self.npay_auto_pay_enabled(),
             "site_url": self.config.get("url", ""),
             "yescaptcha_enabled": yescaptcha_enabled,
             "yescaptcha_test_mode": (
@@ -1871,7 +1843,6 @@ class ReservationForm(ctk.CTkFrame):
                 self.yescaptcha_soft_id_entry.insert(0, config["yescaptcha_soft_id"])
 
             self.catalog_auto_refresh_var.set(bool(config.get("catalog_auto_refresh", True)))
-            self.npay_auto_pay_var.set(bool(config.get("naver_npay_auto_pay", False)))
             if saved_site == self.current_site:
                 if not config.get("selected_branch_id"):
                     selected_branch_id = self._selected_branch_id()
@@ -1929,7 +1900,6 @@ class ReservationForm(ctk.CTkFrame):
                 "show_server_time": bool(self.show_server_time_checkbox.get()),
                 "remember_personal_info": remember_personal,
                 "catalog_auto_refresh": bool(self.catalog_auto_refresh_var.get()),
-                "naver_npay_auto_pay": bool(self.npay_auto_pay_var.get()),
                 "selected_branch_id": self._selected_branch_id(),
                 "selected_theme_id": self._selected_theme_id(),
                 "yescaptcha_enabled": bool(self.yescaptcha_enabled_var.get()),

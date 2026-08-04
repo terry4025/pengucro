@@ -1608,26 +1608,22 @@ class MainWindow(ctk.CTk):
         # must not be allowed to carry a stale developer-mode flag into an actual
         # booking run.
         payload["devMode"] = self.form.developer_mode_enabled()
-        payload["npayAutoPay"] = self.form.npay_auto_pay_enabled()
+        is_naver = self.form.engine_mode_btn.get() == NAVER_MODE
         self.log_panel.append_log(
             (
                 "[주의] 개발자 테스트 모드 · 선결제 상품은 임시 예약 후 "
                 "Npay 최종 결제 직전에 멈춥니다."
                 if payload["devMode"]
-                else "[정보] 실제 예약 제출 모드 · 예약 가능 시 예약 제출을 진행합니다."
+                else (
+                    "[주의] 실제 예약 제출 모드 · Npay 선결제 상품은 "
+                    "최종 결제까지 자동 진행합니다."
+                    if is_naver
+                    else "[정보] 실제 예약 제출 모드 · 예약 가능 시 예약 제출을 진행합니다."
+                )
             ),
-            "warning" if payload["devMode"] else "info",
+            "warning" if payload["devMode"] or is_naver else "info",
         )
-        if self.form.engine_mode_btn.get() == NAVER_MODE and not payload["devMode"]:
-            self.log_panel.append_log(
-                (
-                    "[주의] Npay 머니 자동결제 사용 · 선결제 상품은 실제 결제 버튼을 누릅니다."
-                    if payload["npayAutoPay"]
-                    else "[정보] Npay 자동결제 꺼짐 · 선결제 상품은 결제 직전 화면에서 대기합니다."
-                ),
-                "warning" if payload["npayAutoPay"] else "info",
-            )
-        if self.form.engine_mode_btn.get() == NAVER_MODE:
+        if is_naver:
             payload["naver_time_offset"] = getattr(self, "naver_time_offset", 0.0)
         try:
             self.active_engine = EngineRegistry.create(
