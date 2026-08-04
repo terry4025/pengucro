@@ -215,6 +215,40 @@ def test_fetch_slot_raw_keeps_page_booking_fields(monkeypatch):
     assert slot["prices"][0]["price"] == 33000
 
 
+@pytest.mark.parametrize(
+    "server_value,expected",
+    [
+        (None, False),
+        (False, False),
+        (True, True),
+    ],
+)
+def test_selected_slot_payment_timing_matches_naver_page_semantics(
+    monkeypatch, server_value, expected
+):
+    body = {"data": {"slotSeat": {"slot": {
+        "id": "1303986499",
+        "isPostPayment": server_value,
+    }}}}
+    api, calls = api_with(monkeypatch, body)
+
+    assert api.fetch_slot_post_payment("1303986499") is expected
+    variables = calls[0]["json"]["variables"]["slotSeatInput"]
+    assert variables == {
+        "businessId": "1498729",
+        "bizItemId": "7094790",
+        "slotId": "1303986499",
+    }
+
+
+def test_selected_slot_payment_timing_returns_unknown_for_incomplete_response(
+    monkeypatch,
+):
+    api, _ = api_with(monkeypatch, {"data": {"slotSeat": None}})
+
+    assert api.fetch_slot_post_payment("1303986499") is None
+
+
 def test_find_slot_matches_on_hhmm(monkeypatch):
     body = {"data": {"schedule": {"bizItemSchedule": {"hourly": [
         slot_payload(unitStartTime="2026-07-26 09:50:00", slotId="a"),

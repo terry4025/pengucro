@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import urllib.parse
 from typing import Any
@@ -74,6 +75,9 @@ from engines.naver_submit import (
     NaverBrowserSubmitter,
     NaverSubmitPayloadBuilder,
     NaverSubmitPreparation,
+    PAYMENT_BOOKING,
+    PAYMENT_NPAY_PREPAID,
+    PAYMENT_POSTPAID,
 )
 from pengucro.models import parse_bool_flag
 from pengucro.storage import SecretStore, data_path, load_json
@@ -358,6 +362,13 @@ class NaverEngine(BaseEngine):
     NAVIGATION_TIMEOUT_MS = 20000
     LOGIN_WAIT_SECONDS = 300.0
     CDP_CONNECT_TIMEOUT_MS = 12000
+    NPAY_PAGE_TIMEOUT_SECONDS = 20.0
+    NPAY_CONTROL_TIMEOUT_SECONDS = 15.0
+    # Locator.click() otherwise inherits Playwright's 30-second default.  The
+    # checkout controls are retried by our own loop, so a short per-action budget
+    # keeps the GUI stop button responsive even while Npay is still rendering.
+    NPAY_ACTION_TIMEOUT_MS = 750
+    NPAY_MONITOR_INTERVAL_SECONDS = 0.25
     # After the page contradicts the API and says 매진, wait this long before
     # driving the page again. The API poll keeps running at full speed regardless.
     TAKEN_BACKOFF_SECONDS = 0.6
@@ -438,6 +449,9 @@ class NaverEngine(BaseEngine):
         self._api_account: NaverAccount | None = None
         self._api_business: dict[str, Any] | None = None
         self._api_biz_item: dict[str, Any] | None = None
+        self._slot_post_payment: dict[str, bool] = {}
+        self._api_payment_signature: tuple[str, str, bool] | None = None
+        self._npay_booking_id = ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -491,6 +505,9 @@ class NaverEngine(BaseEngine):
         self._api_account = None
         self._api_business = None
         self._api_biz_item = None
+        self._slot_post_payment = {}
+        self._api_payment_signature = None
+        self._npay_booking_id = ""
         booking_url = self._resolve_url(reservation_data)
         if not booking_url:
             raise NaverApiError(
@@ -519,6 +536,20 @@ class NaverEngine(BaseEngine):
             f"네이버 예약 준비 · {meta.name or '상품'} · {target_date} {target_time}",
             "info",
         )
+        try:
+            self._api_biz_item = await asyncio.to_thread(
+                self.api.fetch_biz_item_raw
+            )
+        except Exception:
+            self._api_biz_item = None
+        if self._api_biz_item:
+            self._log_item_payment_preview(self._api_biz_item)
+        else:
+            self.log(
+                "[정보] 예약 시작 전 결제 방식 확인 대기 · 상품 정보를 아직 "
+                "받지 못해 대상 슬롯 공개 후 다시 판별합니다.",
+                "info",
+            )
         await asyncio.to_thread(self.clock.sync, True)
 
         blocked = meta.hard_block()
@@ -542,7 +573,7 @@ class NaverEngine(BaseEngine):
                 self.log(
                     f"[정보] 예약 오픈 예정 {meta.open_at:%Y-%m-%d %H:%M} · "
                     f"서버 시간 기준 {self._format_remaining(remaining)} 남음 · "
-                    "오픈 직전까지 대기하다가 오픈 시각에 새로고침 후 즉시 제출합니다.",
+                    "오픈 시각에는 준비된 API 직접 제출을 우선 사용합니다.",
                     "info",
                 )
             else:
@@ -610,6 +641,124 @@ class NaverEngine(BaseEngine):
             dev_mode=parse_bool_flag(reservation_data.get("devMode", False)),
         )
 
+    async def _augment_slot_payment(
+        self, slot: dict[str, Any] | None, *, timeout: float | None = None
+    ) -> dict[str, Any] | None:
+        """Attach the official selected-slot pre/post-payment flag once.
+
+        The public hourly schedule does not include this field.  Naver's own page
+        immediately follows a time selection with the read-only ``Slot`` query,
+        so doing the same during preparation lets us classify payment before the
+        opening boundary without rendering or clicking the timetable.
+        """
+        if not isinstance(slot, dict) or not isinstance(self._api_biz_item, dict):
+            return slot
+        if not parse_bool_flag(self._api_biz_item.get("isNPayUsed")):
+            return slot
+        slot_id = str(slot.get("slotId") or "")
+        if not slot_id or self.api is None:
+            return slot
+
+        resolved = self._slot_post_payment.get(slot_id)
+        if resolved is None:
+            fetcher = getattr(self.api, "fetch_slot_post_payment", None)
+            if not callable(fetcher):
+                return slot
+            try:
+                task = asyncio.to_thread(fetcher, slot_id)
+                value = (
+                    await asyncio.wait_for(task, timeout=timeout)
+                    if timeout is not None
+                    else await task
+                )
+            except Exception:
+                value = None
+            if value is None:
+                return slot
+            resolved = bool(value)
+            self._slot_post_payment[slot_id] = resolved
+
+        augmented = dict(slot)
+        augmented["_isPostPaymentResolved"] = True
+        augmented["isPostPayment"] = resolved
+        return augmented
+
+    def _log_item_payment_preview(self, biz_item: dict[str, Any]) -> None:
+        """Show a product-level payment type even before the target slot exists."""
+        if not parse_bool_flag(biz_item.get("isNPayUsed")):
+            mode = PAYMENT_BOOKING
+            source = "bizItem.isNPayUsed=false"
+        else:
+            raw_setting = biz_item.get("paymentSettingJson")
+            if isinstance(raw_setting, dict):
+                payment_setting = raw_setting
+            elif isinstance(raw_setting, str):
+                try:
+                    parsed = json.loads(raw_setting)
+                except (TypeError, ValueError):
+                    parsed = {}
+                payment_setting = parsed if isinstance(parsed, dict) else {}
+            else:
+                payment_setting = {}
+            payment_moment = str(
+                payment_setting.get("paymentMoment") or ""
+            ).upper()
+            mode = (
+                PAYMENT_POSTPAID
+                if payment_moment == "POST"
+                else PAYMENT_NPAY_PREPAID
+            )
+            source = (
+                "bizItem.paymentSettingJson.paymentMoment"
+                if payment_moment
+                else "bizItem.isNPayUsed=true·네이버 기본값(선결제)"
+            )
+
+        self._log_payment_preparation(
+            NaverSubmitPreparation(
+                False,
+                payment_mode=mode,
+                payment_source=source,
+            ),
+            provisional=True,
+        )
+
+    def _log_payment_preparation(
+        self,
+        preparation: NaverSubmitPreparation,
+        *,
+        provisional: bool = False,
+    ) -> None:
+        signature = (
+            preparation.payment_mode,
+            preparation.payment_source,
+            provisional,
+        )
+        if signature == self._api_payment_signature:
+            return
+        self._api_payment_signature = signature
+        if provisional:
+            suffix = (
+                "상품 정보 기준 1차 판별입니다. 대상 슬롯이 공개되면 "
+                "슬롯 정보로 최종 확인합니다."
+            )
+        else:
+            suffix = (
+                "API 선점 후 Npay 결제 화면으로 즉시 이동합니다."
+                if preparation.requires_checkout
+                else "예약번호 생성까지 API로 즉시 처리합니다."
+            )
+        self.log(
+            f"[정보] 예약 시작 전 결제 방식 확인 · {preparation.payment_label} · "
+            f"근거 {preparation.payment_source or '상품 메타데이터'} · {suffix}",
+            "success",
+        )
+
+    def _api_may_submit(self, dev_mode: bool) -> bool:
+        if not self._api_submit_enabled or self._api_preparation is None:
+            return False
+        return not dev_mode or self._api_preparation.requires_checkout
+
     async def _prepare_api_submit(self, reservation_data, dev_mode: bool) -> None:
         """Prepare the supported direct mutation without exposing its secrets."""
         if self._api_submit_blocked:
@@ -655,6 +804,7 @@ class NaverEngine(BaseEngine):
             slot = await asyncio.to_thread(
                 self.api.fetch_slot_raw, target_date, target_time
             )
+            slot = await self._augment_slot_payment(slot)
         except Exception as exc:
             self.log(
                 f"[경고] API 직접 제출 준비 실패 ({type(exc).__name__}) · "
@@ -711,7 +861,8 @@ class NaverEngine(BaseEngine):
                 "info",
             )
             return
-        if dev_mode:
+        self._log_payment_preparation(preparation)
+        if dev_mode and not preparation.requires_checkout:
             field_names = ", ".join(sorted(preparation.payload))
             self.log(
                 f"[정보] 개발자 테스트 · API 페이로드 검증 완료 · "
@@ -723,11 +874,19 @@ class NaverEngine(BaseEngine):
             return
 
         self._api_submit_enabled = True
-        self.log(
-            f"[정보] API 직접 제출 준비 완료 · slotId={preparation.slot_id} · "
-            "오픈 순간 페이지 새로고침 없이 제출합니다.",
-            "success",
-        )
+        if dev_mode:
+            self.log(
+                f"[정보] 개발자 테스트 · Npay API 임시 선점 준비 완료 · "
+                f"slotId={preparation.slot_id} · 오픈 순간 새로고침 없이 선점한 뒤 "
+                "최종 결제 직전에 멈춥니다.",
+                "warning",
+            )
+        else:
+            self.log(
+                f"[정보] API 직접 제출 준비 완료 · slotId={preparation.slot_id} · "
+                "오픈 순간 페이지 새로고침 없이 제출합니다.",
+                "success",
+            )
 
     async def _refresh_api_submit(self, reservation_data) -> bool:
         """Refresh volatile account/slot data without discarding a ready payload."""
@@ -765,6 +924,10 @@ class NaverEngine(BaseEngine):
             else self._api_account
         )
         slot = slot_result if isinstance(slot_result, dict) else None
+        if slot is not None:
+            slot = await self._augment_slot_payment(
+                slot, timeout=self.API_PREFLIGHT_SLOT_TIMEOUT_SECONDS
+            )
         if account is None or slot is None:
             self.log(
                 "[정보] API 오픈 직전 갱신이 지연되어 기존 검증값을 사용합니다.",
@@ -793,9 +956,11 @@ class NaverEngine(BaseEngine):
             != self._api_preparation.payload.get("csrfToken")
             or preparation.payload.get("price")
             != self._api_preparation.payload.get("price")
+            or preparation.payment_mode != self._api_preparation.payment_mode
         )
         self._api_account = account
         self._api_preparation = preparation
+        self._log_payment_preparation(preparation)
         if changed:
             self.log(
                 f"[정보] API 오픈 직전 갱신 완료 · slotId={preparation.slot_id}",
@@ -977,8 +1142,12 @@ class NaverEngine(BaseEngine):
                         "제출을 시작합니다.",
                         "warning",
                     )
-                    if self._api_submit_enabled and not dev_mode:
-                        outcome, detail = await self._submit_api_first(signature)
+                    if self._api_may_submit(dev_mode):
+                        outcome, detail = await self._submit_api_first(
+                            signature,
+                            reservation_data=reservation_data,
+                            dev_mode=dev_mode,
+                        )
                         if outcome == "fallback":
                             outcome, detail = await self._submit(
                                 target_date,
@@ -1009,9 +1178,18 @@ class NaverEngine(BaseEngine):
                 self.log(f"🎉 네이버 예약 성공! {detail}", "success")
                 self.notify_success()
                 return
+            if outcome == "stopped" or self.stop_event.is_set():
+                return
             if outcome == "dev":
                 while not self.stop_event.is_set():
                     await asyncio.sleep(0.5)
+                return
+            if outcome == "payment":
+                self.log(f"[정보] {detail}", "success")
+                completion = await self._monitor_npay_completion()
+                if completion:
+                    self.log(f"🎉 네이버 예약 결제 완료! {completion}", "success")
+                    self.notify_success()
                 return
             if outcome == "unknown":
                 self.log(
@@ -1353,7 +1531,11 @@ class NaverEngine(BaseEngine):
         )
 
     async def _submit_api_first(
-        self, signature: tuple[Any, ...] | None = None
+        self,
+        signature: tuple[Any, ...] | None = None,
+        *,
+        reservation_data: dict[str, Any] | None = None,
+        dev_mode: bool = False,
     ) -> tuple[str, str]:
         """Send the prepared mutation, retrying only the server's not-open reply."""
         if (
@@ -1389,6 +1571,16 @@ class NaverEngine(BaseEngine):
             )
 
             if result.outcome == SubmitOutcome.SUCCESS:
+                if self._api_preparation.requires_checkout:
+                    return await self._continue_npay_checkout(
+                        booking_id=result.booking_id,
+                        payment_url=self._normalize_payment_url(result.url),
+                        dev_mode=dev_mode,
+                        auto_pay=parse_bool_flag(
+                            (reservation_data or {}).get("npayAutoPay", False)
+                        ),
+                        navigate_immediately=True,
+                    )
                 return (
                     "success",
                     f"예약번호 {result.booking_id}"
@@ -1425,7 +1617,7 @@ class NaverEngine(BaseEngine):
     ) -> tuple[str, str]:
         """Own the opening moment: direct mutation first, browser fallback second."""
         remaining = self._seconds_until_open()
-        if self._api_prepare_pending and not dev_mode:
+        if self._api_prepare_pending:
             if remaining is not None and remaining > 0:
                 self.log(
                     f"[정보] 오픈 {remaining * 1000:.0f}ms 전 · "
@@ -1438,7 +1630,7 @@ class NaverEngine(BaseEngine):
             await self._prepare_api_submit(reservation_data, dev_mode=False)
             remaining = self._seconds_until_open()
 
-        if self._api_submit_enabled and not dev_mode:
+        if self._api_may_submit(dev_mode):
             if (
                 remaining is not None
                 and remaining >= self.API_PREFLIGHT_MIN_SECONDS
@@ -1455,7 +1647,10 @@ class NaverEngine(BaseEngine):
             if self.stop_event.is_set():
                 return "error", "중지됨"
 
-            outcome, detail = await self._submit_api_first()
+            outcome, detail = await self._submit_api_first(
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
             if outcome != "fallback":
                 return outcome, detail
             remaining = self._seconds_until_open()
@@ -1783,23 +1978,35 @@ class NaverEngine(BaseEngine):
             # not the disabled attribute -- until the required question is answered.
             submit = page.locator(
                 'button[class*="btn_request"], button:has-text("동의하고 예약하기"), '
-                'a:has-text("동의하고 예약하기")'
+                'button:has-text("동의하고 결제하기"), '
+                'a:has-text("동의하고 예약하기"), a:has-text("동의하고 결제하기")'
             ).first
             try:
                 await submit.wait_for(state="visible", timeout=4000)
             except Exception:
-                return "retry", "'동의하고 예약하기' 버튼을 찾지 못했습니다"
+                return "retry", "최종 예약·결제 버튼을 찾지 못했습니다"
 
             async def enabled():
                 classes = (await submit.get_attribute("class")) or ""
                 return "disabled" not in classes.lower()
 
             if not await self._poll_for(enabled, timeout=3.0, interval=0.025):
-                return "retry", "'동의하고 예약하기' 버튼이 계속 비활성 상태입니다"
+                return "retry", "최종 예약·결제 버튼이 계속 비활성 상태입니다"
             timing.mark("버튼활성")
             self.log(f"[정보] 제출 준비 완료 · {timing.summary()}", "info")
 
-            if dev_mode:
+            is_npay = await self._is_npay_submission(submit)
+            if is_npay:
+                self.log(
+                    "[정보] 네이버 선결제형 확인 · Npay 결제 단계로 진행합니다.",
+                    "info",
+                )
+            else:
+                self.log(
+                    "[정보] 네이버 예약 완료형 확인 · 예약번호 생성으로 완료 처리합니다.",
+                    "info",
+                )
+            if dev_mode and not is_npay:
                 # The debug dump is deliberately after the timing report so it
                 # cannot inflate the measurement of the real critical path.
                 await self._dump_debug(page)
@@ -1810,6 +2017,15 @@ class NaverEngine(BaseEngine):
                 )
                 return "dev", ""
 
+            if is_npay:
+                return await self._submit_npay(
+                    submit,
+                    dev_mode=dev_mode,
+                    auto_pay=parse_bool_flag(
+                        reservation_data.get("npayAutoPay", False)
+                    ),
+                )
+
             await submit.click()
             self.log("🚀 '동의하고 예약하기' 클릭", "warning")
             return await self._verify_result()
@@ -1818,6 +2034,501 @@ class NaverEngine(BaseEngine):
             if self.stop_event.is_set():
                 return "error", "중지됨"
             return "retry", f"{type(exc).__name__}: {str(exc)[:120]}"
+
+    async def _is_npay_submission(self, submit) -> bool:
+        """Classify the live action as checkout or booking-only/post-payment.
+
+        ``isNPayUsed`` also appears on some on-site/post-payment products, so the
+        final button rendered by Naver is the authoritative signal.  Metadata is
+        only a fallback when the live label cannot be read.
+        """
+        try:
+            text = re.sub(
+                r"\s+", " ", await submit.inner_text() or ""
+            ).strip().lower()
+        except Exception:
+            text = ""
+        if "결제" in text:
+            return True
+        if "예약" in text:
+            return False
+        if self._api_preparation is not None and self._api_preparation.ready:
+            return self._api_preparation.requires_checkout
+        if isinstance(self._api_biz_item, dict):
+            value = self._api_biz_item.get("isNPayUsed")
+            if value is not None:
+                return parse_bool_flag(value)
+        return "npay" in text or "naver pay" in text
+
+    @staticmethod
+    def _is_submit_booking_response(response) -> bool:
+        try:
+            if "/graphql" not in str(response.url):
+                return False
+            post_data = response.request.post_data or ""
+            return "submitBooking" in post_data
+        except Exception:
+            return False
+
+    @staticmethod
+    def _normalize_payment_url(raw_url: Any) -> str:
+        if isinstance(raw_url, dict):
+            raw_url = raw_url.get("pc") or raw_url.get("mobile") or ""
+        return str(raw_url or "")
+
+    @staticmethod
+    def _parse_submit_booking_response(payload: Any) -> tuple[str, str, str]:
+        """Return booking id, trusted navigation candidate, and server error."""
+        documents = payload if isinstance(payload, list) else [payload]
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
+            node = (document.get("data") or {}).get("submitBooking")
+            if isinstance(node, dict):
+                booking_id = str(node.get("bookingId") or "")
+                raw_url = NaverEngine._normalize_payment_url(node.get("url"))
+                return booking_id, raw_url, ""
+            errors = document.get("errors") or []
+            messages = [
+                str(error.get("message") or "")
+                for error in errors
+                if isinstance(error, dict) and error.get("message")
+            ]
+            if messages:
+                return "", "", " · ".join(messages)[:240]
+        return "", "", ""
+
+    @staticmethod
+    def _is_npay_url(url: str) -> bool:
+        try:
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+        except Exception:
+            return False
+        return host == "pay.naver.com" or host.endswith(".pay.naver.com")
+
+    async def _submit_npay(
+        self, submit, *, dev_mode: bool, auto_pay: bool
+    ) -> tuple[str, str]:
+        """Create the temporary booking, then drive the official Npay order page."""
+        page = self._page
+        if page is None:
+            return "error", "브라우저가 준비되지 않았습니다"
+
+        response = None
+        clicked = False
+        capture_error = ""
+        try:
+            async with page.expect_response(
+                self._is_submit_booking_response,
+                timeout=self.NAVIGATION_TIMEOUT_MS,
+            ) as response_info:
+                await submit.click()
+                clicked = True
+            response = await response_info.value
+        except Exception as exc:
+            capture_error = f"{type(exc).__name__}: {str(exc)[:100]}"
+            if not clicked:
+                try:
+                    await submit.click()
+                    clicked = True
+                except Exception as click_exc:
+                    return "retry", f"결제 예약 버튼 클릭 실패: {click_exc}"
+
+        self.log("🚀 '동의하고 결제하기' 클릭", "warning")
+
+        booking_id = ""
+        payment_url = ""
+        server_error = ""
+        if response is not None:
+            try:
+                booking_id, payment_url, server_error = (
+                    self._parse_submit_booking_response(await response.json())
+                )
+            except Exception as exc:
+                capture_error = f"응답 해석 실패: {type(exc).__name__}"
+
+        if server_error:
+            return self._classify(server_error), server_error
+
+        return await self._continue_npay_checkout(
+            booking_id=booking_id,
+            payment_url=payment_url,
+            dev_mode=dev_mode,
+            auto_pay=auto_pay,
+            navigate_immediately=False,
+            capture_error=capture_error,
+        )
+
+    async def _continue_npay_checkout(
+        self,
+        *,
+        booking_id: str,
+        payment_url: str,
+        dev_mode: bool,
+        auto_pay: bool,
+        navigate_immediately: bool,
+        capture_error: str = "",
+    ) -> tuple[str, str]:
+        """Continue an Npay hold created by either API or browser submission."""
+        if booking_id:
+            self._npay_booking_id = booking_id
+            self.log(
+                f"🎯 Npay 예약 자리 임시 선점 성공 · 예약번호 {booking_id} · "
+                "결제를 완료해야 최종 확정됩니다.",
+                "success",
+            )
+
+        if self.stop_event.is_set():
+            return "stopped", "중지됨"
+
+        payment_page = (
+            await self._navigate_to_npay_page(payment_url)
+            if navigate_immediately
+            else await self._wait_for_npay_page(payment_url)
+        )
+        if self.stop_event.is_set():
+            return "stopped", "중지됨"
+        if payment_page is None:
+            notice = await self._page_notice()
+            if notice and not booking_id:
+                return self._classify(notice), notice
+            if booking_id:
+                return (
+                    "payment",
+                    f"예약번호 {booking_id} 임시 선점 완료 · 결제 페이지 이동을 "
+                    "확인하지 못했습니다. 열린 Chrome에서 직접 확인해주세요.",
+                )
+            return (
+                "unknown",
+                "결제 제출 결과를 확인하지 못했습니다"
+                + (f" ({capture_error})" if capture_error else ""),
+            )
+
+        self._page = payment_page
+        selected, selection_detail = await self._select_npay_money(payment_page)
+        if self.stop_event.is_set():
+            return "stopped", "중지됨"
+        if not selected:
+            self.log(
+                f"[경고] Npay 머니를 자동 선택하지 못했습니다 · {selection_detail}",
+                "warning",
+            )
+            return (
+                "payment",
+                f"예약번호 {booking_id or '확인 필요'} 임시 선점 완료 · "
+                "Npay 머니를 직접 선택하고 결제해주세요.",
+            )
+
+        self.log(f"[정보] Npay 머니 선택 완료 · {selection_detail}", "success")
+        pay_button, button_text = await self._find_npay_pay_button(payment_page)
+        if self.stop_event.is_set():
+            return "stopped", "중지됨"
+        if pay_button is None:
+            return (
+                "payment",
+                f"예약번호 {booking_id or '확인 필요'} 임시 선점 완료 · "
+                "최종 결제 버튼을 찾지 못해 화면을 유지합니다.",
+            )
+
+        if dev_mode:
+            await self._dump_debug(payment_page, "naver_npay_checkout_debug.html")
+            self.log(
+                f"[완료] [개발자 테스트] Npay 머니를 선택하고 "
+                f"'{button_text}' 직전에 멈췄습니다. 결제하지 않습니다. "
+                f"예약번호 {booking_id or '확인 필요'}는 임시 선점 상태입니다.",
+                "success",
+            )
+            return "dev", ""
+
+        if not auto_pay:
+            return (
+                "payment",
+                f"예약번호 {booking_id or '확인 필요'} 임시 선점 완료 · "
+                f"Npay 자동결제가 꺼져 있어 '{button_text}' 직전에 대기합니다.",
+            )
+
+        try:
+            await pay_button.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await pay_button.click(timeout=5000)
+        except Exception as exc:
+            return (
+                "payment",
+                f"예약번호 {booking_id or '확인 필요'} 임시 선점 완료 · "
+                f"최종 결제 버튼 클릭 실패 ({type(exc).__name__}) · 직접 눌러주세요.",
+            )
+
+        self.log(f"💳 Npay 머니 '{button_text}' 클릭", "warning")
+        return (
+            "payment",
+            f"예약번호 {booking_id or '확인 필요'} · Npay 결제 요청을 전송했습니다. "
+            "추가 비밀번호·본인인증이 표시되면 Chrome에서 완료해주세요.",
+        )
+
+    async def _navigate_to_npay_page(self, payment_url: str):
+        """Use the trusted URL returned by direct submit without a render wait."""
+        if self._page is None or not self._is_npay_url(payment_url):
+            return None
+        try:
+            await self._page.goto(
+                payment_url, wait_until="domcontentloaded", timeout=10000
+            )
+        except Exception:
+            return None
+        return self._page
+
+    async def _wait_for_npay_page(self, payment_url: str = ""):
+        deadline = time.monotonic() + self.NPAY_PAGE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            pages = []
+            if self._context is not None:
+                try:
+                    pages.extend(list(self._context.pages))
+                except Exception:
+                    pass
+            if self._page is not None and self._page not in pages:
+                pages.append(self._page)
+
+            for candidate in reversed(pages):
+                try:
+                    url = candidate.url or ""
+                except Exception:
+                    continue
+                if not self._is_npay_url(url):
+                    continue
+                try:
+                    await candidate.bring_to_front()
+                    await candidate.wait_for_load_state(
+                        "domcontentloaded", timeout=5000
+                    )
+                except Exception:
+                    pass
+                return candidate
+            await asyncio.sleep(0.05)
+
+        # The mutation already created a booking. If Naver returned a trusted
+        # payment URL but its own redirect failed, use that exact URL once instead
+        # of submitting the booking again and risking a duplicate.
+        if self.stop_event.is_set():
+            return None
+        if self._page is not None and self._is_npay_url(payment_url):
+            try:
+                await self._page.goto(
+                    payment_url, wait_until="domcontentloaded", timeout=10000
+                )
+                return self._page
+            except Exception:
+                if self.stop_event.is_set():
+                    return False, "중지 요청"
+                pass
+        return None
+
+    async def _select_npay_money(self, page) -> tuple[bool, str]:
+        pattern = re.compile(
+            r"(?:N\s*pay|네이버\s*페이|네이버페이)\s*머니", re.IGNORECASE
+        )
+        deadline = time.monotonic() + self.NPAY_CONTROL_TIMEOUT_SECONDS
+        last_detail = "결제수단이 아직 표시되지 않았습니다"
+
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            # Accessible radio names are the most stable signal and work whether
+            # the visual label says Npay or 네이버페이.
+            try:
+                radios = page.get_by_role("radio", name=pattern)
+                count = min(await radios.count(), 8)
+                for index in range(count):
+                    radio = radios.nth(index)
+                    if not await radio.is_visible():
+                        continue
+                    try:
+                        if not await radio.is_checked():
+                            await radio.click(timeout=self.NPAY_ACTION_TIMEOUT_MS)
+                    except Exception:
+                        if self.stop_event.is_set():
+                            return False, "중지 요청"
+                        await radio.click(timeout=self.NPAY_ACTION_TIMEOUT_MS)
+                    if self.stop_event.is_set():
+                        return False, "중지 요청"
+                    if await self._npay_money_selected(page):
+                        return True, "접근성 라디오 상태 확인"
+                    last_detail = "Npay 머니 라디오를 눌렀지만 선택 상태를 확인하지 못했습니다"
+            except Exception:
+                pass
+
+            # Some Npay builds hide the native radio. Click the visible label/text
+            # and still require a checked/aria-checked/selected state afterward.
+            for candidate_factory in (
+                lambda: page.locator("label").filter(has_text=pattern),
+                lambda: page.get_by_text(pattern),
+            ):
+                try:
+                    candidates = candidate_factory()
+                    count = min(await candidates.count(), 12)
+                    for index in range(count):
+                        candidate = candidates.nth(index)
+                        if not await candidate.is_visible():
+                            continue
+                        await candidate.click(timeout=self.NPAY_ACTION_TIMEOUT_MS)
+                        if self.stop_event.is_set():
+                            return False, "중지 요청"
+                        if await self._npay_money_selected(page):
+                            return True, "화면 결제수단 선택 상태 확인"
+                        last_detail = (
+                            "Npay 머니 항목을 눌렀지만 선택 상태를 확인하지 못했습니다"
+                        )
+                        break
+                except Exception:
+                    if self.stop_event.is_set():
+                        return False, "중지 요청"
+                    continue
+
+            await asyncio.sleep(0.1)
+        return False, last_detail
+
+    @staticmethod
+    async def _npay_money_selected(page) -> bool:
+        script = r"""() => {
+            const rx = /(?:N\s*pay|네이버\s*페이|네이버페이)\s*머니/i;
+            const textOf = (el) => ((el && el.innerText) || '').replace(/\s+/g, ' ');
+            const controls = Array.from(document.querySelectorAll(
+                'input[type="radio"], [role="radio"], [aria-checked]'));
+            for (const control of controls) {
+                const scope = control.closest('label, li, article, section, div') || control;
+                if (!rx.test(textOf(scope))) continue;
+                if (control.checked || control.getAttribute('aria-checked') === 'true') return true;
+                const cls = ((control.className || '') + ' ' + (scope.className || '')).toLowerCase();
+                if (/(^|[\s_-])(selected|checked|active)([\s_-]|$)/.test(cls)) return true;
+                if (control.getAttribute('data-selected') === 'true'
+                    || scope.getAttribute('data-selected') === 'true') return true;
+            }
+            return false;
+        }"""
+        try:
+            return bool(await page.evaluate(script))
+        except Exception:
+            return False
+
+    async def _find_npay_pay_button(self, page):
+        pattern = re.compile(r"^(?:[\d,]+\s*원\s*)?결제하기$", re.IGNORECASE)
+        deadline = time.monotonic() + self.NPAY_CONTROL_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            pools = []
+            try:
+                pools.append(page.get_by_role("button", name=pattern))
+            except Exception:
+                pass
+            try:
+                pools.append(page.locator("button").filter(has_text=pattern))
+            except Exception:
+                pass
+
+            best = None
+            best_text = ""
+            best_score = -1
+            for pool in pools:
+                try:
+                    count = min(await pool.count(), 12)
+                except Exception:
+                    continue
+                for index in range(count):
+                    if self.stop_event.is_set():
+                        return None, "결제하기"
+                    candidate = pool.nth(index)
+                    try:
+                        if not await candidate.is_visible() or not await candidate.is_enabled():
+                            continue
+                        aria_disabled = await candidate.get_attribute("aria-disabled")
+                        classes = (await candidate.get_attribute("class") or "").lower()
+                        if aria_disabled == "true" or "disabled" in classes:
+                            continue
+                        text = re.sub(r"\s+", " ", await candidate.inner_text()).strip()
+                    except Exception:
+                        continue
+                    if not pattern.match(text):
+                        continue
+                    score = 2 if re.search(r"[\d,]+\s*원", text) else 1
+                    if score > best_score:
+                        best = candidate
+                        best_text = text
+                        best_score = score
+            if best is not None:
+                return best, best_text
+            await asyncio.sleep(0.1)
+        return None, "결제하기"
+
+    async def _monitor_npay_completion(self) -> str:
+        auth_reported = False
+        while not self.stop_event.is_set():
+            pages = []
+            if self._context is not None:
+                try:
+                    pages.extend(list(self._context.pages))
+                except Exception:
+                    pass
+            if self._page is not None and self._page not in pages:
+                pages.append(self._page)
+            if not pages:
+                return ""
+
+            for page in reversed(pages):
+                try:
+                    url = page.url or ""
+                except Exception:
+                    url = ""
+                if (
+                    page is not self._page
+                    and self._npay_booking_id
+                    and self._npay_booking_id not in url
+                ):
+                    continue
+                try:
+                    body = await page.locator("body").inner_text(timeout=1000)
+                except Exception:
+                    body = ""
+
+                success_text = (
+                    "결제가 완료", "결제 완료", "예약이 완료", "예약 완료",
+                    "예약되었습니다",
+                )
+                try:
+                    parsed = urllib.parse.urlparse(url)
+                    host = (parsed.hostname or "").lower()
+                    path = parsed.path.lower()
+                except Exception:
+                    host = ""
+                    path = ""
+                success_by_url = (
+                    host.endswith("booking.naver.com")
+                    and ("booking-detail" in path or "/my/bookings/" in path)
+                ) or (
+                    self._is_npay_url(url)
+                    and ("/complete" in path or "/completion" in path)
+                )
+                if success_by_url or any(
+                    token in body for token in success_text
+                ):
+                    self._page = page
+                    suffix = (
+                        f"예약번호 {self._npay_booking_id}"
+                        if self._npay_booking_id else url
+                    )
+                    return suffix or "완료 화면 확인"
+
+                if not auth_reported and any(
+                    token in body
+                    for token in ("결제 비밀번호", "본인인증", "비밀번호 입력", "생체인증")
+                ):
+                    auth_reported = True
+                    self._page = page
+                    self.log(
+                        "[정보] Npay 본인인증이 필요합니다. 열린 Chrome에서 인증하면 "
+                        "완료 상태를 계속 확인합니다.",
+                        "warning",
+                    )
+            await asyncio.sleep(self.NPAY_MONITOR_INTERVAL_SECONDS)
+        return ""
 
     async def _find_slot_button(
         self, target_minutes: int, target_date: str, reload_first: bool

@@ -709,6 +709,21 @@ class ReservationForm(ctk.CTkFrame):
         )
         self.captcha_notice_label.grid(row=1, column=0, sticky="ew")
 
+        self.npay_auto_pay_var = ctk.BooleanVar(value=False)
+        self.npay_auto_pay_checkbox = ctk.CTkCheckBox(
+            self.advanced_frame,
+            text="Npay 머니 자동결제 (실제 결제)",
+            variable=self.npay_auto_pay_var,
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.ACCENT_BLUE,
+            hover_color=theme.ACCENT_BLUE,
+            text_color=theme.TEXT_MUTE,
+            checkbox_width=14,
+            checkbox_height=14,
+            corner_radius=theme.ROUNDED_SM,
+            command=self.auto_save,
+        )
+
         self.catalog_auto_refresh_var = ctk.BooleanVar(value=True)
         self.catalog_auto_refresh_checkbox = ctk.CTkCheckBox(
             self.advanced_frame,
@@ -923,7 +938,7 @@ class ReservationForm(ctk.CTkFrame):
     # browser, so stopping short of the final click leaves something to inspect.
     # The HTTP engines post a form and have no such halfway point.
     DEV_MODE_ENGINE_IDS = ("naver", "keyescape")
-    DEV_MODE_TEXT_ON = "개발자 테스트 모드 (제출 직전에 멈추고 화면 유지)"
+    DEV_MODE_TEXT_ON = "개발자 테스트 (Npay는 임시 예약 후 결제 직전 정지)"
     DEV_MODE_TEXT_OFF = "개발자 테스트 모드 (네이버·키이스케이프 전용)"
 
     def _dev_mode_supported(self) -> bool:
@@ -941,6 +956,12 @@ class ReservationForm(ctk.CTkFrame):
         if not self._dev_mode_supported():
             return False
         return bool(self.dev_mode_checkbox.get())
+
+    def npay_auto_pay_enabled(self) -> bool:
+        """Final Npay payment is opt-in and only meaningful in Naver mode."""
+        if self.engine_mode_btn.get() != NAVER_MODE:
+            return False
+        return bool(self.npay_auto_pay_checkbox.get())
 
     def _update_dev_mode_state(self) -> None:
         if self._dev_mode_supported():
@@ -1008,6 +1029,11 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
             
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
+            self.captcha_notice_label.grid_forget()
+            self.npay_auto_pay_checkbox.grid(row=1, column=0, sticky="w")
+            self.npay_auto_pay_checkbox.configure(
+                state="normal", text_color=theme.TEXT_MUTE
+            )
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
@@ -1025,6 +1051,8 @@ class ReservationForm(ctk.CTkFrame):
             
             self._toggle_custom_theme()
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
+            self.npay_auto_pay_checkbox.grid_forget()
+            self.captcha_notice_label.grid(row=1, column=0, sticky="ew")
 
         self._update_dev_mode_state()
 
@@ -1061,6 +1089,7 @@ class ReservationForm(ctk.CTkFrame):
             self.engine_mode_btn,
             self.show_server_time_checkbox,
             self.dev_mode_checkbox,
+            self.npay_auto_pay_checkbox,
             self.advanced_toggle_btn,
             self.remember_personal_checkbox,
             self.catalog_auto_refresh_checkbox,
@@ -1318,6 +1347,7 @@ class ReservationForm(ctk.CTkFrame):
             # prevents a stale variable value from suppressing a real booking
             # after the user visibly turned developer mode off.
             "devMode": self.developer_mode_enabled(),
+            "npayAutoPay": self.npay_auto_pay_enabled(),
             "site_url": self.config.get("url", ""),
             "engine_metadata": {
                 "branch": self.config.get("branch_metadata", {}).get(branch_id, {}),
@@ -1570,6 +1600,7 @@ class ReservationForm(ctk.CTkFrame):
             else:
                 self.show_server_time_checkbox.deselect()
             self.catalog_auto_refresh_var.set(bool(config.get("catalog_auto_refresh", True)))
+            self.npay_auto_pay_var.set(bool(config.get("naver_npay_auto_pay", False)))
             if saved_site == self.current_site:
                 if not config.get("selected_branch_id"):
                     selected_branch_id = self._selected_branch_id()
@@ -1622,6 +1653,7 @@ class ReservationForm(ctk.CTkFrame):
                 "show_server_time": bool(self.show_server_time_checkbox.get()),
                 "remember_personal_info": remember_personal,
                 "catalog_auto_refresh": bool(self.catalog_auto_refresh_var.get()),
+                "naver_npay_auto_pay": bool(self.npay_auto_pay_var.get()),
                 "selected_branch_id": self._selected_branch_id(),
                 "selected_theme_id": self._selected_theme_id(),
             }

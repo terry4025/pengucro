@@ -8,7 +8,7 @@ import pytest
 
 from engines.naver_api import NaverSlot, SubmitOutcome, SubmitResult
 from engines.naver_engine import NaverEngine
-from engines.naver_submit import NaverSubmitPreparation
+from engines.naver_submit import PAYMENT_NPAY_PREPAID, NaverSubmitPreparation
 
 KST = timezone(timedelta(hours=9))
 
@@ -108,6 +108,18 @@ class FakePreparationApi:
             "maxBookingCount": 1,
             "prices": [{"priceId": "1", "price": 33000, "isImp": True}],
         }
+
+
+class FakeNpayPreparationApi(FakePreparationApi):
+    def fetch_biz_item_raw(self):
+        item = super().fetch_biz_item_raw()
+        item["isNPayUsed"] = True
+        item["paymentSettingJson"] = None
+        return item
+
+    def fetch_slot_post_payment(self, slot_id):
+        assert slot_id == "1331382668"
+        return False
 
 
 class DelayedSlotPreparationApi(FakePreparationApi):
@@ -266,6 +278,56 @@ def test_developer_mode_prepares_but_never_arms_transport():
     assert "csrf-secret" not in joined
     assert "01012345678" not in joined
     assert "홍길동" not in joined
+
+
+def test_npay_developer_mode_arms_only_temporary_api_hold():
+    logs = []
+    engine = NaverEngine(lambda message, _level: logs.append(message))
+    engine.api = FakeNpayPreparationApi()
+    engine._page = AccountPage()
+
+    asyncio.run(
+        engine._prepare_api_submit(PREPARATION_RESERVATION, dev_mode=True)
+    )
+
+    assert engine._api_submit_enabled is True
+    assert engine._api_preparation.requires_checkout is True
+    assert engine._api_preparation.payload["isNPayUsed"] is True
+    assert engine._api_preparation.payload["isPostPayment"] is False
+    joined = "\n".join(logs)
+    assert "예약 시작 전 결제 방식 확인" in joined
+    assert "네이버페이 선결제형" in joined
+    assert "새로고침 없이 선점" in joined
+    assert "최종 결제 직전" in joined
+
+
+@pytest.mark.parametrize(
+    ("biz_item", "expected"),
+    [
+        ({"isNPayUsed": False}, "예약 완료형(후결제·현장결제)"),
+        ({"isNPayUsed": True}, "네이버페이 선결제형"),
+        (
+            {
+                "isNPayUsed": True,
+                "paymentSettingJson": '{"paymentMoment":"POST"}',
+            },
+            "후결제형",
+        ),
+    ],
+)
+def test_payment_type_is_logged_from_item_before_slot_is_published(
+    biz_item, expected
+):
+    logs = []
+    engine = NaverEngine(lambda message, _level: logs.append(message))
+
+    engine._log_item_payment_preview(biz_item)
+
+    joined = "\n".join(logs)
+    assert "예약 시작 전 결제 방식 확인" in joined
+    assert expected in joined
+    assert "상품 정보 기준 1차 판별" in joined
+    assert "대상 슬롯이 공개되면" in joined
 
 
 def test_api_prepare_does_not_rearm_after_direct_path_was_blocked():
@@ -1088,3 +1150,308 @@ def test_poll_for_gives_up_and_survives_exceptions():
         raise RuntimeError("boom")
 
     assert asyncio.run(NaverEngine._poll_for(probe, timeout=0.1, interval=0.01)) is None
+
+
+class FakeNpayRequest:
+    post_data = '{"operationName":"submitBooking"}'
+
+
+class FakeNpayResponse:
+    url = "https://m.booking.naver.com/graphql"
+    request = FakeNpayRequest()
+
+    async def json(self):
+        return {"data": {"submitBooking": {
+            "bookingId": "1310923519",
+            "url": "https://order.pay.naver.com/orderSheet/test",
+        }}}
+
+
+class FakeExpectedResponse:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    @property
+    def value(self):
+        async def resolve():
+            return self.response
+        return resolve()
+
+
+class FakeNpayBookingPage:
+    def expect_response(self, predicate, timeout):
+        assert timeout > 0
+        response = FakeNpayResponse()
+        assert predicate(response) is True
+        return FakeExpectedResponse(response)
+
+
+class FakeClickButton:
+    def __init__(self):
+        self.clicks = 0
+        self.scrolls = 0
+
+    async def click(self, **_kwargs):
+        self.clicks += 1
+
+    async def scroll_into_view_if_needed(self):
+        self.scrolls += 1
+
+
+class FakeLabeledSubmit:
+    def __init__(self, text):
+        self.text = text
+
+    async def inner_text(self):
+        return self.text
+
+
+def configure_fake_npay_checkout(engine, pay_button):
+    checkout_page = object()
+
+    async def wait_for_page(_payment_url):
+        return checkout_page
+
+    async def navigate_to_page(payment_url):
+        assert payment_url == "https://order.pay.naver.com/orderSheet/test"
+        return checkout_page
+
+    async def select_money(page):
+        assert page is checkout_page
+        return True, "선택 확인"
+
+    async def find_pay_button(page):
+        assert page is checkout_page
+        return pay_button, "50,000원 결제하기"
+
+    async def dump_debug(_page, _filename):
+        return None
+
+    engine._wait_for_npay_page = wait_for_page
+    engine._navigate_to_npay_page = navigate_to_page
+    engine._select_npay_money = select_money
+    engine._find_npay_pay_button = find_pay_button
+    engine._dump_debug = dump_debug
+
+
+def test_npay_response_parser_extracts_booking_before_payment_redirect():
+    booking_id, url, error = NaverEngine._parse_submit_booking_response({
+        "data": {"submitBooking": {
+            "bookingId": "1310923519",
+            "url": {"pc": "https://order.pay.naver.com/orderSheet/test"},
+        }}
+    })
+
+    assert booking_id == "1310923519"
+    assert NaverEngine._is_npay_url(url) is True
+    assert error == ""
+
+
+def test_direct_npay_api_hold_continues_to_checkout_without_page_submission():
+    engine = make_engine()
+    pay_button = FakeClickButton()
+    configure_fake_npay_checkout(engine, pay_button)
+    arm_direct_submit(engine, [
+        SubmitResult(
+            SubmitOutcome.SUCCESS,
+            booking_id="1310923519",
+            url={"pc": "https://order.pay.naver.com/orderSheet/test"},
+        )
+    ])
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={"slotId": "1303986499", "isNPayUsed": True},
+        slot_id="1303986499",
+        payment_mode=PAYMENT_NPAY_PREPAID,
+        payment_source="slotSeat.isPostPayment",
+    )
+
+    outcome, detail = asyncio.run(engine._submit_api_first(
+        reservation_data={"npayAutoPay": False},
+        dev_mode=False,
+    ))
+
+    assert outcome == "payment"
+    assert "자동결제가 꺼져" in detail
+    assert engine._api_submitter.calls == 1
+    assert engine._npay_booking_id == "1310923519"
+    assert pay_button.clicks == 0
+
+
+def test_direct_npay_developer_mode_creates_hold_but_never_pays():
+    engine = make_engine()
+    pay_button = FakeClickButton()
+    configure_fake_npay_checkout(engine, pay_button)
+    arm_direct_submit(engine, [
+        SubmitResult(
+            SubmitOutcome.SUCCESS,
+            booking_id="1310923519",
+            url={"pc": "https://order.pay.naver.com/orderSheet/test"},
+        )
+    ])
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={"slotId": "1303986499", "isNPayUsed": True},
+        slot_id="1303986499",
+        payment_mode=PAYMENT_NPAY_PREPAID,
+    )
+
+    assert engine._api_may_submit(dev_mode=True) is True
+    outcome, _detail = asyncio.run(engine._submit_api_first(
+        reservation_data={"npayAutoPay": True},
+        dev_mode=True,
+    ))
+
+    assert outcome == "dev"
+    assert engine._api_submitter.calls == 1
+    assert pay_button.clicks == 0
+
+
+def test_live_booking_label_overrides_npay_metadata_for_post_payment():
+    engine = make_engine()
+    engine._api_biz_item = {
+        "isNPayUsed": True,
+        "isPostPayment": True,
+    }
+
+    is_npay = asyncio.run(engine._is_npay_submission(
+        FakeLabeledSubmit("동의하고 예약하기")
+    ))
+
+    assert is_npay is False
+
+
+def test_live_payment_label_selects_npay_checkout():
+    engine = make_engine()
+    engine._api_biz_item = {"isNPayUsed": True}
+
+    is_npay = asyncio.run(engine._is_npay_submission(
+        FakeLabeledSubmit("50,000원 결제하기")
+    ))
+
+    assert is_npay is True
+
+
+def test_npay_metadata_is_only_used_when_live_label_is_unavailable():
+    engine = make_engine()
+    engine._api_biz_item = {"isNPayUsed": True}
+
+    is_npay = asyncio.run(engine._is_npay_submission(FakeLabeledSubmit("")))
+
+    assert is_npay is True
+
+
+def test_npay_developer_mode_stops_before_final_payment_click():
+    engine = make_engine()
+    engine._page = FakeNpayBookingPage()
+    booking_button = FakeClickButton()
+    pay_button = FakeClickButton()
+    configure_fake_npay_checkout(engine, pay_button)
+
+    outcome, _detail = asyncio.run(engine._submit_npay(
+        booking_button, dev_mode=True, auto_pay=True
+    ))
+
+    assert outcome == "dev"
+    assert booking_button.clicks == 1
+    assert pay_button.clicks == 0
+    assert engine._npay_booking_id == "1310923519"
+
+
+def test_npay_auto_pay_clicks_final_button_exactly_once():
+    engine = make_engine()
+    engine._page = FakeNpayBookingPage()
+    booking_button = FakeClickButton()
+    pay_button = FakeClickButton()
+    configure_fake_npay_checkout(engine, pay_button)
+
+    outcome, detail = asyncio.run(engine._submit_npay(
+        booking_button, dev_mode=False, auto_pay=True
+    ))
+
+    assert outcome == "payment"
+    assert "결제 요청" in detail
+    assert booking_button.clicks == 1
+    assert pay_button.clicks == 1
+    assert pay_button.scrolls == 1
+
+
+def test_npay_auto_pay_opt_out_leaves_button_for_manual_payment():
+    engine = make_engine()
+    engine._page = FakeNpayBookingPage()
+    booking_button = FakeClickButton()
+    pay_button = FakeClickButton()
+    configure_fake_npay_checkout(engine, pay_button)
+
+    outcome, detail = asyncio.run(engine._submit_npay(
+        booking_button, dev_mode=False, auto_pay=False
+    ))
+
+    assert outcome == "payment"
+    assert "자동결제가 꺼져" in detail
+    assert booking_button.clicks == 1
+    assert pay_button.clicks == 0
+
+
+def test_npay_checkout_stops_before_control_scan_when_stop_is_requested():
+    engine = make_engine()
+    checkout_page = object()
+
+    async def navigate(_payment_url):
+        engine.stop_event.set()
+        return checkout_page
+
+    async def must_not_scan(_page):
+        raise AssertionError("중지 후에는 Npay 결제수단을 탐색하면 안 됩니다")
+
+    engine._navigate_to_npay_page = navigate
+    engine._select_npay_money = must_not_scan
+
+    outcome, detail = asyncio.run(engine._continue_npay_checkout(
+        booking_id="1311029802",
+        payment_url="https://order.pay.naver.com/orderSheet/test",
+        dev_mode=False,
+        auto_pay=False,
+        navigate_immediately=True,
+    ))
+
+    assert outcome == "stopped"
+    assert detail == "중지됨"
+
+
+def test_npay_money_click_uses_short_timeout_and_honors_stop_immediately():
+    engine = make_engine()
+
+    class Radio:
+        async def is_visible(self):
+            return True
+
+        async def is_checked(self):
+            return False
+
+        async def click(self, *, timeout):
+            assert timeout == engine.NPAY_ACTION_TIMEOUT_MS
+            engine.stop_event.set()
+
+    class RadioPool:
+        async def count(self):
+            return 1
+
+        def nth(self, _index):
+            return Radio()
+
+    class CheckoutPage:
+        def get_by_role(self, _role, name):
+            assert name is not None
+            return RadioPool()
+
+    selected, detail = asyncio.run(engine._select_npay_money(CheckoutPage()))
+
+    assert selected is False
+    assert detail == "중지 요청"

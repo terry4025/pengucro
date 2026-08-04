@@ -133,6 +133,20 @@ HOURLY_SCHEDULE_QUERY = """query hourlySchedule($scheduleParams: ScheduleParams)
   }
 }"""
 
+# Naver's request page does not decide pre-payment from ``isNPayUsed`` alone.
+# The authoritative flag belongs to the selected slot and is fetched by the
+# official page as soon as a time is selected.  ``null`` is deliberately treated
+# as false by that page (pre-payment); true means the booking completes without
+# opening the immediate Npay checkout.
+SLOT_PAYMENT_QUERY = """query Slot($slotSeatInput: SlotSeatParams) {
+  slotSeat(input: $slotSeatInput) {
+    slot {
+      id
+      isPostPayment
+    }
+  }
+}"""
+
 # bookableSettingJson and friends are JSON scalars: selecting subfields on them is
 # a hard GraphQL error ("must not have a selection since type JSON has no
 # subfields"), so they are requested bare.
@@ -620,6 +634,29 @@ class NaverBookingApi:
             if slot is not None and slot.time_str == wanted:
                 return entry
         return None
+
+    def fetch_slot_post_payment(self, slot_id: str) -> bool | None:
+        """Return the official selected-slot payment timing.
+
+        The GraphQL field is nullable.  Naver's own client interprets both
+        ``null`` and ``false`` as immediate payment, so a successful response
+        containing either value returns ``False`` here.  ``None`` is reserved for
+        an incomplete response where the timing could not be resolved.
+        """
+        if not slot_id:
+            return None
+        data = self._post("Slot", SLOT_PAYMENT_QUERY, {
+            "slotSeatInput": {
+                "businessId": self.business_id,
+                "bizItemId": self.biz_item_id,
+                "slotId": str(slot_id),
+            },
+        })
+        slot_seat = data.get("slotSeat") or {}
+        slot = slot_seat.get("slot") if isinstance(slot_seat, dict) else None
+        if not isinstance(slot, dict) or "isPostPayment" not in slot:
+            return None
+        return slot.get("isPostPayment") is True
 
     def find_slot(self, date_str: str, time_str: str) -> NaverSlot | None:
         """The slot for one date and ``HH:MM``, or None when it does not exist yet."""

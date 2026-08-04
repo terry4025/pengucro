@@ -1,15 +1,16 @@
 """Build and send Naver's direct ``submitBooking`` request.
 
-The page itself still owns authentication. This module only supports the simple
-EPISODE shape used by the escape-room products: no seats, no fixed period and no
-Naver Pay checkout. Unsupported products deliberately fall back to the browser
-flow instead of guessing at a payment or seating payload.
+The page itself still owns authentication. This module supports the EPISODE
+shape used by escape-room products, including ordinary completion, Npay
+pre-payment and post-payment. Seat and fixed-period products still fall back to
+the browser because their payloads have materially different state.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,9 @@ from engines.naver_api import (
 
 EPISODE_BUSINESS_TYPE_ID = 12
 TERMS_VERSION = "20251030"
+PAYMENT_BOOKING = "booking"
+PAYMENT_NPAY_PREPAID = "npay_prepaid"
+PAYMENT_POSTPAID = "postpaid"
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,20 @@ class NaverSubmitPreparation:
     payload: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     slot_id: str = ""
+    payment_mode: str = PAYMENT_BOOKING
+    payment_source: str = ""
+
+    @property
+    def requires_checkout(self) -> bool:
+        return self.payment_mode == PAYMENT_NPAY_PREPAID
+
+    @property
+    def payment_label(self) -> str:
+        return {
+            PAYMENT_BOOKING: "예약 완료형(후결제·현장결제)",
+            PAYMENT_NPAY_PREPAID: "네이버페이 선결제형",
+            PAYMENT_POSTPAID: "후결제형",
+        }.get(self.payment_mode, self.payment_mode or "알 수 없음")
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -62,6 +80,55 @@ def _iso_millis_utc(value: datetime) -> str:
 
 def _digits(value: Any) -> str:
     return re.sub(r"\D", "", str(value or ""))
+
+
+def _bool_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return copy.deepcopy(loaded) if isinstance(loaded, dict) else {}
+    return {}
+
+
+def _payment_profile(
+    biz_item: Mapping[str, Any], slot: Mapping[str, Any]
+) -> tuple[str, str, bool, bool, dict[str, Any]]:
+    """Mirror the official request page's pre/post-payment decision.
+
+    ``isNPayUsed`` only means that the merchant is connected to Npay.  The
+    selected slot's ``isPostPayment`` field is authoritative.  Naver treats a
+    successful Slot query returning null as false (immediate checkout), which is
+    why the engine carries an explicit ``_isPostPaymentResolved`` marker.
+    """
+    is_npay_used = _bool_flag(biz_item.get("isNPayUsed"))
+    payment_setting = _json_mapping(biz_item.get("paymentSettingJson"))
+    if not is_npay_used:
+        return PAYMENT_BOOKING, "bizItem.isNPayUsed=false", False, False, payment_setting
+
+    if _bool_flag(slot.get("_isPostPaymentResolved")):
+        is_post_payment = slot.get("isPostPayment") is True
+        source = "slotSeat.isPostPayment"
+    else:
+        payment_moment = str(payment_setting.get("paymentMoment") or "").upper()
+        is_post_payment = payment_moment == "POST"
+        source = (
+            "bizItem.paymentSettingJson.paymentMoment"
+            if payment_moment
+            else "네이버 기본값(선결제)"
+        )
+
+    mode = PAYMENT_POSTPAID if is_post_payment else PAYMENT_NPAY_PREPAID
+    return mode, source, True, is_post_payment, payment_setting
 
 
 def _first_resource(resources: Any) -> str | None:
@@ -136,14 +203,30 @@ class NaverSubmitPayloadBuilder:
             return NaverSubmitPreparation(
                 False, reason="이 상품 유형의 API 직접 제출은 지원하지 않습니다"
             )
+        if biz_item.get("isSeatUsed") or biz_item.get("isPeriodFixed"):
+            return NaverSubmitPreparation(
+                False,
+                reason="좌석제·기간제 상품은 API 직접 제출을 지원하지 않습니다",
+            )
+
+        (
+            payment_mode,
+            payment_source,
+            is_npay_used,
+            is_post_payment,
+            payment_setting,
+        ) = _payment_profile(biz_item, slot)
         if (
-            biz_item.get("isSeatUsed")
-            or biz_item.get("isPeriodFixed")
-            or biz_item.get("isNPayUsed")
+            is_npay_used
+            and is_post_payment
+            and str(payment_setting.get("paymentMoment") or "").upper() == "POST"
+            and not payment_setting.get("userSelectedPaymentMethod")
         ):
             return NaverSubmitPreparation(
                 False,
-                reason="좌석제·기간제·네이버페이 상품은 API 직접 제출을 지원하지 않습니다",
+                reason="후결제 결제수단이 아직 선택되지 않아 API 페이로드를 확정할 수 없습니다",
+                payment_mode=payment_mode,
+                payment_source=payment_source,
             )
 
         start = _parse_datetime(slot.get("unitStartDateTime"))
@@ -211,7 +294,7 @@ class NaverSubmitPayloadBuilder:
         payload: dict[str, Any] = {
             "bookingId": None,
             "businessTypeId": EPISODE_BUSINESS_TYPE_ID,
-            "isNPayUsed": False,
+            "isNPayUsed": is_npay_used,
             "businessId": str(business.get("businessId") or ""),
             "businessName": str(
                 raw_names.get("name") or business.get("name") or ""
@@ -252,7 +335,7 @@ class NaverSubmitPayloadBuilder:
             "isSmsAlarm": account.is_sms_alarm,
             "csrfToken": account.csrf_token,
             "optionCategories": [],
-            "isPostPayment": False,
+            "isPostPayment": is_post_payment,
             "slotId": str(slot.get("slotId") or ""),
             "startMinute": start_minute,
             "endDate": start_kst.strftime("%Y-%m-%d"),
@@ -261,7 +344,7 @@ class NaverSubmitPayloadBuilder:
             "visitorName": "",
             "visitorPhone": "",
             "hasVisitor": False,
-            "paymentSettingJson": None,
+            "paymentSettingJson": payment_setting or None,
             "extraFeeJson": {},
             "nPayRegStatusCode": business.get("nPayRegStatusCode"),
             "startDate": start_kst.strftime("%Y-%m-%d"),
@@ -313,6 +396,8 @@ class NaverSubmitPayloadBuilder:
             True,
             payload=payload,
             slot_id=str(payload["slotId"]),
+            payment_mode=payment_mode,
+            payment_source=payment_source,
         )
 
 

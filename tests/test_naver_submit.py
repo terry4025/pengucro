@@ -163,8 +163,8 @@ def test_builder_rejects_account_without_login_or_csrf():
     assert "csrf-secret" not in result.reason
 
 
-def test_builder_rejects_unsupported_seat_period_and_npay_products():
-    for field in ("isSeatUsed", "isPeriodFixed", "isNPayUsed"):
+def test_builder_rejects_unsupported_seat_and_period_products():
+    for field in ("isSeatUsed", "isPeriodFixed"):
         item = deepcopy(BIZ_ITEM)
         item[field] = True
 
@@ -172,6 +172,58 @@ def test_builder_rejects_unsupported_seat_period_and_npay_products():
 
         assert result.ready is False
         assert "지원하지" in result.reason
+
+
+def test_builder_supports_npay_prepaid_without_page_refresh():
+    item = deepcopy(BIZ_ITEM)
+    item["isNPayUsed"] = True
+    item["paymentSettingJson"] = None
+    slot = deepcopy(SLOT)
+    slot["_isPostPaymentResolved"] = True
+    slot["isPostPayment"] = False
+
+    result = prepare(biz_item=item, slot=slot)
+
+    assert result.ready is True
+    assert result.requires_checkout is True
+    assert result.payment_label == "네이버페이 선결제형"
+    assert result.payment_source == "slotSeat.isPostPayment"
+    assert result.payload["isNPayUsed"] is True
+    assert result.payload["isPostPayment"] is False
+    assert result.payload["paymentSettingJson"] is None
+
+
+def test_builder_supports_npay_postpaid_as_booking_completion():
+    item = deepcopy(BIZ_ITEM)
+    item["isNPayUsed"] = True
+    item["paymentSettingJson"] = None
+    slot = deepcopy(SLOT)
+    slot["_isPostPaymentResolved"] = True
+    slot["isPostPayment"] = True
+
+    result = prepare(biz_item=item, slot=slot)
+
+    assert result.ready is True
+    assert result.requires_checkout is False
+    assert result.payment_label == "후결제형"
+    assert result.payload["isNPayUsed"] is True
+    assert result.payload["isPostPayment"] is True
+
+
+def test_builder_uses_item_payment_moment_before_slot_detail_is_available():
+    item = deepcopy(BIZ_ITEM)
+    item["isNPayUsed"] = True
+    item["paymentSettingJson"] = {
+        "paymentMoment": "POST",
+        "userSelectedPaymentMethod": "ONSITE",
+    }
+
+    result = prepare(biz_item=item)
+
+    assert result.ready is True
+    assert result.payment_label == "후결제형"
+    assert result.payment_source == "bizItem.paymentSettingJson.paymentMoment"
+    assert result.payload["paymentSettingJson"]["userSelectedPaymentMethod"] == "ONSITE"
 
 
 def test_builder_rejects_slot_that_does_not_match_target_time():

@@ -73,6 +73,7 @@ class ReservationRequest:
     site_url: str = ""
     naver_time_offset: float = 0.0
     engine_metadata: Mapping[str, Any] = field(default_factory=dict)
+    npay_auto_pay: bool = False
 
     @classmethod
     def from_mapping(cls, site: str, values: Mapping[str, Any]) -> "ReservationRequest":
@@ -95,6 +96,7 @@ class ReservationRequest:
             payment_type=str(values.get("paymentType", "1")),
             policy=str(values.get("policy", "true")).lower() == "true",
             developer_mode=parse_bool_flag(values.get("devMode", False)),
+            npay_auto_pay=parse_bool_flag(values.get("npayAutoPay", False)),
             site_url=str(values.get("site_url", "")).strip(),
             naver_time_offset=float(values.get("naver_time_offset", 0.0) or 0.0),
             engine_metadata=dict(values.get("engine_metadata", {})),
@@ -137,6 +139,7 @@ class ReservationRequest:
             "paymentType": self.payment_type,
             "policy": "true" if self.policy else "false",
             "devMode": self.developer_mode,
+            "npayAutoPay": self.npay_auto_pay,
             "site_url": self.site_url,
             "naver_time_offset": self.naver_time_offset,
             "branchLabel": self.branch_label,
@@ -155,8 +158,13 @@ class ReservationRequest:
             f"예약자: {self.name}\n"
             f"실행 방식: "
             + (
-                "개발자 테스트 (실제 제출 안 함)"
+                "개발자 테스트 (Npay 선결제는 임시 예약 후 결제 직전 정지)"
                 if self.developer_mode
                 else "실제 예약 제출"
+            )
+            + (
+                "\nNpay 머니 자동결제: 사용"
+                if self.npay_auto_pay and not self.developer_mode
+                else ""
             )
         )

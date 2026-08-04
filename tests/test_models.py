@@ -100,4 +100,23 @@ def test_summary_uses_human_readable_labels():
 
 def test_summary_makes_developer_mode_unmistakable():
     request = valid_request(developer_mode=True)
-    assert "개발자 테스트 (실제 제출 안 함)" in request.summary()
+    assert "Npay 선결제는 임시 예약 후 결제 직전 정지" in request.summary()
+
+
+def test_npay_auto_pay_is_explicit_and_round_trips_to_engine_payload():
+    request = ReservationRequest.from_mapping(
+        "네이버 예약",
+        {
+            "branch": "1",
+            "reservationDate": (date.today() + timedelta(days=1)).isoformat(),
+            "reservationTime": "14:30",
+            "name": "홍길동",
+            "people": "2",
+            "themePK": "https://booking.naver.com/items/1",
+            "npayAutoPay": True,
+        },
+    )
+
+    assert request.npay_auto_pay is True
+    assert request.to_engine_payload()["npayAutoPay"] is True
+    assert "Npay 머니 자동결제: 사용" in request.summary()
