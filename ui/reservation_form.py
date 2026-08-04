@@ -1422,7 +1422,7 @@ class ReservationForm(ctk.CTkFrame):
 
         client = YesCaptchaClient(client_key, soft_id)
         ok, balance, msg = client.get_balance()
-        
+
         main_win = self.winfo_toplevel()
         if hasattr(main_win, "log_panel") and hasattr(main_win.log_panel, "append_log"):
             main_win.log_panel.append_log(f"[YesCaptcha] {msg}", "success" if ok else "error")
