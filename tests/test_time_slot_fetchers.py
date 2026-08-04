@@ -1,5 +1,6 @@
 from __future__ import annotations
 import pytest
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 from engines.time_slot_fetchers import (
     fetch_any_time_slots,
@@ -211,6 +212,82 @@ def test_fetch_naver_slots_without_item_id_returns_empty(monkeypatch):
         date_str="2026-07-28",
         timeout=5.0,
     ) == []
+
+
+def test_fetch_naver_slots_uses_same_weekday_template_when_date_is_closed(monkeypatch):
+    """A disabled Naver calendar day has no hourly records of its own.
+
+    The picker must still offer its timetable by copying the most recent schedule
+    for the same weekday.  These are selectable template times, not claims that
+    the still-closed target date is already bookable.
+    """
+    import engines.naver_api as naver_api
+
+    kst = timezone(timedelta(hours=9))
+
+    def payload(time_text, slot_id):
+        return {
+            "id": slot_id,
+            "slotId": slot_id,
+            "scheduleId": "schedule",
+            "detailScheduleId": None,
+            "unitStartTime": time_text,
+            "stock": 1,
+            "bookingCount": 1,
+            "occupiedBookingCount": 0,
+            "isBusinessDay": True,
+            "isSaleDay": True,
+            "isUnitSaleDay": True,
+            "isUnitBusinessDay": True,
+            "isHoliday": False,
+            "minBookingCount": 1,
+            "maxBookingCount": 1,
+            "saleStartDateTime": None,
+            "saleEndDateTime": None,
+        }
+
+    class FakeApi:
+        def __init__(self, *_args, **_kwargs):
+            self.calls = []
+
+        def fetch_slots(self, date_from, date_to=None):
+            self.calls.append((date_from, date_to))
+            if date_from == "2026-08-09" and date_to is None:
+                return []
+            return [
+                naver_api.NaverSlot.from_payload(payload("2026-08-01 09:40:00", "sat")),
+                naver_api.NaverSlot.from_payload(payload("2026-08-02 13:45:00", "sun-1")),
+                naver_api.NaverSlot.from_payload(payload("2026-08-02 15:00:00", "sun-2")),
+            ]
+
+        def fetch_item_meta(self):
+            return naver_api.NaverItemMeta(
+                name="버디",
+                server_time=datetime(2026, 8, 2, 18, 0, tzinfo=kst),
+                is_closed_booking=False,
+                is_closed_for_user=False,
+                open_at=datetime(2026, 8, 1, 22, 0, tzinfo=kst),
+                is_opened=True,
+                uses_open_schedule=True,
+                is_paused=False,
+                custom_form=[],
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(naver_api, "NaverBookingApi", FakeApi)
+
+    slots = fetch_naver_slots(
+        "https://booking.naver.com/booking/12/bizes/1325520/items/6446475",
+        "2026-08-09",
+        5.0,
+    )
+
+    assert [slot.time for slot in slots] == ["13:45", "15:00"]
+    assert all(slot.available is False for slot in slots)
+    assert all(slot.estimated is True for slot in slots)
+    assert all(slot.source_date == "2026-08-02" for slot in slots)
 
 
 def test_fetch_any_time_slots_routing(monkeypatch):

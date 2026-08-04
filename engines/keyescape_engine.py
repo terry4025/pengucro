@@ -5,9 +5,10 @@ Flow
 1. The program enters Step 2 (``reservation2.php``) and fills in the reservation
    details -- name, the three phone fields, party size, payment method and the
    consent checkboxes.
-2. The **user** solves the reCAPTCHA by hand. The program only observes whether
-   a token is present; it never solves, submits or otherwise works around the
-   challenge. There is no third-party solving service any more.
+2. With YesCaptcha enabled, an API token is acquired shortly before opening and
+   verified in the actual form before submission. With it disabled, the program
+   only observes a token the user solved manually and never clicks or patches the
+   widget.
 3. The program polls the site's own availability endpoint until the backend
    reports the target slot as actually bookable, then presses 예약하기 and
    confirms the outcome.
@@ -37,7 +38,8 @@ import requests
 from engines import browser_session
 from engines.base_engine import BaseEngine
 from engines.server_clock import ServerClock
-from pengucro.models import BookingResult
+from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
+from pengucro.models import BookingResult, coerce_bool
 from pengucro.storage import append_history, data_path, load_json
 
 
@@ -55,6 +57,12 @@ SERVER_OPEN_TIME_PATTERN = re.compile(r"예약\s*오픈\s*시간[^0-9]{0,6}(\d{1
 # Text the site paints over document.body once its devtools detector fires.
 # Used to recognise a wiped page instead of polling a corpse forever.
 DEVTOOLS_BLOCK_MARKER = "개발자 도구 사용이 금지"
+
+# reCAPTCHA v2 site key as rendered by reservation2.php
+# (<span id="captcha" class="g-recaptcha" data-sitekey="...">). Only a fallback:
+# the key is read off the live page so a rotation does not silently produce
+# tokens for the wrong widget. Kept in sync with reference/keyescape.
+FALLBACK_SITEKEY = "6Le0ObMqAAAAAF7j701m2aQsHLQFe_KDYpKvw3jQ"
 
 # Neutralises the site's devtools guard *before* its own scripts run.
 #
@@ -167,8 +175,22 @@ class KeyescapeEngine(BaseEngine):
     # reCAPTCHA v2 tokens are single use and expire in about two minutes.
     CAPTCHA_TTL_SECONDS = 115
     CAPTCHA_WARN_SECONDS = 25
+    # Start close enough to the open moment that a fast result is submitted
+    # within YesCaptcha's recommended 60-second window. A slower task may finish
+    # after opening; the watch loop submits it immediately when it arrives.
+    CAPTCHA_SOLVE_LEAD = 60.0
+    CAPTCHA_SOLVE_TIMEOUT = 120
+    # Re-request once the token has less than this much life left.
+    CAPTCHA_REFRESH_MARGIN = 30.0
+    YESCAPTCHA_MAX_FAILURES = 4
+    YESCAPTCHA_RETRY_COOLDOWN = 5.0
+    # Manual mode only: the widget is poked at most this often, this many times.
+    ANCHOR_CLICK_COOLDOWN = 25.0
+    ANCHOR_CLICK_MAX = 2
 
+    MAX_STANDBY_PAGES = 3
     SUBMIT_MAX_ATTEMPTS = 5
+    SIBLING_SUCCESS_GRACE_SECONDS = 0.25
     PLACEHOLDER_SLOT_ID = "9999"
     # How many times the step 2 screen may be rebuilt after the site's guard
     # wipes it, before giving up and handing the window to the user.
@@ -224,15 +246,112 @@ class KeyescapeEngine(BaseEngine):
             config.get("keyescape_close_chrome_on_exit", False)
         )
 
+        # --- captcha state -------------------------------------------------
+        self._sitekey = ""
+        self._yc_enabled = False
+        self._yc_test_mode = False
+        self._yc_test_attempted = False
+        self._yc_token_test_only = False
+        self._yc_client_key = ""
+        self._yc_soft_id = DEFAULT_SOFT_ID
+        self._yc_token = ""
+        self._yc_token_at = 0.0
+        self._yc_task = None
+        self._yc_cancel_event = threading.Event()
+        self._yc_failures = 0
+        self._yc_last_attempt = 0.0
+        self._yc_token_submitted = False
+        self._anchor_clicks = 0
+        self._anchor_last_click = 0.0
+        self._page_count = 1
+        self._page_workers = []
+        self._winner_page = None
+        self._page_success_event = threading.Event()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    @staticmethod
+    def read_yescaptcha_settings(reservation_data):
+        """Return (enabled, client_key, soft_id) from a payload dict or request.
+
+        Engines are handed ReservationRequest.to_engine_payload(), a plain dict,
+        but the same object is occasionally passed straight through in tests, so
+        both shapes are accepted. The three sources are tried in order and the
+        first one that yields the flag wins -- reading the flag from one source
+        and the key from another is what previously produced an "enabled" run
+        with an empty key.
+        """
+        def pick(source):
+            if source is None:
+                return None
+            if isinstance(source, dict):
+                if "yescaptcha_enabled" not in source:
+                    return None
+                enabled = coerce_bool(source.get("yescaptcha_enabled", False))
+                key = str(source.get("yescaptcha_client_key", "") or "").strip()
+                soft = str(source.get("yescaptcha_soft_id", "") or "").strip()
+            else:
+                if not hasattr(source, "yescaptcha_enabled"):
+                    return None
+                enabled = coerce_bool(getattr(source, "yescaptcha_enabled", False))
+                key = str(getattr(source, "yescaptcha_client_key", "") or "").strip()
+                soft = str(getattr(source, "yescaptcha_soft_id", "") or "").strip()
+            return enabled, key, soft or DEFAULT_SOFT_ID
+
+        for source in (
+            reservation_data,
+            getattr(reservation_data, "raw_data", None),
+        ):
+            found = pick(source)
+            if found is not None:
+                return found
+        return False, "", DEFAULT_SOFT_ID
+
+    @staticmethod
+    def read_yescaptcha_test_mode(reservation_data):
+        """Return the immediate one-shot test flag from the same payload source."""
+        for source in (
+            reservation_data,
+            getattr(reservation_data, "raw_data", None),
+        ):
+            if source is None:
+                continue
+            if isinstance(source, dict):
+                if "yescaptcha_test_mode" in source:
+                    return coerce_bool(source.get("yescaptcha_test_mode", False))
+            elif hasattr(source, "yescaptcha_test_mode"):
+                return coerce_bool(getattr(source, "yescaptcha_test_mode", False))
+        return False
+
     def start_reservation(self, reservation_data, num_threads, is_async=False):
+        enabled, client_key, _soft_id = self.read_yescaptcha_settings(reservation_data)
+        test_mode = self.read_yescaptcha_test_mode(reservation_data)
+
+        requested = int(num_threads or 1)
+        self._page_count = max(1, min(requested, self.MAX_STANDBY_PAGES))
+        self._winner_page = None
+        self._page_success_event.clear()
+        if requested != self._page_count:
+            self.log(
+                f"[정보] 키이스케이프 동시 페이지 수를 {requested} → "
+                f"{self._page_count}로 조정했습니다. (최대 {self.MAX_STANDBY_PAGES})",
+                "info",
+            )
+        if enabled:
+            self.log(
+                "[YesCaptcha ON] 캡차 자동 해결을 사용합니다."
+                + (" · 즉시 테스트 1회 활성화" if test_mode and client_key else "")
+                + ("" if client_key else " (경고: API 키가 비어 있어 수동 인증으로 진행합니다)"),
+                "info" if client_key else "warning",
+            )
         self.log(
-            "키이스케이프는 사용자가 직접 캡차를 인증하는 방식으로 동작합니다. "
-            "브라우저 창을 닫지 마세요.",
+            f"키이스케이프 모드: 브라우저 1개에서 {self._page_count}개 페이지를 "
+            "핫 스탠바이로 준비합니다. 캡차가 준비된 모든 페이지가 오픈 시각에 동시에 제출합니다.",
             "info",
         )
+        # One coordinator thread owns one Playwright connection and all pages.
+        # Page-level concurrency happens as asyncio tasks inside that thread.
         super().start_reservation(reservation_data, num_threads=1, is_async=False)
 
     def make_reservation_thread(self, reservation_data):
@@ -393,6 +512,97 @@ class KeyescapeEngine(BaseEngine):
             theme_name = theme_name or "테마"
         return theme_num, theme_name
 
+    def _set_shared_open_at(self, epoch):
+        """Apply a server-corrected opening moment to every standby page."""
+        self.open_at = epoch
+        for worker in self._page_workers:
+            worker.open_at = epoch
+
+    def _make_page_worker(self, page_index):
+        """Create isolated captcha/page state while sharing the run coordinator."""
+        worker = KeyescapeEngine(
+            log_callback=self.log_callback,
+            success_callback=None,
+            site_url=self.site_url,
+        )
+        worker.stop_event = self.stop_event
+        worker.listener_stop = self.listener_stop
+        worker.clock = self.clock
+        worker.open_at = self.open_at
+        worker._page_index = page_index
+        worker._page_count = self._page_count
+        worker._page_success_event = self._page_success_event
+        worker._clock_sync_enabled = page_index == 1
+        worker._open_at_update_callback = self._set_shared_open_at
+        prefix = f"[{page_index}번 페이지]"
+
+        worker.log = lambda message, log_type="info": self.log(
+            f"{prefix} {message}", log_type
+        )
+        worker.silent_tick = lambda message: self.silent_tick(
+            f"{prefix} {message}"
+        )
+
+        def notify(result=None):
+            won = self.notify_success(result)
+            self._page_success_event.set()
+            if won:
+                self._winner_page = page_index
+            return won
+
+        worker.notify_success = notify
+        return worker
+
+    async def _prepare_standby_page(
+        self,
+        context,
+        page_index,
+        reservation_data,
+        zizum_num,
+        theme_num,
+        theme_info_num,
+        target_date,
+        form_slot_id,
+        target_time,
+        theme_name,
+    ):
+        worker = self._make_page_worker(page_index)
+        page = None
+        try:
+            page = await context.new_page()
+            page.set_default_timeout(15000)
+            try:
+                await page.add_init_script(DEVTOOLS_GUARD_SCRIPT)
+            except Exception:
+                pass
+            dialog_state = self._new_submission_state()
+            await worker._prepare_page(page, dialog_state)
+            await worker._enter_step_two(
+                page,
+                zizum_num,
+                theme_num,
+                theme_info_num,
+                target_date,
+                form_slot_id,
+                target_time,
+                theme_name,
+            )
+            await worker._fill_form(page, reservation_data)
+            worker.log("예약 페이지 준비 완료 · 독립 캡차 토큰 대기", "success")
+            return worker, page, dialog_state
+        except Exception as exc:
+            worker.log(f"[경고] 페이지 준비 실패: {exc}", "warning")
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            try:
+                worker._session.close()
+            except Exception:
+                pass
+            return None
+
     # ------------------------------------------------------------------
     # Main run
     # ------------------------------------------------------------------
@@ -462,27 +672,70 @@ class KeyescapeEngine(BaseEngine):
                 # Must happen before the first page exists: init scripts only
                 # apply to documents created after registration.
                 await self._harden_context(context)
-                page = await context.new_page()
-                page.set_default_timeout(15000)
-
-                dialog_state = {"message": ""}
-                await self._prepare_page(page, dialog_state)
-
-                await self._enter_step_two(
-                    page, zizum_num, theme_num, theme_info_num,
-                    target_date, form_slot_id, target_time, theme_name,
+                prepared = await asyncio.gather(*(
+                    self._prepare_standby_page(
+                        context,
+                        page_index,
+                        reservation_data,
+                        zizum_num,
+                        theme_num,
+                        theme_info_num,
+                        target_date,
+                        form_slot_id,
+                        target_time,
+                        theme_name,
+                    )
+                    for page_index in range(1, self._page_count + 1)
+                ))
+                prepared = [entry for entry in prepared if entry is not None]
+                if not prepared:
+                    self.log("[에러] 준비된 키이스케이프 예약 페이지가 없습니다.", "error")
+                    return
+                self._page_workers = [entry[0] for entry in prepared]
+                self.log(
+                    f"[정보] 핫 스탠바이 {len(prepared)}개 페이지 준비 완료 · "
+                    "각 페이지는 독립 YesCaptcha 토큰을 사용합니다.",
+                    "success",
                 )
-                await self._fill_form(page, reservation_data)
-
-                await self._watch_and_submit(
-                    page, dialog_state, reservation_data,
-                    target_date, target_time, zizum_num, theme_num, theme_name,
-                    slot_id,
-                )
+                results = await asyncio.gather(*(
+                    worker._watch_and_submit(
+                        page,
+                        dialog_state,
+                        reservation_data,
+                        target_date,
+                        target_time,
+                        zizum_num,
+                        theme_num,
+                        theme_name,
+                        slot_id,
+                    )
+                    for worker, page, dialog_state in prepared
+                ), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception) and not self.stop_event.is_set():
+                        self.log(f"[경고] 스탠바이 페이지 작업 오류: {result}", "warning")
             except Exception as exc:
                 if not self.stop_event.is_set():
                     self.log(f"[에러] 키이스케이프 처리 중 오류: {exc}", "error")
             finally:
+                for worker in self._page_workers:
+                    await worker._cancel_yescaptcha_task()
+                    try:
+                        worker._session.close()
+                    except Exception:
+                        pass
+                # Keep only the winning page (or page 1 on manual stop) for
+                # review; close standby tabs so repeated runs do not leak tabs.
+                keep_page = self._winner_page or 1
+                for worker, page, _dialog_state in locals().get("prepared", []):
+                    page_index = worker._page_index
+                    if page_index == keep_page:
+                        continue
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                self._page_workers = []
                 # The worker tears its own browser down. Doing it from another
                 # thread raced with whatever this coroutine was mid-way through.
                 if owns_browser:
@@ -669,16 +922,107 @@ class KeyescapeEngine(BaseEngine):
         except Exception as exc:
             self.log(f"[경고] 개발자도구 감지 스크립트 차단 실패: {exc}", "warning")
 
+    @staticmethod
+    def _new_submission_state():
+        return {
+            "message": "",
+            "submission_status": "",
+            "booking_number": "",
+            "ck_code": "",
+        }
+
+    @staticmethod
+    def _dialog_indicates_success(message):
+        compact = re.sub(r"\s+", "", message or "")
+        if any(token in compact for token in ("예약불가", "이미완료", "이미예약", "마감")):
+            return False
+        return any(token in compact for token in (
+            "입금확인이되면예약확정",
+            "예약신청이완료",
+            "예약이완료되었습니다",
+        ))
+
+    @staticmethod
+    def _record_submission_payload(dialog_state, payload):
+        """Record the booking endpoint's JSON before the page can navigate away."""
+        if not isinstance(payload, dict):
+            return False
+        message = str(payload.get("msg", "") or "")
+        if message:
+            dialog_state["message"] = message
+        if not payload.get("status"):
+            if message:
+                dialog_state["submission_status"] = "failure"
+            return False
+
+        details = payload.get("data")
+        details = details if isinstance(details, dict) else {}
+        dialog_state["submission_status"] = "success"
+        dialog_state["booking_number"] = str(details.get("num", "") or "")
+        dialog_state["ck_code"] = str(details.get("ck_code", "") or "")
+        return True
+
     async def _prepare_page(self, page, dialog_state):
         async def handle_dialog(dialog):
             dialog_state["message"] = dialog.message or ""
-            self.log(f"[알림] 사이트 메시지: {dialog_state['message'][:120]}", "warning")
+            if self._dialog_indicates_success(dialog_state["message"]):
+                dialog_state["submission_status"] = "success"
+                self._page_success_event.set()
+                self.log(
+                    f"[서버 응답] 예약 접수 성공 · {dialog_state['message'][:120]}",
+                    "success",
+                )
+            else:
+                dialog_state["submission_status"] = "failure"
+                if (
+                    self._page_count > 1
+                    and self._classify_failure(dialog_state["message"]) == "capacity"
+                ):
+                    self.log(
+                        "[핫 스탠바이 응답] 이 페이지는 이미 예약 완료 응답을 받았습니다. "
+                        "다른 페이지의 성공 여부를 확인합니다.",
+                        "info",
+                    )
+                else:
+                    self.log(
+                        f"[알림] 사이트 메시지: {dialog_state['message'][:120]}",
+                        "warning",
+                    )
             try:
                 await dialog.accept()
             except Exception:
                 pass
 
+        async def handle_response(response):
+            try:
+                if "/controller/run_proc.php" not in (response.url or ""):
+                    return
+                request = response.request
+                if str(getattr(request, "method", "") or "").upper() != "POST":
+                    return
+                post_data = getattr(request, "post_data", "") or ""
+                if callable(post_data):
+                    post_data = post_data()
+                payload = await response.json()
+                details = payload.get("data") if isinstance(payload, dict) else None
+                has_booking_ids = (
+                    isinstance(details, dict)
+                    and bool(details.get("num"))
+                    and bool(details.get("ck_code"))
+                )
+                # The endpoint serves several actions. Prefer the submitted
+                # action marker; if Chromium omits multipart post_data, the two
+                # booking identifiers uniquely identify a successful ins_rev.
+                if "ins_rev" not in str(post_data) and not has_booking_ids:
+                    return
+                if self._record_submission_payload(dialog_state, payload):
+                    self._page_success_event.set()
+            except Exception:
+                # Dialog and completion-page detection remain as fallbacks.
+                return
+
         page.on("dialog", handle_dialog)
+        page.on("response", handle_response)
 
     async def _is_blocked(self, page):
         """True when the site has replaced the page with its block screen."""
@@ -821,22 +1165,420 @@ class KeyescapeEngine(BaseEngine):
             )
 
     # ------------------------------------------------------------------
-    # Captcha observation (observe only -- never solve)
+    # reCAPTCHA
     # ------------------------------------------------------------------
-    async def _captcha_token_present(self, page):
+    async def _read_sitekey(self, page):
+        """The site key rendered on the live page, falling back to the known one.
+
+        Hard-coding it meant a silent, unexplainable failure the day the site
+        rotates the key: YesCaptcha happily solves the *wrong* widget and the
+        booking endpoint rejects the token as '잘못된 접근'.
+        """
+        if self._sitekey:
+            return self._sitekey
+        try:
+            found = await page.evaluate(
+                """() => {
+                    const el = document.querySelector('#captcha[data-sitekey]')
+                        || document.querySelector('.g-recaptcha[data-sitekey]')
+                        || document.querySelector('[data-sitekey]');
+                    if (el) { return el.getAttribute('data-sitekey') || ''; }
+                    // Rendered by grecaptcha.render() rather than markup: the
+                    // anchor iframe carries the key in its query string.
+                    for (const frame of document.querySelectorAll('iframe')) {
+                        const match = (frame.src || '').match(/[?&]k=([^&]+)/);
+                        if (match) { return decodeURIComponent(match[1]); }
+                    }
+                    return '';
+                }"""
+            )
+        except Exception:
+            found = ""
+        found = (found or "").strip()
+        if found and found != FALLBACK_SITEKEY:
+            self.log(f"[정보] 페이지에서 캡차 sitekey를 읽었습니다 · {found[:12]}…", "info")
+        elif not found:
+            self.log(
+                "[경고] 페이지에서 캡차 sitekey를 찾지 못해 내장 값을 사용합니다.",
+                "warning",
+            )
+        self._sitekey = found or FALLBACK_SITEKEY
+        return self._sitekey
+
+    async def _challenge_open(self, page):
+        """True while the image challenge popup is on screen.
+
+        Clicking the anchor again at that point dismisses the challenge, so this
+        is the guard that stops the widget from being reset forever.
+        """
         try:
             return bool(await page.evaluate(
                 """() => {
-                    if (window.grecaptcha && typeof grecaptcha.getResponse === 'function') {
-                        try { return (grecaptcha.getResponse() || '').length > 0; }
-                        catch (e) { /* fall through */ }
+                    for (const frame of document.querySelectorAll('iframe')) {
+                        const src = frame.src || '';
+                        if (!src.includes('recaptcha') || !src.includes('bframe')) {
+                            continue;
+                        }
+                        // The popup wrapper is display:none until the challenge
+                        // is actually shown.
+                        let node = frame;
+                        while (node && node !== document.body) {
+                            const style = window.getComputedStyle(node);
+                            if (style.display === 'none' || style.visibility === 'hidden') {
+                                return false;
+                            }
+                            node = node.parentElement;
+                        }
+                        const box = frame.getBoundingClientRect();
+                        return box.width > 0 && box.height > 0;
                     }
-                    const field = document.querySelector('textarea[name="g-recaptcha-response"]');
-                    return !!(field && field.value && field.value.length > 0);
+                    return false;
                 }"""
             ))
         except Exception:
             return False
+
+    async def _nudge_recaptcha_widget(self, page):
+        """Click '로봇이 아닙니다' at most a couple of times, well spaced out.
+
+        This used to be called on every pass of the watch loop -- up to twenty
+        times a second near the open moment. Each click resets the widget and
+        closes any challenge the user was working on, so the token could never
+        appear and the run degenerated into clicking the checkbox forever. The
+        click is now rate-limited, capped, skipped while a challenge is open,
+        and skipped entirely when YesCaptcha is supplying the token, since an
+        API token needs no widget interaction at all.
+        """
+        if self._anchor_clicks >= self.ANCHOR_CLICK_MAX:
+            return False
+        now = time.monotonic()
+        if now - self._anchor_last_click < self.ANCHOR_CLICK_COOLDOWN:
+            return False
+        if await self._challenge_open(page):
+            self._log_throttled(
+                "challenge_open",
+                "[정보] 이미지 퍼즐이 열려 있습니다. 브라우저에서 직접 풀어주세요.",
+                "info",
+                interval=20.0,
+            )
+            return False
+
+        anchor = None
+        for frame in page.frames:
+            if "recaptcha/api2/anchor" in (frame.url or ""):
+                anchor = frame
+                break
+        if anchor is None:
+            self._log_throttled(
+                "anchor_missing",
+                "[경고] 캡차 위젯(anchor 프레임)을 찾지 못했습니다.",
+                "warning",
+                interval=30.0,
+            )
+            return False
+
+        self._anchor_last_click = now
+        self._anchor_clicks += 1
+        try:
+            await anchor.locator("#recaptcha-anchor").click(timeout=3000)
+        except Exception as exc:
+            self.log(f"[경고] '로봇이 아닙니다' 클릭 실패: {exc}", "warning")
+            return False
+        self.log(
+            f"[캡차] '로봇이 아닙니다'를 클릭했습니다. "
+            f"({self._anchor_clicks}/{self.ANCHOR_CLICK_MAX})",
+            "info",
+        )
+        return True
+
+    async def _captcha_token_value(self, page):
+        """Return the token currently stored in the widget textarea.
+
+        Reads the widget's own textarea only. grecaptcha.getResponse() is
+        deliberately *not* consulted: the YesCaptcha path patches it, so asking
+        it would report an injected token as if the widget had produced one and
+        make expiry undetectable.
+        """
+        try:
+            return str(await page.evaluate(
+                """() => {
+                    const areas = document.querySelectorAll(
+                        'textarea[name="g-recaptcha-response"]'
+                    );
+                    for (const area of areas) {
+                        if (area.value && area.value.length > 0) { return area.value; }
+                    }
+                    return '';
+                }"""
+            ) or "")
+        except Exception:
+            return ""
+
+    async def _captcha_token_present(self, page):
+        """Compatibility predicate used by tests and manual-captcha callers."""
+        return bool(await self._captcha_token_value(page))
+
+    @staticmethod
+    def _is_manual_widget_token(widget_value, injected_token):
+        """True only for a widget token that was not injected by this worker."""
+        return bool(widget_value and widget_value != injected_token)
+
+    # -- YesCaptcha token lifecycle -------------------------------------
+    TOKEN_PATCH_SCRIPT = """(token) => {
+        window.__pgCaptchaToken = token || '';
+        const areas = document.querySelectorAll('textarea[name="g-recaptcha-response"]');
+        areas.forEach((area) => { area.value = window.__pgCaptchaToken; });
+        // The page validates with grecaptcha.getResponse() before FormData reads
+        // the textarea. Patch only while an API token is active and restore the
+        // original getter when that token is cleared. This prevents an OFF/manual
+        // run from inheriting a synthetic getter.
+        if (window.grecaptcha && window.__pgCaptchaToken) {
+            if (!window.__pgCaptchaPatch) {
+                window.__pgCaptchaPatch = {
+                    owner: window.grecaptcha,
+                    original: typeof window.grecaptcha.getResponse === 'function'
+                        ? window.grecaptcha.getResponse
+                        : null,
+                };
+            }
+            window.grecaptcha.getResponse = function () {
+                if (window.__pgCaptchaToken) { return window.__pgCaptchaToken; }
+                const patch = window.__pgCaptchaPatch;
+                try {
+                    return patch && patch.original
+                        ? patch.original.apply(patch.owner, arguments)
+                        : '';
+                }
+                catch (e) { return ''; }
+            };
+        } else if (window.__pgCaptchaPatch) {
+            const patch = window.__pgCaptchaPatch;
+            if (patch.owner && patch.original) {
+                patch.owner.getResponse = patch.original;
+            }
+            delete window.__pgCaptchaPatch;
+        }
+        return areas.length;
+    }"""
+
+    TOKEN_READY_SCRIPT = """(token) => {
+        const form = document.querySelector('#form');
+        if (!form || !token) {
+            return { formFields: 0, formMatches: false, getterMatches: false };
+        }
+        const fields = form.querySelectorAll('textarea[name="g-recaptcha-response"]');
+        let posted = '';
+        try { posted = new FormData(form).get('g-recaptcha-response') || ''; }
+        catch (e) { posted = ''; }
+        let getter = '';
+        try {
+            getter = window.grecaptcha && typeof window.grecaptcha.getResponse === 'function'
+                ? window.grecaptcha.getResponse()
+                : '';
+        } catch (e) { getter = ''; }
+        return {
+            formFields: fields.length,
+            formMatches: fields.length > 0 && posted === token,
+            getterMatches: getter === token,
+        };
+    }"""
+
+    async def _write_token(self, page, token, *, quiet=False):
+        """Put a token (or '' to drop one) into the form. Returns fields written."""
+        try:
+            # The token is passed as an argument, never interpolated into the
+            # script source: a stray quote or backslash used to break the whole
+            # evaluate() and the failure was swallowed silently.
+            written = int(
+                await page.evaluate(self.TOKEN_PATCH_SCRIPT, token or "") or 0
+            )
+        except Exception as exc:
+            if not quiet:
+                self.log(f"[경고] 캡차 토큰 주입 실패: {exc}", "warning")
+            return 0
+        return written
+
+    async def _inject_yescaptcha_token(self, page, token):
+        """Write and independently verify the exact value that the form will post."""
+        if not (self._yescaptcha_active() and token):
+            return False
+        written = await self._write_token(page, token)
+        if not written:
+            return False
+        try:
+            state = await page.evaluate(self.TOKEN_READY_SCRIPT, token)
+        except Exception as exc:
+            self.log(f"[경고] 캡차 토큰 제출 상태 확인 실패: {exc}", "warning")
+            return False
+        state = state if isinstance(state, dict) else {}
+        form_matches = bool(state.get("formMatches"))
+        getter_matches = bool(state.get("getterMatches"))
+        if not (form_matches and getter_matches):
+            self.log(
+                "[경고] YesCaptcha 토큰이 예약 폼과 캡차 검사 함수에 동일하게 반영되지 않았습니다. "
+                f"(폼 필드 {int(state.get('formFields', 0) or 0)}개)",
+                "warning",
+            )
+            return False
+        return True
+
+    def _yescaptcha_active(self):
+        return bool(self._yc_enabled and self._yc_client_key)
+
+    def _token_seconds_left(self):
+        if not self._yc_token:
+            return 0.0
+        return self.CAPTCHA_TTL_SECONDS - (time.monotonic() - self._yc_token_at)
+
+    def _drop_token(self):
+        self._yc_token = ""
+        self._yc_token_at = 0.0
+        self._yc_token_test_only = False
+
+    async def _retire_submitted_yescaptcha_token(self, page):
+        """Drop a one-shot token after the booking button handed it to the site."""
+        if not self._yc_token_submitted:
+            return False
+        self._drop_token()
+        # This is best-effort cleanup after the one-shot response has already
+        # been submitted. A page/driver disconnect here is not an injection
+        # failure and must not turn a successful booking log into an error.
+        await self._write_token(page, "", quiet=True)
+        self._yc_token_submitted = False
+        return True
+
+    async def _cancel_yescaptcha_task(self):
+        self._yc_cancel_event.set()
+        task = self._yc_task
+        self._yc_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def _solve_with_yescaptcha(self, page, test_only=False):
+        """One create + poll round trip. Stores the token on success."""
+        try:
+            await self._solve_with_yescaptcha_inner(page, test_only=test_only)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # This runs as a detached task: an escaping exception would only
+            # surface as asyncio's "Task exception was never retrieved".
+            self._yc_failures += 1
+            self.log(f"[YesCaptcha] 해결 중 예외: {exc}", "warning")
+
+    async def _solve_with_yescaptcha_inner(self, page, test_only=False):
+        loop = asyncio.get_running_loop()
+        client = YesCaptchaClient(self._yc_client_key, self._yc_soft_id)
+        sitekey = await self._read_sitekey(page)
+        if not sitekey:
+            self._yc_failures += 1
+            self.log("[YesCaptcha] 캡차 sitekey가 없어 API 요청을 중단했습니다.", "warning")
+            return
+
+        ok, task_id, err = await loop.run_in_executor(
+            None, lambda: client.create_recaptcha_v2_task(self.reservation_url, sitekey)
+        )
+        if not ok:
+            self._yc_failures += 1
+            self.log(f"[YesCaptcha] 태스크 접수 실패: {err}", "warning")
+            return
+        self.log(
+            f"[YesCaptcha] 태스크 생성 (ID {task_id}, 키 식별자 {client.key_fingerprint}) "
+            "· 토큰 발급 대기 중…",
+            "info",
+        )
+
+        poll_ok, token, poll_err = await loop.run_in_executor(
+            None,
+            lambda: client.poll_result(
+                task_id,
+                timeout_seconds=self.CAPTCHA_SOLVE_TIMEOUT,
+                stop_event=self._yc_cancel_event,
+            ),
+        )
+        if poll_ok and token and self._yescaptcha_active():
+            self._yc_token = token
+            self._yc_token_test_only = bool(test_only)
+            # Timed from arrival, not from the request: the clock Google cares
+            # about starts when the token is minted, and polling can take 30 s.
+            self._yc_token_at = time.monotonic()
+            self._yc_failures = 0
+            self.log(
+                f"[YesCaptcha] {'테스트용 ' if test_only else ''}API 토큰 발급 완료 · "
+                f"약 {int(self._token_seconds_left())}초간 유효 "
+                "(화면 체크 표시는 비어 있어도 정상이며, 폼 주입 상태를 별도로 검증합니다)",
+                "info",
+            )
+        elif not self._yc_cancel_event.is_set():
+            self._yc_failures += 1
+            self.log(f"[YesCaptcha] 자동 해결 실패: {poll_err}", "warning")
+
+    def _ensure_yescaptcha_token(self, page, remaining):
+        """Start a solve round when one is due. Non-blocking.
+
+        Requesting the token up front was the other half of the failure: a v2
+        token dies in about two minutes, so a run started an hour before the
+        window opened arrived at the submit with a corpse and never asked for
+        another one.
+        """
+        if not self._yescaptcha_active():
+            return
+        if self._yc_failures >= self.YESCAPTCHA_MAX_FAILURES:
+            self._log_throttled(
+                "yc_giveup",
+                f"[경고] YesCaptcha 자동 해결이 {self._yc_failures}회 실패했습니다. "
+                "브라우저에서 직접 인증해주세요.",
+                "warning",
+                interval=30.0,
+            )
+            return
+        if self._yc_task is not None and not self._yc_task.done():
+            return
+        self._yc_task = None
+        if self._token_seconds_left() > self.CAPTCHA_REFRESH_MARGIN:
+            return
+        # Space out retries. Without this a network hiccup would consume the
+        # whole failure budget in a few seconds.
+        now = time.monotonic()
+        if now - self._yc_last_attempt < self.YESCAPTCHA_RETRY_COOLDOWN:
+            return
+        normal_due = remaining is None or remaining <= self.CAPTCHA_SOLVE_LEAD
+        test_due = (
+            self._yc_test_mode
+            and not self._yc_test_attempted
+            and not normal_due
+        )
+        if not normal_due and not test_due:
+            self._log_throttled(
+                "yc_wait",
+                f"[정보] 캡차 토큰은 오픈 {int(self.CAPTCHA_SOLVE_LEAD)}초 전에 발급합니다. "
+                "(토큰 수명이 약 2분이라 미리 받아두면 만료됩니다)",
+                "info",
+                interval=60.0,
+            )
+            return
+        if test_due:
+            self._yc_test_attempted = True
+            self.log(
+                "[YesCaptcha 테스트] 오픈 시각을 무시하고 즉시 1회 토큰 발급을 시작합니다. "
+                "발급된 토큰은 실제 예약과 같은 경로로 주입·유지하며 반복 발급하지 않습니다.",
+                "warning",
+            )
+        self._yc_last_attempt = time.monotonic()
+        self._yc_cancel_event.clear()
+        solve = (
+            self._solve_with_yescaptcha(page, test_only=True)
+            if test_due
+            else self._solve_with_yescaptcha(page)
+        )
+        self._yc_task = asyncio.create_task(solve)
 
     # ------------------------------------------------------------------
     # Detection + submission
@@ -851,8 +1593,56 @@ class KeyescapeEngine(BaseEngine):
         prompted = False
         captcha_ok = False
         captcha_since = 0.0
+        # "manual" -> the widget produced it, "api" -> YesCaptcha did. Only the
+        # api case has a known mint time, so only it can be expired on schedule.
+        captcha_source = ""
         last_resync = time.monotonic()
         restores = 0
+
+        await self._cancel_yescaptcha_task()
+        self._yc_cancel_event = threading.Event()
+        self._drop_token()
+        self._yc_failures = 0
+        self._yc_last_attempt = 0.0
+        self._yc_token_submitted = False
+        self._yc_test_attempted = False
+        (
+            self._yc_enabled,
+            self._yc_client_key,
+            self._yc_soft_id,
+        ) = self.read_yescaptcha_settings(reservation_data)
+        self._yc_test_mode = (
+            self._yc_enabled
+            and self.read_yescaptcha_test_mode(reservation_data)
+        )
+
+        if self._yc_enabled and not self._yc_client_key:
+            self.log(
+                "[경고] YesCaptcha가 켜져 있지만 API 키가 비어 있습니다. "
+                "고급 설정에서 Client Key를 입력해주세요. 이번 실행은 수동 인증으로 진행합니다.",
+                "warning",
+            )
+        if self._yc_enabled and self._yc_client_key:
+            if self._yc_test_mode:
+                self.log(
+                    "[YesCaptcha 테스트 모드 ON] 시작 즉시 1회 발급·주입을 검증합니다. "
+                    f"실제 예약용 토큰은 오픈 {int(self.CAPTCHA_SOLVE_LEAD)}초 전에 "
+                    f"별도로 발급합니다. (SoftID {self._yc_soft_id})",
+                    "warning",
+                )
+            else:
+                self.log(
+                    f"[YesCaptcha] 자동 해결 대기 중 · 오픈 {int(self.CAPTCHA_SOLVE_LEAD)}초 전에 "
+                    f"토큰을 발급합니다. (SoftID {self._yc_soft_id})",
+                    "info",
+                )
+            await self._read_sitekey(page)
+        else:
+            self.log(
+                "[YesCaptcha OFF] API 호출, 토큰 주입, 캡차 체크박스 자동 클릭을 하지 않습니다. "
+                "브라우저에서 직접 인증해주세요.",
+                "warning",
+            )
 
         if dev_mode:
             self.log(
@@ -884,9 +1674,15 @@ class KeyescapeEngine(BaseEngine):
                 )
                 if not await self._restore_step_two(page, reservation_data):
                     return
+                # A rebuilt document has a fresh widget and no patched getter,
+                # so the injection has to happen again. The token itself is
+                # still good, so it is kept -- only the page-side state resets.
                 captcha_ok = False
                 captcha_since = 0.0
+                captcha_source = ""
                 prompted = False
+                self._anchor_clicks = 0
+                self._anchor_last_click = 0.0
                 await asyncio.sleep(0.2)
                 continue
 
@@ -895,9 +1691,11 @@ class KeyescapeEngine(BaseEngine):
                 self.clock.seconds_until(self.open_at)
                 if self.open_at is not None else 0.0
             )
-            if time.monotonic() - last_resync >= self.RESYNC_INTERVAL or (
-                0 < remaining <= self.FINAL_SYNC_LEAD and
-                time.monotonic() - last_resync >= 5.0
+            if getattr(self, "_clock_sync_enabled", True) and (
+                time.monotonic() - last_resync >= self.RESYNC_INTERVAL or (
+                    0 < remaining <= self.FINAL_SYNC_LEAD and
+                    time.monotonic() - last_resync >= 5.0
+                )
             ):
                 last_resync = time.monotonic()
                 await asyncio.get_running_loop().run_in_executor(
@@ -908,17 +1706,126 @@ class KeyescapeEngine(BaseEngine):
                     if self.open_at is not None else 0.0
                 )
 
-            # -- captcha state (observed only) ---------------------------
-            token = await self._captcha_token_present(page)
-            if token and not captcha_ok:
-                captcha_ok = True
-                captcha_since = time.monotonic()
-                self.log("[완료] 캡차 인증을 확인했습니다.", "success")
-            elif not token and captcha_ok:
+            # -- captcha ------------------------------------------------
+            # `remaining` is None when the open moment is unknown, which the
+            # token scheduler reads as "submit as soon as possible".
+            lead = None if self.open_at is None else remaining
+            self._ensure_yescaptcha_token(page, lead)
+
+            widget_token_value = await self._captcha_token_value(page)
+            # Our own injected token also lives in this textarea. Comparing only
+            # its presence made the next loop call it a "manual solve", discard
+            # the API token, then announce 인증/해제 back-to-back. A manual token
+            # is one whose exact value differs from the token we injected.
+            manual_widget_token = self._is_manual_widget_token(
+                widget_token_value, self._yc_token
+            )
+            if (
+                captcha_source != "api"
+                and self._yc_token_test_only
+                and self._token_seconds_left() <= 0
+            ):
+                self.log(
+                    "[YesCaptcha 테스트 실패] 테스트 토큰이 폼 검증 전에 만료되어 폐기합니다.",
+                    "warning",
+                )
+                self._drop_token()
+            elif manual_widget_token and self._yc_token_test_only:
+                self.log(
+                    "[YesCaptcha 테스트 건너뜀] 브라우저에 수동 캡차 토큰이 이미 있어 "
+                    "덮어쓰지 않고 테스트 토큰을 폐기합니다.",
+                    "warning",
+                )
+                self._drop_token()
+
+            if captcha_source == "api":
+                # An injected token has a known mint time, so it can be retired
+                # on schedule instead of being re-submitted until the site
+                # rejects it. Dropping it also clears the patched getter, so a
+                # manual solve takes over cleanly.
+                if self._token_seconds_left() <= 0:
+                    test_token = self._yc_token_test_only
+                    self.log(
+                        (
+                            "[YesCaptcha 테스트 종료] 실제 예약과 동일한 활성 상태 확인을 "
+                            "마쳤으며 테스트 토큰이 만료되어 예약 폼에서 제거합니다."
+                            if test_token else
+                            "[경고] YesCaptcha 토큰이 만료됐습니다. 새 토큰을 발급합니다."
+                        ),
+                        "info" if test_token else "warning",
+                    )
+                    self._drop_token()
+                    await self._write_token(page, "")
+                    captcha_ok = False
+                    captcha_since = 0.0
+                    captcha_source = ""
+                elif self._yc_token and self._token_seconds_left() > 0:
+                    left = self._token_seconds_left()
+                    if left <= self.CAPTCHA_WARN_SECONDS:
+                        self._log_throttled(
+                            "captcha_expiry",
+                            f"[경고] YesCaptcha 토큰 유효시간 약 {max(0, int(left))}초 남음",
+                            "warning",
+                            interval=10.0,
+                        )
+
+            if not captcha_ok:
+                if manual_widget_token:
+                    # The person (or a plain checkbox pass) solved it.
+                    captcha_ok = True
+                    captcha_source = "manual"
+                    captcha_since = time.monotonic()
+                    self.log(
+                        "[수동 캡차] 인증 완료 · 예약 제출 준비됨",
+                        "success",
+                    )
+                elif (
+                    self._yescaptcha_active()
+                    and self._yc_token
+                    and self._token_seconds_left() > 0
+                ):
+                    test_token = self._yc_token_test_only
+                    if await self._inject_yescaptcha_token(page, self._yc_token):
+                        captcha_ok = True
+                        captcha_source = "api"
+                        captcha_since = time.monotonic()
+                        if test_token:
+                            self.log(
+                                "[YesCaptcha 테스트 확인] 실제 예약과 동일한 토큰 주입·폼 검증 "
+                                f"경로를 통과했습니다 · 약 {int(self._token_seconds_left())}초간 "
+                                "활성 상태를 유지합니다. 사이트 화면의 체크 표시가 비어 있어도 "
+                                "해결된 상태이며, 최종 승인은 실제 제출 응답에서 확정됩니다.",
+                                "success",
+                            )
+                        else:
+                            self.log(
+                                f"[YesCaptcha] 예약 폼 토큰 준비 확인 · 약 "
+                                f"{int(self._token_seconds_left())}초간 유효 "
+                                "· 화면 체크 표시는 비어 있어도 해결된 상태입니다 "
+                                "(최종 승인은 사이트 제출 응답으로 확인)",
+                                "info",
+                            )
+                    else:
+                        if test_token:
+                            self.log(
+                                "[YesCaptcha 테스트 실패] 발급된 토큰이 예약 폼에 정상 반영되지 않았습니다. "
+                                "테스트 토큰을 폐기합니다.",
+                                "warning",
+                            )
+                            self._drop_token()
+                            await self._write_token(page, "")
+                        self._log_throttled(
+                            "inject_fail",
+                            "[경고] 캡차 응답 필드를 찾지 못해 토큰을 주입할 수 없습니다.",
+                            "warning",
+                            interval=15.0,
+                        )
+            elif captcha_source == "manual" and not manual_widget_token:
                 captcha_ok = False
                 captcha_since = 0.0
+                captcha_source = ""
                 self.log("[경고] 캡차 인증이 해제되었습니다. 다시 인증해주세요.", "warning")
-            if captcha_ok:
+            elif captcha_source == "manual":
                 left = self.CAPTCHA_TTL_SECONDS - (time.monotonic() - captcha_since)
                 if left <= self.CAPTCHA_WARN_SECONDS:
                     self._log_throttled(
@@ -933,11 +1840,17 @@ class KeyescapeEngine(BaseEngine):
                 self.open_at is None or remaining <= self.CAPTCHA_PROMPT_LEAD
             ):
                 prompted = True
-                self.log(
-                    "[경고] 지금 브라우저에서 '로봇이 아닙니다'를 인증해주세요. "
-                    "인증은 약 2분간만 유효합니다.",
-                    "warning",
-                )
+                if self._yescaptcha_active():
+                    self.log(
+                        "[정보] 오픈이 가까워졌습니다. 캡차는 YesCaptcha가 자동으로 처리합니다.",
+                        "info",
+                    )
+                else:
+                    self.log(
+                        "[경고] 지금 브라우저에서 '로봇이 아닙니다'를 인증해주세요. "
+                        "인증은 약 2분간만 유효합니다.",
+                        "warning",
+                    )
                 try:
                     await page.bring_to_front()
                 except Exception:
@@ -950,7 +1863,15 @@ class KeyescapeEngine(BaseEngine):
                     "waiting",
                     f"[정보] 서버 시간 기준 오픈까지 "
                     f"{self._format_remaining(remaining)} 남음"
-                    + ("" if captcha_ok else " · 캡차 미인증"),
+                    + (
+                        ""
+                        if captcha_ok
+                        else (
+                            " · YesCaptcha 토큰 발급 대기"
+                            if self._yescaptcha_active()
+                            else " · 수동 캡차 미인증"
+                        )
+                    ),
                     "info",
                     interval=30.0 if remaining > 180 else 10.0,
                 )
@@ -962,11 +1883,17 @@ class KeyescapeEngine(BaseEngine):
 
             # -- the moment has arrived ----------------------------------
             if not captcha_ok:
+                automatic = self._yescaptcha_active()
                 self._log_throttled(
                     "await_captcha",
-                    "[경고] 오픈 시각이 되었지만 캡차 인증이 없습니다. "
-                    "인증하시면 즉시 제출합니다.",
-                    "warning",
+                    (
+                        "[YesCaptcha] 오픈 시각 도달 · 이 페이지는 토큰 발급 대기 중이며 "
+                        "준비되는 즉시 제출합니다."
+                        if automatic else
+                        "[경고] 오픈 시각이 되었지만 수동 캡차 인증이 없습니다. "
+                        "인증하시면 즉시 제출합니다."
+                    ),
+                    "info" if automatic else "warning",
                     interval=5.0,
                 )
                 await asyncio.sleep(0.1)
@@ -980,29 +1907,39 @@ class KeyescapeEngine(BaseEngine):
                 )
                 return
 
-            if not self.submission_lock.acquire(blocking=False):
-                await asyncio.sleep(0.05)
-                continue
-            try:
-                submit_attempts += 1
-                dialog_state["message"] = ""
-                result = await self._submit(
-                    page, dialog_state, slot_id, theme_name,
-                    target_date, target_time, zizum_num, dev_mode,
-                )
-            finally:
-                try:
-                    self.submission_lock.release()
-                except RuntimeError:
-                    pass
+            # Every standby page owns an independent form and captcha token.
+            # Do not serialize them through BaseEngine.submission_lock: firing
+            # all ready pages in the same event-loop turn is the purpose of this
+            # mode. A first success stops pages that have not submitted yet,
+            # while requests already handed to the site finish collecting their
+            # own result below.
+            submit_attempts += 1
+            dialog_state["message"] = ""
+            result = await self._submit(
+                page, dialog_state, slot_id, theme_name,
+                target_date, target_time, zizum_num, dev_mode,
+                api_token_active=(captcha_source == "api"),
+            )
 
+            submitted_api_token = (
+                captcha_source == "api" and self._yc_token_submitted
+            )
             if result == "success":
                 return
-            if result == "capacity":
+            if submitted_api_token:
+                # A reCAPTCHA response is one-shot. Once the click handed it to
+                # the site it must never be re-used, even when the response was
+                # "not open", an unknown error, or a completion timeout.
+                captcha_ok = False
+                captcha_since = 0.0
+                captcha_source = ""
+                await self._retire_submitted_yescaptcha_token(page)
                 self.log(
-                    "[에러] 이미 다른 사람이 예약을 완료한 시간대입니다. 이번 회차는 마감되었습니다.",
-                    "error",
+                    "[YesCaptcha] 토큰을 사이트에 제출해 일회용으로 소모 처리했습니다.",
+                    "info",
                 )
+            if result == "capacity":
+                await self._report_capacity_result()
                 return
 
             message = dialog_state.get("message", "")
@@ -1011,7 +1948,13 @@ class KeyescapeEngine(BaseEngine):
                 # anything parsed from the notice or the bundled table.
                 corrected = self._open_time_from_message(message, target_date)
                 if corrected is not None and corrected != self.open_at:
-                    self.open_at = corrected
+                    update_open_at = getattr(
+                        self, "_open_at_update_callback", None
+                    )
+                    if update_open_at is not None:
+                        update_open_at(corrected)
+                    else:
+                        self.open_at = corrected
                     self.log(
                         "[정보] 서버가 알려준 오픈 시각으로 일정을 재조정했습니다 · "
                         f"{self._format_remaining(self.clock.seconds_until(corrected))} 남음",
@@ -1024,16 +1967,50 @@ class KeyescapeEngine(BaseEngine):
             elif result == "captcha_consumed":
                 captcha_ok = False
                 captcha_since = 0.0
-                self.log(
-                    "[경고] 제출로 캡차가 소모되었습니다(사이트가 자동 초기화합니다). "
-                    "다시 인증해주세요.",
-                    "warning",
-                )
+                was_api = submitted_api_token or captcha_source == "api"
+                captcha_source = ""
+                if was_api and not submitted_api_token:
+                    self._drop_token()
+                    await self._write_token(page, "")
+                if was_api:
+                    self.log(
+                        "[경고] 사이트가 YesCaptcha 토큰을 승인하지 않았습니다. "
+                        "사용한 토큰은 폐기하고 새 토큰을 요청합니다.",
+                        "warning",
+                    )
+                else:
+                    self.log(
+                        "[경고] 제출로 캡차가 소모되었습니다(사이트가 자동 초기화합니다). "
+                        "다시 인증해주세요.",
+                        "warning",
+                    )
                 try:
                     await page.bring_to_front()
                 except Exception:
                     pass
+            elif result == "captcha_not_ready":
+                captcha_ok = False
+                captcha_since = 0.0
+                captcha_source = ""
             await asyncio.sleep(0.2)
+
+    async def _report_capacity_result(self):
+        """Distinguish a sibling page losing to our winner from a true loss."""
+        if self._page_count > 1 and not self._page_success_event.is_set():
+            await asyncio.sleep(self.SIBLING_SUCCESS_GRACE_SECONDS)
+        if self._page_success_event.is_set():
+            self.log(
+                "[정보] 같은 실행의 다른 핫 스탠바이 페이지가 먼저 예약에 성공했습니다. "
+                "이 페이지의 '이미 예약 완료' 응답은 정상이며 추가 제출 없이 종료합니다.",
+                "info",
+            )
+            return "sibling"
+        self.log(
+            "[에러] 다른 실행 또는 다른 사용자가 먼저 예약을 완료한 시간대입니다. "
+            "이번 회차는 마감되었습니다.",
+            "error",
+        )
+        return "external"
 
     def _open_time_from_message(self, message, target_date):
         """Recompute the open moment from a '예약오픈시간 : HH:MM' rejection."""
@@ -1054,7 +2031,10 @@ class KeyescapeEngine(BaseEngine):
     async def _submit(
         self, page, dialog_state, slot_id, theme_name,
         target_date, target_time, zizum_num, dev_mode,
+        api_token_active=False,
     ):
+        self._yc_token_submitted = False
+        dialog_state.update(self._new_submission_state())
         # Put the real slot id into the form before anything is sent.
         #
         # Step 1 posts camelCase names (themeTimeNum) but the Step 2 page renders
@@ -1088,6 +2068,20 @@ class KeyescapeEngine(BaseEngine):
             await self._dump_debug(page)
             return "retry"
 
+        # Re-stamp the API token immediately before the click. The site calls
+        # grecaptcha.reset() on every rejection, which blanks the textarea that
+        # FormData reads, so a token that survived one failed attempt would
+        # otherwise be posted as an empty string on the next one. Only done when
+        # the API token is the one in play: overwriting a hand-solved token with
+        # a stale API one would break an otherwise good attempt.
+        if api_token_active and self._yc_token and self._token_seconds_left() > 0:
+            if not await self._inject_yescaptcha_token(page, self._yc_token):
+                self.log(
+                    "[경고] YesCaptcha 토큰이 실제 제출 폼에 준비되지 않아 클릭을 중단했습니다.",
+                    "warning",
+                )
+                return "captcha_not_ready"
+
         self.log(f"예약하기를 클릭합니다. (슬롯 ID {slot_id}, 필드 {written}개 갱신)", "info")
         try:
             clicked = await page.evaluate(
@@ -1109,13 +2103,25 @@ class KeyescapeEngine(BaseEngine):
             self.log("[경고] 예약하기 버튼을 찾지 못했습니다.", "warning")
             await self._dump_debug(page)
             return "retry"
+        self._yc_token_submitted = bool(api_token_active)
 
-        completion = await self._await_completion(page)
+        completion = await self._await_completion(
+            page,
+            include_context_pages=(self._page_count <= 1),
+            finish_inflight=True,
+            submission_state=dialog_state,
+        )
         if completion is None:
             return self._classify_failure(dialog_state.get("message", ""))
 
-        booking_number = await self._extract_booking_number(completion)
-        self.log("[완료] 예약이 완료되었습니다.", "success")
+        self._page_success_event.set()
+        booking_number = dialog_state.get("booking_number", "")
+        if not booking_number:
+            booking_number = await self._extract_booking_number(completion)
+        if dialog_state.get("submission_status") == "success":
+            self.log("[완료] 서버에서 예약 성공 응답을 확인했습니다.", "success")
+        else:
+            self.log("[완료] 예약 완료 화면을 확인했습니다.", "success")
         if booking_number:
             self.log(f"★ 예약번호 {booking_number} ★", "success")
         try:
@@ -1186,23 +2192,55 @@ class KeyescapeEngine(BaseEngine):
         return false;
     }"""
 
-    async def _await_completion(self, page, timeout=8.0):
+    async def _await_completion(
+        self,
+        page,
+        timeout=8.0,
+        *,
+        include_context_pages=True,
+        finish_inflight=False,
+        submission_state=None,
+    ):
         """Return the page showing the completion screen, or None.
 
         Waiting on the original page's URL alone was too narrow: if the site
-        answers in a new tab, or its guard wipes the body before the URL check
-        lands, the run treated a booking that actually went through as a failure
-        and kept resubmitting. Every page in the context is examined, by URL and
-        by completion-only markup.
+        answers in a new tab, a single-page run could treat a booking that
+        actually went through as a failure and keep resubmitting. In hot-standby
+        mode, however, scanning every sibling page makes concurrent requests
+        steal each other's success screen. Each worker therefore watches only
+        its own page (and a popup whose opener is that page). Requests already
+        sent may also finish this check after another page records first success.
         """
         deadline = time.monotonic() + timeout
         while True:
+            if submission_state:
+                status = submission_state.get("submission_status", "")
+                if status == "success":
+                    return page
+                if status == "failure":
+                    return None
+
+            candidates = [page]
             try:
-                candidates = list(page.context.pages)
+                context_pages = list(page.context.pages)
             except Exception:
-                candidates = [page]
-            if page not in candidates:
-                candidates.append(page)
+                context_pages = [page]
+            if include_context_pages:
+                candidates = context_pages
+                if page not in candidates:
+                    candidates.append(page)
+            else:
+                # Keep support for a site-owned completion popup without letting
+                # one standby page claim a sibling standby page's reservation.
+                for candidate in context_pages:
+                    if candidate is page:
+                        continue
+                    try:
+                        opener = await candidate.opener()
+                    except Exception:
+                        opener = None
+                    if opener is page:
+                        candidates.append(candidate)
 
             for candidate in candidates:
                 try:
@@ -1217,7 +2255,10 @@ class KeyescapeEngine(BaseEngine):
                 except Exception:
                     continue
 
-            if time.monotonic() >= deadline or self.stop_event.is_set():
+            if (
+                time.monotonic() >= deadline
+                or (self.stop_event.is_set() and not finish_inflight)
+            ):
                 return None
             await asyncio.sleep(0.2)
 

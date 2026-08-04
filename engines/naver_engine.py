@@ -556,29 +556,34 @@ class NaverEngine(BaseEngine):
         if blocked:
             raise NaverApiError(blocked)
 
+        target_open_at = await asyncio.to_thread(
+            self.api.resolve_target_open_at, target_date, meta
+        )
         # The engine never sleeps until this time: API polling continues. The
-        # synchronized server clock also drives the strike turn at the opening
-        # boundary, which owns the reload and the submit together so the page is
-        # driven the instant the date starts rendering -- and, just as important,
-        # is not being driven for a doomed submit in the seconds before it.
+        # synchronized server clock drives the API-first strike at the opening
+        # boundary; the browser is only the fallback when direct submission is
+        # unavailable for that product/session.
         self._open_at_epoch = (
-            meta.open_at.timestamp()
-            if (meta.uses_open_schedule and meta.open_at) else None
+            target_open_at.timestamp()
+            if (meta.uses_open_schedule and target_open_at) else None
         )
         self._open_strike_pending = False
-        if meta.uses_open_schedule and meta.open_at:
-            remaining = self.clock.seconds_until(meta.open_at.timestamp())
+        if meta.uses_open_schedule and target_open_at:
+            remaining = self.clock.seconds_until(target_open_at.timestamp())
             if remaining > 0:
                 self._open_strike_pending = True
                 self.log(
-                    f"[정보] 예약 오픈 예정 {meta.open_at:%Y-%m-%d %H:%M} · "
+                    f"[정보] {target_date} 예약 오픈 예정 "
+                    f"{target_open_at:%Y-%m-%d %H:%M} · "
                     f"서버 시간 기준 {self._format_remaining(remaining)} 남음 · "
-                    "오픈 시각에는 준비된 API 직접 제출을 우선 사용합니다.",
+                    "오픈 시각에 API 직접 제출을 우선하고, 준비되지 않은 경우에만 "
+                    "예약 화면으로 제출합니다.",
                     "info",
                 )
             else:
                 self.log(
-                    f"[정보] 예약 오픈 {meta.open_at:%Y-%m-%d %H:%M} (이미 지남)", "info"
+                    f"[정보] {target_date} 예약 오픈 "
+                    f"{target_open_at:%Y-%m-%d %H:%M} (이미 지남)", "info"
                 )
 
         form = meta.custom_form or await asyncio.to_thread(self.api.fetch_business_form)
@@ -2320,8 +2325,6 @@ class NaverEngine(BaseEngine):
                 )
                 return self._page
             except Exception:
-                if self.stop_event.is_set():
-                    return False, "중지 요청"
                 pass
         return None
 
@@ -2355,6 +2358,8 @@ class NaverEngine(BaseEngine):
                         return True, "접근성 라디오 상태 확인"
                     last_detail = "Npay 머니 라디오를 눌렀지만 선택 상태를 확인하지 못했습니다"
             except Exception:
+                if self.stop_event.is_set():
+                    return False, "중지 요청"
                 pass
 
             # Some Npay builds hide the native radio. Click the visible label/text

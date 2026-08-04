@@ -5,7 +5,14 @@ from data.themes import (
     JIGUBYEOL_THEMES, PHOBIADUNGEON_THEMES, SITES_CONFIG, JIGUBYEOL_THEME_ALIASES,
     KEYESCAPE_THEMES, DOOMESCAPE_THEMES
 )
-from pengucro.models import LEGACY_MODE_MAP, NAVER_MODE, STANDARD_MODE, ReservationRequest
+from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
+from pengucro.models import (
+    LEGACY_MODE_MAP,
+    NAVER_MODE,
+    STANDARD_MODE,
+    ReservationRequest,
+    coerce_bool,
+)
 from pengucro.storage import SecretStore, load_json, save_json
 from datetime import datetime, timedelta
 import calendar
@@ -23,6 +30,10 @@ PRESERVED_CONFIG_KEYS = (
     "naver_poll_interval",
     "naver_poll_burst_interval",
     "naver_poll_relax_after",
+    "yescaptcha_enabled",
+    "yescaptcha_test_mode",
+    "yescaptcha_client_key",
+    "yescaptcha_soft_id",
 )
 
 
@@ -210,14 +221,26 @@ class TimePickerDialog(ctk.CTkToplevel):
             self._show_empty("표시할 시간이 없습니다.")
             return
 
+        estimated = [slot for slot in slots if getattr(slot, "estimated", False)]
         available = [slot for slot in slots if slot.available]
-        self.status.configure(
-            text=(
-                f"예약 가능 {len(available)}개 · 마감/미오픈 {len(slots) - len(available)}개 "
-                f"(전체 {len(slots)}개) · 마감은 ✕ 표시"
-            ),
-            text_color=theme.TINT_SUCCESS_FG if available else theme.ACCENT_YELLOW,
-        )
+        if estimated:
+            source_date = getattr(estimated[0], "source_date", "")
+            source_text = f"{source_date} 같은 요일" if source_date else "같은 요일의 최근"
+            self.status.configure(
+                text=(
+                    f"아직 닫힌 날짜 · {source_text} 시간표 {len(slots)}개를 표시합니다. "
+                    "시간은 선택할 수 있으며 오픈 후 실제 상태를 다시 확인합니다."
+                ),
+                text_color=theme.ACCENT_YELLOW,
+            )
+        else:
+            self.status.configure(
+                text=(
+                    f"예약 가능 {len(available)}개 · 마감/미오픈 {len(slots) - len(available)}개 "
+                    f"(전체 {len(slots)}개) · 마감은 ✕ 표시"
+                ),
+                text_color=theme.TINT_SUCCESS_FG if available else theme.ACCENT_YELLOW,
+            )
 
         rows = (len(slots) + self.COLUMNS - 1) // self.COLUMNS
         host = self._build_host(rows)
@@ -228,17 +251,20 @@ class TimePickerDialog(ctk.CTkToplevel):
             row, column = divmod(index, self.COLUMNS)
             # A glyph suffix carries the state as well as the colour does, so
             # availability is not conveyed by colour alone.
-            label = slot.time if slot.available else f"{slot.time} ✕"
+            selectable = getattr(slot, "selectable", slot.available)
+            label = f"{slot.time} ◇" if getattr(slot, "estimated", False) else (
+                slot.time if slot.available else f"{slot.time} ✕"
+            )
             button = ctk.CTkButton(
                 host,
                 text=label,
                 font=theme.FONT_BODY_MD,
-                state="normal" if slot.available else "disabled",
-                fg_color=theme.ELEVATED_COLOR if slot.available else theme.SURFACE_COLOR,
+                state="normal" if selectable else "disabled",
+                fg_color=theme.ELEVATED_COLOR if selectable else theme.SURFACE_COLOR,
                 hover_color=theme.ACCENT_BLUE,
                 border_width=1,
-                border_color=theme.CONTROL_BORDER if slot.available else theme.HAIRLINE_COLOR,
-                text_color=theme.TEXT_PRIMARY if slot.available else theme.TEXT_DISABLED,
+                border_color=theme.CONTROL_BORDER if selectable else theme.HAIRLINE_COLOR,
+                text_color=theme.TEXT_PRIMARY if selectable else theme.TEXT_DISABLED,
                 text_color_disabled=theme.TEXT_DISABLED,
                 corner_radius=theme.ROUNDED_SM,
                 command=lambda value=slot.time: self._choose(value),
@@ -319,6 +345,7 @@ class ReservationForm(ctk.CTkFrame):
         # clamps anything higher anyway, and this keeps the slider honest about it.
         self.standard_threads = 30
         self.naver_threads = 1
+        self.keyescape_threads = 1
         self.last_mode = STANDARD_MODE
 
         # Grid configuration for 2 columns
@@ -696,18 +723,105 @@ class ReservationForm(ctk.CTkFrame):
         )
         self.remember_personal_checkbox.grid(row=0, column=0, sticky="w", pady=(0, theme.SPACE_2))
 
-        # The third-party captcha solving key used to live here. Keyescape now
-        # relies on the user solving the challenge in the browser, so there is
-        # nothing to configure.
-        self.captcha_notice_label = ctk.CTkLabel(
+        # YesCaptcha Auto-Solver Frame inside Advanced Settings
+        self.yescaptcha_frame = ctk.CTkFrame(
             self.advanced_frame,
-            text="키이스케이프는 브라우저에서 직접 캡차를 인증합니다.",
-            font=theme.FONT_LABEL,
-            text_color=theme.TEXT_TERTIARY,
-            anchor="w",
-            justify="left",
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
+            corner_radius=theme.ROUNDED_MD
         )
-        self.captcha_notice_label.grid(row=1, column=0, sticky="ew")
+        self.yescaptcha_frame.grid(row=1, column=0, sticky="ew", pady=(0, theme.SPACE_2))
+
+        self.yc_header_frame = ctk.CTkFrame(self.yescaptcha_frame, fg_color="transparent")
+        self.yc_header_frame.pack(fill="x", padx=8, pady=(6, 4))
+
+        self.yescaptcha_enabled_var = ctk.BooleanVar(value=False)
+        self.yescaptcha_checkbox = ctk.CTkCheckBox(
+            self.yc_header_frame,
+            text="YesCaptcha 자동 해결 사용 (ON/OFF)",
+            variable=self.yescaptcha_enabled_var,
+            font=(theme.FONT_FAMILY, 11, "bold"),
+            fg_color=theme.ACCENT_BLUE,
+            hover_color=theme.ACCENT_BLUE,
+            text_color=theme.TEXT_PRIMARY,
+            checkbox_width=14,
+            checkbox_height=14,
+            corner_radius=theme.ROUNDED_SM,
+            command=self._on_yescaptcha_toggle
+        )
+        self.yescaptcha_checkbox.pack(side="left", anchor="w")
+
+        self.yescaptcha_balance_btn = ctk.CTkButton(
+            self.yc_header_frame,
+            text="잔액 확인",
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.SURFACE_COLOR,
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            height=22,
+            width=64,
+            corner_radius=theme.ROUNDED_SM,
+            command=self._check_yescaptcha_balance
+        )
+        self.yescaptcha_balance_btn.pack(side="right")
+
+        self.yc_inputs_frame = ctk.CTkFrame(self.yescaptcha_frame, fg_color="transparent")
+        self.yc_inputs_frame.pack(fill="x", padx=8, pady=(0, 6))
+
+        self.yc_key_label = ctk.CTkLabel(self.yc_inputs_frame, text="API Key:", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
+        self.yc_key_label.pack(side="left", padx=(0, 4))
+
+        self.yescaptcha_client_key_entry = ctk.CTkEntry(
+            self.yc_inputs_frame,
+            placeholder_text="YesCaptcha Client Key",
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_DISABLED,
+            corner_radius=theme.ROUNDED_SM,
+            height=24
+        )
+        self.yescaptcha_client_key_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.yc_soft_label = ctk.CTkLabel(self.yc_inputs_frame, text="SoftID:", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
+        self.yc_soft_label.pack(side="left", padx=(0, 4))
+
+        self.yescaptcha_soft_id_entry = ctk.CTkEntry(
+            self.yc_inputs_frame,
+            placeholder_text="SoftID",
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_DISABLED,
+            corner_radius=theme.ROUNDED_SM,
+            height=24,
+            width=60
+        )
+        self.yescaptcha_soft_id_entry.insert(0, DEFAULT_SOFT_ID)
+        self.yescaptcha_soft_id_entry.pack(side="left")
+
+        self.yescaptcha_test_mode_var = ctk.BooleanVar(value=False)
+        self.yescaptcha_test_mode_checkbox = ctk.CTkCheckBox(
+            self.yescaptcha_frame,
+            text="즉시 테스트 모드 (시작 즉시 1회 검증 · 포인트 사용)",
+            variable=self.yescaptcha_test_mode_var,
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.ACCENT_BLUE,
+            hover_color=theme.ACCENT_BLUE,
+            text_color=theme.TEXT_DISABLED,
+            checkbox_width=14,
+            checkbox_height=14,
+            corner_radius=theme.ROUNDED_SM,
+            state="disabled",
+            command=self._on_yescaptcha_test_mode_toggle,
+        )
+        self.yescaptcha_test_mode_checkbox.pack(
+            fill="x", padx=8, pady=(0, 6), anchor="w"
+        )
+
+        self._setup_entry_focus(self.yescaptcha_client_key_entry)
+        self._setup_entry_focus(self.yescaptcha_soft_id_entry)
 
         self.npay_auto_pay_var = ctk.BooleanVar(value=False)
         self.npay_auto_pay_checkbox = ctk.CTkCheckBox(
@@ -835,19 +949,39 @@ class ReservationForm(ctk.CTkFrame):
         self._on_date_change()
 
     def _open_time_picker(self):
-        branch_id = self.config.get("branches", {}).get(self.branch_var.get(), "")
-        theme_id = self._theme_id_for_name(branch_id, self.theme_var.get())
         reservation_date = self.date_entry.get().strip()
+        is_naver = self.engine_mode_btn.get() == NAVER_MODE
+        lookup_config = self.config
+        if is_naver:
+            branch_id = "1"
+            theme_id = self.config.get("themes", {}).get("1", {}).get(
+                self.theme_var.get(), ""
+            )
+            if not theme_id or theme_id == "naver":
+                theme_id = self.config.get("url", "")
+            # Naver's fetcher needs the selected item URL (/items/{id}), while a
+            # multi-theme site's root URL only contains the business id.
+            lookup_config = dict(self.config)
+            lookup_config["url"] = theme_id
+        else:
+            branch_id = self.config.get("branches", {}).get(self.branch_var.get(), "")
+            theme_id = self._theme_id_for_name(branch_id, self.theme_var.get())
+
         if not branch_id or not theme_id or len(reservation_date) != 10:
             from tkinter import messagebox
 
-            messagebox.showwarning("시간 조회", "지점, 테마, 날짜를 먼저 선택해주세요.", parent=self)
+            required = "테마, 날짜" if is_naver else "지점, 테마, 날짜"
+            messagebox.showwarning(
+                "시간 조회", f"{required}를 먼저 선택해주세요.", parent=self
+            )
             return
 
         def loader():
             from engines.time_slot_fetchers import fetch_any_time_slots
 
-            return fetch_any_time_slots(self.config, branch_id, theme_id, reservation_date)
+            return fetch_any_time_slots(
+                lookup_config, branch_id, theme_id, reservation_date
+            )
 
         TimePickerDialog(self, loader, self._set_selected_time)
 
@@ -901,38 +1035,93 @@ class ReservationForm(ctk.CTkFrame):
         if not getattr(self, "_booking_running", False):
             self.catalog_refresh_btn.configure(state="disabled" if busy else "normal")
 
-    def _on_mode_change(self, mode):
-        # Save current slider value to appropriate variable before switching, but not during initialization
-        if not getattr(self, "_is_initializing", False):
-            if self.last_mode == NAVER_MODE:
-                self.naver_threads = int(self.threads_slider.get())
-            else:
-                self.standard_threads = int(self.threads_slider.get())
+    def _site_uses_keyescape(self, site_name=None) -> bool:
+        """Return whether a standard-mode site is backed by KeyescapeEngine."""
+        site_name = self.current_site if site_name is None else site_name
+        if site_name == "키이스케이프":
+            return True
+        site = self.custom_sites.get(site_name) or {}
+        return (site.get("engine_id") or site.get("style")) == "keyescape"
 
-        if mode == NAVER_MODE:
-            # Locked at 1, and the control says so. The slider used to run to 8
-            # while the engine clamped the value to 1 anyway -- one Naver account
-            # can hold one booking, so a second worker only repeats the same
-            # request from the same session. Leaving the slider movable made the
-            # UI claim something the engine does not do.
+    def _keyescape_ui_active(self) -> bool:
+        return (
+            self.engine_mode_btn.get() != NAVER_MODE
+            and self._site_uses_keyescape()
+        )
+
+    def _remember_active_thread_value(self) -> None:
+        """Save the slider under the policy that owned it before a mode change."""
+        value = int(self.threads_slider.get())
+        if self.last_mode == NAVER_MODE:
             self.naver_threads = 1
-            self.threads_slider.configure(to=8, number_of_steps=7, state="disabled")
-            self.threads_slider.set(1)
-            self.threads_value_label.configure(text="1")
-            self.threads_title_label.configure(text="동시 시도 수 (네이버는 1개 고정)")
+        elif self._site_uses_keyescape():
+            self.keyescape_threads = max(1, min(value, 3))
         else:
-            self.set_site(self.current_site)
-            self.standard_threads = max(1, min(self.standard_threads, 50))
-            self.threads_slider.configure(to=50, number_of_steps=49, state="normal")
-            self.threads_slider.set(self.standard_threads)
-            self.threads_value_label.configure(text=str(self.standard_threads))
-            self.threads_title_label.configure(text="동시 시도 수")
-            
-        self._update_widgets_state()
-            
+            self.standard_threads = max(1, min(value, 50))
+
+    def _apply_thread_policy(self) -> None:
+        """Fully reset the shared slider for the active engine family.
+
+        Every branch writes range, step count, state, value and labels. This is
+        intentionally idempotent: site and mode callbacks can arrive in either
+        order without leaking Keyescape's cap into standard sites or unlocking
+        Naver's fixed single worker.
+        """
+        if self.engine_mode_btn.get() == NAVER_MODE:
+            self.naver_threads = 1
+            self.threads_slider.configure(
+                from_=1, to=8, number_of_steps=7, state="disabled"
+            )
+            self.threads_slider.set(1)
+            self.threads_value_label.configure(
+                text="1", text_color=theme.TEXT_DISABLED
+            )
+            self.threads_title_label.configure(
+                text="동시 시도 수 (네이버는 1개 고정)",
+                text_color=theme.TEXT_DISABLED,
+            )
+            return
+
+        if self._site_uses_keyescape():
+            self.keyescape_threads = max(1, min(self.keyescape_threads, 3))
+            self.threads_slider.configure(
+                from_=1, to=3, number_of_steps=2, state="normal"
+            )
+            self.threads_slider.set(self.keyescape_threads)
+            self.threads_value_label.configure(
+                text=str(self.keyescape_threads), text_color=theme.ACCENT_BLUE
+            )
+            self.threads_title_label.configure(
+                text="동시 시도 페이지 (최대 3)", text_color=theme.TEXT_MUTE
+            )
+            return
+
+        self.standard_threads = max(1, min(self.standard_threads, 50))
+        self.threads_slider.configure(
+            from_=1, to=50, number_of_steps=49, state="normal"
+        )
+        self.threads_slider.set(self.standard_threads)
+        self.threads_value_label.configure(
+            text=str(self.standard_threads), text_color=theme.ACCENT_BLUE
+        )
+        self.threads_title_label.configure(
+            text="동시 시도 수", text_color=theme.TEXT_MUTE
+        )
+
+    def _on_mode_change(self, mode):
+        if not getattr(self, "_is_initializing", False):
+            self._remember_active_thread_value()
+
         self.last_mode = mode
+        if mode == NAVER_MODE:
+            self.naver_threads = 1
+
+        # MainWindow selects the remembered site for the new mode. set_site()
+        # applies the same policy during that callback; the final call below is
+        # deliberate and makes standalone ReservationForm use correct as well.
         if self.mode_callback:
             self.mode_callback(mode)
+        self._update_widgets_state()
 
     # Engines that actually honour reservation_data["devMode"]: they drive a real
     # browser, so stopping short of the final click leaves something to inspect.
@@ -983,26 +1172,27 @@ class ReservationForm(ctk.CTkFrame):
         if getattr(self, "_booking_running", False):
             return
         is_naver = (self.engine_mode_btn.get() == NAVER_MODE)
+        keyescape_active = self._keyescape_ui_active()
+        yescaptcha_on = (
+            keyescape_active and bool(self.yescaptcha_enabled_var.get())
+        )
+        self.yescaptcha_test_mode_checkbox.configure(
+            state="normal" if yescaptcha_on else "disabled",
+            text_color=theme.TEXT_MUTE if yescaptcha_on else theme.TEXT_DISABLED,
+        )
+
+        if keyescape_active:
+            self.yescaptcha_frame.grid(
+                row=1, column=0, sticky="ew", pady=(0, theme.SPACE_2)
+            )
+        else:
+            self.yescaptcha_frame.grid_forget()
         
         if getattr(self, "_advanced_visible", False):
             self.threads_frame.grid(row=8, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
         else:
             self.threads_frame.grid_forget()
-        if self.current_site == "키이스케이프":
-            self.threads_slider.configure(state="disabled")
-            self.threads_slider.set(1)
-            self.threads_value_label.configure(text="1", text_color=theme.TEXT_DISABLED)
-            self.threads_title_label.configure(text_color=theme.TEXT_DISABLED)
-        else:
-            self.threads_slider.configure(state="normal")
-            self.threads_title_label.configure(text_color=theme.TEXT_MUTE)
-            self.threads_value_label.configure(text_color=theme.ACCENT_BLUE)
-            if is_naver:
-                self.threads_slider.set(self.naver_threads)
-                self.threads_value_label.configure(text=str(self.naver_threads))
-            else:
-                self.threads_slider.set(self.standard_threads)
-                self.threads_value_label.configure(text=str(self.standard_threads))
+        self._apply_thread_policy()
 
         if is_naver:
             # Disable Naver-incompatible controls but keep them in layout to prevent vertical layout shifting
@@ -1027,9 +1217,8 @@ class ReservationForm(ctk.CTkFrame):
             # Disable phone entry as Naver Booking autofills phone from active logged in user session
             self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
-            
+
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
-            self.captcha_notice_label.grid_forget()
             self.npay_auto_pay_checkbox.grid(row=1, column=0, sticky="w")
             self.npay_auto_pay_checkbox.configure(
                 state="normal", text_color=theme.TEXT_MUTE
@@ -1052,7 +1241,6 @@ class ReservationForm(ctk.CTkFrame):
             self._toggle_custom_theme()
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
             self.npay_auto_pay_checkbox.grid_forget()
-            self.captcha_notice_label.grid(row=1, column=0, sticky="ew")
 
         self._update_dev_mode_state()
 
@@ -1213,15 +1401,49 @@ class ReservationForm(ctk.CTkFrame):
             self.master._update_server_time_sync_state()
         self.auto_save()
 
-    def _on_threads_slider_move(self, value):
-        if self.current_site == "키이스케이프":
+    def _on_yescaptcha_toggle(self):
+        if not self.yescaptcha_enabled_var.get():
+            self.yescaptcha_test_mode_var.set(False)
+        self._update_widgets_state()
+        self.auto_save()
+
+    def _on_yescaptcha_test_mode_toggle(self):
+        if self.yescaptcha_test_mode_var.get() and not self.yescaptcha_enabled_var.get():
+            self.yescaptcha_test_mode_var.set(False)
+        self.auto_save()
+
+    def _check_yescaptcha_balance(self):
+        from tkinter import messagebox
+        client_key = self.yescaptcha_client_key_entry.get().strip()
+        soft_id = self.yescaptcha_soft_id_entry.get().strip() or DEFAULT_SOFT_ID
+        if not client_key:
+            messagebox.showwarning("YesCaptcha 경고", "YesCaptcha Client Key (API Key)를 입력해 주세요.")
             return
-        val = int(value)
-        self.threads_value_label.configure(text=str(val))
-        if self.engine_mode_btn.get() == NAVER_MODE:
-            self.naver_threads = val
+
+        client = YesCaptchaClient(client_key, soft_id)
+        ok, balance, msg = client.get_balance()
+        
+        main_win = self.winfo_toplevel()
+        if hasattr(main_win, "log_panel") and hasattr(main_win.log_panel, "append_log"):
+            main_win.log_panel.append_log(f"[YesCaptcha] {msg}", "success" if ok else "error")
+
+        if ok:
+            messagebox.showinfo("YesCaptcha 잔액 확인", f"조회 성공!\n현재 보유 잔액/포인트: {int(balance):,} P")
         else:
-            self.standard_threads = val
+            messagebox.showerror("YesCaptcha 조회 실패", f"잔액 조회 실패:\n{msg}")
+
+    def _on_threads_slider_move(self, value):
+        val = int(value)
+        if self.engine_mode_btn.get() == NAVER_MODE:
+            self.naver_threads = 1
+            self.threads_slider.set(1)
+            self.threads_value_label.configure(text="1")
+            return
+        self.threads_value_label.configure(text=str(val))
+        if self._site_uses_keyescape():
+            self.keyescape_threads = max(1, min(val, 3))
+        else:
+            self.standard_threads = max(1, min(val, 50))
         self.auto_save()
 
     def _on_date_change(self, event=None):
@@ -1331,6 +1553,10 @@ class ReservationForm(ctk.CTkFrame):
         else:
             theme_pk = JIGUBYEOL_THEMES.get(branch_id, {}).get(theme_name, "")
 
+        keyescape_active = self._keyescape_ui_active()
+        yescaptcha_enabled = (
+            keyescape_active and bool(self.yescaptcha_enabled_var.get())
+        )
         raw_values = {
             "branch": branch_id,
             "branchLabel": self.branch_var.get(),
@@ -1349,6 +1575,15 @@ class ReservationForm(ctk.CTkFrame):
             "devMode": self.developer_mode_enabled(),
             "npayAutoPay": self.npay_auto_pay_enabled(),
             "site_url": self.config.get("url", ""),
+            "yescaptcha_enabled": yescaptcha_enabled,
+            "yescaptcha_test_mode": (
+                yescaptcha_enabled and bool(self.yescaptcha_test_mode_var.get())
+            ),
+            "yescaptcha_client_key": (
+                self.yescaptcha_client_key_entry.get().strip()
+                if keyescape_active else ""
+            ),
+            "yescaptcha_soft_id": self.yescaptcha_soft_id_entry.get().strip() or DEFAULT_SOFT_ID,
             "engine_metadata": {
                 "branch": self.config.get("branch_metadata", {}).get(branch_id, {}),
                 "theme": self.config.get("theme_metadata", {}).get(branch_id, {}).get(theme_pk, {}),
@@ -1363,7 +1598,13 @@ class ReservationForm(ctk.CTkFrame):
         if errors:
             return None, errors[0], 0, False
 
-        threads = 1 if self.current_site == "키이스케이프" else int(self.threads_slider.get())
+        if is_naver:
+            threads = 1
+        elif keyescape_active:
+            threads = int(self.threads_slider.get())
+            threads = max(1, min(threads, 3))
+        else:
+            threads = max(1, min(int(self.threads_slider.get()), 50))
         return request, None, threads, not is_naver
 
     def _format_phone(self, event=None):
@@ -1581,7 +1822,12 @@ class ReservationForm(ctk.CTkFrame):
             if "threads" in config:
                 self.standard_threads = max(1, min(int(config["threads"]), 50))
             if "naver_threads" in config:
-                self.naver_threads = max(1, min(int(config["naver_threads"]), 8))
+                # NaverEngine always owns exactly one browser worker.
+                self.naver_threads = 1
+            if "keyescape_threads" in config:
+                self.keyescape_threads = max(
+                    1, min(int(config["keyescape_threads"]), 3)
+                )
 
             if "engine_mode" in config:
                 mode_val = LEGACY_MODE_MAP.get(config["engine_mode"], config["engine_mode"])
@@ -1599,6 +1845,31 @@ class ReservationForm(ctk.CTkFrame):
                     self.show_server_time_checkbox.deselect()
             else:
                 self.show_server_time_checkbox.deselect()
+
+            if "yescaptcha_enabled" in config:
+                if coerce_bool(config["yescaptcha_enabled"]):
+                    self.yescaptcha_checkbox.select()
+                else:
+                    self.yescaptcha_checkbox.deselect()
+            if (
+                coerce_bool(config.get("yescaptcha_enabled", False))
+                and coerce_bool(config.get("yescaptcha_test_mode", False))
+            ):
+                self.yescaptcha_test_mode_checkbox.select()
+            else:
+                self.yescaptcha_test_mode_checkbox.deselect()
+            yescaptcha_on = bool(self.yescaptcha_enabled_var.get())
+            self.yescaptcha_test_mode_checkbox.configure(
+                state="normal" if yescaptcha_on else "disabled",
+                text_color=theme.TEXT_MUTE if yescaptcha_on else theme.TEXT_DISABLED,
+            )
+            if "yescaptcha_client_key" in config:
+                self.yescaptcha_client_key_entry.delete(0, "end")
+                self.yescaptcha_client_key_entry.insert(0, config["yescaptcha_client_key"])
+            if "yescaptcha_soft_id" in config:
+                self.yescaptcha_soft_id_entry.delete(0, "end")
+                self.yescaptcha_soft_id_entry.insert(0, config["yescaptcha_soft_id"])
+
             self.catalog_auto_refresh_var.set(bool(config.get("catalog_auto_refresh", True)))
             self.npay_auto_pay_var.set(bool(config.get("naver_npay_auto_pay", False)))
             if saved_site == self.current_site:
@@ -1624,7 +1895,11 @@ class ReservationForm(ctk.CTkFrame):
         try:
             # Sync active memory thread counts before saving
             if self.engine_mode_btn.get() == NAVER_MODE:
-                self.naver_threads = int(self.threads_slider.get())
+                self.naver_threads = 1
+            elif self._site_uses_keyescape():
+                self.keyescape_threads = max(
+                    1, min(int(self.threads_slider.get()), 3)
+                )
             else:
                 self.standard_threads = int(self.threads_slider.get())
 
@@ -1648,6 +1923,7 @@ class ReservationForm(ctk.CTkFrame):
                 "people": self.people_entry.get().strip(),
                 "threads": self.standard_threads,
                 "naver_threads": self.naver_threads,
+                "keyescape_threads": self.keyescape_threads,
                 "is_async": self.engine_mode_btn.get() == STANDARD_MODE,
                 "engine_mode": self.engine_mode_btn.get(),
                 "show_server_time": bool(self.show_server_time_checkbox.get()),
@@ -1656,6 +1932,10 @@ class ReservationForm(ctk.CTkFrame):
                 "naver_npay_auto_pay": bool(self.npay_auto_pay_var.get()),
                 "selected_branch_id": self._selected_branch_id(),
                 "selected_theme_id": self._selected_theme_id(),
+                "yescaptcha_enabled": bool(self.yescaptcha_enabled_var.get()),
+                "yescaptcha_test_mode": bool(self.yescaptcha_test_mode_var.get()),
+                "yescaptcha_client_key": self.yescaptcha_client_key_entry.get().strip(),
+                "yescaptcha_soft_id": self.yescaptcha_soft_id_entry.get().strip(),
             }
             # save_config rewrites config.json wholesale, so settings that are
             # not surfaced in this form (currently the scroll repaint switch)

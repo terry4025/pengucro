@@ -17,6 +17,16 @@ class ZeroWorldTimeSlot:
     time: str
     slot_id: str
     available: bool
+    # Naver omits hourly records entirely for a calendar day that has not opened.
+    # In that case the picker copies the latest timetable for the same weekday.
+    # It is selectable as a time choice, but deliberately remains unavailable so
+    # the UI never claims the closed target date can already be booked.
+    estimated: bool = False
+    source_date: str = ""
+
+    @property
+    def selectable(self) -> bool:
+        return self.available or self.estimated
 
 
 def subject_for_branch(branch_id: str) -> str:

@@ -20,6 +20,7 @@ from engines.naver_api import (
     KST,
     NaverApiError,
     NaverBookingApi,
+    NaverItemMeta,
     NaverServerClock,
     NaverSlot,
     parse_ids,
@@ -296,6 +297,59 @@ def test_item_meta_reads_json_scalars(monkeypatch):
     assert meta.open_at.strftime("%H:%M") == "00:00"
     assert meta.uses_open_schedule and meta.is_opened
     assert meta.hard_block() is None
+
+
+def test_target_open_time_is_shifted_from_latest_published_schedule(monkeypatch):
+    """openDateTime belongs to the last published day, not every target day.
+
+    Live example (오늘의 한 페이지 / 버디, 2026-08-02): the item reports
+    2026-08-01 22:00 while schedules exist through 2026-08-08.  Therefore the
+    still-closed 2026-08-09 date opens one day later, at 2026-08-02 22:00.
+    """
+    api = NaverBookingApi("1325520", "6446475", "12")
+    meta = NaverItemMeta(
+        name="버디",
+        server_time=datetime(2026, 8, 2, 17, 51, tzinfo=KST),
+        is_closed_booking=False,
+        is_closed_for_user=False,
+        open_at=datetime(2026, 8, 1, 22, 0, tzinfo=KST),
+        is_opened=True,
+        uses_open_schedule=True,
+        is_paused=False,
+        custom_form=[],
+    )
+    published = [
+        NaverSlot.from_payload(slot_payload(unitStartTime="2026-08-02 09:40:00")),
+        NaverSlot.from_payload(slot_payload(unitStartTime="2026-08-08 22:40:00")),
+    ]
+    monkeypatch.setattr(api, "fetch_slots", lambda *_args, **_kwargs: published)
+
+    resolved = api.resolve_target_open_at("2026-08-09", meta)
+
+    assert resolved == datetime(2026, 8, 2, 22, 0, tzinfo=KST)
+
+
+def test_unopened_one_time_item_keeps_its_announced_open_time(monkeypatch):
+    api = NaverBookingApi("1498729", "7531350", "12")
+    announced = datetime(2026, 11, 27, 0, 0, tzinfo=KST)
+    meta = NaverItemMeta(
+        name="채널27",
+        server_time=datetime(2026, 8, 2, 17, 51, tzinfo=KST),
+        is_closed_booking=False,
+        is_closed_for_user=False,
+        open_at=announced,
+        is_opened=False,
+        uses_open_schedule=True,
+        is_paused=False,
+        custom_form=[],
+    )
+    monkeypatch.setattr(
+        api,
+        "fetch_slots",
+        lambda *_args, **_kwargs: pytest.fail("아직 한 번도 열린 적 없는 상품은 보정하지 않아야 합니다"),
+    )
+
+    assert api.resolve_target_open_at("2026-12-01", meta) == announced
 
 
 @pytest.mark.parametrize(

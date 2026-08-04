@@ -666,6 +666,56 @@ class NaverBookingApi:
                 return slot
         return None
 
+    def resolve_target_open_at(
+        self, date_str: str, meta: NaverItemMeta
+    ) -> datetime | None:
+        """Translate the item's rolling open marker to one reservation date.
+
+        For rolling calendars Naver's ``bookableSettingJson.openDateTime`` is the
+        opening moment of the *latest date currently published*, not the opening
+        moment of every date a user may type.  The public schedule response tells
+        us which date that marker belongs to: take its latest published day and
+        shift the marker by the calendar-day distance to ``date_str``.
+
+        Items that have never opened (``isOpened == false``) are one-shot/future
+        announcements, so their timestamp is already authoritative and must not
+        be shifted.  Any lookup/parsing failure also keeps Naver's raw value; a
+        conservative fallback is safer than inventing an opening time.
+        """
+        announced = meta.open_at
+        if (
+            announced is None
+            or not meta.uses_open_schedule
+            or not meta.is_opened
+        ):
+            return announced
+
+        try:
+            target_day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return announced
+
+        server_day = (
+            meta.server_time.date()
+            if meta.server_time is not None
+            else datetime.now(KST).date()
+        )
+        # Include enough history to survive sparse/weekly calendars and include
+        # the target itself when it is already open. GraphQL simply omits closed
+        # future days, so the maximum returned date remains the rolling anchor.
+        date_from = min(server_day, target_day) - timedelta(days=35)
+        date_to = max(server_day, target_day) + timedelta(days=35)
+        try:
+            published = self.fetch_slots(date_from.isoformat(), date_to.isoformat())
+        except NaverApiError:
+            return announced
+        published_days = {slot.start.date() for slot in published if slot is not None}
+        if not published_days:
+            return announced
+
+        anchor_day = max(published_days)
+        return announced + timedelta(days=(target_day - anchor_day).days)
+
     def fetch_item_meta(self) -> NaverItemMeta:
         data = self._post("bizItem", BIZ_ITEM_QUERY, {
             "input": {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 import urllib.parse
+from datetime import datetime, timedelta
 from typing import Any
 import requests
 from bs4 import BeautifulSoup
@@ -184,9 +185,42 @@ def fetch_naver_slots(
 
     service_id, business_id, item_id = ids
     api = NaverBookingApi(business_id, item_id, service_id, timeout=timeout)
+    estimated = False
+    source_date = ""
     try:
         slots = api.fetch_slots(date_str)
+        if not slots:
+            # A closed Naver calendar day has no hourly records.  Its weekday
+            # pattern is still useful for choosing a target time, so read the
+            # latest published occurrence of the same weekday.  Availability is
+            # intentionally false below: these are timetable choices, not a
+            # promise that the target date is already bookable.
+            target_day = datetime.strptime(date_str, "%Y-%m-%d").date()
+            meta = api.fetch_item_meta()
+            reference_day = (
+                meta.server_time.date()
+                if meta.server_time is not None
+                else datetime.now().date()
+            )
+            history = api.fetch_slots(
+                (reference_day - timedelta(days=28)).isoformat(),
+                (reference_day + timedelta(days=14)).isoformat(),
+            )
+            same_weekday = [
+                slot for slot in history
+                if slot.start.date() < target_day
+                and slot.start.weekday() == target_day.weekday()
+            ]
+            if same_weekday:
+                source_day = max(slot.start.date() for slot in same_weekday)
+                slots = [
+                    slot for slot in same_weekday if slot.start.date() == source_day
+                ]
+                estimated = True
+                source_date = source_day.isoformat()
     except NaverApiError:
+        return []
+    except (TypeError, ValueError):
         return []
     finally:
         api.close()
@@ -195,8 +229,10 @@ def fetch_naver_slots(
         (
             ZeroWorldTimeSlot(
                 time=slot.time_str,
-                slot_id=slot.slot_id,
-                available=slot.is_open(),
+                slot_id="" if estimated else slot.slot_id,
+                available=False if estimated else slot.is_open(),
+                estimated=estimated,
+                source_date=source_date,
             )
             for slot in slots
         ),

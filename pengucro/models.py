@@ -30,6 +30,21 @@ def parse_bool_flag(value: Any, default: bool = False) -> bool:
     return default
 
 
+def coerce_bool(value: Any) -> bool:
+    """Interpret persisted/UI boolean values without treating "false" as true."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "off", "no", "n"}:
+            return False
+        if normalized in {"1", "true", "on", "yes", "y"}:
+            return True
+    return bool(value)
+
+
 class BookingEventType(str, Enum):
     INFO = "info"
     ATTEMPT = "attempt"
@@ -72,6 +87,10 @@ class ReservationRequest:
     developer_mode: bool = False
     site_url: str = ""
     naver_time_offset: float = 0.0
+    yescaptcha_enabled: bool = False
+    yescaptcha_test_mode: bool = False
+    yescaptcha_client_key: str = ""
+    yescaptcha_soft_id: str = "26273"
     engine_metadata: Mapping[str, Any] = field(default_factory=dict)
     npay_auto_pay: bool = False
 
@@ -96,10 +115,14 @@ class ReservationRequest:
             payment_type=str(values.get("paymentType", "1")),
             policy=str(values.get("policy", "true")).lower() == "true",
             developer_mode=parse_bool_flag(values.get("devMode", False)),
-            npay_auto_pay=parse_bool_flag(values.get("npayAutoPay", False)),
             site_url=str(values.get("site_url", "")).strip(),
             naver_time_offset=float(values.get("naver_time_offset", 0.0) or 0.0),
+            yescaptcha_enabled=coerce_bool(values.get("yescaptcha_enabled", False)),
+            yescaptcha_test_mode=coerce_bool(values.get("yescaptcha_test_mode", False)),
+            yescaptcha_client_key=str(values.get("yescaptcha_client_key", "")).strip(),
+            yescaptcha_soft_id=str(values.get("yescaptcha_soft_id", "26273")).strip() or "26273",
             engine_metadata=dict(values.get("engine_metadata", {})),
+            npay_auto_pay=parse_bool_flag(values.get("npayAutoPay", False)),
         )
 
     def validate(self, *, phone_required: bool = True) -> list[str]:
@@ -144,6 +167,14 @@ class ReservationRequest:
             "naver_time_offset": self.naver_time_offset,
             "branchLabel": self.branch_label,
             "themeLabel": self.theme_label,
+            # Engines receive this dict, not the request object. Leaving these
+            # out silently disabled YesCaptcha: the keyescape engine read
+            # payload.get("yescaptcha_enabled") and always got False, so it
+            # never asked the API and fell back to clicking the widget forever.
+            "yescaptcha_enabled": self.yescaptcha_enabled,
+            "yescaptcha_test_mode": self.yescaptcha_test_mode,
+            "yescaptcha_client_key": self.yescaptcha_client_key,
+            "yescaptcha_soft_id": self.yescaptcha_soft_id,
             "engine_metadata": dict(self.engine_metadata),
         }
 

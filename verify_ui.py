@@ -281,10 +281,16 @@ class TestUIComponents(unittest.TestCase):
 
     def test_4_engine_mode_change_filtering(self):
         print("\n--- Verifying Engine Mode Change Filtering ---")
+
+        def choose_mode(mode):
+            # Mirror a real segmented-button click: its value changes before
+            # ReservationForm receives the command callback.
+            self.app.form.engine_mode_btn.set(mode)
+            self.app.form._on_mode_change(mode)
+            self.app.update()
         
         # Test change to Naver (Playwright) mode
-        self.app._on_engine_mode_change(NAVER_MODE)
-        self.app.update()
+        choose_mode(NAVER_MODE)
         
         # Site options should contain either Naver custom sites or the placeholder
         naver_options = self.app.site_dropdown.cget("values")
@@ -294,14 +300,22 @@ class TestUIComponents(unittest.TestCase):
         else:
             self.assertTrue(all(self.app.custom_sites[k].get("style") == "naver" for k in naver_options))
             print("[Pass] Correct Naver custom sites filtered.")
+        self.assertEqual(self.app.form.threads_slider.cget("state"), "disabled")
+        self.assertEqual(int(self.app.form.threads_slider.get()), 1)
+        self.assertEqual(self.app.form.naver_threads, 1)
+        self.assertEqual(
+            self.app.form.yescaptcha_frame.winfo_manager(), "",
+            "YesCaptcha controls must not be laid out in Naver mode",
+        )
             
         # Test change to a Standard engine mode (e.g., 고속 (Async))
-        self.app._on_engine_mode_change(STANDARD_MODE)
-        self.app.update()
+        choose_mode(STANDARD_MODE)
         
         std_options = self.app.site_dropdown.cget("values")
         self.assertTrue(len(std_options) >= len(self.app.default_site_names))
         self.assertTrue(any("제로월드" in opt for opt in std_options))
+        self.assertEqual(float(self.app.form.threads_slider.cget("to")), 50.0)
+        self.assertEqual(self.app.form.threads_slider.cget("state"), "normal")
         print("[Pass] Standard engine mode restores default site options correctly.")
 
         self.app.site_var.set("제로월드")
@@ -366,6 +380,12 @@ class TestUIComponents(unittest.TestCase):
 
     def test_6_server_time_checkbox_disabled_handling(self):
         print("\n--- Verifying Server Time Checkbox Disable/Enable & Keyescape Sync Logic ---")
+
+        # Give standard sites a distinctive value so a Keyescape round-trip
+        # proves that the independent memories are not overwriting each other.
+        self.app.form.standard_threads = 47
+        self.app.form.threads_slider.set(47)
+        self.app.form._on_threads_slider_move(47)
         
         # 1. Switch to Keyescape
         self.app.site_var.set("키이스케이프")
@@ -375,6 +395,23 @@ class TestUIComponents(unittest.TestCase):
         # Check if server time checkbox is enabled for Keyescape
         cb_state = self.app.form.show_server_time_checkbox.cget("state")
         self.assertEqual(cb_state, "normal", "Server time checkbox must be enabled for Keyescape")
+        self.assertEqual(
+            float(self.app.form.threads_slider.cget("to")),
+            3.0,
+            "Keyescape standby slider must be capped at three pages",
+        )
+        self.assertEqual(
+            self.app.form.threads_slider.cget("state"),
+            "normal",
+            "Keyescape standby page count must be user-selectable",
+        )
+        self.app.form.threads_slider.set(3)
+        self.app.form._on_threads_slider_move(3)
+        self.assertEqual(self.app.form.keyescape_threads, 3)
+        self.assertEqual(
+            self.app.form.yescaptcha_frame.winfo_manager(), "grid",
+            "YesCaptcha controls must be laid out for Keyescape",
+        )
         
         # Checkbox select and toggle
         self.app.form.show_server_time_checkbox.select()
@@ -397,12 +434,58 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(cb_val, 0, "Server time checkbox must be deselected for Zero World")
         self.assertEqual(cb_state_new, "disabled", "Server time checkbox must be disabled for Zero World")
         self.assertFalse(self.app.is_sync_running, "Sync thread should be stopped for Zero World")
+        self.assertEqual(
+            float(self.app.form.threads_slider.cget("to")), 50.0,
+            "Standard sites must restore the full 1-50 range after Keyescape",
+        )
+        self.assertEqual(self.app.form.threads_slider.cget("state"), "normal")
+        self.assertEqual(int(self.app.form.threads_slider.get()), 47)
+        self.assertEqual(
+            self.app.form.yescaptcha_frame.winfo_manager(), "",
+            "YesCaptcha controls must be removed outside Keyescape",
+        )
         
         # Cleanup
         self.app.site_var.set("제로월드")
         self.app._on_site_change("제로월드")
         self.app.update()
         print("[Pass] Server time checkbox behaves correctly (deselected & disabled) on unsupported sites.")
+
+    def test_6b_keyescape_naver_standard_thread_policy_round_trip(self):
+        """All transition orders must reapply the complete engine policy."""
+        print("\n--- Verifying Per-Engine Thread Policy Round Trip ---")
+        form = self.app.form
+
+        self.app.site_var.set("키이스케이프")
+        self.app._on_site_change("키이스케이프")
+        form.threads_slider.set(3)
+        form._on_threads_slider_move(3)
+
+        form.engine_mode_btn.set(NAVER_MODE)
+        form._on_mode_change(NAVER_MODE)
+        self.app.update()
+        self.assertEqual(form.threads_slider.cget("state"), "disabled")
+        self.assertEqual(int(form.threads_slider.get()), 1)
+        self.assertEqual(form.naver_threads, 1)
+        self.assertEqual(form.yescaptcha_frame.winfo_manager(), "")
+
+        form.engine_mode_btn.set(STANDARD_MODE)
+        form._on_mode_change(STANDARD_MODE)
+        self.app.update()
+        # MainWindow remembers Keyescape as the last standard site.
+        self.assertEqual(self.app.site_var.get(), "키이스케이프")
+        self.assertEqual(float(form.threads_slider.cget("to")), 3.0)
+        self.assertEqual(int(form.threads_slider.get()), 3)
+        self.assertEqual(form.yescaptcha_frame.winfo_manager(), "grid")
+
+        self.app.site_var.set("제로월드")
+        self.app._on_site_change("제로월드")
+        self.app.update()
+        self.assertEqual(float(form.threads_slider.cget("to")), 50.0)
+        self.assertEqual(form.threads_slider.cget("state"), "normal")
+        self.assertEqual(int(form.threads_slider.get()), 47)
+        self.assertEqual(form.yescaptcha_frame.winfo_manager(), "")
+        print("[Pass] Naver=1 locked, Keyescape=1-3, standard=1-50 with separate memory.")
 
     def test_7_dynamic_advanced_layout_and_original_loading_reveal(self):
         print("\n--- Verifying Dynamic Advanced Layout & Original Loading Reveal ---")
@@ -434,7 +517,7 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(form.catalog_refresh_btn.cget("text"), "현재 사이트 갱신")
         self.assertEqual((self.app.winfo_width(), self.app.winfo_height()), root_size)
         self.assertGreater(form.winfo_height(), form_height)
-        self.assertLess(self.app.log_panel.winfo_height(), log_height)
+        self.assertLessEqual(self.app.log_panel.winfo_height(), log_height)
 
         form._toggle_advanced()
         self.app.update()

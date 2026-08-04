@@ -120,3 +120,71 @@ def test_npay_auto_pay_is_explicit_and_round_trips_to_engine_payload():
     assert request.npay_auto_pay is True
     assert request.to_engine_payload()["npayAutoPay"] is True
     assert "Npay 머니 자동결제: 사용" in request.summary()
+
+
+def test_engine_payload_carries_yescaptcha_settings():
+    """Engines receive the payload dict, not the request object.
+
+    Omitting these keys silently disabled YesCaptcha: the keyescape engine read
+    payload.get("yescaptcha_enabled"), always got False, never called the API,
+    and fell back to clicking the reCAPTCHA checkbox in a loop.
+    """
+    request = ReservationRequest.from_mapping(
+        "키이스케이프",
+        {
+            "branch": "3",
+            "reservationDate": (date.today() + timedelta(days=1)).isoformat(),
+            "reservationTime": "20:00",
+            "name": "테스트",
+            "phone": "010-1234-5678",
+            "people": "2",
+            "themePK": "44",
+            "yescaptcha_enabled": True,
+            "yescaptcha_test_mode": True,
+            "yescaptcha_client_key": "  client-key  ",
+            "yescaptcha_soft_id": "26273",
+        },
+    )
+    payload = request.to_engine_payload()
+    assert payload["yescaptcha_enabled"] is True
+    assert payload["yescaptcha_test_mode"] is True
+    assert payload["yescaptcha_client_key"] == "client-key"
+    assert payload["yescaptcha_soft_id"] == "26273"
+
+
+def test_engine_payload_defaults_yescaptcha_to_off():
+    request = ReservationRequest.from_mapping(
+        "키이스케이프",
+        {
+            "branch": "3",
+            "reservationDate": (date.today() + timedelta(days=1)).isoformat(),
+            "reservationTime": "20:00",
+            "name": "테스트",
+            "phone": "010-1234-5678",
+            "people": "2",
+            "themePK": "44",
+        },
+    )
+    payload = request.to_engine_payload()
+    assert payload["yescaptcha_enabled"] is False
+    assert payload["yescaptcha_test_mode"] is False
+    assert payload["yescaptcha_client_key"] == ""
+
+
+@pytest.mark.parametrize("value", [False, None, "", "false", "FALSE", "off", "0"])
+def test_yescaptcha_false_like_values_stay_off(value):
+    request = ReservationRequest.from_mapping(
+        "키이스케이프",
+        {
+            "branch": "3",
+            "reservationDate": (date.today() + timedelta(days=1)).isoformat(),
+            "reservationTime": "20:00",
+            "name": "테스트",
+            "phone": "010-1234-5678",
+            "people": "2",
+            "themePK": "44",
+            "yescaptcha_enabled": value,
+            "yescaptcha_client_key": "must-not-run",
+        },
+    )
+    assert request.yescaptcha_enabled is False

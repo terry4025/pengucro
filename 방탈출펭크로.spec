@@ -13,6 +13,7 @@ a = Analysis(
         'engines.jigubyeol_engine',
         'engines.keyescape_engine',
         'engines.naver_engine',
+        'engines.yescaptcha_client',
         'playwright.async_api',
         'win32crypt',
         # Modules added in the 5.32/5.4 reworks. They are imported normally, so
@@ -40,7 +41,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로v5.44',
+    name='방탈출펭크로v5.5_yescaptcha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
