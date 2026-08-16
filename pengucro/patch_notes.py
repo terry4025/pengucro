@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.21",
+        changes=(
+            "CGV IMAX 전용 지점 선택과 미오픈 날짜의 영화·상영관·복수 희망시간 사전 설정 추가",
+            "CGV 목표 영화 공개 상태에 따라 장시간 대기 감시와 회차 공개 후 고속 좌석 감시 자동 전환",
+            "CGV 상영 포맷·희망시간·좌석 우선순위의 저장·복원 및 실제 회차 매칭 정확도 개선",
+            "CGV 지점·날짜·영화·상영관 변경 시 이전 시간·좌석 설정이 남는 문제 수정",
+        ),
+    ),
+    PatchNote(
         version="6.20",
         changes=(
             "네이버 오픈 시각 예약을 Chrome 내부 타이머로 직접 제출하도록 개선",
