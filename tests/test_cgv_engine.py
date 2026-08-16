@@ -465,3 +465,746 @@ def test_cgv_engine_detects_recoverable_browser_errors():
     assert CgvEngine._is_recoverable_browser_error(
         ValueError("Something else went wrong")
     ) is False
+
+
+def test_developer_mode_retains_direct_hold():
+    starts = []
+    payload = _seat_payload("H22", "H23")
+
+    class Page:
+        pass
+
+    engine = CgvEngine(lambda *_args: None)
+    engine._browser_auth_data = lambda _page: {"custNo": "cust-dev", "cusgdCd": "01"}
+
+    def fake_start(*_args, **kwargs):
+        starts.append(kwargs.get("direct_hold"))
+        return True
+
+    engine._start_fast_seat_monitor = fake_start
+    engine._read_fast_seat_monitor = lambda _page: {
+        "running": False,
+        "completed": 1,
+        "hit": {
+            "data": payload,
+            "transaction": {
+                "priceResponse": {"statusCode": 0},
+                "holdResponse": {"statusCode": 0, "data": {"movAtktNo": "hold-dev-1"}},
+                "holdPayload": {},
+            },
+        },
+    }
+    engine._stop_fast_seat_monitor = lambda _page: None
+    engine._select_api_seats_in_ui = lambda *_args: True
+    engine._install_cached_hold_responses = lambda *_args: None
+    engine._click_visible_by_text = lambda *_args: False
+    engine._cancel_api_hold = lambda *_args: None
+    engine._restore_fetch = lambda *_args: None
+
+    held, fallback = engine._watch_and_hold_api(
+        Page(),
+        {"siteNo": "0013", "scnYmd": "20260818", "scnsNo": "018", "scnSseq": "2"},
+        (CgvSeatGroup(("H22", "H23")),),
+        2,
+        True,  # developer_mode=True
+        {"nonmember_birth": "19900101", "nonmember_phone": "01012345678"},
+    )
+
+    assert len(starts) == 1
+    assert starts[0] is not None
+    assert starts[0]["auth"]["custNo"] == "cust-dev"
+    assert starts[0]["people"] == 2
+    assert "searchMovAtktSeatPrcList" in starts[0]["priceUrl"]
+    assert "seatTempPrmp" in starts[0]["holdUrl"]
+
+
+def test_already_selected_seat_produces_zero_clicks():
+    clicks = []
+
+    class MockLocatorItem:
+        def __init__(self, seat_id: str, aria_pressed: str = "false", class_name: str = ""):
+            self.seat_id = seat_id
+            self.aria_pressed = aria_pressed
+            self.class_name = class_name
+
+        def is_visible(self):
+            return True
+
+        def is_enabled(self):
+            return True
+
+        def get_attribute(self, attr: str):
+            if attr == "aria-pressed":
+                return self.aria_pressed
+            if attr == "aria-selected":
+                return "false"
+            if attr == "class":
+                return self.class_name
+            return None
+
+        def click(self, **_kwargs):
+            clicks.append(self.seat_id)
+
+    class MockLocator:
+        def __init__(self, items):
+            self.items = items
+
+        def count(self):
+            return len(self.items)
+
+        def nth(self, idx):
+            return self.items[idx]
+
+    class Page:
+        def evaluate(self, *_args, **_kwargs):
+            return None
+
+        def locator(self, selector: str):
+            if 'data-seatlocno="loc-selected"' in selector:
+                return MockLocator([MockLocatorItem("loc-selected", aria_pressed="true", class_name="seat_btn selected")])
+            if 'data-seatlocno="loc-unselected"' in selector:
+                return MockLocator([MockLocatorItem("loc-unselected", aria_pressed="false", class_name="seat_btn")])
+            return MockLocator([])
+
+    page = Page()
+
+    # Selecting already-selected seat produces 0 clicks
+    result_selected = CgvEngine._ensure_seat_selected_by_id(page, "loc-selected")
+    assert result_selected is True
+    assert len(clicks) == 0
+
+    # Selecting unselected seat produces 1 click
+    result_unselected = CgvEngine._ensure_seat_selected_by_id(page, "loc-unselected")
+    assert result_unselected is True
+    assert clicks == ["loc-unselected"]
+
+
+def test_mixed_selected_unselected_seat_groups_only_clicks_unselected():
+    clicked_ids = []
+
+    class MockSeatCandidate:
+        def __init__(self, seat_id: str, is_selected: bool):
+            self.seat_id = seat_id
+            self.is_selected = is_selected
+
+        def is_visible(self):
+            return True
+
+        def is_enabled(self):
+            return True
+
+        def get_attribute(self, attr: str):
+            if attr == "aria-pressed":
+                return "true" if self.is_selected else "false"
+            if attr == "class":
+                return "seat_btn selected" if self.is_selected else "seat_btn"
+            return None
+
+        def click(self, **_kwargs):
+            clicked_ids.append(self.seat_id)
+
+    class MockLocatorList:
+        def __init__(self, candidates):
+            self.candidates = candidates
+
+        def count(self):
+            return len(self.candidates)
+
+        def nth(self, idx):
+            return self.candidates[idx]
+
+    class Page:
+        def evaluate(self, script, *args):
+            if "querySelectorAll('button[data-seatlocno]')" in script:
+                return [
+                    {"id": "loc-b10", "label": "B10", "selected": True, "available": False, "unavailable": False},
+                    {"id": "loc-b11", "label": "B11", "selected": False, "available": True, "unavailable": False},
+                ]
+            return None
+
+        def locator(self, selector: str):
+            if 'data-seatlocno="loc-b10"' in selector:
+                return MockLocatorList([MockSeatCandidate("loc-b10", is_selected=True)])
+            if 'data-seatlocno="loc-b11"' in selector:
+                return MockLocatorList([MockSeatCandidate("loc-b11", is_selected=False)])
+            return MockLocatorList([])
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    engine = CgvEngine(lambda *_args: None)
+    engine._submit_seat_selection = lambda _page: True
+
+    page = Page()
+    groups = (CgvSeatGroup(("B10", "B11")),)
+
+    held = engine._select_and_hold_seats(page, groups, 2, developer_mode=False)
+
+    assert held is True
+    # Only the unselected seat B11 was clicked; already-selected B10 was untouched
+    assert clicked_ids == ["loc-b11"]
+
+
+def test_available_seat_elements_three_state_classification():
+    class Page:
+        def evaluate(self, script):
+            if "button[data-seatlocno]" in script:
+                return [
+                    {"id": "loc-1", "label": "A01", "available": True, "selected": False, "unavailable": False},
+                    {"id": "loc-2", "label": "A02", "available": False, "selected": True, "unavailable": False},
+                    {"id": "loc-3", "label": "A03", "available": False, "selected": False, "unavailable": True},
+                ]
+            return []
+
+    elements = CgvEngine._available_seat_elements(Page())
+    assert len(elements) == 3
+    assert elements[0] == {"id": "loc-1", "label": "A01", "available": True, "selected": False, "unavailable": False}
+    assert elements[1] == {"id": "loc-2", "label": "A02", "available": False, "selected": True, "unavailable": False}
+    assert elements[2] == {"id": "loc-3", "label": "A03", "available": False, "selected": False, "unavailable": True}
+
+
+def test_submit_seat_selection_single_shot_and_waits_for_transition():
+    clicks = []
+    poll_count = [0]
+
+    class Page:
+        def evaluate(self, script, *args):
+            if "clean(b.textContent) === '선택완료'" in script:
+                clicks.append("submit_btn")
+                return True
+            if "text.includes('이미 선택된')" in script:
+                return False
+            if "hasPaySection" in script or "visibleSeats" in script:
+                poll_count[0] += 1
+                # Transition succeeds on 2nd poll
+                return poll_count[0] >= 2
+            return False
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    engine = CgvEngine(lambda *_args: None)
+    page = Page()
+
+    success = engine._submit_seat_selection(page)
+
+    assert success is True
+    # Button was clicked exactly ONCE (single-shot), not multiple blind clicks
+    assert clicks == ["submit_btn"]
+    assert poll_count[0] == 2
+
+
+def test_submit_seat_selection_detects_conflict_dialog():
+    dismissed = []
+
+    class Page:
+        def evaluate(self, script, *args):
+            if "clean(b.textContent) === '선택완료'" in script:
+                return True
+            if "text.includes('이미 선택된')" in script:
+                return True
+            return False
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    engine = CgvEngine(lambda *_args: None)
+    engine._click_visible_by_text = lambda _page, labels: dismissed.append(labels) or True
+    page = Page()
+
+    success = engine._submit_seat_selection(page)
+
+    assert success is False
+    assert dismissed == [("확인", "닫기", "취소")]
+
+
+def test_seat_stage_recoverable_error_triggers_session_reconnect():
+    reconnect_calls = []
+
+    class DeadPage:
+        def reload(self, **_kwargs):
+            raise RuntimeError("TargetClosedError: Target page, context or browser has been closed")
+
+    class RecoveredPage:
+        def reload(self, **_kwargs):
+            pass
+
+    dead_page = DeadPage()
+    recovered_page = RecoveredPage()
+
+    engine = CgvEngine(lambda *_args: None)
+    schedule = {"siteNo": "0013", "scnYmd": "20260818", "scnsNo": "018", "scnSseq": "2"}
+
+    def fake_reconnect(sched, people):
+        reconnect_calls.append((sched, people))
+        return recovered_page
+
+    engine._reconnect_seat_session = fake_reconnect
+
+    page_out, ok = engine._reload_or_recover_seat_page(dead_page, schedule=schedule, people=2)
+
+    assert ok is True
+    assert page_out is recovered_page
+    assert len(reconnect_calls) == 1
+    assert reconnect_calls[0] == (schedule, 2)
+
+
+def test_ensure_seat_selected_handles_all_attributes_and_edge_cases():
+    class Page:
+        def evaluate(self, script, arg):
+            if arg == "loc-aria-selected":
+                return True
+            if arg == "loc-active-class":
+                return True
+            if arg == "loc-disabled":
+                return False
+            if arg == "loc-not-found":
+                return None
+            return None
+
+        def locator(self, selector: str):
+            class MockLoc:
+                def count(self):
+                    return 0
+            return MockLoc()
+
+    page = Page()
+
+    # aria-selected or active class returning True from DOM
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-aria-selected") is True
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-active-class") is True
+    # Disabled seat returns False
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-disabled") is False
+    # Not found returns False
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-not-found") is False
+
+
+def test_reload_or_recover_seat_page_edge_cases():
+    engine = CgvEngine(lambda *_args: None)
+
+    # 1. Normal reload succeeds
+    class NormalPage:
+        def reload(self, **_kwargs):
+            pass
+
+    engine._select_visitors = lambda _page, _people: True
+    page_out, ok = engine._reload_or_recover_seat_page(NormalPage(), people=1)
+    assert ok is True
+
+    # 2. Non-recoverable error returns False
+    class CrashPage:
+        def reload(self, **_kwargs):
+            raise ValueError("Unexpected DOM parsing failure")
+
+    page_out, ok = engine._reload_or_recover_seat_page(CrashPage(), people=1)
+    assert ok is False
+
+    # 3. Stop event set returns False immediately
+    engine.stop_event.set()
+    page_out, ok = engine._reload_or_recover_seat_page(CrashPage(), people=1)
+    assert ok is False
+    engine.stop_event.clear()
+
+
+def test_submit_seat_selection_timeout_returns_false():
+    class Page:
+        def evaluate(self, script, *args):
+            if "clean(b.textContent) === '선택완료'" in script:
+                return True
+            return False
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    engine = CgvEngine(lambda *_args: None)
+    engine.stop_event.set()  # Stop event set terminates wait loop
+    page = Page()
+
+    success = engine._submit_seat_selection(page)
+    assert success is False
+    engine.stop_event.clear()
+
+
+def test_submit_seat_selection_not_clicked_returns_false_immediately():
+    class Page:
+        def evaluate(self, script, *args):
+            # 선택완료 button not found
+            if "clean(b.textContent) === '선택완료'" in script:
+                return False
+            # Even if transition check would evaluate true because 0 seat buttons exist
+            if "seatButtons.length === 0" in script:
+                return True
+            return False
+
+        def locator(self, _selector):
+            class MockLoc:
+                def count(self):
+                    return 0
+            return MockLoc()
+
+        def get_by_text(self, *_args, **_kwargs):
+            class MockLoc:
+                def count(self):
+                    return 0
+            return MockLoc()
+
+    engine = CgvEngine(lambda *_args: None)
+    page = Page()
+
+    # Must return False because submit button was never clicked
+    success = engine._submit_seat_selection(page)
+    assert success is False
+
+
+def test_select_and_hold_seats_recovers_when_seat_click_fails_midway():
+    engine = CgvEngine(lambda *_args: None)
+    attempts = [0]
+    reload_count = [0]
+
+    class Page:
+        def wait_for_timeout(self, _ms):
+            pass
+
+    def fake_available_elements(_page):
+        attempts[0] += 1
+        if attempts[0] == 1:
+            # First attempt: Group (A01, A02) available in DOM
+            return [
+                {"id": "loc-a1", "label": "A01", "available": True, "selected": False, "unavailable": False},
+                {"id": "loc-a2", "label": "A02", "available": True, "selected": False, "unavailable": False},
+            ]
+        else:
+            # Second attempt: Group (B01, B02) available in DOM
+            return [
+                {"id": "loc-b1", "label": "B01", "available": True, "selected": False, "unavailable": False},
+                {"id": "loc-b2", "label": "B02", "available": True, "selected": False, "unavailable": False},
+            ]
+
+    def fake_ensure_selected(_page, seat_id):
+        # A01 succeeds, but A02 fails (collision with another user)
+        if seat_id == "loc-a1":
+            return True
+        if seat_id == "loc-a2":
+            return False
+        # B01 and B02 succeed
+        if seat_id in ("loc-b1", "loc-b2"):
+            return True
+        return False
+
+    def fake_reload(page, schedule=None, people=1):
+        reload_count[0] += 1
+        return page, True
+
+    engine._available_seat_elements = fake_available_elements
+    engine._ensure_seat_selected_by_id = fake_ensure_selected
+    engine._reload_or_recover_seat_page = fake_reload
+    engine._submit_seat_selection = lambda _page: True
+
+    groups = (CgvSeatGroup(("A01", "A02")), CgvSeatGroup(("B01", "B02")))
+    held = engine._select_and_hold_seats(Page(), groups, 2, False)
+
+    assert held is True
+    assert reload_count[0] >= 1
+    assert attempts[0] >= 2
+
+
+def test_rapid_consecutive_conflict_popups_recovery():
+    engine = CgvEngine(lambda *_args: None)
+    submit_attempts = [0]
+    dismissals = []
+    reloads = [0]
+
+    class Page:
+        def wait_for_timeout(self, _ms):
+            pass
+
+    def fake_available_elements(_page):
+        return [
+            {"id": "loc-1", "label": "C01", "available": True, "selected": False, "unavailable": False},
+            {"id": "loc-2", "label": "C02", "available": True, "selected": False, "unavailable": False},
+        ]
+
+    def fake_submit(_page):
+        submit_attempts[0] += 1
+        if submit_attempts[0] < 3:
+            # First 2 attempts produce conflict popup
+            dismissals.append("dismiss_conflict")
+            return False
+        # 3rd attempt succeeds
+        return True
+
+    def fake_reload(page, schedule=None, people=1):
+        reloads[0] += 1
+        return page, True
+
+    engine._available_seat_elements = fake_available_elements
+    engine._ensure_seat_selected_by_id = lambda _p, _id: True
+    engine._submit_seat_selection = fake_submit
+    engine._reload_or_recover_seat_page = fake_reload
+
+    groups = (CgvSeatGroup(("C01", "C02")),)
+    held = engine._select_and_hold_seats(Page(), groups, 2, False)
+
+    assert held is True
+    assert submit_attempts[0] == 3
+    assert len(dismissals) == 2
+    assert reloads[0] == 2
+
+
+def test_ensure_seat_selected_handles_on_and_finish_classes():
+    class Page:
+        def evaluate(self, script, arg):
+            if arg == "loc-on":
+                return True
+            if arg == "loc-finish":
+                return False
+            if arg == "loc-soldout":
+                return False
+            return None
+
+    page = Page()
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-on") is True
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-finish") is False
+    assert CgvEngine._ensure_seat_selected_by_id(page, "loc-soldout") is False
+
+
+def test_exception_handling_in_helpers():
+    class CrashPage:
+        def evaluate(self, *_args, **_kwargs):
+            raise RuntimeError("CDP disconnected")
+
+    page = CrashPage()
+    # Helpers should return safe fallbacks without throwing unhandled exceptions
+    assert CgvEngine._available_seat_elements(page) == []
+    assert CgvEngine._browser_auth_data(page) == {}
+    assert CgvEngine._read_fast_seat_monitor(page) == {}
+    engine = CgvEngine(lambda *_args: None)
+    assert engine._start_fast_seat_monitor(page, "http://fake", (CgvSeatGroup(("A1",)),), 1) is False
+    assert engine._sync_seat_payload_to_ui(page, {}) is False
+    assert engine._enter_visitor_page(page, {}) is False
+
+
+def test_choose_available_group_matches_both_padded_and_unpadded_seat_numbers():
+    # DOM has padded label "A01", "A02"
+    elements = [
+        {"id": "loc-a1", "label": "A01", "unavailable": False},
+        {"id": "loc-a2", "label": "A02", "unavailable": False},
+    ]
+    # Priority group has unpadded "A1", "A2"
+    groups = (CgvSeatGroup(("A1", "A2")),)
+
+    selected = CgvEngine.choose_available_group(elements, groups)
+    assert selected is not None
+    group, ids = selected
+    assert group.seats == ("A1", "A2")
+    assert ids == {"A1": "loc-a1", "A2": "loc-a2"}
+
+    # Reverse: DOM has unpadded label "B1", "B2", group has padded "B01", "B02"
+    elements_unpadded = [
+        {"id": "loc-b1", "label": "B1", "unavailable": False},
+        {"id": "loc-b2", "label": "B2", "unavailable": False},
+    ]
+    groups_padded = (CgvSeatGroup(("B01", "B02")),)
+    selected_padded = CgvEngine.choose_available_group(elements_unpadded, groups_padded)
+    assert selected_padded is not None
+    group_p, ids_p = selected_padded
+    assert group_p.seats == ("B01", "B02")
+    assert ids_p == {"B01": "loc-b1", "B02": "loc-b2"}
+
+
+def test_ensure_seat_selected_distinguishes_unselected_and_inactive_classes():
+    clicks = []
+
+    class MockLocatorItem:
+        def __init__(self, seat_id: str, class_name: str):
+            self.seat_id = seat_id
+            self.class_name = class_name
+
+        def is_visible(self):
+            return True
+
+        def is_enabled(self):
+            return True
+
+        def get_attribute(self, attr: str):
+            if attr in ("aria-pressed", "aria-selected"):
+                return "false"
+            if attr == "class":
+                return self.class_name
+            return None
+
+        def click(self, **_kwargs):
+            clicks.append(self.seat_id)
+
+    class MockLocator:
+        def __init__(self, item):
+            self.item = item
+
+        def count(self):
+            return 1
+
+        def nth(self, _idx):
+            return self.item
+
+    class Page:
+        def evaluate(self, *_args, **_kwargs):
+            return None  # Force fallback to locator check
+
+        def locator(self, selector: str):
+            if 'data-seatlocno="loc-unselected"' in selector:
+                return MockLocator(MockLocatorItem("loc-unselected", "seat_btn unselected"))
+            if 'data-seatlocno="loc-inactive"' in selector:
+                return MockLocator(MockLocatorItem("loc-inactive", "seat_btn inactive"))
+            return MockLocator(MockLocatorItem("unknown", "seat_btn"))
+
+    page = Page()
+
+    # "unselected" must NOT be treated as "selected" -> should click
+    res1 = CgvEngine._ensure_seat_selected_by_id(page, "loc-unselected")
+    assert res1 is True
+    assert "loc-unselected" in clicks
+
+    # "inactive" must NOT be treated as "active" -> should click
+    res2 = CgvEngine._ensure_seat_selected_by_id(page, "loc-inactive")
+    assert res2 is True
+    assert "loc-inactive" in clicks
+
+
+def test_reconnect_seat_session_handles_browser_cdp_reconnect():
+    engine = CgvEngine(lambda *_args: None)
+    reconnected = [0]
+
+    class FakePage:
+        def __init__(self, url="https://cgv.co.kr"):
+            self.url = url
+
+        def is_closed(self):
+            return False
+
+        def on(self, *_args, **_kwargs):
+            pass
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = [FakePage()]
+
+        def new_page(self):
+            p = FakePage()
+            self.pages.append(p)
+            return p
+
+    class FakeBrowser:
+        def __init__(self):
+            self.contexts = [FakeContext()]
+
+        def is_connected(self):
+            return False
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            reconnected[0] += 1
+            fb = FakeBrowser()
+            fb.is_connected = lambda: True
+            return fb
+
+    class FakePlaywright:
+        def __init__(self):
+            self.chromium = FakeChromium()
+
+    class FakeChrome:
+        def __init__(self):
+            self.endpoint = "http://127.0.0.1:9222"
+
+    engine._playwright = FakePlaywright()
+    engine._chrome = FakeChrome()
+    engine._browser = FakeBrowser()
+    engine._enter_visitor_page = lambda _page, _sched: True
+    engine._select_visitors = lambda _page, _people: True
+
+    page = engine._reconnect_seat_session(schedule={"siteNo": "0013"}, people=2)
+    assert page is not None
+    assert reconnected[0] == 1
+
+
+def test_select_api_seats_in_ui_retries_if_dom_updates_asynchronously():
+    engine = CgvEngine(lambda *_args: None)
+    attempts = [0]
+
+    def fake_ensure_selected(_page, _seat_id):
+        attempts[0] += 1
+        # Succeeds on 3rd retry
+        return attempts[0] >= 3
+
+    engine._ensure_seat_selected_by_id = fake_ensure_selected
+    engine._sync_seat_payload_to_ui = lambda _p, _payload: True
+
+    class Page:
+        def wait_for_timeout(self, _ms):
+            pass
+
+    class FakeSeat:
+        seat_id = "loc-test-1"
+
+    ok = engine._select_api_seats_in_ui(Page(), {}, [FakeSeat()])
+    assert ok is True
+    assert attempts[0] == 3
+
+
+def test_choose_available_group_normalizes_group_seat_names_case_and_spacing():
+    elements = [
+        {"id": "loc-a1", "label": "A1", "unavailable": False},
+        {"id": "loc-a2", "label": "A2", "unavailable": False},
+    ]
+    # Lowercase & spaced group input
+    groups = (CgvSeatGroup(("a 1", "a 2")),)
+    selected = CgvEngine.choose_available_group(elements, groups)
+
+    assert selected is not None
+    group, ids = selected
+    assert ids["a 1"] == "loc-a1"
+    assert ids["a 2"] == "loc-a2"
+
+
+def test_select_api_seats_in_ui_handles_dict_and_string_seats():
+    engine = CgvEngine(lambda *_args: None)
+    selected_ids = []
+
+    def fake_ensure_selected(_page, seat_id):
+        selected_ids.append(seat_id)
+        return True
+
+    engine._ensure_seat_selected_by_id = fake_ensure_selected
+    engine._sync_seat_payload_to_ui = lambda _p, _payload: True
+
+    class Page:
+        def wait_for_timeout(self, _ms):
+            pass
+
+    dict_seat = {"seatLocNo": "loc-dict-1"}
+    str_seat = "loc-str-2"
+
+    ok = engine._select_api_seats_in_ui(Page(), {}, [dict_seat, str_seat])
+    assert ok is True
+    assert selected_ids == ["loc-dict-1", "loc-str-2"]
+
+
+def test_select_and_hold_seats_survives_wait_for_timeout_exception():
+    engine = CgvEngine(lambda *_args: None)
+
+    class Page:
+        def wait_for_timeout(self, _ms):
+            raise RuntimeError("wait_for_timeout not supported in headless mode")
+
+    engine._available_seat_elements = lambda _p: [
+        {"id": "loc-1", "label": "D01", "available": True, "selected": False, "unavailable": False},
+    ]
+    engine._ensure_seat_selected_by_id = lambda _p, _id: True
+    engine._submit_seat_selection = lambda _p: True
+
+    groups = (CgvSeatGroup(("D01",)),)
+    held = engine._select_and_hold_seats(Page(), groups, 1, False)
+    assert held is True
+
+
+
+

@@ -64,6 +64,10 @@ class CgvEngine(BaseEngine):
         super().__init__(log_callback, success_callback, **kwargs)
         self.scan_concurrency = 1
         self._browser_lock = threading.Lock()
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._chrome = None
 
     def start_reservation(
         self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False
@@ -244,42 +248,45 @@ class CgvEngine(BaseEngine):
 
     @staticmethod
     def _browser_auth_data(page) -> dict[str, str]:
-        result = page.evaluate(
-            """
-            () => {
-              let query = {};
-              try { query = JSON.parse(sessionStorage.getItem('query') || '{}'); } catch (_) {}
-              let seatContext = null;
-              for (const node of document.querySelectorAll('body *')) {
-                const key = Object.keys(node).find(name => name.startsWith('__reactFiber$'));
-                let fiber = key ? node[key] : null;
-                for (let depth = 0; fiber && depth < 80; depth += 1, fiber = fiber.return) {
-                  let dep = fiber.dependencies && fiber.dependencies.firstContext;
-                  while (dep) {
-                    const values = [dep.memoizedValue,
-                      dep.context && dep.context._currentValue,
-                      dep.context && dep.context._currentValue2];
-                    for (const value of values) {
-                      if (value && value.seatReload && value.setParams) seatContext = value;
+        try:
+            result = page.evaluate(
+                """
+                () => {
+                  let query = {};
+                  try { query = JSON.parse(sessionStorage.getItem('query') || '{}'); } catch (_) {}
+                  let seatContext = null;
+                  for (const node of document.querySelectorAll('body *')) {
+                    const key = Object.keys(node).find(name => name.startsWith('__reactFiber$'));
+                    let fiber = key ? node[key] : null;
+                    for (let depth = 0; fiber && depth < 80; depth += 1, fiber = fiber.return) {
+                      let dep = fiber.dependencies && fiber.dependencies.firstContext;
+                      while (dep) {
+                        const values = [dep.memoizedValue,
+                          dep.context && dep.context._currentValue,
+                          dep.context && dep.context._currentValue2];
+                        for (const value of values) {
+                          if (value && value.seatReload && value.setParams) seatContext = value;
+                        }
+                        dep = dep.next;
+                      }
                     }
-                    dep = dep.next;
+                    if (seatContext) break;
                   }
+                  const cert = (seatContext && seatContext.nmbrCrtfData) || {};
+                  const token = (seatContext && seatContext.accessTokenInfo) || {};
+                  return {
+                    custNo: String((seatContext && seatContext.custNo) || query.custNo || ''),
+                    cusgdCd: String(token.cntCusgdCd || '01'),
+                    bymd: String(cert.bymd || query.bymd || ''),
+                    mbltNo: String(cert.mbltNo || query.mbltNo || ''),
+                    nmbrCrtfNo: String(cert.encNmbrCrtfNo || cert.nmbrCrtfNo || query.nmbrCrtfNo || '')
+                  };
                 }
-                if (seatContext) break;
-              }
-              const cert = (seatContext && seatContext.nmbrCrtfData) || {};
-              const token = (seatContext && seatContext.accessTokenInfo) || {};
-              return {
-                custNo: String((seatContext && seatContext.custNo) || query.custNo || ''),
-                cusgdCd: String(token.cntCusgdCd || '01'),
-                bymd: String(cert.bymd || query.bymd || ''),
-                mbltNo: String(cert.mbltNo || query.mbltNo || ''),
-                nmbrCrtfNo: String(cert.encNmbrCrtfNo || cert.nmbrCrtfNo || query.nmbrCrtfNo || '')
-              };
-            }
-            """
-        )
-        return {str(key): str(value or "") for key, value in result.items()} if isinstance(result, dict) else {}
+                """
+            )
+            return {str(key): str(value or "") for key, value in result.items()} if isinstance(result, dict) else {}
+        except Exception:
+            return {}
 
     @staticmethod
     def choose_available_api_group(seats, groups: tuple[CgvSeatGroup, ...]):
@@ -295,97 +302,182 @@ class CgvEngine(BaseEngine):
 
     @staticmethod
     def _sync_seat_payload_to_ui(page, payload: dict[str, Any]) -> bool:
-        result = page.evaluate(
-            """
-            payload => {
-              const item = payload && payload.data && payload.data.items && payload.data.items[0];
-              if (!item) return false;
-              let store = null, seatContext = null;
-              for (const node of document.querySelectorAll('body *')) {
-                const key = Object.keys(node).find(name => name.startsWith('__reactFiber$'));
-                let fiber = key ? node[key] : null;
-                for (let depth = 0; fiber && depth < 80; depth += 1, fiber = fiber.return) {
-                  let dep = fiber.dependencies && fiber.dependencies.firstContext;
-                  while (dep) {
-                    const values = [dep.memoizedValue,
-                      dep.context && dep.context._currentValue,
-                      dep.context && dep.context._currentValue2];
-                    for (const value of values) {
-                      if (value && value.store && value.store.dispatch) store = value.store;
-                      if (value && value.seatReload && value.setSeatList) seatContext = value;
+        try:
+            result = page.evaluate(
+                """
+                payload => {
+                  const item = payload && payload.data && payload.data.items && payload.data.items[0];
+                  if (!item) return false;
+                  let store = null, seatContext = null;
+                  for (const node of document.querySelectorAll('body *')) {
+                    const key = Object.keys(node).find(name => name.startsWith('__reactFiber$'));
+                    let fiber = key ? node[key] : null;
+                    for (let depth = 0; fiber && depth < 80; depth += 1, fiber = fiber.return) {
+                      let dep = fiber.dependencies && fiber.dependencies.firstContext;
+                      while (dep) {
+                        const values = [dep.memoizedValue,
+                          dep.context && dep.context._currentValue,
+                          dep.context && dep.context._currentValue2];
+                        for (const value of values) {
+                          if (value && value.store && value.store.dispatch) store = value.store;
+                          if (value && value.seatReload && value.setSeatList) seatContext = value;
+                        }
+                        dep = dep.next;
+                      }
                     }
-                    dep = dep.next;
+                    if (store && seatContext) break;
                   }
+                  if (!store) return false;
+                  const fields = {
+                    Sbord: item.sbord, SeatArea: item.seatArea, Seats: item.seats,
+                    Salfrms: item.salfrms, Stknds: item.stknds, Szone: item.szone,
+                    Szones: item.szones, Sblcks: item.sblcks
+                  };
+                  for (const [name, value] of Object.entries(fields)) {
+                    if (value !== undefined) {
+                      store.dispatch({type: `seatMap/reduxSet${name}`, payload: value});
+                    }
+                  }
+                  if (seatContext) seatContext.setSeatList(item.seats || []);
+                  return true;
                 }
-                if (store && seatContext) break;
-              }
-              if (!store) return false;
-              const fields = {
-                Sbord: item.sbord, SeatArea: item.seatArea, Seats: item.seats,
-                Salfrms: item.salfrms, Stknds: item.stknds, Szone: item.szone,
-                Szones: item.szones, Sblcks: item.sblcks
-              };
-              for (const [name, value] of Object.entries(fields)) {
-                if (value !== undefined) {
-                  store.dispatch({type: `seatMap/reduxSet${name}`, payload: value});
-                }
-              }
-              if (seatContext) seatContext.setSeatList(item.seats || []);
-              return true;
-            }
-            """,
-            payload,
-        )
-        return bool(result)
+                """,
+                payload,
+            )
+            return bool(result)
+        except Exception:
+            return False
 
     def _select_api_seats_in_ui(self, page, payload, selected) -> bool:
         self._sync_seat_payload_to_ui(page, payload)
-        page.wait_for_timeout(50)
         for seat in selected:
-            if not self._click_seat_by_id(page, seat.seat_id):
+            seat_id = getattr(seat, "seat_id", None) or (
+                seat.get("seat_id") or seat.get("seatLocNo") or seat.get("id")
+                if isinstance(seat, dict)
+                else str(seat)
+            )
+            success = False
+            for _ in range(5):
+                if self._ensure_seat_selected_by_id(page, seat_id):
+                    success = True
+                    break
+                try:
+                    page.wait_for_timeout(50)
+                except Exception:
+                    time.sleep(0.05)
+            if not success:
                 return False
         return True
 
     @staticmethod
-    def _click_seat_by_id(page, seat_id: str) -> bool:
-        locator = page.locator(f'button[data-seatlocno="{seat_id}"]')
-        for index in range(locator.count()):
-            candidate = locator.nth(index)
-            try:
-                if candidate.is_visible() and candidate.is_enabled():
+    def _ensure_seat_selected_by_id(page, seat_id: str) -> bool:
+        """Ensure a seat is selected by its seat_id (loc no) idempotently.
+
+        If the seat is already selected (via aria-pressed, aria-selected, or selected/active/on classes),
+        returns True without clicking so the seat is not toggled off.
+        If unselected and enabled, clicks it once to select.
+        """
+        seat_id = str(seat_id)
+        try:
+            result = page.evaluate(
+                r"""
+                (seatId) => {
+                  const btn = document.querySelector(`button[data-seatlocno="${seatId}"]`);
+                  if (!btn) return null;
+                  const classes = String(btn.className || '').toLowerCase();
+                  const tokens = new Set(classes.split(/[\s_\-]+/));
+                  const isSelected = btn.getAttribute('aria-pressed') === 'true' ||
+                                     btn.getAttribute('aria-selected') === 'true' ||
+                                     tokens.has('selected') || tokens.has('active') || tokens.has('on') ||
+                                     (btn.classList && (btn.classList.contains('selected') || btn.classList.contains('active') || btn.classList.contains('on')));
+                  if (isSelected) {
+                    return true;
+                  }
+                  const unavailable = btn.disabled || btn.getAttribute('aria-disabled') === 'true' ||
+                                      ['disabled', 'complete', 'sold', 'reserved', 'finish', 'soldout'].some(k => tokens.has(k) || classes.includes(k));
+                  if (unavailable) {
+                    return false;
+                  }
+                  if (typeof btn.scrollIntoView === 'function') {
+                    btn.scrollIntoView({block: 'center', inline: 'center'});
+                  }
+                  btn.click();
+                  return true;
+                }
+                """,
+                seat_id,
+            )
+            if result is not None:
+                return bool(result)
+        except Exception:
+            pass
+
+        try:
+            locator = page.locator(f'button[data-seatlocno="{seat_id}"]')
+            for index in range(locator.count()):
+                candidate = locator.nth(index)
+                try:
+                    if not (candidate.is_visible() and candidate.is_enabled()):
+                        continue
+                    if candidate.get_attribute("aria-disabled") == "true":
+                        return False
+                    aria_pressed = candidate.get_attribute("aria-pressed")
+                    aria_selected = candidate.get_attribute("aria-selected")
+                    classes = (candidate.get_attribute("class") or "").lower()
+                    class_tokens = set(re.split(r"[\s_-]+", classes))
+                    if (
+                        aria_pressed == "true"
+                        or aria_selected == "true"
+                        or bool(class_tokens & {"selected", "active", "on"})
+                    ):
+                        return True
+                    if any(
+                        unavail in class_tokens or unavail in classes
+                        for unavail in ("disabled", "complete", "sold", "reserved", "finish", "soldout")
+                    ):
+                        return False
                     candidate.click(timeout=1500)
                     return True
-            except Exception:
-                continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
         return False
 
     @staticmethod
+    def _click_seat_by_id(page, seat_id: str) -> bool:
+        return CgvEngine._ensure_seat_selected_by_id(page, seat_id)
+
+    @staticmethod
     def _install_cached_hold_responses(page, price_response, hold_response) -> None:
-        page.evaluate(
-            """
-            ({priceResponse, holdResponse}) => {
-              const original = window.__pengucroOriginalFetch || window.fetch.bind(window);
-              window.__pengucroOriginalFetch = original;
-              let priceUsed = false, holdUsed = false;
-              const make = value => new Response(JSON.stringify(value), {
-                status: 200, headers: {'Content-Type': 'application/json'}
-              });
-              window.fetch = async (...args) => {
-                const url = String(args[0] && args[0].url ? args[0].url : args[0]);
-                if (!priceUsed && url.includes('searchMovAtktSeatPrcList')) {
-                  priceUsed = true; return make(priceResponse);
+        try:
+            page.evaluate(
+                """
+                ({priceResponse, holdResponse}) => {
+                  const original = window.__pengucroOriginalFetch || window.fetch.bind(window);
+                  window.__pengucroOriginalFetch = original;
+                  let priceUsed = false, holdUsed = false;
+                  const make = value => new Response(JSON.stringify(value), {
+                    status: 200, headers: {'Content-Type': 'application/json'}
+                  });
+                  window.fetch = async (...args) => {
+                    const url = String(args[0] && args[0].url ? args[0].url : args[0]);
+                    if (!priceUsed && url.includes('searchMovAtktSeatPrcList')) {
+                      priceUsed = true; return make(priceResponse);
+                    }
+                    if (!holdUsed && url.includes('seatTempPrmp') && !url.includes('Cncl')) {
+                      holdUsed = true;
+                      setTimeout(() => { window.fetch = original; }, 1000);
+                      return make(holdResponse);
+                    }
+                    return original(...args);
+                  };
                 }
-                if (!holdUsed && url.includes('seatTempPrmp') && !url.includes('Cncl')) {
-                  holdUsed = true;
-                  setTimeout(() => { window.fetch = original; }, 1000);
-                  return make(holdResponse);
-                }
-                return original(...args);
-              };
-            }
-            """,
-            {"priceResponse": price_response, "holdResponse": hold_response},
-        )
+                """,
+                {"priceResponse": price_response, "holdResponse": hold_response},
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _restore_fetch(page) -> None:
@@ -471,324 +563,335 @@ class CgvEngine(BaseEngine):
             80,
             int(launch_interval_ms or self.FAST_SEAT_LAUNCH_INTERVAL_MS),
         )
-        result = page.evaluate(
-            r"""
-            ({url, groups, concurrency, intervalMs, maxConsecutiveErrors, directHold}) => {
-              const previous = window.__pengucroFastSeatMonitor;
-              if (previous && typeof previous.stop === 'function') previous.stop();
+        try:
+            result = page.evaluate(
+                r"""
+                ({url, groups, concurrency, intervalMs, maxConsecutiveErrors, directHold}) => {
+                  const previous = window.__pengucroFastSeatMonitor;
+                  if (previous && typeof previous.stop === 'function') previous.stop();
 
-              const state = {
-                running: true,
-                attempts: 0,
-                completed: 0,
-                inflight: 0,
-                consecutiveErrors: 0,
-                lastStatus: 0,
-                lastElapsedMs: 0,
-                blocked: false,
-                unauthorized: false,
-                lastError: '',
-                terminalError: '',
-                conflicts: 0,
-                hit: null,
-                timer: null,
-                controllers: new Set(),
-              };
-              const normalize = value => String(value || '')
-                .toUpperCase().replace(/[\s_-]+/g, '');
-              const normalizedGroups = groups.map(group => group.map(normalize));
-              const availableSeats = payload => {
-                const data = payload && payload.data ? payload.data : payload;
-                let items = data && data.items ? data.items : [];
-                if (!Array.isArray(items)) items = items ? [items] : [];
-                const seatsByLabel = new Map();
-                for (const item of items) {
-                  const seats = item && Array.isArray(item.seats) ? item.seats : [];
-                  for (const seat of seats) {
-                    if (String(seat.seatStusCd || '') !== '00') continue;
-                    if (String(seat.seatSaleYn || 'Y').toUpperCase() !== 'Y') continue;
-                    seatsByLabel.set(
-                      normalize(`${seat.seatRowNm || ''}${seat.seatNo || ''}`),
-                      seat,
-                    );
-                  }
-                }
-                return seatsByLabel;
-              };
-              const findGroup = payload => {
-                const available = availableSeats(payload);
-                for (const group of normalizedGroups) {
-                  if (group.every(label => available.has(label))) {
-                    return {labels: group, seats: group.map(label => available.get(label))};
-                  }
-                }
-                return null;
-              };
-              state.stop = () => {
-                if (!state.running && !state.timer) return;
-                state.running = false;
-                if (state.timer) clearInterval(state.timer);
-                state.timer = null;
-                for (const controller of state.controllers) controller.abort();
-                state.controllers.clear();
-              };
-              const pauseOtherRequests = keep => {
-                state.running = false;
-                if (state.timer) clearInterval(state.timer);
-                state.timer = null;
-                for (const controller of state.controllers) {
-                  if (controller !== keep) controller.abort();
-                }
-              };
-              const postJson = async (targetUrl, body, signal) => {
-                const response = await fetch(targetUrl, {
-                  method: 'POST',
-                  credentials: 'include',
-                  cache: 'no-store',
-                  headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
-                  body: JSON.stringify(body),
-                  signal,
-                });
-                let data = null;
-                try { data = await response.json(); } catch (_) {}
-                return {ok: response.ok, status: response.status, data};
-              };
-              const buildPricePayload = selected => {
-                const schedule = directHold.schedule;
-                return {
-                  coCd: schedule.coCd,
-                  siteNo: schedule.siteNo,
-                  scnsNo: schedule.scnsNo,
-                  scnYmd: schedule.scnYmd,
-                  scnSseq: schedule.scnSseq,
-                  movNo: schedule.movNo,
-                  rtctlScopCd: schedule.rtctlScopCd,
-                  prcrulDivCd: schedule.prcrulDivCd,
-                  sachlTypCd: schedule.sachlTypCd,
-                  prodBnduList: [{prodBnduCd: '01', prodBnduQty: directHold.people}],
-                  seatList: selected.map(seat => ({
-                    seatLocNo: String(seat.seatLocNo || ''),
-                    szoneKindCd: String(seat.szoneKindCd || ''),
-                    stkndCd: String(seat.stkndCd || ''),
-                    seatSalfrmCd: String(seat.seatSalfrmCd || ''),
-                    prodBnduCd: '01',
-                  })),
-                  zoneGroupYn: 'N',
-                };
-              };
-              const buildHoldPayload = selected => {
-                const schedule = directHold.schedule;
-                const auth = directHold.auth;
-                return {
-                  coCd: schedule.coCd,
-                  bymd: auth.bymd,
-                  mbltNo: auth.mbltNo,
-                  siteNo: schedule.siteNo,
-                  scnYmd: schedule.scnYmd,
-                  scnsNo: schedule.scnsNo,
-                  scnSseq: schedule.scnSseq,
-                  movAtktNo: '',
-                  custNo: auth.custNo,
-                  cusgdCd: auth.cusgdCd,
-                  nmbrCrtfNo: auth.nmbrCrtfNo,
-                  sachlCd: '10',
-                  atktChnlCd: '01',
-                  sachlTypCd: schedule.sachlTypCd,
-                  rtctlScopCd: schedule.rtctlScopCd,
-                  seatPrmpDataList: selected.map(seat => ({
-                    seatRowNm: String(seat.seatRowNm || ''),
-                    seatNo: String(seat.seatNo || ''),
-                    seatLocNo: String(seat.seatLocNo || ''),
-                    sbordNo: String(seat.sbordNo || ''),
-                    seatAreaNo: String(seat.seatAreaNo || ''),
-                    szoneNo: String(seat.szoneNo || ''),
-                  })),
-                };
-              };
-              let launch;
-              const resume = () => {
-                if (state.hit || state.blocked || state.unauthorized || state.terminalError) return;
-                state.running = true;
-                state.timer = setInterval(launch, intervalMs);
-                setTimeout(launch, 0);
-              };
-              launch = async () => {
-                if (!state.running || state.inflight >= concurrency) return;
-                const controller = new AbortController();
-                state.controllers.add(controller);
-                state.inflight += 1;
-                state.attempts += 1;
-                const started = performance.now();
-                try {
-                  const response = await fetch(url, {
-                    method: 'GET',
-                    cache: 'no-store',
-                    credentials: 'include',
-                    headers: {'Accept': 'application/json, text/plain, */*'},
-                    signal: controller.signal,
-                  });
-                  state.lastStatus = response.status;
-                  state.lastElapsedMs = performance.now() - started;
-                  if (response.status === 403 || response.status === 429) {
-                    state.blocked = true;
-                    state.lastError = `HTTP ${response.status}`;
-                    state.stop();
-                    return;
-                  }
-                  if (response.status === 401) {
-                    state.unauthorized = true;
-                    state.lastError = 'HTTP 401';
-                    state.stop();
-                    return;
-                  }
-                  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                  const payload = await response.json();
-                  state.consecutiveErrors = 0;
-                  const group = findGroup(payload);
-                  if (group) {
-                    pauseOtherRequests(controller);
-                    if (!directHold) {
-                      state.hit = {
-                        data: payload,
-                        group: group.labels,
-                        elapsedMs: state.lastElapsedMs,
-                      };
-                      return;
+                  const state = {
+                    running: true,
+                    attempts: 0,
+                    completed: 0,
+                    inflight: 0,
+                    consecutiveErrors: 0,
+                    lastStatus: 0,
+                    lastElapsedMs: 0,
+                    blocked: false,
+                    unauthorized: false,
+                    lastError: '',
+                    terminalError: '',
+                    conflicts: 0,
+                    hit: null,
+                    timer: null,
+                    controllers: new Set(),
+                  };
+                  const normalize = value => String(value || '')
+                    .toUpperCase().replace(/[\s_-]+/g, '');
+                  const normalizedGroups = groups.map(group => group.map(normalize));
+                  const availableSeats = payload => {
+                    const data = payload && payload.data ? payload.data : payload;
+                    let items = data && data.items ? data.items : [];
+                    if (!Array.isArray(items)) items = items ? [items] : [];
+                    const seatsByLabel = new Map();
+                    for (const item of items) {
+                      const seats = item && Array.isArray(item.seats) ? item.seats : [];
+                      for (const seat of seats) {
+                        if (String(seat.seatStusCd || '') !== '00') continue;
+                        if (String(seat.seatSaleYn || 'Y').toUpperCase() !== 'Y') continue;
+                        const row = String(seat.seatRowNm || '').toUpperCase();
+                        const no = String(seat.seatNo || '');
+                        const num = parseInt(no, 10);
+                        const label = normalize(`${row}${no}`);
+                        seatsByLabel.set(label, seat);
+                        if (!isNaN(num)) {
+                          seatsByLabel.set(normalize(`${row}${num}`), seat);
+                          seatsByLabel.set(normalize(`${row}${String(num).padStart(2, '0')}`), seat);
+                        }
+                      }
                     }
-
-                    const transactionStarted = performance.now();
-                    const transactionController = new AbortController();
-                    state.controllers.add(transactionController);
+                    return seatsByLabel;
+                  };
+                  const findGroup = payload => {
+                    const available = availableSeats(payload);
+                    for (const group of normalizedGroups) {
+                      if (group.every(label => available.has(label))) {
+                        return {labels: group, seats: group.map(label => available.get(label))};
+                      }
+                    }
+                    return null;
+                  };
+                  state.stop = () => {
+                    if (!state.running && !state.timer) return;
+                    state.running = false;
+                    if (state.timer) clearInterval(state.timer);
+                    state.timer = null;
+                    for (const controller of state.controllers) controller.abort();
+                    state.controllers.clear();
+                  };
+                  const pauseOtherRequests = keep => {
+                    state.running = false;
+                    if (state.timer) clearInterval(state.timer);
+                    state.timer = null;
+                    for (const controller of state.controllers) {
+                      if (controller !== keep) controller.abort();
+                    }
+                  };
+                  const postJson = async (targetUrl, body, signal) => {
+                    const response = await fetch(targetUrl, {
+                      method: 'POST',
+                      credentials: 'include',
+                      cache: 'no-store',
+                      headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+                      body: JSON.stringify(body),
+                      signal,
+                    });
+                    let data = null;
+                    try { data = await response.json(); } catch (_) {}
+                    return {ok: response.ok, status: response.status, data};
+                  };
+                  const buildPricePayload = selected => {
+                    const schedule = directHold.schedule;
+                    return {
+                      coCd: schedule.coCd,
+                      siteNo: schedule.siteNo,
+                      scnsNo: schedule.scnsNo,
+                      scnYmd: schedule.scnYmd,
+                      scnSseq: schedule.scnSseq,
+                      movNo: schedule.movNo,
+                      rtctlScopCd: schedule.rtctlScopCd,
+                      prcrulDivCd: schedule.prcrulDivCd,
+                      sachlTypCd: schedule.sachlTypCd,
+                      prodBnduList: [{prodBnduCd: '01', prodBnduQty: directHold.people}],
+                      seatList: selected.map(seat => ({
+                        seatLocNo: String(seat.seatLocNo || ''),
+                        szoneKindCd: String(seat.szoneKindCd || ''),
+                        stkndCd: String(seat.stkndCd || ''),
+                        seatSalfrmCd: String(seat.seatSalfrmCd || ''),
+                        prodBnduCd: '01',
+                      })),
+                      zoneGroupYn: 'N',
+                    };
+                  };
+                  const buildHoldPayload = selected => {
+                    const schedule = directHold.schedule;
+                    const auth = directHold.auth;
+                    return {
+                      coCd: schedule.coCd,
+                      bymd: auth.bymd,
+                      mbltNo: auth.mbltNo,
+                      siteNo: schedule.siteNo,
+                      scnYmd: schedule.scnYmd,
+                      scnsNo: schedule.scnsNo,
+                      scnSseq: schedule.scnSseq,
+                      movAtktNo: '',
+                      custNo: auth.custNo,
+                      cusgdCd: auth.cusgdCd,
+                      nmbrCrtfNo: auth.nmbrCrtfNo,
+                      sachlCd: '10',
+                      atktChnlCd: '01',
+                      sachlTypCd: schedule.sachlTypCd,
+                      rtctlScopCd: schedule.rtctlScopCd,
+                      seatPrmpDataList: selected.map(seat => ({
+                        seatRowNm: String(seat.seatRowNm || ''),
+                        seatNo: String(seat.seatNo || ''),
+                        seatLocNo: String(seat.seatLocNo || ''),
+                        sbordNo: String(seat.sbordNo || ''),
+                        seatAreaNo: String(seat.seatAreaNo || ''),
+                        szoneNo: String(seat.szoneNo || ''),
+                      })),
+                    };
+                  };
+                  let launch;
+                  const resume = () => {
+                    if (state.hit || state.blocked || state.unauthorized || state.terminalError) return;
+                    state.running = true;
+                    state.timer = setInterval(launch, intervalMs);
+                    setTimeout(launch, 0);
+                  };
+                  launch = async () => {
+                    if (!state.running || state.inflight >= concurrency) return;
+                    const controller = new AbortController();
+                    state.controllers.add(controller);
+                    state.inflight += 1;
+                    state.attempts += 1;
+                    const started = performance.now();
                     try {
-                      const pricePayload = buildPricePayload(group.seats);
-                      const price = await postJson(
-                        directHold.priceUrl,
-                        pricePayload,
-                        transactionController.signal,
-                      );
-                      state.lastStatus = price.status;
-                      if (price.status === 401 || price.status === 403) {
-                        state.unauthorized = true;
-                        state.lastError = `price HTTP ${price.status}`;
-                        return;
-                      }
-                      if (price.status === 429) {
+                      const response = await fetch(url, {
+                        method: 'GET',
+                        cache: 'no-store',
+                        credentials: 'include',
+                        headers: {'Accept': 'application/json, text/plain, */*'},
+                        signal: controller.signal,
+                      });
+                      state.lastStatus = response.status;
+                      state.lastElapsedMs = performance.now() - started;
+                      if (response.status === 403 || response.status === 429) {
                         state.blocked = true;
-                        state.lastError = 'price HTTP 429';
+                        state.lastError = `HTTP ${response.status}`;
+                        state.stop();
                         return;
                       }
-                      if (!price.data || typeof price.data !== 'object') {
-                        state.terminalError = 'price-response-shape';
+                      if (response.status === 401) {
+                        state.unauthorized = true;
+                        state.lastError = 'HTTP 401';
+                        state.stop();
                         return;
                       }
-                      if (!price.ok || Number(price.data.statusCode ?? -1) !== 0) {
-                        state.conflicts += 1;
-                        resume();
-                        return;
-                      }
+                      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                      const payload = await response.json();
+                      state.consecutiveErrors = 0;
+                      const group = findGroup(payload);
+                      if (group) {
+                        pauseOtherRequests(controller);
+                        if (!directHold) {
+                          state.hit = {
+                            data: payload,
+                            group: group.labels,
+                            elapsedMs: state.lastElapsedMs,
+                          };
+                          return;
+                        }
 
-                      const holdPayload = buildHoldPayload(group.seats);
-                      const hold = await postJson(
-                        directHold.holdUrl,
-                        holdPayload,
-                        transactionController.signal,
-                      );
-                      state.lastStatus = hold.status;
-                      if (hold.status === 401 || hold.status === 403) {
-                        state.unauthorized = true;
-                        state.lastError = `hold HTTP ${hold.status}`;
-                        return;
+                        const transactionStarted = performance.now();
+                        const transactionController = new AbortController();
+                        state.controllers.add(transactionController);
+                        try {
+                          const pricePayload = buildPricePayload(group.seats);
+                          const price = await postJson(
+                            directHold.priceUrl,
+                            pricePayload,
+                            transactionController.signal,
+                          );
+                          state.lastStatus = price.status;
+                          if (price.status === 401 || price.status === 403) {
+                            state.unauthorized = true;
+                            state.lastError = `price HTTP ${price.status}`;
+                            return;
+                          }
+                          if (price.status === 429) {
+                            state.blocked = true;
+                            state.lastError = 'price HTTP 429';
+                            return;
+                          }
+                          if (!price.data || typeof price.data !== 'object') {
+                            state.terminalError = 'price-response-shape';
+                            return;
+                          }
+                          if (!price.ok || Number(price.data.statusCode ?? -1) !== 0) {
+                            state.conflicts += 1;
+                            resume();
+                            return;
+                          }
+
+                          const holdPayload = buildHoldPayload(group.seats);
+                          const hold = await postJson(
+                            directHold.holdUrl,
+                            holdPayload,
+                            transactionController.signal,
+                          );
+                          state.lastStatus = hold.status;
+                          if (hold.status === 401 || hold.status === 403) {
+                            state.unauthorized = true;
+                            state.lastError = `hold HTTP ${hold.status}`;
+                            return;
+                          }
+                          if (hold.status === 429) {
+                            state.blocked = true;
+                            state.lastError = 'hold HTTP 429';
+                            return;
+                          }
+                          if (!hold.data || typeof hold.data !== 'object') {
+                            state.terminalError = 'hold-response-shape';
+                            return;
+                          }
+                          const holdData = hold.data.data || {};
+                          const held = hold.ok
+                            && Number(hold.data.statusCode ?? -1) === 0
+                            && String(holdData.resultCode ?? '0') === '0'
+                            && Boolean(holdData.movAtktNo);
+                          if (!held) {
+                            state.conflicts += 1;
+                            resume();
+                            return;
+                          }
+                          state.hit = {
+                            data: payload,
+                            group: group.labels,
+                            elapsedMs: state.lastElapsedMs,
+                            transaction: {
+                              priceResponse: price.data,
+                              holdResponse: hold.data,
+                              holdPayload,
+                              elapsedMs: performance.now() - transactionStarted,
+                            },
+                          };
+                        } finally {
+                          state.controllers.delete(transactionController);
+                        }
                       }
-                      if (hold.status === 429) {
-                        state.blocked = true;
-                        state.lastError = 'hold HTTP 429';
-                        return;
+                    } catch (error) {
+                      if (!(error && error.name === 'AbortError')) {
+                        state.consecutiveErrors += 1;
+                        state.lastError = String(error || 'fetch failed');
+                        if (state.consecutiveErrors >= maxConsecutiveErrors) state.stop();
                       }
-                      if (!hold.data || typeof hold.data !== 'object') {
-                        state.terminalError = 'hold-response-shape';
-                        return;
-                      }
-                      const holdData = hold.data.data || {};
-                      const held = hold.ok
-                        && Number(hold.data.statusCode ?? -1) === 0
-                        && String(holdData.resultCode ?? '0') === '0'
-                        && Boolean(holdData.movAtktNo);
-                      if (!held) {
-                        state.conflicts += 1;
-                        resume();
-                        return;
-                      }
-                      state.hit = {
-                        data: payload,
-                        group: group.labels,
-                        elapsedMs: state.lastElapsedMs,
-                        transaction: {
-                          priceResponse: price.data,
-                          holdResponse: hold.data,
-                          holdPayload,
-                          elapsedMs: performance.now() - transactionStarted,
-                        },
-                      };
                     } finally {
-                      state.controllers.delete(transactionController);
+                      state.controllers.delete(controller);
+                      state.inflight = Math.max(0, state.inflight - 1);
+                      state.completed += 1;
                     }
-                  }
-                } catch (error) {
-                  if (!(error && error.name === 'AbortError')) {
-                    state.consecutiveErrors += 1;
-                    state.lastError = String(error || 'fetch failed');
-                    if (state.consecutiveErrors >= maxConsecutiveErrors) state.stop();
-                  }
-                } finally {
-                  state.controllers.delete(controller);
-                  state.inflight = Math.max(0, state.inflight - 1);
-                  state.completed += 1;
-                }
-              };
+                  };
 
-              window.__pengucroFastSeatMonitor = state;
-              launch();
-              state.timer = setInterval(launch, intervalMs);
-              return true;
-            }
-            """,
-            {
-                "url": seat_url,
-                "groups": [list(group.seats) for group in groups],
-                "concurrency": max(1, min(int(concurrency), CGV_MAX_WORKERS)),
-                "intervalMs": interval,
-                "maxConsecutiveErrors": self.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS,
-                "directHold": direct_hold,
-            },
-        )
-        return bool(result)
+                  window.__pengucroFastSeatMonitor = state;
+                  launch();
+                  state.timer = setInterval(launch, intervalMs);
+                  return true;
+                }
+                """,
+                {
+                    "url": seat_url,
+                    "groups": [list(group.seats) for group in groups],
+                    "concurrency": max(1, min(int(concurrency), CGV_MAX_WORKERS)),
+                    "intervalMs": interval,
+                    "maxConsecutiveErrors": self.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS,
+                    "directHold": direct_hold,
+                },
+            )
+            return bool(result)
+        except Exception:
+            return False
 
     @staticmethod
     def _read_fast_seat_monitor(page) -> dict[str, Any]:
-        result = page.evaluate(
-            r"""
-            () => {
-              const state = window.__pengucroFastSeatMonitor;
-              if (!state) return null;
-              return {
-                running: state.running,
-                attempts: state.attempts,
-                completed: state.completed,
-                inflight: state.inflight,
-                consecutiveErrors: state.consecutiveErrors,
-                lastStatus: state.lastStatus,
-                lastElapsedMs: state.lastElapsedMs,
-                blocked: state.blocked,
-                unauthorized: state.unauthorized,
-                lastError: state.lastError,
-                terminalError: state.terminalError,
-                conflicts: state.conflicts,
-                hit: state.hit,
-              };
-            }
-            """
-        )
-        return dict(result) if isinstance(result, dict) else {}
+        try:
+            result = page.evaluate(
+                r"""
+                () => {
+                  const state = window.__pengucroFastSeatMonitor;
+                  if (!state) return null;
+                  return {
+                    running: state.running,
+                    attempts: state.attempts,
+                    completed: state.completed,
+                    inflight: state.inflight,
+                    consecutiveErrors: state.consecutiveErrors,
+                    lastStatus: state.lastStatus,
+                    lastElapsedMs: state.lastElapsedMs,
+                    blocked: state.blocked,
+                    unauthorized: state.unauthorized,
+                    lastError: state.lastError,
+                    terminalError: state.terminalError,
+                    conflicts: state.conflicts,
+                    hit: state.hit,
+                  };
+                }
+                """
+            )
+            return dict(result) if isinstance(result, dict) else {}
+        except Exception:
+            return {}
 
     @staticmethod
     def _stop_fast_seat_monitor(page) -> None:
@@ -816,11 +919,7 @@ class CgvEngine(BaseEngine):
     ) -> tuple[bool, bool]:
         auth = self._browser_auth_data(page)
         seat_url = self._seat_url(schedule, auth.get("custNo", ""))
-        direct_hold = (
-            None
-            if developer_mode
-            else self._direct_hold_config(schedule, people, auth, cgv)
-        )
+        direct_hold = self._direct_hold_config(schedule, people, auth, cgv)
         preferred_concurrency = self.scan_concurrency
         concurrency = preferred_concurrency
         launch_interval_ms = self.FAST_SEAT_LAUNCH_INTERVAL_MS
@@ -1172,31 +1271,34 @@ class CgvEngine(BaseEngine):
         return payload
 
     def _enter_visitor_page(self, page, schedule: dict[str, Any]) -> bool:
-        payload = self._query_payload(schedule)
-        page.evaluate(
-            "payload => { sessionStorage.setItem('query', JSON.stringify(payload)); "
-            "sessionStorage.setItem('rsrtHistoryBack', 'Y'); }",
-            payload,
-        )
-        page.goto(f"{CGV_HOME_URL}/cnm/selectVisitorCnt", wait_until="domcontentloaded", timeout=30000)
-        if "/mem/login" in page.url:
-            self.log(
-                "열린 CGV Chrome에서 로그인해주세요. 로그인 완료를 감지하면 자동으로 계속합니다.",
-                "warning",
-            )
-            while not self.stop_event.is_set() and "/mem/login" in page.url:
-                page.wait_for_timeout(500)
-            if self.stop_event.is_set():
-                return False
+        try:
+            payload = self._query_payload(schedule)
             page.evaluate(
-                "payload => sessionStorage.setItem('query', JSON.stringify(payload))", payload
+                "payload => { sessionStorage.setItem('query', JSON.stringify(payload)); "
+                "sessionStorage.setItem('rsrtHistoryBack', 'Y'); }",
+                payload,
             )
-            page.goto(
-                f"{CGV_HOME_URL}/cnm/selectVisitorCnt",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
-        return not self._is_block_page(page)
+            page.goto(f"{CGV_HOME_URL}/cnm/selectVisitorCnt", wait_until="domcontentloaded", timeout=30000)
+            if "/mem/login" in page.url:
+                self.log(
+                    "열린 CGV Chrome에서 로그인해주세요. 로그인 완료를 감지하면 자동으로 계속합니다.",
+                    "warning",
+                )
+                while not self.stop_event.is_set() and "/mem/login" in page.url:
+                    page.wait_for_timeout(500)
+                if self.stop_event.is_set():
+                    return False
+                page.evaluate(
+                    "payload => sessionStorage.setItem('query', JSON.stringify(payload))", payload
+                )
+                page.goto(
+                    f"{CGV_HOME_URL}/cnm/selectVisitorCnt",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            return not self._is_block_page(page)
+        except Exception:
+            return False
 
     @staticmethod
     def _click_visible_by_text(page, labels: tuple[str, ...]) -> bool:
@@ -1326,18 +1428,36 @@ class CgvEngine(BaseEngine):
 
     @staticmethod
     def _available_seat_elements(page) -> list[dict[str, Any]]:
-        result = page.evaluate(
-            """
-            () => [...document.querySelectorAll('button[data-seatlocno]')].map(node => {
-              const label = node.textContent || '';
-              const classes = String(node.className || '').toLowerCase();
-              const unavailable = node.disabled || node.getAttribute('aria-disabled') === 'true' ||
-                                  /disabled|complete|sold|reserved/.test(classes);
-              return {id: node.getAttribute('data-seatlocno') || '', label, unavailable};
-            })
-            """
-        )
-        return [dict(item) for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+        try:
+            result = page.evaluate(
+                r"""
+                () => [...document.querySelectorAll('button[data-seatlocno]')].map(node => {
+                  const label = node.textContent || '';
+                  const classes = String(node.className || '').toLowerCase();
+                  const tokens = new Set(classes.split(/[\s_\-]+/));
+                  const isSelected = node.getAttribute('aria-pressed') === 'true' ||
+                                     node.getAttribute('aria-selected') === 'true' ||
+                                     tokens.has('selected') || tokens.has('active') || tokens.has('on') ||
+                                     (node.classList && (node.classList.contains('selected') || node.classList.contains('active') || node.classList.contains('on')));
+                  const isUnavailable = !isSelected && (
+                      node.disabled ||
+                      node.getAttribute('aria-disabled') === 'true' ||
+                      ['disabled', 'complete', 'sold', 'reserved', 'finish', 'soldout'].some(k => tokens.has(k) || classes.includes(k))
+                  );
+                  const isAvailable = !isUnavailable && !isSelected;
+                  return {
+                    id: node.getAttribute('data-seatlocno') || '',
+                    label,
+                    available: isAvailable,
+                    selected: isSelected,
+                    unavailable: isUnavailable,
+                  };
+                })
+                """
+            )
+            return [dict(item) for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+        except Exception:
+            return []
 
     @staticmethod
     def choose_available_group(
@@ -1348,29 +1468,37 @@ class CgvEngine(BaseEngine):
             if element.get("unavailable"):
                 continue
             label = str(element.get("label", ""))
+            seat_id = str(element.get("id", ""))
             for match in re.finditer(r"([A-Za-z가-힣]+)\s*[-_ ]?\s*([0-9]+)", label):
-                available[normalize_seat_name("".join(match.groups()))] = str(element.get("id", ""))
+                row_str, num_str = match.groups()
+                available[normalize_seat_name(f"{row_str}{num_str}")] = seat_id
+                try:
+                    num_int = int(num_str)
+                    available[normalize_seat_name(f"{row_str}{num_int}")] = seat_id
+                    available[normalize_seat_name(f"{row_str}{num_int:02d}")] = seat_id
+                except (ValueError, TypeError):
+                    pass
         for group in groups:
-            if is_contiguous_seat_group(group.seats) and all(
-                seat in available for seat in group.seats
+            norm_seats = tuple(normalize_seat_name(seat) for seat in group.seats)
+            if is_contiguous_seat_group(norm_seats) and all(
+                s in available for s in norm_seats
             ):
-                return group, {seat: available[seat] for seat in group.seats}
+                return group, {seat: available[normalize_seat_name(seat)] for seat in group.seats}
         return None
 
     def _submit_seat_selection(self, page) -> bool:
-        """Click '선택완료' in the seat map modal and ensure the modal closes or transitions."""
-        for attempt in range(6):
-            # 1. Try JavaScript click on the exact active '선택완료' button inside modal
-            clicked = False
-            try:
-                clicked = page.evaluate(
+        """Click '선택완료' in the seat map modal and wait for page transition."""
+        clicked = False
+        try:
+            clicked = bool(
+                page.evaluate(
                     r"""
                     () => {
                       const clean = s => (s || '').replace(/\s+/g, '');
                       const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                      const target = buttons.find(b => clean(b.textContent) === '선택완료' && !b.disabled);
+                      const target = buttons.find(b => clean(b.textContent) === '선택완료' && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
                       if (target) {
-                        target.scrollIntoView({block: 'center'});
+                        if (typeof target.scrollIntoView === 'function') target.scrollIntoView({block: 'center'});
                         target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
                         target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
                         target.click();
@@ -1380,70 +1508,181 @@ class CgvEngine(BaseEngine):
                     }
                     """
                 )
-            except Exception:
-                clicked = False
+            )
+        except Exception:
+            clicked = False
 
-            # 2. Try Playwright locator
-            if not clicked:
-                for loc in (
-                    page.locator("button:has-text('선택완료'), a:has-text('선택완료')"),
-                    page.get_by_text("선택완료", exact=True),
-                    page.get_by_text("선택 완료", exact=True),
-                ):
-                    try:
-                        for idx in range(loc.count()):
-                            btn = loc.nth(idx)
-                            if btn.is_visible():
-                                btn.click(force=True, timeout=1500)
-                                clicked = True
-                                break
-                        if clicked:
+        if not clicked:
+            for loc in (
+                page.locator("button:has-text('선택완료'), a:has-text('선택완료')"),
+                page.get_by_text("선택완료", exact=True),
+                page.get_by_text("선택 완료", exact=True),
+            ):
+                try:
+                    for idx in range(loc.count()):
+                        btn = loc.nth(idx)
+                        if (
+                            btn.is_visible()
+                            and btn.is_enabled()
+                            and btn.get_attribute("aria-disabled") != "true"
+                        ):
+                            btn.click(force=True, timeout=1500)
+                            clicked = True
                             break
-                    except Exception:
-                        continue
+                    if clicked:
+                        break
+                except Exception:
+                    continue
 
-            page.wait_for_timeout(800)
+        if not clicked:
+            return False
 
-            # Check if conflict alert dialog popped up
-            has_conflict = False
+        def check_conflict() -> bool:
             try:
-                has_conflict = page.evaluate(
-                    r"""
-                    () => {
-                      const text = (document.body.innerText || '');
-                      return text.includes('이미 선택된') || text.includes('다른 고객이') || text.includes('예매 중인 좌석');
-                    }
-                    """
+                return bool(
+                    page.evaluate(
+                        r"""
+                        () => {
+                          const text = (document.body.innerText || '');
+                          return text.includes('이미 선택된') || text.includes('다른 고객이') ||
+                                 text.includes('예매 중인 좌석') || text.includes('예매중인 좌석') ||
+                                 text.includes('선점된 좌석') || text.includes('선택하신 좌석') ||
+                                 text.includes('선택된 좌석이') || text.includes('이미 예매');
+                        }
+                        """
+                    )
                 )
             except Exception:
-                has_conflict = False
-
-            if has_conflict:
-                self._click_visible_by_text(page, ("확인",))
                 return False
 
-            # Check if seat modal is closed (seat buttons are no longer present or payment elements appear)
-            modal_closed = False
+        def check_transition() -> bool:
             try:
-                modal_closed = page.evaluate(
-                    r"""
-                    () => {
-                      const seatButtons = document.querySelectorAll('button[data-seatlocno]');
-                      const visibleSeats = Array.from(seatButtons).filter(b => b.offsetParent !== null);
-                      const hasPaySection = document.body.innerText.includes('결제수단') ||
-                                            document.body.innerText.includes('N pay') ||
-                                            document.body.innerText.includes('최종 결제금액');
-                      return visibleSeats.length === 0 || hasPaySection;
-                    }
-                    """
+                return bool(
+                    page.evaluate(
+                        r"""
+                        () => {
+                          const seatButtons = document.querySelectorAll('button[data-seatlocno]');
+                          const visibleSeats = Array.from(seatButtons).filter(b => b.offsetParent !== null && !b.hidden);
+                          const bodyText = document.body.innerText || '';
+                          const hasPaySection = bodyText.includes('결제수단') ||
+                                                bodyText.includes('N pay') ||
+                                                bodyText.includes('최종 결제금액') ||
+                                                bodyText.includes('결제하기');
+                          return (seatButtons.length === 0 || visibleSeats.length === 0) || hasPaySection;
+                        }
+                        """
+                    )
                 )
             except Exception:
-                modal_closed = False
+                return False
 
-            if modal_closed:
+        start_time = time.monotonic()
+        while not self.stop_event.is_set() and time.monotonic() - start_time < 10.0:
+            if check_conflict():
+                self._click_visible_by_text(page, ("확인", "닫기", "취소"))
+                return False
+
+            if check_transition():
                 return True
 
-        return False
+            try:
+                page.wait_for_timeout(150)
+            except Exception:
+                if self.stop_event.wait(0.15):
+                    break
+
+        if check_conflict():
+            self._click_visible_by_text(page, ("확인", "닫기", "취소"))
+            return False
+
+        return check_transition()
+
+    def _reconnect_seat_session(
+        self,
+        schedule: dict[str, Any] | None = None,
+        people: int = 1,
+    ) -> Any:
+        try:
+            playwright = getattr(self, "_playwright", None)
+            chrome = getattr(self, "_chrome", None)
+            browser = getattr(self, "_browser", None)
+            if chrome is None or not getattr(chrome, "endpoint", None):
+                chrome = browser_session.start_isolated(log=self.log)
+                self._chrome = chrome
+            if browser is None or not getattr(browser, "is_connected", lambda: True)():
+                if playwright is not None and chrome is not None and getattr(chrome, "endpoint", None):
+                    browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
+                    self._browser = browser
+            context = None
+            if browser is not None:
+                try:
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                except Exception:
+                    if playwright is not None and chrome is not None and getattr(chrome, "endpoint", None):
+                        browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
+                        self._browser = browser
+                        context = browser.contexts[0] if browser.contexts else browser.new_context()
+                self._context = context
+            if context is not None:
+                page = next(
+                    (
+                        item
+                        for item in context.pages
+                        if not item.is_closed() and "cgv.co.kr" in item.url
+                    ),
+                    None,
+                )
+                page = page or context.new_page()
+                page.on("dialog", lambda dialog: dialog.accept())
+                if schedule:
+                    if not self._enter_visitor_page(page, schedule):
+                        return None
+                else:
+                    page.goto(
+                        f"{CGV_HOME_URL}/cnm/selectVisitorCnt",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                if not self._select_visitors(page, people):
+                    return None
+                return page
+        except Exception as rec_err:
+            self.log(
+                f"[CGV] 좌석 단계 브라우저 재연결 대기/실패: {format_exception(rec_err)}",
+                "warning",
+            )
+        return None
+
+    def _reload_or_recover_seat_page(
+        self,
+        page,
+        schedule: dict[str, Any] | None = None,
+        people: int = 1,
+    ) -> tuple[Any, bool]:
+        """Safely reload seat page; if TargetClosedError or CDP disconnect occurs, reconnect and restore state."""
+        try:
+            if hasattr(page, "is_closed") and page.is_closed():
+                raise RuntimeError("TargetClosedError: Target page has been closed")
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+            if not self._select_visitors(page, people):
+                return page, False
+            return page, True
+        except Exception as exc:
+            if self.stop_event.is_set():
+                return page, False
+            if self._is_recoverable_browser_error(exc) or (
+                hasattr(page, "is_closed") and page.is_closed()
+            ):
+                self.log(
+                    f"[CGV] 좌석 단계 브라우저 연결 끊김 감지 ({exc.__class__.__name__}) · 자동 재연결 시도 중...",
+                    "warning",
+                )
+                recovered_page = self._reconnect_seat_session(schedule, people)
+                if recovered_page is not None:
+                    self.log("[CGV] 좌석 단계 브라우저 재연결 성공 · 좌석 선택을 계속합니다.", "success")
+                    return recovered_page, True
+            self.log(f"CGV 좌석 페이지 새로고침 오류: {format_exception(exc)}", "warning")
+            return page, False
 
     def _select_and_hold_seats(
         self,
@@ -1451,6 +1690,7 @@ class CgvEngine(BaseEngine):
         groups: tuple[CgvSeatGroup, ...],
         people: int,
         developer_mode: bool,
+        schedule: dict[str, Any] | None = None,
     ) -> bool:
         last_reload = time.monotonic()
         while not self.stop_event.is_set():
@@ -1461,16 +1701,32 @@ class CgvEngine(BaseEngine):
             chosen = self.choose_available_group(elements, groups)
             if chosen:
                 group, ids = chosen
+                selection_ok = True
                 for seat in group.seats:
-                    if not self._click_seat_by_id(page, ids[seat]):
-                        self.log(f"CGV 좌석 {seat} 선택 버튼을 누르지 못했습니다.", "warning")
+                    if not self._ensure_seat_selected_by_id(page, ids[seat]):
+                        self.silent_tick(f"CGV 좌석 {seat} 선택 실패 · 다시 시도")
+                        selection_ok = False
+                        break
+                if not selection_ok:
+                    page, ok = self._reload_or_recover_seat_page(
+                        page, schedule=schedule, people=people
+                    )
+                    if not ok:
                         return False
+                    last_reload = time.monotonic()
+                    continue
+
                 self.log(f"선택 좌석 확보 가능: {', '.join(group.seats)}", "success")
-                page.wait_for_timeout(400)
+                try:
+                    page.wait_for_timeout(400)
+                except Exception:
+                    self.stop_event.wait(0.4)
                 if not self._submit_seat_selection(page):
                     self.silent_tick("CGV 좌석 선점 경합 발생 또는 모달 전환 재시도")
-                    page.reload(wait_until="domcontentloaded", timeout=30000)
-                    if not self._select_visitors(page, people):
+                    page, ok = self._reload_or_recover_seat_page(
+                        page, schedule=schedule, people=people
+                    )
+                    if not ok:
                         return False
                     last_reload = time.monotonic()
                     continue
@@ -1481,12 +1737,17 @@ class CgvEngine(BaseEngine):
             self.silent_tick("선택한 CGV 좌석 묶음이 아직 비어 있지 않습니다")
             now = time.monotonic()
             if now - last_reload >= 1.5:
-                page.reload(wait_until="domcontentloaded", timeout=30000)
-                if not self._select_visitors(page, people):
+                page, ok = self._reload_or_recover_seat_page(
+                    page, schedule=schedule, people=people
+                )
+                if not ok:
                     return False
                 last_reload = now
             else:
-                page.wait_for_timeout(300)
+                try:
+                    page.wait_for_timeout(300)
+                except Exception:
+                    self.stop_event.wait(0.3)
         return False
 
     def _ensure_member_session(self, page, context) -> bool:
@@ -1610,8 +1871,12 @@ class CgvEngine(BaseEngine):
         keep_open = False
         try:
             with self._browser_lock, sync_playwright() as playwright:
+                self._playwright = playwright
+                self._chrome = chrome
                 browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
+                self._browser = browser
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
+                self._context = context
                 page = next((item for item in context.pages if "cgv.co.kr" in item.url), None)
                 page = page or context.new_page()
                 page.on("dialog", lambda dialog: dialog.accept())
@@ -1754,10 +2019,12 @@ class CgvEngine(BaseEngine):
                 )
                 if use_browser_fallback and not self.stop_event.is_set():
                     self._restore_fetch(page)
-                    page.reload(wait_until="domcontentloaded", timeout=30000)
-                    if self._select_visitors(page, people):
+                    page, ok = self._reload_or_recover_seat_page(
+                        page, schedule=schedule, people=people
+                    )
+                    if ok:
                         held = self._select_and_hold_seats(
-                            page, groups, people, developer_mode
+                            page, groups, people, developer_mode, schedule=schedule
                         )
                 keep_open = True
                 if held:
@@ -1778,6 +2045,10 @@ class CgvEngine(BaseEngine):
                 self.log(f"CGV 예약 흐름 오류: {format_exception(exc)}", "error")
                 keep_open = True
         finally:
+            self._playwright = None
+            self._browser = None
+            self._context = None
+            self._chrome = None
             if keep_open:
                 self._release_browser_lease_when_closed(chrome)
             else:
