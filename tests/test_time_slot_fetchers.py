@@ -95,6 +95,60 @@ def test_fetch_keyescape_slots(monkeypatch):
     assert slots[1].available is False
 
 
+def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(monkeypatch):
+    """A Saturday target must use the previous Saturday, not the nearer Friday."""
+    import requests
+
+    calls = []
+
+    def fake_post(_url, data, **_kwargs):
+        calls.append(dict(data))
+        if data["t"] == "get_theme_date":
+            return MockResponse(200, {
+                "status": True,
+                "calendarData": {"today": "2026-08-09"},
+            }, is_json=True)
+        if data["t"] == "get_theme_info_list":
+            return MockResponse(200, {
+                "status": True,
+                "data": [{
+                    "info_num": "43", "theme_num": "65", "doing": 7,
+                }],
+            }, is_json=True)
+        if data["date"] == "2026-08-15":
+            return MockResponse(200, {
+                "status": False, "msg": "예약 가능 한 날짜가 아닙니다.",
+            }, is_json=True)
+        if data["date"] == "2026-08-08":
+            return MockResponse(200, {
+                "status": True,
+                "data": [
+                    {"num": "2219", "hh": "9", "mm": "50", "enable": "Y"},
+                    {"num": "2292", "hh": "10", "mm": "50", "enable": "N"},
+                ],
+            }, is_json=True)
+        pytest.fail(f"unexpected date probe: {data}")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    slots = fetch_keyescape_slots(
+        base_url="https://keyescape.com",
+        branch_id="22",
+        theme_id="43",
+        date_str="2026-08-15",
+        timeout=5.0,
+    )
+
+    assert [slot.time for slot in slots] == ["09:50", "10:50"]
+    assert all(slot.estimated for slot in slots)
+    assert all(slot.source_date == "2026-08-08" for slot in slots)
+    assert all(slot.estimate_basis == "same_weekday" for slot in slots)
+    assert all(slot.slot_id == "" for slot in slots)
+    assert all(slot.available is False for slot in slots)
+    probed_dates = [call.get("date") for call in calls if call["t"] == "get_theme_time"]
+    assert probed_dates == ["2026-08-15", "2026-08-08"]
+
+
 def test_fetch_jigubyeol_slots(monkeypatch):
     import requests
     # 지구별방탈출 가상 HTML 응답 모킹 (실제 play33 버튼 형태)
@@ -288,6 +342,7 @@ def test_fetch_naver_slots_uses_same_weekday_template_when_date_is_closed(monkey
     assert all(slot.available is False for slot in slots)
     assert all(slot.estimated is True for slot in slots)
     assert all(slot.source_date == "2026-08-02" for slot in slots)
+    assert all(slot.estimate_basis == "same_weekday" for slot in slots)
 
 
 def test_fetch_any_time_slots_routing(monkeypatch):
@@ -299,12 +354,15 @@ def test_fetch_any_time_slots_routing(monkeypatch):
     mock_jigu = MagicMock(return_value=["jigubyeol"])
     mock_doom = MagicMock(return_value=["doomescape"])
     mock_nav = MagicMock(return_value=["naver"])
+    mock_dpsnnn = MagicMock(return_value=["dpsnnn"])
     
     monkeypatch.setattr(tsf, "fetch_zeroworld_slots", mock_zero)
     monkeypatch.setattr(tsf, "fetch_keyescape_slots", mock_key)
     monkeypatch.setattr(tsf, "fetch_jigubyeol_slots", mock_jigu)
     monkeypatch.setattr(tsf, "fetch_doomescape_slots", mock_doom)
     monkeypatch.setattr(tsf, "fetch_naver_slots", mock_nav)
+    import engines.dpsnnn_engine as dpsnnn_module
+    monkeypatch.setattr(dpsnnn_module, "fetch_dpsnnn_slots", mock_dpsnnn)
     
     # 1. Zeroworld 라우팅 테스트
     config = {"engine_id": "zeroworld_shin", "base_url": "https://zero.com"}
@@ -331,9 +389,15 @@ def test_fetch_any_time_slots_routing(monkeypatch):
     res = fetch_any_time_slots(config, "1", "2", "2026-07-28")
     assert res == ["naver"]
 
+    # 6. 단편선 전용 엔진 라우팅 테스트
+    config = {"engine_id": "dpsnnn", "base_url": "https://www.dpsnnn.com"}
+    res = fetch_any_time_slots(config, "seongsu", "문장", "2026-07-28")
+    assert res == ["dpsnnn"]
 
-def test_fetch_doomescape_slots(monkeypatch):
+
+def test_fetch_doomescape_slots(monkeypatch, tmp_path):
     import requests
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
     # 둠이스케이프 HTML 모킹 (sinbiweb 스타일의 tm_box 구성)
     mock_html = """
     <div class="tm_box">
@@ -365,3 +429,269 @@ def test_fetch_doomescape_slots(monkeypatch):
     assert slots[1].time == "14:00"
     assert slots[1].slot_id == "102"
     assert slots[1].available is False
+
+
+def test_fetch_doomescape_slots_reuses_cached_same_weekday(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    source_html = """
+    <input name="rev_days" value="2026-08-08">
+    <div class="tm_box">
+        <p class="name">Rendering</p>
+        <a href="?theme_time_num=801"><span class="num">12:30</span><span class="txt">예약가능</span></a>
+        <a href="?theme_time_num=802"><span class="num">14:00</span><span class="txt">예약마감</span></a>
+    </div>
+    """
+    unopened_html = '<input name="rev_days" value="2026-08-15"><div class="calendar">예약</div>'
+
+    def fake_get(_url, *, params, **_kwargs):
+        html = source_html if params["rev_days"] == "2026-08-08" else unopened_html
+        return MockResponse(200, html)
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert fetch_doomescape_slots(
+        "https://doomescape.com", "3", "8", "2026-08-08", 5.0
+    )
+
+    slots = fetch_doomescape_slots(
+        "https://doomescape.com", "3", "8", "2026-08-15", 5.0
+    )
+
+    assert [slot.time for slot in slots] == ["12:30", "14:00"]
+    assert all(slot.estimated for slot in slots)
+    assert all(slot.source_date == "2026-08-08" for slot in slots)
+    assert all(slot.estimate_basis == "same_weekday" for slot in slots)
+
+
+def test_doomescape_cache_prefers_same_weekday_over_nearer_weekday(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+
+    def html_for(day, time_value):
+        return f"""
+        <input name="rev_days" value="{day}">
+        <div class="tm_box"><p class="name">Rendering</p>
+          <a href="?theme_time_num=1"><span class="num">{time_value}</span><span class="txt">예약가능</span></a>
+        </div>
+        """
+
+    pages = {
+        "2026-08-08": html_for("2026-08-08", "12:30"),  # Saturday
+        "2026-08-14": html_for("2026-08-14", "11:00"),  # Friday, but nearer
+        "2026-08-15": '<input name="rev_days" value="2026-08-15"><div>예약</div>',
+    }
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda _url, *, params, **_kwargs: MockResponse(200, pages[params["rev_days"]]),
+    )
+    fetch_doomescape_slots("https://doomescape.com", "3", "8", "2026-08-08", 5.0)
+    fetch_doomescape_slots("https://doomescape.com", "3", "8", "2026-08-14", 5.0)
+
+    slots = fetch_doomescape_slots(
+        "https://doomescape.com", "3", "8", "2026-08-15", 5.0
+    )
+
+    assert [slot.time for slot in slots] == ["12:30"]
+    assert slots[0].source_date == "2026-08-08"
+    assert slots[0].estimate_basis == "same_weekday"
+
+
+def test_fetch_doomescape_slots_rejects_server_error_page(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *_args, **_kwargs: MockResponse(200, "<html><h1>Service Unavailable</h1></html>"),
+    )
+
+    with pytest.raises(ValueError, match="서버 장애.*저장된 시간표가 없습니다"):
+        fetch_doomescape_slots(
+            "https://doomescape.com", "3", "8", "2026-08-15", 5.0
+        )
+
+
+def test_fetch_doomescape_slots_uses_cache_during_traffic_over(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    source_html = """
+    <input name="rev_days" value="2026-08-08">
+    <div class="tm_box"><p class="name">허수아비</p>
+      <a href="?theme_time_num=801"><span class="num">11:00</span><span class="txt">예약가능</span></a>
+    </div>
+    """
+    traffic_html = "<html><title>:: 일일전송량 초과 안내 ::</title><body>트래픽 초과</body></html>"
+
+    def fake_get(_url, *, params, **_kwargs):
+        response = MockResponse(
+            200,
+            source_html if params["rev_days"] == "2026-08-08" else traffic_html,
+        )
+        response.url = (
+            "https://doomescape.com/layout/res/home.php"
+            if params["rev_days"] == "2026-08-08"
+            else "http://www.nesolution.com/msg/traffic_over.aspx?gno=180014"
+        )
+        return response
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert fetch_doomescape_slots(
+        "https://doomescape.com", "4", "34", "2026-08-08", 5.0
+    )
+
+    slots = fetch_doomescape_slots(
+        "https://doomescape.com", "4", "34", "2026-08-15", 5.0
+    )
+
+    assert [slot.time for slot in slots] == ["11:00"]
+    assert slots[0].estimated is True
+    assert slots[0].estimate_reason == "traffic_over"
+    assert slots[0].source_date == "2026-08-08"
+
+
+def test_fetch_doomescape_slots_caches_every_theme_from_one_page(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    source_html = """
+    <input name="rev_days" value="2026-08-08">
+    <div class="tm_box"><p class="name">허수아비</p>
+      <a href="?theme_time_num=801"><span class="num">11:00</span><span class="txt">예약가능</span></a>
+    </div>
+    <div class="tm_box"><p class="name">옵스큐라</p>
+      <a href="?theme_time_num=901"><span class="num">11:20</span><span class="txt">예약가능</span></a>
+    </div>
+    """
+    unopened_html = '<input name="rev_days" value="2026-08-15"><div>예약</div>'
+
+    def fake_get(_url, *, params, **_kwargs):
+        return MockResponse(
+            200,
+            source_html if params["rev_days"] == "2026-08-08" else unopened_html,
+        )
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert fetch_doomescape_slots(
+        "https://doomescape.com", "4", "34", "2026-08-08", 5.0
+    )
+
+    obscura = fetch_doomescape_slots(
+        "https://doomescape.com", "4", "35", "2026-08-15", 5.0
+    )
+
+    assert [slot.time for slot in obscura] == ["11:20"]
+    assert obscura[0].estimated is True
+    assert obscura[0].source_date == "2026-08-08"
+
+
+def test_fetch_doomescape_slots_shares_branch_date_page_between_themes(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    page_html = """
+    <input name="rev_days" value="2026-08-15">
+    <div class="tm_box"><p class="name">허수아비</p>
+      <a href="?theme_time_num=801"><span class="num">11:00</span><span class="txt">예약가능</span></a>
+    </div>
+    <div class="tm_box"><p class="name">옵스큐라</p>
+      <a href="?theme_time_num=901"><span class="num">11:20</span><span class="txt">예약가능</span></a>
+    </div>
+    """
+    calls = []
+
+    def fake_get(_url, *, params, **_kwargs):
+        calls.append(dict(params))
+        return MockResponse(200, page_html)
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    scarecrow = fetch_doomescape_slots(
+        "https://doomescape.com", "4", "34", "2026-08-15", 5.0
+    )
+    obscura = fetch_doomescape_slots(
+        "https://doomescape.com", "4", "35", "2026-08-15", 5.0
+    )
+
+    assert [slot.time for slot in scarecrow] == ["11:00"]
+    assert [slot.time for slot in obscura] == ["11:20"]
+    assert len(calls) == 1
+
+
+def test_doomescape_unopened_date_seeds_all_themes_on_a_cold_install(monkeypatch, tmp_path):
+    import requests
+    import engines.time_slot_fetchers as module
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "_doomescape_reference_day", lambda: datetime(2026, 8, 13).date())
+
+    weekday_html = """
+    <input name="rev_days" value="{date}">
+    <div class="tm_box"><p class="name">허수아비</p>
+      <a href="?theme_time_num=801"><span class="num">11:00</span><span class="txt">예약가능</span></a>
+    </div>
+    <div class="tm_box"><p class="name">옵스큐라</p>
+      <a href="?theme_time_num=901"><span class="num">11:20</span><span class="txt">예약가능</span></a>
+    </div>
+    """
+    holiday_html = """
+    <input name="rev_days" value="2026-08-17">
+    <div class="tm_box"><p class="name">허수아비</p>
+      <a href="?theme_time_num=802"><span class="num">12:20</span><span class="txt">예약가능</span></a>
+    </div>
+    <div class="tm_box"><p class="name">옵스큐라</p>
+      <a href="?theme_time_num=902"><span class="num">12:40</span><span class="txt">예약가능</span></a>
+    </div>
+    """
+    unopened_html = '<input name="rev_days" value="{date}"><div class="tm_box"></div>'
+    calls = []
+
+    def fake_get(_url, *, params, **_kwargs):
+        requested = params["rev_days"]
+        calls.append(requested)
+        if requested in {"2026-08-13", "2026-08-14"}:
+            return MockResponse(200, weekday_html.format(date=requested))
+        if requested == "2026-08-17":
+            return MockResponse(200, holiday_html)
+        return MockResponse(200, unopened_html.format(date=requested))
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    scarecrow = fetch_doomescape_slots(
+        "https://doomescape.com", "4", "34", "2026-08-18", 5.0
+    )
+    obscura = fetch_doomescape_slots(
+        "https://doomescape.com", "4", "35", "2026-08-18", 5.0
+    )
+
+    assert [slot.time for slot in scarecrow] == ["11:00"]
+    assert [slot.time for slot in obscura] == ["11:20"]
+    assert all(slot.estimated for slot in scarecrow + obscura)
+    assert "2026-08-13" in calls and "2026-08-14" in calls
+    assert calls.count("2026-08-18") == 1
+
+
+def test_doomescape_estimate_never_crosses_weekday_and_weekend(monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    weekend_html = """
+    <input name="rev_days" value="2026-08-15">
+    <div class="tm_box"><p class="name">허수아비</p>
+      <a href="?theme_time_num=801"><span class="num">11:00</span><span class="txt">예약가능</span></a>
+    </div>
+    """
+
+    monkeypatch.setattr(requests, "get", lambda *_args, **_kwargs: MockResponse(200, weekend_html))
+    assert fetch_doomescape_slots(
+        "https://doomescape.com", "4", "34", "2026-08-15", 5.0
+    )
+
+    from engines.time_slot_fetchers import _estimate_doomescape_timetable
+
+    assert _estimate_doomescape_timetable(
+        "https://doomescape.com", "4", "34", "2026-08-18"
+    ) == []

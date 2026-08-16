@@ -100,6 +100,7 @@ ROW_GAP = 2
 # ---------------------------------------------------------------------------
 H_TITLEBAR = 36                # Fixed: asserted by verify_ui.py
 H_BADGE = 24
+H_STATUS = 20                 # Quiet header status line (dot + plain text)
 H_GHOST = 26                   # Borderless / text-only buttons
 H_CONTROL = 28                 # Entries, dropdowns, segmented buttons
 H_BUTTON = 32                  # Dialog action buttons
@@ -109,6 +110,7 @@ H_CTA = 40                     # Full width primary call to action
 # Fonts
 # ---------------------------------------------------------------------------
 FONT_FAMILY = "Segoe UI"
+FONT_KOREAN_FAMILY = "Malgun Gothic"  # Windows-native Korean glyphs stay crisp at small sizes.
 FONT_DISPLAY = (FONT_FAMILY, 20, "bold")
 FONT_HEADING = (FONT_FAMILY, 13, "bold")
 FONT_TITLE = (FONT_FAMILY, 14, "bold")
@@ -116,6 +118,10 @@ FONT_BODY_MD = (FONT_FAMILY, 12, "normal")
 FONT_BODY_SM = (FONT_FAMILY, 11, "bold")   # Small label headers
 FONT_CAPTION = (FONT_FAMILY, 10, "normal")
 FONT_LABEL = (FONT_FAMILY, 11, "normal")
+FONT_KR_DISPLAY = (FONT_KOREAN_FAMILY, 20, "bold")
+FONT_KR_TITLE = (FONT_KOREAN_FAMILY, 13, "bold")
+FONT_KR_BODY = (FONT_KOREAN_FAMILY, 12, "normal")
+FONT_KR_LABEL = (FONT_KOREAN_FAMILY, 11, "normal")
 
 # Consolas ships with every supported Windows release, so this needs no
 # runtime probe. It is a real fixed-width face, which keeps the "[HH:MM:SS]"

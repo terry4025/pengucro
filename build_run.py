@@ -10,10 +10,19 @@ from pathlib import Path
 import PyInstaller.__main__
 
 SPEC = Path(__file__).with_name("방탈출펭크로.spec")
+ROOT = Path(__file__).resolve().parent
+DIST = ROOT / "dist"
+WORK = ROOT / "build_main_yescaptcha"
 
 if not SPEC.exists():
     print(f"spec not found: {SPEC}")
     sys.exit(1)
 
 print(f"building from: {SPEC}")
-PyInstaller.__main__.run(["--noconfirm", "--clean", str(SPEC)])
+PyInstaller.__main__.run([
+    "--noconfirm",
+    "--clean",
+    "--distpath", str(DIST),
+    "--workpath", str(WORK),
+    str(SPEC),
+])

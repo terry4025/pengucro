@@ -7,6 +7,8 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
+from pengucro import logging_setup
+from pengucro.diagnostics import format_exception
 from pengucro.models import BookingEvent, BookingEventType, BookingResult
 
 
@@ -107,6 +109,10 @@ class BaseEngine:
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_message = f"[{timestamp}] {message}"
 
+        # Persist at the engine boundary so file I/O stays off the Tk event
+        # consumer and each line retains its concrete engine class.
+        logging_setup.persist_log_line(self.__class__.__name__, message, log_type)
+
         if "시도 중" in message:
             error_part = "재시도"
             if "시도 중... (" in message:
@@ -133,8 +139,14 @@ class BaseEngine:
         self.emit_event(BookingEventType.ATTEMPT, error_message)
 
     def silent_tick(self, error_message: str) -> None:
+        self.silent_ticks(1, error_message)
+
+    def silent_ticks(self, count: int, error_message: str) -> None:
+        """Record a burst of equivalent attempts with one UI/event update."""
+
+        count = max(1, int(count))
         with self._lock:
-            self._attempt_count += 1
+            self._attempt_count += count
             self._last_error = error_message
             count = self._attempt_count
             is_new = error_message not in self._seen_errors
@@ -175,6 +187,10 @@ class BaseEngine:
         raise NotImplementedError("Subclasses must implement make_reservation_async_task")
 
     def start_reservation(self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False) -> None:
+        # Protect non-GUI/legacy entry points as well. MainWindow replaces the
+        # per-run registry earlier; this idempotent registration closes the gap
+        # for callers that instantiate an engine directly.
+        logging_setup.register_sensitive_mapping(reservation_data)
         if self.is_running:
             self.log("예약 엔진이 이미 실행 중입니다.", "warning")
             return
@@ -224,7 +240,7 @@ class BaseEngine:
             loop.run_until_complete(self.run_async_tasks(reservation_data, num_tasks))
         except Exception as exc:
             if not self.stop_event.is_set():
-                self.log(f"비동기 예약 실행 오류: {exc}", "error")
+                self.log(f"비동기 예약 실행 오류: {format_exception(exc)}", "error")
         finally:
             pending = asyncio.all_tasks(loop)
             for task in pending:
@@ -258,7 +274,7 @@ class BaseEngine:
             results = await asyncio.gather(*workers, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception) and not self.stop_event.is_set():
-                    self.log(f"예약 작업 오류: {result}", "error")
+                    self.log(f"예약 작업 오류: {format_exception(result)}", "error")
         finally:
             await self._close_session_pool()
 

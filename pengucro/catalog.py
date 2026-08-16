@@ -41,6 +41,8 @@ def is_transient_network_error(exc: Exception) -> bool:
             "connect timeout",
             "read timed out",
             "사이트 연결 오류",
+            "요청 제한",
+            "사람 인증 화면",
         )
     )
 
@@ -327,6 +329,81 @@ class CatalogService:
                     )
             return copy.deepcopy(candidate), applied, [], ""
 
+        if candidate.metadata.get("authoritative_dynamic_catalog"):
+            applied: list[CatalogChange] = []
+            for branch_id, old_branch in current.branches.items():
+                new_branch = candidate.branches.get(branch_id)
+                if new_branch is None:
+                    applied.append(
+                        CatalogChange(
+                            "removed", "branch", old_id=branch_id, old_name=old_branch.name
+                        )
+                    )
+                    continue
+                if old_branch.name != new_branch.name:
+                    applied.append(
+                        CatalogChange(
+                            "renamed", "branch", old_id=branch_id, new_id=branch_id,
+                            old_name=old_branch.name, new_name=new_branch.name,
+                        )
+                    )
+                if old_branch.metadata != new_branch.metadata:
+                    applied.append(
+                        CatalogChange(
+                            "metadata_updated", "branch", old_id=branch_id, new_id=branch_id,
+                            old_name=old_branch.name, new_name=new_branch.name,
+                        )
+                    )
+                for theme_id, old_theme in old_branch.themes.items():
+                    new_theme = new_branch.themes.get(theme_id)
+                    if new_theme is None:
+                        applied.append(
+                            CatalogChange(
+                                "removed", "theme", parent_id=branch_id,
+                                old_id=theme_id, old_name=old_theme.name,
+                            )
+                        )
+                    elif old_theme.name != new_theme.name:
+                        applied.append(
+                            CatalogChange(
+                                "renamed", "theme", parent_id=branch_id,
+                                old_id=theme_id, new_id=theme_id,
+                                old_name=old_theme.name, new_name=new_theme.name,
+                            )
+                        )
+                    elif old_theme.metadata != new_theme.metadata:
+                        applied.append(
+                            CatalogChange(
+                                "metadata_updated", "theme", parent_id=branch_id,
+                                old_id=theme_id, new_id=theme_id,
+                                old_name=old_theme.name, new_name=new_theme.name,
+                            )
+                        )
+                for theme_id, new_theme in new_branch.themes.items():
+                    if theme_id not in old_branch.themes:
+                        applied.append(
+                            CatalogChange(
+                                "added", "theme", parent_id=branch_id,
+                                new_id=theme_id, new_name=new_theme.name,
+                            )
+                        )
+            for branch_id, new_branch in candidate.branches.items():
+                if branch_id in current.branches:
+                    continue
+                applied.append(
+                    CatalogChange(
+                        "added", "branch", new_id=branch_id, new_name=new_branch.name
+                    )
+                )
+                for theme in new_branch.themes.values():
+                    applied.append(
+                        CatalogChange(
+                            "added", "theme", parent_id=branch_id,
+                            new_id=theme.id, new_name=theme.name,
+                        )
+                    )
+            return copy.deepcopy(candidate), applied, [], ""
+
         current_count = current.item_count()
         candidate_count = candidate.item_count()
         if current_count and candidate_count <= current_count * 0.5:
@@ -379,6 +456,17 @@ class CatalogService:
                         new_name=new_branch.name,
                     )
                 )
+            if old_branch.metadata != new_branch.metadata:
+                applied.append(
+                    CatalogChange(
+                        "metadata_updated",
+                        "branch",
+                        old_id=branch_id,
+                        new_id=branch_id,
+                        old_name=old_branch.name,
+                        new_name=new_branch.name,
+                    )
+                )
 
             theme_id_changes = self._find_id_changes(old_branch.themes, new_branch.themes)
             changed_new_theme_ids = {new.id for _, new in theme_id_changes}
@@ -418,6 +506,18 @@ class CatalogService:
                         applied.append(
                             CatalogChange(
                                 "renamed",
+                                "theme",
+                                parent_id=branch_id,
+                                old_id=theme_id,
+                                new_id=theme_id,
+                                old_name=old_theme.name,
+                                new_name=current_theme.name,
+                            )
+                        )
+                    if old_theme.metadata != current_theme.metadata:
+                        applied.append(
+                            CatalogChange(
+                                "metadata_updated",
                                 "theme",
                                 parent_id=branch_id,
                                 old_id=theme_id,

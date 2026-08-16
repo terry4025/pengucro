@@ -4,6 +4,8 @@ import time
 
 import requests
 
+from pengucro.diagnostics import format_exception
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SOFT_ID = "26273"  # YesCaptcha SoftID
@@ -63,7 +65,7 @@ class YesCaptchaClient:
                 err_desc = data.get("errorDescription", "알 수 없는 오류")
                 return False, 0.0, f"오류 ({data.get('errorCode')}): {err_desc}"
         except Exception as e:
-            return False, 0.0, f"네트워크 통신 오류: {e}"
+            return False, 0.0, f"네트워크 통신 오류: {format_exception(e)}"
 
     def create_recaptcha_v2_task(self, website_url: str, website_key: str, is_invisible: bool = False) -> tuple[bool, str, str]:
         """
@@ -102,7 +104,7 @@ class YesCaptchaClient:
                 err_desc = data.get("errorDescription", "태스크 생성 실패")
                 return False, "", f"YesCaptcha 오류 ({data.get('errorCode')}): {err_desc}"
         except Exception as e:
-            return False, "", f"YesCaptcha 태스크 생성 요청 실패: {e}"
+            return False, "", f"YesCaptcha 태스크 생성 요청 실패: {format_exception(e)}"
 
     def poll_result(self, task_id: str, timeout_seconds: int = 120, stop_event=None) -> tuple[bool, str, str]:
         """
@@ -119,11 +121,13 @@ class YesCaptchaClient:
         }
 
         start_time = time.time()
+        poll_attempt = 0
         while time.time() - start_time < timeout_seconds:
             if stop_event and stop_event.is_set():
                 return False, "", "사용자에 의해 중지되었습니다."
 
             try:
+                poll_attempt += 1
                 r = requests.post(url, json=payload, timeout=10)
                 data = self._response_json(r)
                 error_id = data.get("errorId", -1)
@@ -147,7 +151,13 @@ class YesCaptchaClient:
                     return False, "", f"YesCaptcha 오류 ({data.get('errorCode')}): {err_desc}"
 
             except Exception as e:
-                logger.warning(f"YesCaptcha 결과 폴링 중 예외 발생: {e}")
+                logger.warning(
+                    "YesCaptcha 결과 폴링 예외 (task=%s, attempt=%d, elapsed=%.1fs): %s",
+                    task_id,
+                    poll_attempt,
+                    time.time() - start_time,
+                    format_exception(e),
+                )
                 time.sleep(POLL_INTERVAL_SECONDS)
 
         return False, "", "YesCaptcha 해결 시간 초과 (Timeout)"

@@ -296,16 +296,9 @@ class LoadingOverlay(ctk.CTkFrame):
         canvas.create_text(
             centre_x,
             logo_y + RING_RADIUS + 26,
-            text="방탈출 펭크로",
+            text=f"방탈출 펭크로 {_app_version()}",
             font=(theme.FONT_FAMILY, 18, "bold"),
             fill=theme.TEXT_PRIMARY,
-        )
-        canvas.create_text(
-            centre_x,
-            logo_y + RING_RADIUS + 48,
-            text=f"v{_app_version()}",
-            font=(theme.FONT_FAMILY, 10),
-            fill=theme.TEXT_TERTIARY,
         )
 
         bar_y = height * PROGRESS_CENTRE_Y

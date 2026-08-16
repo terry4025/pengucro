@@ -9,26 +9,31 @@ Flow
    verified in the actual form before submission. With it disabled, the program
    only observes a token the user solved manually and never clicks or patches the
    widget.
-3. The program polls the site's own availability endpoint until the backend
-   reports the target slot as actually bookable, then presses 예약하기 and
-   confirms the outcome.
+3. The program waits on the site's server clock.  One standby page may use a
+   schedule id that was verified across multiple published dates; the remaining
+   pages retain the live target-date lookup as a safety net.
 
-Why the backend signal instead of a clock
------------------------------------------
+Why both the server clock and a live fallback are retained
+-----------------------------------------------------------
 ``/controller/run_proc.php`` with ``t=get_theme_time`` returns one row per time
 slot with an ``enable`` field; the site's own front-end renders ``enable === 'N'``
-as a disabled radio button. That field is the exact condition under which
-예약하기 can succeed, so it is used as the trigger. The previous implementation
-ignored ``enable`` entirely and treated "the row exists" as "the slot is open",
-which made it submit while the slot was still closed -- and every rejected
-submission consumes the reCAPTCHA token.
+as a disabled radio button. It does not reliably prove that a future date's
+booking window is open.  The clock remains the authority for *when* to submit.
+Repeated public schedules showed that slot ids belong to a theme/schedule/time
+row rather than to one calendar date. Monday through Thursday still require two
+matching dates; Friday through Sunday may use one fresh full schedule only when
+the site's explicit A/B/C/D schedule-group marker matches the target weekday.
 
 Branch opening times are still read, but only to pace the polling and to tell
 the user how long they have to wait. Nothing depends on them being correct.
 """
 
 import asyncio
+import ctypes
+import hashlib
+import json
 import re
+import statistics
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -37,10 +42,12 @@ import requests
 
 from engines import browser_session
 from engines.base_engine import BaseEngine
+from engines.keyescape_coordination import SharedServerClock, SharedSlotLookup
 from engines.server_clock import ServerClock
 from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
+from pengucro.diagnostics import write_redacted_debug_text
 from pengucro.models import BookingResult, coerce_bool
-from pengucro.storage import append_history, data_path, load_json
+from pengucro.storage import append_history, data_path, load_json, save_json
 
 
 # '-예약 오픈 시간은 10:00분 입니다.' and similar wordings found in the branch
@@ -165,20 +172,25 @@ class KeyescapeEngine(BaseEngine):
     # reproduced with and without a session), so it cannot be polled either --
     # each attempt would burn a token, since the site itself calls
     # grecaptcha.reset() on failure. Hence a clock trigger.
-    CAPTCHA_PROMPT_LEAD = 150.0     # ask the user to solve this early
+    CAPTCHA_PROMPT_LEAD = 90.0      # keep manual solves inside a safe token window
     FINAL_SYNC_LEAD = 20.0          # last clock re-sync before firing
     RESYNC_INTERVAL = 120.0         # periodic re-sync while waiting
-    FIRE_LEAD = 0.15                # submit this far before the boundary
+    FIRE_LEAD = 0.0                 # the server now rejects even slightly early calls
     POLL_IDLE_SECONDS = 1.0
-    POLL_NEAR_SECONDS = 0.05
+    POLL_NEAR_SECONDS = 0.02
 
     # reCAPTCHA v2 tokens are single use and expire in about two minutes.
-    CAPTCHA_TTL_SECONDS = 115
+    CAPTCHA_TTL_SECONDS = 105       # leave safety margin under Google's 120 s limit
     CAPTCHA_WARN_SECONDS = 25
     # Start close enough to the open moment that a fast result is submitted
     # within YesCaptcha's recommended 60-second window. A slower task may finish
     # after opening; the watch loop submits it immediately when it arrives.
-    CAPTCHA_SOLVE_LEAD = 60.0
+    CAPTCHA_SOLVE_LEAD = 70.0
+    CAPTCHA_SOLVE_LEAD_MIN = 70.0
+    CAPTCHA_SOLVE_LEAD_MAX = 90.0
+    CAPTCHA_SOLVE_EXTRA_MARGIN = 25.0
+    CAPTCHA_TIMING_FILE = "keyescape_captcha_timing.json"
+    CAPTCHA_TIMING_SAMPLE_LIMIT = 30
     CAPTCHA_SOLVE_TIMEOUT = 120
     # Re-request once the token has less than this much life left.
     CAPTCHA_REFRESH_MARGIN = 30.0
@@ -192,6 +204,25 @@ class KeyescapeEngine(BaseEngine):
     SUBMIT_MAX_ATTEMPTS = 5
     SIBLING_SUCCESS_GRACE_SECONDS = 0.25
     PLACEHOLDER_SLOT_ID = "9999"
+    SLOT_OPEN_RETRY_SECONDS = 0.12
+    SLOT_RETRY_MIN_SECONDS = 0.08
+    SLOT_RETRY_MAX_SECONDS = 0.20
+    SLOT_HEDGE_DELAY_SECONDS = 0.025
+    SLOT_HEDGE_MIN_SECONDS = 0.015
+    SLOT_HEDGE_MAX_SECONDS = 0.060
+    SLOT_READ_LEAD_SECONDS = 0.040
+    SLOT_READ_LEAD_MIN_SECONDS = 0.010
+    SLOT_READ_LEAD_MAX_SECONDS = 0.080
+    SLOT_PREWARM_LEAD_SECONDS = 3.0
+    FINAL_QUIET_LEAD_SECONDS = 2.0
+    TIMING_HISTORY_FILE = "keyescape_timing.json"
+    SLOT_TEMPLATE_FILE = "keyescape_slot_templates.json"
+    TIMING_SAMPLE_LIMIT = 20
+    SLOT_TEMPLATE_LIMIT = 40
+    TRUSTED_TEMPLATE_MAX_AGE_DAYS = 21
+    TRUSTED_SINGLE_TEMPLATE_MAX_AGE_DAYS = 8
+    TRUSTED_FIRE_EXTRA_SECONDS = 0.005
+    SHARED_SLOT_WAIT_SECONDS = 1.5
     # How many times the step 2 screen may be rebuilt after the site's guard
     # wipes it, before giving up and handing the window to the user.
     MAX_PAGE_RESTORES = 3
@@ -205,15 +236,19 @@ class KeyescapeEngine(BaseEngine):
         # One session for the whole run. The previous code called
         # requests.post() directly every 0.1 s, paying a fresh TCP + TLS
         # handshake roughly ten times a second.
-        self._session = requests.Session()
-        self._session.headers.update({
+        self._request_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
             "X-Requested-With": "XMLHttpRequest",
             "Referer": f"{self.site_url}/reservation.php",
-        })
+        }
+        self._session = self._new_site_session()
+        # Created lazily by the coordinator only. Page workers keep their own
+        # browser/captcha state, but do not waste sockets on an unused hedge.
+        self._slot_hedge_session = None
+        self._slot_background_tasks: set[asyncio.Task] = set()
         self._last_messages: dict[str, float] = {}
 
         # config.json switches:
@@ -230,6 +265,7 @@ class KeyescapeEngine(BaseEngine):
         self.clock = ServerClock(
             f"{self.site_url}/reservation.php", session=self._session, log=self.log
         )
+        self._clock_share = SharedServerClock(self.site_url.lower())
         self._preferred_end_day = 0
         self._last_slot_state = ""
         # Snapshot of the step 2 bootstrap form, used to rebuild the screen if
@@ -261,12 +297,100 @@ class KeyescapeEngine(BaseEngine):
         self._yc_failures = 0
         self._yc_last_attempt = 0.0
         self._yc_token_submitted = False
+        self._yc_profile_key = "default"
+        self._captcha_solve_lead = self.CAPTCHA_SOLVE_LEAD
         self._anchor_clicks = 0
         self._anchor_last_click = 0.0
         self._page_count = 1
         self._page_workers = []
         self._winner_page = None
         self._page_success_event = threading.Event()
+        self._browser_connection_lost = False
+        # One authoritative target-date slot lookup is shared by every standby
+        # page.  Only page 1 may use a separately two-date-verified schedule id;
+        # placeholder values are never accepted as final values.
+        self._live_slot_state = None
+        self._trusted_slot_id = ""
+        self._trusted_slot_sources: tuple[str, ...] = ()
+        self._slot_share = None
+
+    def _new_site_session(self):
+        session = requests.Session()
+        session.headers.update(self._request_headers)
+        return session
+
+    def _sync_server_clock(self, announce=False):
+        return self._clock_share.sync(
+            self.clock,
+            announce=bool(announce),
+            max_age=5.0,
+            wait_timeout=3.0,
+        )
+
+    @staticmethod
+    def _captcha_profile_id(client_key: str) -> str:
+        if not client_key:
+            return "default"
+        return hashlib.sha256(client_key.encode("utf-8")).hexdigest()[:12]
+
+    def _load_captcha_solve_lead(self) -> float:
+        history = load_json(self.CAPTCHA_TIMING_FILE, {"entries": {}})
+        entries = history.get("entries", {}) if isinstance(history, dict) else {}
+        samples = entries.get(self._yc_profile_key, []) if isinstance(entries, dict) else []
+        valid = []
+        for sample in samples if isinstance(samples, list) else []:
+            try:
+                seconds = float(sample.get("seconds", 0.0))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if 1.0 <= seconds <= float(self.CAPTCHA_SOLVE_TIMEOUT):
+                valid.append(seconds)
+        if len(valid) < 3:
+            return self.CAPTCHA_SOLVE_LEAD
+        valid.sort()
+        percentile_index = max(0, min(len(valid) - 1, round((len(valid) - 1) * 0.90)))
+        suggested = valid[percentile_index] + self.CAPTCHA_SOLVE_EXTRA_MARGIN
+        return min(
+            self.CAPTCHA_SOLVE_LEAD_MAX,
+            max(self.CAPTCHA_SOLVE_LEAD_MIN, suggested),
+        )
+
+    def _remember_captcha_solve_time(self, seconds: float) -> None:
+        try:
+            elapsed = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if not (1.0 <= elapsed <= float(self.CAPTCHA_SOLVE_TIMEOUT)):
+            return
+        history = load_json(self.CAPTCHA_TIMING_FILE, {"version": 1, "entries": {}})
+        if not isinstance(history, dict):
+            history = {"version": 1, "entries": {}}
+        entries = history.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+            history["entries"] = entries
+        samples = entries.get(self._yc_profile_key, [])
+        if not isinstance(samples, list):
+            samples = []
+        samples.append({
+            "seconds": round(elapsed, 3),
+            "observed_at": datetime.now(KST).isoformat(timespec="seconds"),
+        })
+        entries[self._yc_profile_key] = samples[-self.CAPTCHA_TIMING_SAMPLE_LIMIT:]
+        try:
+            save_json(self.CAPTCHA_TIMING_FILE, history)
+        except OSError:
+            return
+        self._captcha_solve_lead = self._load_captcha_solve_lead()
+
+    def _captcha_lead_seconds(self) -> float:
+        try:
+            return min(
+                self.CAPTCHA_SOLVE_LEAD_MAX,
+                max(self.CAPTCHA_SOLVE_LEAD_MIN, float(self._captcha_solve_lead)),
+            )
+        except (TypeError, ValueError):
+            return self.CAPTCHA_SOLVE_LEAD
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -375,8 +499,9 @@ class KeyescapeEngine(BaseEngine):
     # ------------------------------------------------------------------
     # Site API
     # ------------------------------------------------------------------
-    def _post(self, payload, timeout=5.0):
-        response = self._session.post(self.api_url, data=payload, timeout=timeout)
+    def _post(self, payload, timeout=5.0, session=None):
+        active_session = session or self._session
+        response = active_session.post(self.api_url, data=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()
 
@@ -391,16 +516,543 @@ class KeyescapeEngine(BaseEngine):
         return await loop.run_in_executor(None, lambda: self._post(payload, timeout))
 
     async def _fetch_slots(self, target_date, zizum_num, theme_num, end_day=0):
-        data = await self._post_async({
+        return await self._fetch_slots_with_session(
+            self._session, target_date, zizum_num, theme_num, end_day
+        )
+
+    async def _fetch_slots_with_session(
+        self, session, target_date, zizum_num, theme_num, end_day=0
+    ):
+        payload = {
             't': 'get_theme_time',
             'date': target_date,
             'zizumNum': zizum_num,
             'themeNum': theme_num,
             'endDay': '1' if end_day else '0',
-        })
+        }
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, lambda: self._post(payload, 5.0, session=session)
+        )
         if not data.get("status") or not data.get("data"):
             return []
         return list(data["data"])
+
+    @staticmethod
+    def _schedule_group(day) -> str:
+        # The live site currently shares one schedule from Monday through
+        # Thursday and uses separate row sets for Friday, Saturday and Sunday.
+        # Weekend/special rows are never inferred from another weekday.
+        return "mon_thu" if day.weekday() <= 3 else f"weekday_{day.weekday()}"
+
+    @staticmethod
+    def _expected_schedule_gubun(day) -> str:
+        return ("A", "A", "A", "A", "B", "C", "D")[day.weekday()]
+
+    @classmethod
+    def _slot_template_gubun(cls, slots) -> str:
+        values = {
+            str(row.get("gubun", "") or "").strip().upper()
+            for row in slots or []
+            if isinstance(row, dict)
+            and cls._slot_time(row)
+            and str(row.get("num", "") or "")
+            and str(row.get("num", "") or "") != cls.PLACEHOLDER_SLOT_ID
+        }
+        values.discard("")
+        return next(iter(values)) if len(values) == 1 else ""
+
+    @classmethod
+    def _slot_template_payload(cls, slots) -> tuple[str, dict[str, str]]:
+        mapping: dict[str, str] = {}
+        for row in slots or []:
+            stamp = cls._slot_time(row)
+            slot_id = str(row.get("num", "") or "") if isinstance(row, dict) else ""
+            if stamp and slot_id and slot_id != cls.PLACEHOLDER_SLOT_ID:
+                mapping[stamp] = slot_id
+        if len(mapping) < 2:
+            return "", {}
+        canonical = json.dumps(
+            sorted(mapping.items()), ensure_ascii=False, separators=(",", ":")
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), mapping
+
+    def _remember_slot_template(
+        self, target_date, zizum_num, theme_num, slots
+    ) -> bool:
+        signature, mapping = self._slot_template_payload(slots)
+        if not signature:
+            return False
+        try:
+            source_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return False
+        key = f"{self.site_url.lower()}|{zizum_num}|{theme_num}"
+        cache = load_json(self.SLOT_TEMPLATE_FILE, {"version": 1, "entries": {}})
+        if not isinstance(cache, dict):
+            cache = {"version": 1, "entries": {}}
+        entries = cache.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+            cache["entries"] = entries
+        history = entries.get(key, [])
+        if not isinstance(history, list):
+            history = []
+        history = [
+            row for row in history
+            if isinstance(row, dict) and row.get("date") != source_day.isoformat()
+        ]
+        history.append({
+            "date": source_day.isoformat(),
+            "weekday": source_day.weekday(),
+            "group": self._schedule_group(source_day),
+            "gubun": self._slot_template_gubun(slots),
+            "signature": signature,
+            "slots": mapping,
+            "observed_at": datetime.now(KST).isoformat(timespec="seconds"),
+        })
+        entries[key] = sorted(
+            history, key=lambda row: str(row.get("date", ""))
+        )[-self.SLOT_TEMPLATE_LIMIT:]
+        try:
+            save_json(self.SLOT_TEMPLATE_FILE, cache)
+        except OSError:
+            return False
+        return True
+
+    def _trusted_slot_from_cache(
+        self, target_date, target_time, zizum_num, theme_num
+    ) -> tuple[str, tuple[str, ...]]:
+        try:
+            target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            return "", ()
+        key = f"{self.site_url.lower()}|{zizum_num}|{theme_num}"
+        cache = load_json(self.SLOT_TEMPLATE_FILE, {"entries": {}})
+        entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+        history = entries.get(key, []) if isinstance(entries, dict) else []
+        candidates = []
+        seen_dates = set()
+        wanted_group = self._schedule_group(target_day)
+        for row in sorted(
+            (item for item in history if isinstance(item, dict)),
+            key=lambda item: str(item.get("date", "")),
+            reverse=True,
+        ):
+            try:
+                source_day = datetime.strptime(
+                    str(row.get("date", "")), "%Y-%m-%d"
+                ).date()
+            except ValueError:
+                continue
+            if source_day >= target_day or row.get("group") != wanted_group:
+                continue
+            if (target_day - source_day).days > self.TRUSTED_TEMPLATE_MAX_AGE_DAYS:
+                continue
+            if source_day in seen_dates:
+                continue
+            slots = row.get("slots")
+            signature = str(row.get("signature", "") or "")
+            if not signature or not isinstance(slots, dict):
+                continue
+            seen_dates.add(source_day)
+            candidates.append((
+                source_day,
+                signature,
+                slots,
+                str(row.get("gubun", "") or "").strip().upper(),
+            ))
+            if len(candidates) >= 2:
+                break
+        if len(candidates) >= 2:
+            newest, previous = candidates[0], candidates[1]
+            if newest[1] != previous[1]:
+                return "", ()
+            newest_id = str(newest[2].get(target_time, "") or "")
+            previous_id = str(previous[2].get(target_time, "") or "")
+            if not newest_id or newest_id != previous_id:
+                return "", ()
+            return newest_id, (newest[0].isoformat(), previous[0].isoformat())
+
+        # The rolling public window normally contains only one Friday, Saturday
+        # and Sunday. Their rows carry an explicit B/C/D group marker, so one
+        # recent *complete* schedule can arm page 1 while the other pages retain
+        # the live target-date safety path. Mon-Thu never uses this relaxation.
+        if len(candidates) == 1 and target_day.weekday() >= 4:
+            source_day, _signature, slots, gubun = candidates[0]
+            if (
+                (target_day - source_day).days
+                <= self.TRUSTED_SINGLE_TEMPLATE_MAX_AGE_DAYS
+                and gubun == self._expected_schedule_gubun(target_day)
+            ):
+                slot_id = str(slots.get(target_time, "") or "")
+                if slot_id:
+                    return slot_id, (source_day.isoformat(),)
+        return "", ()
+
+    async def _prime_trusted_slot_template(
+        self, target_date, target_time, zizum_num, theme_num, doing_days
+    ) -> tuple[str, tuple[str, ...]]:
+        """Observe published dates and prepare the guarded schedule fast path."""
+        try:
+            target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+            server_day = datetime.fromtimestamp(self.clock.now(), KST).date()
+        except (TypeError, ValueError, OSError):
+            return "", ()
+        wanted_group = self._schedule_group(target_day)
+        candidates = [
+            server_day + timedelta(days=offset)
+            for offset in range(max(0, min(int(doing_days or 0), 8)))
+            if server_day + timedelta(days=offset) < target_day
+            and self._schedule_group(server_day + timedelta(days=offset)) == wanted_group
+        ]
+        for source_day in sorted(candidates, reverse=True)[:4]:
+            try:
+                slots = await self._fetch_slots(
+                    source_day.isoformat(), zizum_num, theme_num
+                )
+            except Exception:
+                continue
+            if slots:
+                self._remember_slot_template(
+                    source_day.isoformat(), zizum_num, theme_num, slots
+                )
+        return self._trusted_slot_from_cache(
+            target_date, target_time, zizum_num, theme_num
+        )
+
+    def _get_slot_hedge_session(self):
+        if self._slot_hedge_session is None:
+            self._slot_hedge_session = self._new_site_session()
+        return self._slot_hedge_session
+
+    @classmethod
+    def _timing_parameters(cls, samples):
+        valid_rtts = []
+        for sample in samples or []:
+            try:
+                value = float(sample.get("read_rtt_ms", 0)) / 1000.0
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if value > 0:
+                valid_rtts.append(value)
+        if not valid_rtts:
+            return (
+                cls.SLOT_HEDGE_DELAY_SECONDS,
+                cls.SLOT_OPEN_RETRY_SECONDS,
+                cls.SLOT_READ_LEAD_SECONDS,
+            )
+        typical_rtt = statistics.median(valid_rtts)
+        hedge_delay = min(
+            cls.SLOT_HEDGE_MAX_SECONDS,
+            max(cls.SLOT_HEDGE_MIN_SECONDS, typical_rtt * 0.35),
+        )
+        retry_delay = min(
+            cls.SLOT_RETRY_MAX_SECONDS,
+            max(cls.SLOT_RETRY_MIN_SECONDS, typical_rtt),
+        )
+        read_lead = min(
+            cls.SLOT_READ_LEAD_MAX_SECONDS,
+            max(cls.SLOT_READ_LEAD_MIN_SECONDS, typical_rtt / 2.0),
+        )
+        return hedge_delay, retry_delay, read_lead
+
+    @staticmethod
+    def _timing_key(zizum_num, theme_num, target_time):
+        return f"{zizum_num}:{theme_num}:{target_time}"
+
+    def _load_timing_profile(self, zizum_num, theme_num, target_time):
+        key = self._timing_key(zizum_num, theme_num, target_time)
+        history = load_json(self.TIMING_HISTORY_FILE, {})
+        if not isinstance(history, dict):
+            history = {}
+        entry = history.get(key, {})
+        samples = entry.get("samples", []) if isinstance(entry, dict) else []
+        hedge_delay, retry_delay, read_lead = self._timing_parameters(samples)
+        return key, hedge_delay, retry_delay, read_lead, bool(samples)
+
+    def _remember_slot_timing(self, state):
+        if state.get("timing_sample") is not None:
+            return
+        try:
+            rtt_ms = max(0.0, float(state.get("last_rtt") or 0.0) * 1000.0)
+        except (TypeError, ValueError):
+            rtt_ms = 0.0
+        publish_delay_ms = 0.0
+        if self.open_at is not None:
+            publish_delay_ms = max(
+                0.0, (self.clock.now() - float(self.open_at)) * 1000.0
+            )
+        state["timing_sample"] = {
+            "read_rtt_ms": round(rtt_ms, 1),
+            "publish_delay_ms": round(publish_delay_ms, 1),
+        }
+
+    def _t0_delta_ms(self) -> float | None:
+        if self.open_at is None:
+            return None
+        return (self.clock.now() - float(self.open_at)) * 1000.0
+
+    def _trace_timing(self, message: str, level: str = "info") -> None:
+        delta = self._t0_delta_ms()
+        stamp = "T?" if delta is None else f"T{delta:+.1f}ms"
+        self.log(f"[타이밍 {stamp}] {message}", level)
+
+    def _persist_slot_timing(self):
+        state = self._live_slot_state or {}
+        key = state.get("timing_key")
+        sample = state.get("timing_sample")
+        if key and isinstance(sample, dict):
+            history = load_json(self.TIMING_HISTORY_FILE, {})
+            if not isinstance(history, dict):
+                history = {}
+            entry = history.get(key, {})
+            samples = entry.get("samples", []) if isinstance(entry, dict) else []
+            samples = [item for item in samples if isinstance(item, dict)]
+            samples.append(sample)
+            history[key] = {"samples": samples[-self.TIMING_SAMPLE_LIMIT:]}
+            try:
+                save_json(self.TIMING_HISTORY_FILE, history)
+            except OSError:
+                pass
+        slots = state.get("last_slots")
+        if isinstance(slots, list) and slots:
+            self._remember_slot_template(
+                state.get("target_date", ""),
+                state.get("zizum_num", ""),
+                state.get("theme_num", ""),
+                slots,
+            )
+
+    def _track_slot_background_task(self, task):
+        self._slot_background_tasks.add(task)
+
+        def finished(done):
+            self._slot_background_tasks.discard(done)
+            try:
+                done.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(finished)
+
+    async def _fetch_live_slots(self, target_date, zizum_num, theme_num, target_time):
+        """Race the first boundary read; later retries stay single-requested."""
+        state = self._live_slot_state or {}
+        hedges_remaining = int(state.get("hedges_remaining", 0) or 0)
+        if hedges_remaining <= 0:
+            started = time.monotonic()
+            self._trace_timing("슬롯 조회 재시도 전송")
+            slots = await self._fetch_slots_with_session(
+                self._session, target_date, zizum_num, theme_num
+            )
+            state["last_rtt"] = time.monotonic() - started
+            self._trace_timing(
+                f"슬롯 조회 재시도 응답 · RTT {state['last_rtt'] * 1000.0:.1f}ms"
+            )
+            return slots
+
+        state["hedges_remaining"] = hedges_remaining - 1
+        hedge_delay = float(
+            state.get("hedge_delay") or self.SLOT_HEDGE_DELAY_SECONDS
+        )
+
+        async def measured_read(session, label):
+            read_started = time.monotonic()
+            self._trace_timing(f"슬롯 조회 {label} 전송")
+            slots = await self._fetch_slots_with_session(
+                session, target_date, zizum_num, theme_num
+            )
+            read_rtt = time.monotonic() - read_started
+            self._trace_timing(
+                f"슬롯 조회 {label} 응답 · RTT {read_rtt * 1000.0:.1f}ms"
+            )
+            return slots, read_rtt
+
+        primary = asyncio.create_task(measured_read(self._session, "1차"))
+        boundary_delay = 0.0
+        if self.open_at is not None:
+            boundary_delay = max(0.0, self.clock.seconds_until(self.open_at))
+        # When the first read was deliberately sent early, reserve the second
+        # connection for T0 itself. If the run is already late, retain the small
+        # hedge stagger so both reads are not emitted in the same instant.
+        timer_active = self._begin_high_resolution_timer()
+        try:
+            await asyncio.sleep(
+                boundary_delay if boundary_delay > 0 else hedge_delay
+            )
+        finally:
+            if timer_active:
+                self._end_high_resolution_timer()
+
+        if primary.done():
+            try:
+                slots, read_rtt = primary.result()
+            except Exception:
+                slots = []
+                read_rtt = 0.0
+            slot_id, _bookable = self._match_slot(slots, target_time)
+            if slot_id and slot_id != self.PLACEHOLDER_SLOT_ID:
+                state["last_rtt"] = read_rtt
+                return slots
+
+        secondary = asyncio.create_task(
+            measured_read(self._get_slot_hedge_session(), "2차")
+        )
+        pending = {primary, secondary}
+        fallback = []
+        first_error = None
+        observed_rtts = []
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    slots, read_rtt = task.result()
+                    observed_rtts.append(read_rtt)
+                except Exception as exc:
+                    first_error = first_error or exc
+                    continue
+                if slots and not fallback:
+                    fallback = slots
+                slot_id, _bookable = self._match_slot(slots, target_time)
+                if slot_id and slot_id != self.PLACEHOLDER_SLOT_ID:
+                    state["last_rtt"] = read_rtt
+                    for remaining in pending:
+                        self._track_slot_background_task(remaining)
+                    return slots
+        if observed_rtts:
+            state["last_rtt"] = min(observed_rtts)
+        if fallback:
+            return fallback
+        if first_error is not None:
+            raise first_error
+        return []
+
+    async def _fetch_coordinated_live_slots(
+        self, target_date, zizum_num, theme_num, target_time
+    ):
+        """Share one public timetable response across local Pengucro processes."""
+        share = self._slot_share
+        if share is None:
+            return await self._fetch_live_slots(
+                target_date, zizum_num, theme_num, target_time
+            )
+        if share.owner:
+            share.mark_started()
+            slots = await self._fetch_live_slots(
+                target_date, zizum_num, theme_num, target_time
+            )
+            if slots:
+                async def publish_shared_rows():
+                    try:
+                        await asyncio.to_thread(share.publish, slots)
+                    except OSError:
+                        pass
+
+                self._track_slot_background_task(
+                    asyncio.create_task(publish_shared_rows())
+                )
+            return slots
+
+        wait_started = time.monotonic()
+        slots = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: share.wait_for_result(self.SHARED_SLOT_WAIT_SECONDS),
+        )
+        waited = time.monotonic() - wait_started
+        if slots:
+            state = self._live_slot_state or {}
+            state["last_rtt"] = waited
+            self._trace_timing(
+                f"다른 실행의 동일 시간표 응답 수신 · 공유 대기 {waited * 1000.0:.1f}ms"
+            )
+            return slots
+
+        self._trace_timing(
+            "공유 시간표 응답이 없어 이 실행의 독립 조회로 전환",
+            "warning",
+        )
+        # Do not pay the rendezvous timeout again on later retries.
+        self._slot_share = None
+        return await self._fetch_live_slots(
+            target_date, zizum_num, theme_num, target_time
+        )
+
+    async def _prewarm_slot_connections(self):
+        """Warm the two read-only connections without downloading a page body."""
+        url = f"{self.site_url}/reservation.php"
+        sessions = (self._session, self._get_slot_hedge_session())
+        loop = asyncio.get_running_loop()
+        results = await asyncio.gather(*(
+            loop.run_in_executor(None, lambda active=session: active.head(url, timeout=5.0))
+            for session in sessions
+        ), return_exceptions=True)
+        return sum(not isinstance(result, Exception) for result in results)
+
+    async def _prewarm_browser_connection(self, page) -> bool:
+        if page is None:
+            return False
+        try:
+            result = await page.evaluate(
+                """async () => {
+                    try {
+                        const response = await fetch(
+                            '/reservation.php?pg_prewarm=' + Date.now(),
+                            {
+                                method: 'HEAD',
+                                cache: 'no-store',
+                                credentials: 'include',
+                            }
+                        );
+                        return response.ok;
+                    } catch (e) {
+                        return false;
+                    }
+                }"""
+            )
+            return bool(result)
+        except Exception:
+            return False
+
+    async def _prewarm_near_open(self, page=None):
+        state = self._live_slot_state or {}
+        if state.get("status") in ("ready", "capacity"):
+            return
+        if self.open_at is not None:
+            while not self.stop_event.is_set():
+                remaining = self.clock.seconds_until(self.open_at)
+                if remaining <= 0:
+                    return
+                if remaining <= self.SLOT_PREWARM_LEAD_SECONDS:
+                    break
+                await asyncio.sleep(min(1.0, max(0.05, remaining - self.SLOT_PREWARM_LEAD_SECONDS)))
+        if self.stop_event.is_set():
+            return
+        warmed, browser_warmed = await asyncio.gather(
+            self._prewarm_slot_connections(),
+            self._prewarm_browser_connection(page),
+        )
+        self.log(
+            f"[정보] 오픈 경계용 슬롯 조회 연결 {warmed}/2개 예열 완료",
+            "info" if warmed == 2 else "warning",
+        )
+        self.log(
+            "[정보] 예약 제출용 Chrome 연결 예열 "
+            f"{'완료' if browser_warmed else '실패 · 기존 연결로 계속 진행'}",
+            "info" if browser_warmed else "warning",
+        )
+        if self._slot_share is not None:
+            self.log(
+                "[정보] 동일 지점·테마·날짜 시간표 "
+                + (
+                    "대표 조회 실행으로 준비했습니다."
+                    if self._slot_share.owner
+                    else "다른 실행의 대표 조회 결과를 공유받습니다."
+                ),
+                "info",
+            )
 
     # NOTE: the endDay flag is sent as the site sends it, but it was measured to
     # make no difference at all -- responses for endDay=0 and endDay=1 were
@@ -447,6 +1099,78 @@ class KeyescapeEngine(BaseEngine):
             bookable = str(slot.get("enable", "")).upper() == "Y" and bool(slot_id)
             return slot_id, bookable
         return "", False
+
+    async def _resolve_live_slot(
+        self, target_date, target_time, zizum_num, theme_num, current_slot=""
+    ):
+        """Return the target date's real slot id once the server publishes it.
+
+        All standby pages share one state and one lock, so speed does not require
+        three duplicate requests at the opening boundary.  A caller without the
+        shared production state (small unit tests/legacy callers) may keep an
+        already-known non-placeholder target slot.
+        """
+        state = getattr(self, "_live_slot_state", None)
+        if state is None:
+            if current_slot and current_slot != self.PLACEHOLDER_SLOT_ID:
+                return str(current_slot), "ready"
+            state = {
+                "slot_id": "", "status": "pending", "last_probe": 0.0,
+                "lock": asyncio.Lock(),
+            }
+            self._live_slot_state = state
+
+        if state.get("status") in ("ready", "capacity"):
+            return str(state.get("slot_id") or ""), str(state.get("status"))
+
+        async with state["lock"]:
+            if state.get("status") in ("ready", "capacity"):
+                return str(state.get("slot_id") or ""), str(state.get("status"))
+            now = time.monotonic()
+            retry_delay = float(
+                state.get("retry_delay") or self.SLOT_OPEN_RETRY_SECONDS
+            )
+            if now - float(state.get("last_probe") or 0.0) < retry_delay:
+                return "", "pending"
+            state["last_probe"] = now
+            try:
+                fetcher = state.get("fetcher") or self._fetch_slots
+                if state.get("fetcher_accepts_target"):
+                    slots = await fetcher(
+                        target_date, zizum_num, theme_num, target_time
+                    )
+                else:
+                    slots = await fetcher(target_date, zizum_num, theme_num)
+            except Exception as exc:
+                self._log_throttled(
+                    "live_slot_error", f"[경고] 오픈 슬롯 확인 실패: {exc}",
+                    "warning", interval=2.0,
+                )
+                return "", "pending"
+
+            try:
+                measured_rtt = float(state.get("last_rtt") or 0.0)
+            except (TypeError, ValueError):
+                measured_rtt = 0.0
+            if measured_rtt > 0:
+                state["retry_delay"] = min(
+                    self.SLOT_RETRY_MAX_SECONDS,
+                    max(self.SLOT_RETRY_MIN_SECONDS, measured_rtt),
+                )
+            slot_id, bookable = self._match_slot(slots, target_time)
+            if not slot_id or slot_id == self.PLACEHOLDER_SLOT_ID:
+                return "", "pending"
+            state["slot_id"] = slot_id
+            state["status"] = "ready" if bookable else "capacity"
+            state["last_slots"] = slots
+            self._trace_timing(
+                f"실제 슬롯 확인 · ID {slot_id} · "
+                f"{'예약 가능' if bookable else '이미 마감'}"
+            )
+            remember = state.get("record_timing")
+            if remember is not None:
+                remember(state)
+            return slot_id, str(state["status"])
 
     async def _fetch_window_info(self, zizum_num, theme_info_num):
         """Return (doing_days, open_time) read live from the site.
@@ -528,10 +1252,16 @@ class KeyescapeEngine(BaseEngine):
         worker.stop_event = self.stop_event
         worker.listener_stop = self.listener_stop
         worker.clock = self.clock
+        worker._clock_share = self._clock_share
         worker.open_at = self.open_at
         worker._page_index = page_index
         worker._page_count = self._page_count
         worker._page_success_event = self._page_success_event
+        worker._live_slot_state = self._live_slot_state
+        worker._trusted_slot_id = (
+            self._trusted_slot_id if page_index == 1 else ""
+        )
+        worker._trusted_slot_sources = self._trusted_slot_sources
         worker._clock_sync_enabled = page_index == 1
         worker._open_at_update_callback = self._set_shared_open_at
         prefix = f"[{page_index}번 페이지]"
@@ -624,7 +1354,7 @@ class KeyescapeEngine(BaseEngine):
 
         # --- the site's clock, not this machine's -------------------------
         await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self.clock.sync(announce=True)
+            None, lambda: self._sync_server_clock(announce=True)
         )
 
         # --- when does the window open -----------------------------------
@@ -636,14 +1366,20 @@ class KeyescapeEngine(BaseEngine):
         )
 
         # --- slot id -----------------------------------------------------
-        # The slot num is per (theme, time) and stays the same across dates
-        # (verified: num 2176 for 09:50 on both an open and an unopened date), so
-        # the real id can be obtained up front. The placeholder is only needed
-        # when the row does not exist at all.
+        # A pre-open row is useful only for building Step 2. The final request
+        # always replaces it with the target date's post-open id.
         slot_id = ""
+        slot_bookable = False
+        initial_slot_rtt = 0.0
         try:
+            initial_slot_started = time.monotonic()
             slots = await self._fetch_slots(target_date, zizum_num, theme_num)
-            slot_id, _bookable = self._match_slot(slots, target_time)
+            initial_slot_rtt = time.monotonic() - initial_slot_started
+            if slots:
+                self._remember_slot_template(
+                    target_date, zizum_num, theme_num, slots
+                )
+            slot_id, slot_bookable = self._match_slot(slots, target_time)
             if not slot_id:
                 for row in slots:
                     if self._slot_time(row) == target_time:
@@ -662,7 +1398,86 @@ class KeyescapeEngine(BaseEngine):
         except Exception as exc:
             self.log(f"[경고] 시간 조회 실패: {exc}", "warning")
 
+        self._trusted_slot_id, self._trusted_slot_sources = (
+            await self._prime_trusted_slot_template(
+                target_date,
+                target_time,
+                zizum_num,
+                theme_num,
+                doing_days,
+            )
+        )
+        if self._trusted_slot_id:
+            basis = (
+                "동일 시간표 2개 날짜 일치"
+                if len(self._trusted_slot_sources) >= 2
+                else "사이트 요일 시간표 그룹 일치"
+            )
+            self.log(
+                "[정보] 검증 시간표 빠른 제출 준비 · "
+                f"슬롯 ID {self._trusted_slot_id} · 기준 날짜 "
+                f"{', '.join(self._trusted_slot_sources)} · {basis} · "
+                "1번 페이지만 오픈 직후 선발사하고 나머지는 실시간 조회를 유지합니다.",
+                "success",
+            )
+        else:
+            self.log(
+                "[정보] 빠른 제출 시간표가 안전 기준을 충족하지 않아 모든 페이지를 "
+                "기존 실시간 슬롯 조회 방식으로 유지합니다.",
+                "info",
+            )
+
         form_slot_id = slot_id or self.PLACEHOLDER_SLOT_ID
+        already_open = (
+            self.open_at is None or self.clock.seconds_until(self.open_at) <= 0
+        )
+        verified_slot = bool(slot_id and already_open)
+        timing_key, hedge_delay, retry_delay, read_lead, has_timing = (
+            self._load_timing_profile(
+                zizum_num, theme_num, target_time
+            )
+        )
+        if not has_timing and initial_slot_rtt > 0:
+            hedge_delay = min(
+                self.SLOT_HEDGE_MAX_SECONDS,
+                max(self.SLOT_HEDGE_MIN_SECONDS, initial_slot_rtt * 0.35),
+            )
+            retry_delay = min(
+                self.SLOT_RETRY_MAX_SECONDS,
+                max(self.SLOT_RETRY_MIN_SECONDS, initial_slot_rtt),
+            )
+            read_lead = min(
+                self.SLOT_READ_LEAD_MAX_SECONDS,
+                max(self.SLOT_READ_LEAD_MIN_SECONDS, initial_slot_rtt / 2.0),
+            )
+        self._live_slot_state = {
+            "slot_id": slot_id if verified_slot else "",
+            "status": (
+                "ready" if verified_slot and slot_bookable else
+                "capacity" if verified_slot else "pending"
+            ),
+            "last_probe": 0.0,
+            "lock": asyncio.Lock(),
+            "fetcher": self._fetch_coordinated_live_slots,
+            "fetcher_accepts_target": True,
+            "hedges_remaining": 1,
+            "hedge_delay": hedge_delay,
+            "retry_delay": retry_delay,
+            "read_lead": read_lead,
+            "last_rtt": 0.0,
+            "timing_key": timing_key,
+            "timing_sample": None,
+            "record_timing": self._remember_slot_timing,
+            "target_date": target_date,
+            "zizum_num": zizum_num,
+            "theme_num": theme_num,
+        }
+        if self.open_at is not None:
+            share_key = (
+                f"{self.site_url.lower()}|{zizum_num}|{theme_num}|{target_date}"
+            )
+            self._slot_share = SharedSlotLookup(share_key, self.open_at)
+            self._slot_share.prepare()
 
         async with async_playwright() as playwright:
             browser, context, chrome_session, owns_browser = await self._open_browser(playwright)
@@ -681,7 +1496,11 @@ class KeyescapeEngine(BaseEngine):
                         theme_num,
                         theme_info_num,
                         target_date,
-                        form_slot_id,
+                        (
+                            self._trusted_slot_id
+                            if page_index == 1 and self._trusted_slot_id
+                            else form_slot_id
+                        ),
                         target_time,
                         theme_name,
                     )
@@ -696,6 +1515,9 @@ class KeyescapeEngine(BaseEngine):
                     f"[정보] 핫 스탠바이 {len(prepared)}개 페이지 준비 완료 · "
                     "각 페이지는 독립 YesCaptcha 토큰을 사용합니다.",
                     "success",
+                )
+                prewarm_task = asyncio.create_task(
+                    self._prewarm_near_open(prepared[0][1])
                 )
                 results = await asyncio.gather(*(
                     worker._watch_and_submit(
@@ -718,6 +1540,14 @@ class KeyescapeEngine(BaseEngine):
                 if not self.stop_event.is_set():
                     self.log(f"[에러] 키이스케이프 처리 중 오류: {exc}", "error")
             finally:
+                prewarm_task = locals().get("prewarm_task")
+                if prewarm_task is not None:
+                    if not prewarm_task.done():
+                        prewarm_task.cancel()
+                    try:
+                        await prewarm_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 for worker in self._page_workers:
                     await worker._cancel_yescaptcha_task()
                     try:
@@ -745,22 +1575,32 @@ class KeyescapeEngine(BaseEngine):
                                 await closer.close()
                         except Exception:
                             continue
-                else:
-                    # Attached to a real Chrome: leave the window and its profile
-                    # alone so the session keeps its accumulated reputation and
-                    # the user can review the result. browser.close() on a CDP
-                    # connection only detaches Playwright; Chrome itself stays up.
-                    # Deliberately silent -- this is routine teardown, not news.
+                # For CDP-attached Chrome, do not call browser.close(). Multiple
+                # Pengucro processes may each own an independent driver connection;
+                # ending one explicitly can invalidate its persistent default
+                # context while another operation is still settling. Exiting the
+                # async_playwright block below disposes only this Playwright driver.
+                if self._slot_background_tasks:
                     try:
-                        await browser.close()
+                        await asyncio.wait(
+                            tuple(self._slot_background_tasks), timeout=5.0
+                        )
                     except Exception:
                         pass
                 try:
                     self._session.close()
                 except Exception:
                     pass
+                if self._slot_hedge_session is not None:
+                    try:
+                        self._slot_hedge_session.close()
+                    except Exception:
+                        pass
+                self._persist_slot_timing()
                 if chrome_session is not None and self._close_chrome_on_exit:
                     chrome_session.close_if_launched()
+                if chrome_session is not None:
+                    chrome_session.release()
 
     def _resolve_open_moment(self, zizum_num, target_date, doing_days, notice_open_time):
         """Epoch seconds (server clock) at which the window opens, or None.
@@ -827,6 +1667,74 @@ class KeyescapeEngine(BaseEngine):
             return f"{minutes}분 {secs}초"
         return f"{secs}초"
 
+    @staticmethod
+    def _begin_high_resolution_timer():
+        try:
+            return ctypes.windll.winmm.timeBeginPeriod(1) == 0
+        except (AttributeError, OSError):
+            return False
+
+    @staticmethod
+    def _end_high_resolution_timer():
+        try:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except (AttributeError, OSError):
+            pass
+
+    def _live_slot_read_lead(self):
+        state = self._live_slot_state or {}
+        try:
+            lead = float(state.get("read_lead") or self.SLOT_READ_LEAD_SECONDS)
+        except (TypeError, ValueError):
+            lead = self.SLOT_READ_LEAD_SECONDS
+        return min(
+            self.SLOT_READ_LEAD_MAX_SECONDS,
+            max(self.SLOT_READ_LEAD_MIN_SECONDS, lead),
+        )
+
+    async def _wait_for_open_quiet(self):
+        """Wait until the read-send point without Playwright or UI work."""
+        timer_active = self._begin_high_resolution_timer()
+        try:
+            read_lead = self._live_slot_read_lead()
+            while not self.stop_event.is_set() and self.open_at is not None:
+                remaining = self.clock.seconds_until(self.open_at)
+                if remaining <= read_lead:
+                    return
+                await asyncio.sleep(0.02 if remaining - read_lead > 0.25 else 0.001)
+        finally:
+            if timer_active:
+                self._end_high_resolution_timer()
+
+    async def _wait_for_trusted_fire(self):
+        """Never let the verified-template page cross the server gate early."""
+        if self.open_at is None:
+            return
+        try:
+            precision = float(self.clock.last_precision or 0.06)
+        except (TypeError, ValueError):
+            precision = 0.06
+        safety = min(0.12, max(0.02, precision) + self.TRUSTED_FIRE_EXTRA_SECONDS)
+        target = float(self.open_at) + safety
+        timer_active = self._begin_high_resolution_timer()
+        try:
+            while not self.stop_event.is_set():
+                remaining = target - self.clock.now()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(0.001 if remaining <= 0.2 else min(0.02, remaining / 2))
+        finally:
+            if timer_active:
+                self._end_high_resolution_timer()
+
+    def _live_slot_retry_delay(self):
+        state = self._live_slot_state or {}
+        try:
+            delay = float(state.get("retry_delay") or self.SLOT_OPEN_RETRY_SECONDS)
+        except (TypeError, ValueError):
+            delay = self.SLOT_OPEN_RETRY_SECONDS
+        return min(self.SLOT_RETRY_MAX_SECONDS, max(self.SLOT_RETRY_MIN_SECONDS, delay))
+
     # ------------------------------------------------------------------
     # Browser setup
     # ------------------------------------------------------------------
@@ -842,7 +1750,7 @@ class KeyescapeEngine(BaseEngine):
              but scores badly and will usually show the image challenge.
         """
         if self._use_real_chrome:
-            session = browser_session.start_or_attach(log=self.log)
+            session = browser_session.start_isolated(log=self.log)
             if session is not None:
                 try:
                     browser = await playwright.chromium.connect_over_cdp(session.endpoint)
@@ -852,13 +1760,14 @@ class KeyescapeEngine(BaseEngine):
                     context = browser.contexts[0] if browser.contexts else await browser.new_context()
                     self.log(
                         "실제 Chrome 프로필에 연결했습니다. "
-                        f"(프로필: {browser_session.profile_dir()})",
+                        f"(프로필: {session.profile_path})",
                         "success",
                     )
                     return browser, context, session, False
                 except Exception as exc:
                     self.log(f"[경고] Chrome DevTools 연결 실패: {exc}", "warning")
                     session.close_if_launched()
+                    session.release()
 
             self.log(
                 "[경고] 실제 Chrome 연결에 실패해 임시 프로필로 진행합니다. "
@@ -1005,23 +1914,47 @@ class KeyescapeEngine(BaseEngine):
                     post_data = post_data()
                 payload = await response.json()
                 details = payload.get("data") if isinstance(payload, dict) else None
-                has_booking_ids = (
+                has_booking_number = (
                     isinstance(details, dict)
                     and bool(details.get("num"))
-                    and bool(details.get("ck_code"))
+                )
+                success_payload = bool(
+                    isinstance(payload, dict)
+                    and payload.get("status")
+                    and (
+                        has_booking_number
+                        or self._dialog_indicates_success(payload.get("msg", ""))
+                    )
                 )
                 # The endpoint serves several actions. Prefer the submitted
-                # action marker; if Chromium omits multipart post_data, the two
-                # booking identifiers uniquely identify a successful ins_rev.
-                if "ins_rev" not in str(post_data) and not has_booking_ids:
+                # action marker; Chromium can omit multipart post_data, and newer
+                # responses do not always include ck_code, so a success message or
+                # reservation number is also sufficient evidence.
+                if "ins_rev" not in str(post_data) and not success_payload:
                     return
+                self._trace_timing("최종 예약 POST 응답 수신")
                 if self._record_submission_payload(dialog_state, payload):
                     self._page_success_event.set()
             except Exception:
                 # Dialog and completion-page detection remain as fallbacks.
                 return
 
+        async def handle_request(request):
+            try:
+                if "/controller/run_proc.php" not in (request.url or ""):
+                    return
+                if str(getattr(request, "method", "") or "").upper() != "POST":
+                    return
+                post_data = getattr(request, "post_data", "") or ""
+                if callable(post_data):
+                    post_data = post_data()
+                if "ins_rev" in str(post_data):
+                    self._trace_timing("최종 예약 POST 네트워크 전송")
+            except Exception:
+                return
+
         page.on("dialog", handle_dialog)
+        page.on("request", handle_request)
         page.on("response", handle_response)
 
     async def _is_blocked(self, page):
@@ -1318,6 +2251,27 @@ class KeyescapeEngine(BaseEngine):
         """Compatibility predicate used by tests and manual-captcha callers."""
         return bool(await self._captcha_token_value(page))
 
+    def _manual_captcha_expired(self, captcha_since):
+        return bool(
+            captcha_since
+            and time.monotonic() - captcha_since >= self.CAPTCHA_TTL_SECONDS
+        )
+
+    async def _reset_captcha_widget(self, page):
+        try:
+            await page.evaluate(
+                """() => {
+                    try {
+                        if (window.grecaptcha) { window.grecaptcha.reset(); }
+                    } catch (e) {}
+                    document.querySelectorAll(
+                        'textarea[name="g-recaptcha-response"]'
+                    ).forEach((area) => { area.value = ''; });
+                }"""
+            )
+        except Exception:
+            pass
+
     @staticmethod
     def _is_manual_widget_token(widget_value, injected_token):
         """True only for a widget token that was not injected by this worker."""
@@ -1383,6 +2337,76 @@ class KeyescapeEngine(BaseEngine):
         };
     }"""
 
+    FINAL_CLICK_SCRIPT = """(args) => {
+        const slotId = String(args.slotId || '');
+        const apiToken = String(args.apiToken || '');
+        const apiTokenActive = Boolean(args.apiTokenActive);
+        const form = document.querySelector('#form');
+        let written = 0;
+        if (form) {
+            for (const name of ['theme_time_num', 'themeTimeNum']) {
+                for (const field of form.querySelectorAll(`[name="${name}"]`)) {
+                    field.value = slotId;
+                    written += 1;
+                }
+            }
+        }
+
+        let captchaReady = true;
+        if (apiTokenActive) {
+            window.__pgCaptchaToken = apiToken;
+            const areas = document.querySelectorAll(
+                'textarea[name="g-recaptcha-response"]'
+            );
+            areas.forEach((area) => { area.value = apiToken; });
+            if (window.grecaptcha && apiToken) {
+                if (!window.__pgCaptchaPatch) {
+                    window.__pgCaptchaPatch = {
+                        owner: window.grecaptcha,
+                        original: typeof window.grecaptcha.getResponse === 'function'
+                            ? window.grecaptcha.getResponse
+                            : null,
+                    };
+                }
+                window.grecaptcha.getResponse = function () {
+                    if (window.__pgCaptchaToken) { return window.__pgCaptchaToken; }
+                    const patch = window.__pgCaptchaPatch;
+                    try {
+                        return patch && patch.original
+                            ? patch.original.apply(patch.owner, arguments)
+                            : '';
+                    } catch (e) { return ''; }
+                };
+            }
+            let posted = '';
+            let getter = '';
+            try { posted = form ? new FormData(form).get('g-recaptcha-response') || '' : ''; }
+            catch (e) { posted = ''; }
+            try {
+                getter = window.grecaptcha && typeof window.grecaptcha.getResponse === 'function'
+                    ? window.grecaptcha.getResponse()
+                    : '';
+            } catch (e) { getter = ''; }
+            captchaReady = Boolean(
+                apiToken && form && areas.length > 0
+                && posted === apiToken && getter === apiToken
+            );
+        }
+
+        const button = document.querySelector('button.submit.pc')
+            || document.querySelector('button.submit')
+            || Array.from(document.querySelectorAll('button, a'))
+                .find(el => (el.innerText || '').includes('예약하기'));
+        const ready = Boolean(form && written > 0 && captchaReady && button);
+        if (ready) { button.click(); }
+        return {
+            written,
+            captchaReady,
+            buttonFound: Boolean(button),
+            clicked: ready,
+        };
+    }"""
+
     async def _write_token(self, page, token, *, quiet=False):
         """Put a token (or '' to drop one) into the form. Returns fields written."""
         try:
@@ -1393,10 +2417,30 @@ class KeyescapeEngine(BaseEngine):
                 await page.evaluate(self.TOKEN_PATCH_SCRIPT, token or "") or 0
             )
         except Exception as exc:
-            if not quiet:
+            if self._is_browser_connection_error(exc):
+                self._browser_connection_lost = True
+                self._log_throttled(
+                    "browser_connection_lost",
+                    "[에러] Chrome 자동화 연결이 종료되었습니다. "
+                    "이 예약 작업을 중단합니다. 다른 프로그램은 독립 Chrome 슬롯에서 계속 실행됩니다.",
+                    "error",
+                    interval=3600.0,
+                )
+            elif not quiet:
                 self.log(f"[경고] 캡차 토큰 주입 실패: {exc}", "warning")
             return 0
         return written
+
+    @staticmethod
+    def _is_browser_connection_error(exc):
+        message = str(exc or "").lower()
+        return any(marker in message for marker in (
+            "connection closed",
+            "browser has been closed",
+            "context or browser has been closed",
+            "target page, context or browser has been closed",
+            "while reading from the driver",
+        ))
 
     async def _inject_yescaptcha_token(self, page, token):
         """Write and independently verify the exact value that the form will post."""
@@ -1476,6 +2520,7 @@ class KeyescapeEngine(BaseEngine):
     async def _solve_with_yescaptcha_inner(self, page, test_only=False):
         loop = asyncio.get_running_loop()
         client = YesCaptchaClient(self._yc_client_key, self._yc_soft_id)
+        solve_started = time.monotonic()
         sitekey = await self._read_sitekey(page)
         if not sitekey:
             self._yc_failures += 1
@@ -1510,8 +2555,11 @@ class KeyescapeEngine(BaseEngine):
             # about starts when the token is minted, and polling can take 30 s.
             self._yc_token_at = time.monotonic()
             self._yc_failures = 0
+            solve_elapsed = time.monotonic() - solve_started
+            self._remember_captcha_solve_time(solve_elapsed)
             self.log(
                 f"[YesCaptcha] {'테스트용 ' if test_only else ''}API 토큰 발급 완료 · "
+                f"발급 {solve_elapsed:.1f}초 · "
                 f"약 {int(self._token_seconds_left())}초간 유효 "
                 "(화면 체크 표시는 비어 있어도 정상이며, 폼 주입 상태를 별도로 검증합니다)",
                 "info",
@@ -1549,7 +2597,8 @@ class KeyescapeEngine(BaseEngine):
         now = time.monotonic()
         if now - self._yc_last_attempt < self.YESCAPTCHA_RETRY_COOLDOWN:
             return
-        normal_due = remaining is None or remaining <= self.CAPTCHA_SOLVE_LEAD
+        solve_lead = self._captcha_lead_seconds()
+        normal_due = remaining is None or remaining <= solve_lead
         test_due = (
             self._yc_test_mode
             and not self._yc_test_attempted
@@ -1558,7 +2607,7 @@ class KeyescapeEngine(BaseEngine):
         if not normal_due and not test_due:
             self._log_throttled(
                 "yc_wait",
-                f"[정보] 캡차 토큰은 오픈 {int(self.CAPTCHA_SOLVE_LEAD)}초 전에 발급합니다. "
+                f"[정보] 캡차 토큰은 오픈 {int(solve_lead)}초 전에 발급합니다. "
                 "(토큰 수명이 약 2분이라 미리 받아두면 만료됩니다)",
                 "info",
                 interval=60.0,
@@ -1596,6 +2645,7 @@ class KeyescapeEngine(BaseEngine):
         # "manual" -> the widget produced it, "api" -> YesCaptcha did. Only the
         # api case has a known mint time, so only it can be expired on schedule.
         captcha_source = ""
+        trusted_attempted = False
         last_resync = time.monotonic()
         restores = 0
 
@@ -1611,6 +2661,9 @@ class KeyescapeEngine(BaseEngine):
             self._yc_client_key,
             self._yc_soft_id,
         ) = self.read_yescaptcha_settings(reservation_data)
+        self._yc_profile_key = self._captcha_profile_id(self._yc_client_key)
+        self._captcha_solve_lead = self._load_captcha_solve_lead()
+        solve_lead = self._captcha_lead_seconds()
         self._yc_test_mode = (
             self._yc_enabled
             and self.read_yescaptcha_test_mode(reservation_data)
@@ -1626,13 +2679,13 @@ class KeyescapeEngine(BaseEngine):
             if self._yc_test_mode:
                 self.log(
                     "[YesCaptcha 테스트 모드 ON] 시작 즉시 1회 발급·주입을 검증합니다. "
-                    f"실제 예약용 토큰은 오픈 {int(self.CAPTCHA_SOLVE_LEAD)}초 전에 "
+                    f"실제 예약용 토큰은 오픈 {int(solve_lead)}초 전에 "
                     f"별도로 발급합니다. (SoftID {self._yc_soft_id})",
                     "warning",
                 )
             else:
                 self.log(
-                    f"[YesCaptcha] 자동 해결 대기 중 · 오픈 {int(self.CAPTCHA_SOLVE_LEAD)}초 전에 "
+                    f"[YesCaptcha] 자동 해결 대기 중 · 오픈 {int(solve_lead)}초 전에 "
                     f"토큰을 발급합니다. (SoftID {self._yc_soft_id})",
                     "info",
                 )
@@ -1655,6 +2708,8 @@ class KeyescapeEngine(BaseEngine):
             return
 
         while not self.stop_event.is_set():
+            if self._browser_connection_lost:
+                return
             # -- the site wiped the page? -------------------------------
             # Without this the loop would keep polling a document that has no
             # captcha and no form, reporting '캡차 미인증' forever.
@@ -1699,7 +2754,7 @@ class KeyescapeEngine(BaseEngine):
             ):
                 last_resync = time.monotonic()
                 await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: self.clock.sync(announce=False)
+                    None, lambda: self._sync_server_clock(announce=False)
                 )
                 remaining = (
                     self.clock.seconds_until(self.open_at)
@@ -1827,7 +2882,18 @@ class KeyescapeEngine(BaseEngine):
                 self.log("[경고] 캡차 인증이 해제되었습니다. 다시 인증해주세요.", "warning")
             elif captcha_source == "manual":
                 left = self.CAPTCHA_TTL_SECONDS - (time.monotonic() - captcha_since)
-                if left <= self.CAPTCHA_WARN_SECONDS:
+                if self._manual_captcha_expired(captcha_since):
+                    await self._reset_captcha_widget(page)
+                    captcha_ok = False
+                    captcha_since = 0.0
+                    captcha_source = ""
+                    prompted = False
+                    self.log(
+                        "[경고] 수동 캡차의 안전 유효시간이 지나 자동 초기화했습니다. "
+                        "새로 인증해주세요.",
+                        "warning",
+                    )
+                elif left <= self.CAPTCHA_WARN_SECONDS:
                     self._log_throttled(
                         "captcha_expiry",
                         f"[경고] 캡차 유효시간 약 {max(0, int(left))}초 남음",
@@ -1858,30 +2924,74 @@ class KeyescapeEngine(BaseEngine):
 
             # -- still waiting -------------------------------------------
             if self.open_at is not None and remaining > self.FIRE_LEAD:
-                self.silent_tick(f"{target_time} 오픈 대기")
-                self._log_throttled(
-                    "waiting",
-                    f"[정보] 서버 시간 기준 오픈까지 "
-                    f"{self._format_remaining(remaining)} 남음"
-                    + (
-                        ""
-                        if captcha_ok
-                        else (
-                            " · YesCaptcha 토큰 발급 대기"
-                            if self._yescaptcha_active()
-                            else " · 수동 캡차 미인증"
-                        )
-                    ),
-                    "info",
-                    interval=30.0 if remaining > 180 else 10.0,
-                )
-                await asyncio.sleep(
-                    self.POLL_NEAR_SECONDS if remaining <= 3.0
-                    else min(self.POLL_IDLE_SECONDS, max(0.05, remaining - 3.0))
-                )
-                continue
+                if captcha_ok and remaining <= self.FINAL_QUIET_LEAD_SECONDS:
+                    self._log_throttled(
+                        "final_quiet",
+                        "[정보] 캡차 준비 완료 · 오픈 직전 경량 대기로 전환합니다.",
+                        "info", interval=60.0,
+                    )
+                    await self._wait_for_open_quiet()
+                    if self.stop_event.is_set():
+                        return
+                    # Fall through in this same loop turn. This deliberately
+                    # avoids another blocked-page/captcha/DOM check after T0.
+                    remaining = self.clock.seconds_until(self.open_at)
+                else:
+                    if remaining > self.FINAL_QUIET_LEAD_SECONDS:
+                        self.silent_tick(f"{target_time} 오픈 대기")
+                    self._log_throttled(
+                        "waiting",
+                        f"[정보] 서버 시간 기준 오픈까지 "
+                        f"{self._format_remaining(remaining)} 남음"
+                        + (
+                            ""
+                            if captcha_ok
+                            else (
+                                " · YesCaptcha 토큰 발급 대기"
+                                if self._yescaptcha_active()
+                                else " · 수동 캡차 미인증"
+                            )
+                        ),
+                        "info",
+                        interval=30.0 if remaining > 180 else 10.0,
+                    )
+                    await asyncio.sleep(
+                        self.POLL_NEAR_SECONDS if remaining <= 3.0
+                        else min(self.POLL_IDLE_SECONDS, max(0.05, remaining - 3.0))
+                    )
+                    continue
 
             # -- the moment has arrived ----------------------------------
+            use_trusted_slot = bool(
+                self._trusted_slot_id and not trusted_attempted
+            )
+            if use_trusted_slot:
+                await self._wait_for_trusted_fire()
+                if self.stop_event.is_set() or self._page_success_event.is_set():
+                    return
+                live_slot_id = self._trusted_slot_id
+                live_slot_status = "trusted"
+                self._trace_timing(
+                    f"검증 시간표 선발사 준비 · ID {live_slot_id} · "
+                    f"기준 {', '.join(self._trusted_slot_sources)}"
+                )
+            else:
+                live_slot_id, live_slot_status = await self._resolve_live_slot(
+                    target_date, target_time, zizum_num, theme_num, slot_id
+                )
+            if live_slot_status == "capacity":
+                await self._report_capacity_result()
+                return
+            if not live_slot_id:
+                self._log_throttled(
+                    "await_live_slot",
+                    "[정보] 오픈 시각 도달 · 대상 날짜의 실제 슬롯 ID 공개를 기다립니다.",
+                    "info", interval=1.0,
+                )
+                await asyncio.sleep(self._live_slot_retry_delay())
+                continue
+            slot_id = live_slot_id
+
             if not captcha_ok:
                 automatic = self._yescaptcha_active()
                 self._log_throttled(
@@ -1914,11 +3024,16 @@ class KeyescapeEngine(BaseEngine):
             # while requests already handed to the site finish collecting their
             # own result below.
             submit_attempts += 1
+            if use_trusted_slot:
+                trusted_attempted = True
             dialog_state["message"] = ""
             result = await self._submit(
                 page, dialog_state, slot_id, theme_name,
                 target_date, target_time, zizum_num, dev_mode,
                 api_token_active=(captcha_source == "api"),
+                captcha_age=(
+                    time.monotonic() - captcha_since if captcha_since else None
+                ),
             )
 
             submitted_api_token = (
@@ -1964,7 +3079,7 @@ class KeyescapeEngine(BaseEngine):
                 else:
                     self.log("[정보] 아직 오픈 전입니다. 대기를 계속합니다.", "info")
                     await asyncio.sleep(0.5)
-            elif result == "captcha_consumed":
+            elif result in ("captcha_consumed", "invalid_request"):
                 captcha_ok = False
                 captcha_since = 0.0
                 was_api = submitted_api_token or captcha_source == "api"
@@ -1974,14 +3089,15 @@ class KeyescapeEngine(BaseEngine):
                     await self._write_token(page, "")
                 if was_api:
                     self.log(
-                        "[경고] 사이트가 YesCaptcha 토큰을 승인하지 않았습니다. "
-                        "사용한 토큰은 폐기하고 새 토큰을 요청합니다.",
+                        "[경고] 사이트가 요청을 승인하지 않았습니다. 사용한 YesCaptcha "
+                        "토큰은 폐기하고 실제 슬롯 ID를 유지한 채 새 토큰을 요청합니다.",
                         "warning",
                     )
                 else:
+                    await self._reset_captcha_widget(page)
                     self.log(
-                        "[경고] 제출로 캡차가 소모되었습니다(사이트가 자동 초기화합니다). "
-                        "다시 인증해주세요.",
+                        "[경고] 제출 요청이 거절되어 수동 캡차를 초기화했습니다. "
+                        "실제 슬롯 ID는 확인됐으므로 캡차만 다시 인증해주세요.",
                         "warning",
                     )
                 try:
@@ -2031,35 +3147,43 @@ class KeyescapeEngine(BaseEngine):
     async def _submit(
         self, page, dialog_state, slot_id, theme_name,
         target_date, target_time, zizum_num, dev_mode,
-        api_token_active=False,
+        api_token_active=False, captcha_age=None,
     ):
+        slot_id = str(slot_id or "").strip()
+        if not slot_id or slot_id == self.PLACEHOLDER_SLOT_ID:
+            self.log(
+                "[경고] 대상 날짜의 실제 슬롯 ID가 없어 제출을 중단했습니다. "
+                f"(날짜 {target_date}, 시간 {target_time}, 슬롯 {slot_id or '빈 값'})",
+                "warning",
+            )
+            return "slot_not_ready"
         self._yc_token_submitted = False
         dialog_state.update(self._new_submission_state())
-        # Put the real slot id into the form before anything is sent.
-        #
-        # Step 1 posts camelCase names (themeTimeNum) but the Step 2 page renders
-        # snake_case ones (theme_time_num). The previous version only wrote to
-        # 'themeTimeNum', which does not exist here, so the loop iterated an empty
-        # NodeList and silently did nothing -- meaning a placeholder id would have
-        # been submitted verbatim. Both spellings are written now.
+        # One CDP round trip owns the complete final browser action: update both
+        # possible slot-id spellings, re-stamp/verify an API captcha token when
+        # one is active, and click the site's existing AJAX submit handler.
         try:
-            written = await page.evaluate(
-                """(value) => {
-                    let count = 0;
-                    for (const name of ['theme_time_num', 'themeTimeNum']) {
-                        for (const field of document.getElementsByName(name)) {
-                            field.value = value;
-                            count += 1;
-                        }
-                    }
-                    return count;
-                }""",
-                str(slot_id),
+            self._trace_timing(f"최종 브라우저 동작 전달 · 슬롯 ID {slot_id}")
+            action = await page.evaluate(
+                self.FINAL_CLICK_SCRIPT,
+                {
+                    "slotId": slot_id,
+                    "apiToken": (
+                        self._yc_token
+                        if api_token_active and self._token_seconds_left() > 0
+                        else ""
+                    ),
+                    "apiTokenActive": bool(api_token_active),
+                },
             )
         except Exception as exc:
-            self.log(f"[경고] 슬롯 ID 주입 실패: {exc}", "warning")
+            if self._is_browser_connection_error(exc):
+                self._browser_connection_lost = True
+            self.log(f"[경고] 최종 예약 동작 실행 실패: {exc}", "warning")
             return "retry"
 
+        action = action if isinstance(action, dict) else {}
+        written = int(action.get("written", 0) or 0)
         if not written:
             self.log(
                 "[에러] 예약 폼에서 슬롯 ID 필드를 찾지 못했습니다. 페이지 구조가 바뀐 것 같습니다.",
@@ -2068,41 +3192,32 @@ class KeyescapeEngine(BaseEngine):
             await self._dump_debug(page)
             return "retry"
 
-        # Re-stamp the API token immediately before the click. The site calls
-        # grecaptcha.reset() on every rejection, which blanks the textarea that
-        # FormData reads, so a token that survived one failed attempt would
-        # otherwise be posted as an empty string on the next one. Only done when
-        # the API token is the one in play: overwriting a hand-solved token with
-        # a stale API one would break an otherwise good attempt.
-        if api_token_active and self._yc_token and self._token_seconds_left() > 0:
-            if not await self._inject_yescaptcha_token(page, self._yc_token):
-                self.log(
-                    "[경고] YesCaptcha 토큰이 실제 제출 폼에 준비되지 않아 클릭을 중단했습니다.",
-                    "warning",
-                )
-                return "captcha_not_ready"
-
-        self.log(f"예약하기를 클릭합니다. (슬롯 ID {slot_id}, 필드 {written}개 갱신)", "info")
-        try:
-            clicked = await page.evaluate(
-                """() => {
-                    const button = document.querySelector('button.submit.pc')
-                        || document.querySelector('button.submit')
-                        || Array.from(document.querySelectorAll('button, a'))
-                            .find(el => (el.innerText || '').includes('예약하기'));
-                    if (!button) { return false; }
-                    button.click();
-                    return true;
-                }"""
+        if api_token_active and not action.get("captchaReady"):
+            self.log(
+                "[경고] YesCaptcha 토큰이 실제 제출 폼에 준비되지 않아 클릭을 중단했습니다.",
+                "warning",
             )
-        except Exception as exc:
-            self.log(f"[경고] 예약하기 클릭 실패: {exc}", "warning")
-            return "retry"
+            return "captcha_not_ready"
 
-        if not clicked:
+        if not action.get("buttonFound"):
             self.log("[경고] 예약하기 버튼을 찾지 못했습니다.", "warning")
             await self._dump_debug(page)
             return "retry"
+
+        if not action.get("clicked"):
+            self.log("[경고] 최종 예약 조건이 준비되지 않아 클릭을 중단했습니다.", "warning")
+            return "retry"
+
+        age_text = (
+            f", 캡차 경과 {captcha_age:.1f}초"
+            if captcha_age is not None else ""
+        )
+        self.log(
+            f"예약하기를 클릭합니다. (실제 슬롯 ID {slot_id}, "
+            f"필드 {written}개 갱신{age_text})",
+            "info",
+        )
+        self._trace_timing("예약 버튼 클릭 완료")
         self._yc_token_submitted = bool(api_token_active)
 
         completion = await self._await_completion(
@@ -2115,9 +3230,9 @@ class KeyescapeEngine(BaseEngine):
             return self._classify_failure(dialog_state.get("message", ""))
 
         self._page_success_event.set()
-        booking_number = dialog_state.get("booking_number", "")
-        if not booking_number:
-            booking_number = await self._extract_booking_number(completion)
+        booking_number = await self._resolve_booking_number(
+            completion, dialog_state
+        )
         if dialog_state.get("submission_status") == "success":
             self.log("[완료] 서버에서 예약 성공 응답을 확인했습니다.", "success")
         else:
@@ -2166,7 +3281,7 @@ class KeyescapeEngine(BaseEngine):
         if any(token in text for token in ("이미 완료", "이미 예약", "정원", "매진", "마감")):
             return "capacity"
         if "접근" in text:
-            return "captcha_consumed"
+            return "invalid_request"
         if any(token in text for token in ("자동등록방지", "자동입력", "로봇", "캡차", "보안문자")):
             return "captcha_consumed"
         if any(token in text for token in
@@ -2262,6 +3377,29 @@ class KeyescapeEngine(BaseEngine):
                 return None
             await asyncio.sleep(0.2)
 
+    async def _resolve_booking_number(self, page, dialog_state, timeout=3.0):
+        """Let the AJAX response/redirect finish before declaring the number absent.
+
+        Keyescape shows its success dialog before the response listener and the
+        reservation3 DOM are guaranteed to have settled. This short post-success
+        wait does not affect booking speed; the server has already accepted it.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            number = str(dialog_state.get("booking_number", "") or "").strip()
+            if number:
+                return number
+            try:
+                number = str(await self._extract_booking_number(page) or "").strip()
+            except Exception:
+                number = ""
+            if number:
+                dialog_state["booking_number"] = number
+                return number
+            if time.monotonic() >= deadline:
+                return ""
+            await asyncio.sleep(0.1)
+
     async def _extract_booking_number(self, page):
         # The completion page renders it as a pair of spans:
         #   <span class="subject">예약번호</span><span class="width_80">15490</span>
@@ -2301,7 +3439,16 @@ class KeyescapeEngine(BaseEngine):
         try:
             html = await page.content()
             path = data_path("keyescape_step2_debug.html")
-            path.write_text(html, encoding="utf-8")
-            self.log(f"[정보] 현재 화면 HTML을 저장했습니다: {path}", "info")
-        except Exception:
-            pass
+            write_redacted_debug_text(path, html)
+            self.log(
+                f"[정보] 민감정보를 제거한 현재 화면 HTML을 저장했습니다: {path}",
+                "info",
+            )
+        except Exception as exc:
+            # Debug capture is best-effort, but its own failure must still be
+            # diagnosable now that these logs persist across application runs.
+            self.log(
+                f"[경고] 키이스케이프 디버그 HTML 저장 실패: "
+                f"{type(exc).__name__}: {str(exc).strip() or '상세 메시지 없음'}",
+                "warning",
+            )

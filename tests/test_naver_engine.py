@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from engines.naver_api import NaverSlot, SubmitOutcome, SubmitResult
+from engines.naver_api import (
+    NaverAccount,
+    NaverItemMeta,
+    NaverSlot,
+    SubmitOutcome,
+    SubmitResult,
+)
 from engines.naver_engine import NaverEngine
 from engines.naver_submit import PAYMENT_NPAY_PREPAID, NaverSubmitPreparation
 
@@ -234,8 +240,38 @@ class FakeSubmitter:
         return self.results.pop(0)
 
 
+class ArmedSubmitter(FakeSubmitter):
+    def __init__(self, results):
+        super().__init__(results)
+        self.armed = []
+        self.cancelled = []
+        self.last_rtt = 0.10
+
+    async def arm_submit_at(self, payload, delay_seconds):
+        self.armed.append((dict(payload), delay_seconds))
+        return "armed-1"
+
+    async def read_armed_submit(self, arm_id, _payload):
+        assert arm_id == "armed-1"
+        return "complete", self.results.pop(0), 42.0
+
+    async def cancel_armed_submit(self, arm_id):
+        self.cancelled.append(arm_id)
+        return True
+
+
 def arm_direct_submit(engine, results):
     engine._api_submitter = FakeSubmitter(results)
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={"slotId": "1331382668", "csrfToken": "secret"},
+        slot_id="1331382668",
+    )
+    engine._api_submit_enabled = True
+
+
+def arm_browser_submit(engine, results):
+    engine._api_submitter = ArmedSubmitter(results)
     engine._api_preparation = NaverSubmitPreparation(
         True,
         payload={"slotId": "1331382668", "csrfToken": "secret"},
@@ -386,6 +422,74 @@ def test_transient_static_read_does_not_permanently_block_direct_submit():
     assert engine.api.business_calls == 2
 
 
+def test_login_state_prefers_live_account_after_switch_over_stale_page_cache(monkeypatch):
+    engine = make_engine()
+    engine._page = type("StaleAccountPage", (), {
+        "url": "https://booking.naver.com/booking/12/bizes/1/items/2",
+        "evaluate": lambda self, _script: _async_value(False),
+    })()
+
+    class LiveSubmitter:
+        def __init__(self, _page):
+            self.last_account_fetch_ok = False
+
+        async def fetch_account(self):
+            self.last_account_fetch_ok = True
+            return NaverAccount(
+                True, "csrf-new", False, user_id="new-account", nickname="새 계정"
+            )
+
+    monkeypatch.setattr("engines.naver_engine.NaverBrowserSubmitter", LiveSubmitter)
+
+    assert asyncio.run(engine._login_state()) is True
+    assert engine._api_account.user_id == "new-account"
+    assert engine._api_account.csrf_token == "csrf-new"
+
+
+def test_adopting_switched_account_discards_old_submission_preparation():
+    logs = []
+    engine = NaverEngine(lambda message, _level: logs.append(message))
+    engine._api_account = NaverAccount(
+        True, "csrf-old", False, user_id="old-account"
+    )
+    engine._api_preparation = NaverSubmitPreparation(
+        True, payload={"csrfToken": "csrf-old", "slotId": "slot-1"}, slot_id="slot-1"
+    )
+    engine._api_submit_enabled = True
+    engine._api_submit_blocked = True
+
+    engine._adopt_browser_account(
+        NaverAccount(True, "csrf-new", False, user_id="new-account")
+    )
+
+    assert engine._api_account.user_id == "new-account"
+    assert engine._api_preparation is None
+    assert engine._api_submit_enabled is False
+    assert engine._api_submit_blocked is False
+    assert engine._api_prepare_pending is True
+    assert any("계정 변경" in message for message in logs)
+
+
+def test_same_live_account_keeps_ready_submission_preparation():
+    engine = make_engine()
+    account = NaverAccount(True, "csrf-same", False, user_id="same-account")
+    preparation = NaverSubmitPreparation(
+        True, payload={"csrfToken": "csrf-same", "slotId": "slot-1"}, slot_id="slot-1"
+    )
+    engine._api_account = account
+    engine._api_preparation = preparation
+    engine._api_submit_enabled = True
+
+    engine._adopt_browser_account(account)
+
+    assert engine._api_preparation is preparation
+    assert engine._api_submit_enabled is True
+
+
+async def _async_value(value):
+    return value
+
+
 # -- the opening moment ----------------------------------------------------
 def test_open_strike_is_claimed_once_inside_the_arming_window():
     engine = make_engine()
@@ -422,6 +526,39 @@ def test_seconds_until_open_is_none_without_a_published_open_time():
     engine._open_at_epoch = 5.0
     engine.clock = FakeClock(12.5)
     assert engine._seconds_until_open() == 12.5
+
+
+def test_refresh_open_schedule_updates_stale_startup_date():
+    engine = make_engine()
+    refreshed = datetime(2026, 8, 9, 11, 0, tzinfo=KST)
+    meta = NaverItemMeta(
+        name="테마",
+        server_time=datetime(2026, 8, 9, 10, 0, tzinfo=KST),
+        is_closed_booking=False,
+        is_closed_for_user=False,
+        open_at=refreshed,
+        is_opened=True,
+        uses_open_schedule=True,
+        is_paused=False,
+        custom_form=[],
+    )
+
+    class Api:
+        def fetch_item_meta(self):
+            return meta
+
+        def resolve_target_open_at(self, target_date, received):
+            assert target_date == "2026-08-16"
+            assert received is meta
+            return refreshed
+
+    engine.api = Api()
+    engine.clock = FakeClock(60.0)
+    engine._open_at_epoch = refreshed.timestamp() - 86400
+
+    assert asyncio.run(engine._refresh_open_schedule("2026-08-16")) is True
+    assert engine._open_at_epoch == refreshed.timestamp()
+    assert engine._open_strike_pending is True
 
 
 def test_wait_for_open_returns_at_the_boundary():
@@ -483,6 +620,35 @@ def test_api_ready_strike_submits_without_page_reload():
     assert outcome == "success"
     assert "999888" in detail
     assert engine._api_submitter.calls == 1
+
+
+def test_open_strike_arms_browser_internal_submit_before_the_boundary():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(0.10)
+    engine.API_BROWSER_ARM_MIN_SECONDS = 0.01
+    engine.API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.0
+    engine.API_BROWSER_ARM_STATUS_SECONDS = 0.0
+    arm_browser_submit(engine, [
+        SubmitResult(SubmitOutcome.SUCCESS, booking_id="999888"),
+    ])
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("armed API path must not reload or invoke submit()")
+
+    engine._goto_item = forbidden
+    engine._submit = forbidden
+    outcome, detail = asyncio.run(
+        engine._strike_at_open(
+            "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+        )
+    )
+
+    assert outcome == "success"
+    assert "999888" in detail
+    assert engine._api_submitter.calls == 0
+    assert len(engine._api_submitter.armed) == 1
+    assert engine._recent_submit_rtt == [pytest.approx(0.042)]
 
 
 def test_open_strike_never_waits_for_clock_sync_inside_the_blackout():
@@ -575,12 +741,38 @@ def test_ambiguous_api_result_never_falls_back_to_a_second_submission():
     assert "확인" in detail
 
 
+def test_duplicate_api_result_stops_without_browser_resubmission():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(-0.01)
+    arm_direct_submit(engine, [
+        SubmitResult(SubmitOutcome.DUPLICATED, message="Duplicated"),
+    ])
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("중복 응답 뒤에는 브라우저로 다시 제출하면 안 됩니다")
+
+    engine._goto_item = forbidden
+    engine._submit = forbidden
+
+    outcome, detail = asyncio.run(
+        engine._strike_at_open(
+            "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+        )
+    )
+
+    assert outcome == "duplicate"
+    assert "Duplicated" in detail
+    assert engine._api_refused_signature is None
+    assert engine._api_submitter.calls == 1
+
+
 def test_api_send_lead_uses_the_browser_transport_round_trip():
     engine = make_engine()
     engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
     engine._api_submitter = type("BrowserTransport", (), {"last_rtt": 0.4})()
 
-    assert engine._api_one_way_seconds() == pytest.approx(0.2)
+    assert engine._api_one_way_seconds() == pytest.approx(0.235)
 
 
 def test_pending_api_strike_refreshes_slot_before_page_reload():
@@ -1437,3 +1629,72 @@ def test_npay_money_click_uses_short_timeout_and_honors_stop_immediately():
 
     assert selected is False
     assert detail == "중지 요청"
+
+
+class FakeQuantityPage:
+    def __init__(self, *, present=True, current=1, maximum=8):
+        self.present = present
+        self.current = current
+        self.maximum = maximum
+        self.actions = []
+
+    async def evaluate(self, _script, action):
+        self.actions.append(action)
+        if not self.present:
+            return {"present": False}
+        if action == "plus" and self.current < self.maximum:
+            self.current += 1
+            return {"present": True, "current": self.current - 1, "clicked": True}
+        if action == "minus" and self.current > 1:
+            self.current -= 1
+            return {"present": True, "current": self.current + 1, "clicked": True}
+        return {
+            "present": True,
+            "current": self.current,
+            "plusDisabled": self.current >= self.maximum,
+            "minusDisabled": self.current <= 1,
+            "groups": 1,
+        }
+
+
+def test_browser_fallback_sets_visible_ticket_quantity_to_people():
+    engine = make_engine()
+    page = FakeQuantityPage(current=1, maximum=8)
+    engine._page = page
+    engine._api_preparation = NaverSubmitPreparation(
+        True, quantity_mode=True
+    )
+
+    ok, detail = asyncio.run(engine._set_browser_booking_count({"people": "4"}))
+
+    assert ok is True
+    assert detail == "티켓 수량 4매"
+    assert page.current == 4
+    assert page.actions.count("plus") == 3
+
+
+def test_browser_fallback_leaves_fixed_slot_without_quantity_control_alone():
+    engine = make_engine()
+    page = FakeQuantityPage(present=False)
+    engine._page = page
+
+    ok, detail = asyncio.run(engine._set_browser_booking_count({"people": "4"}))
+
+    assert ok is True
+    assert "단일 슬롯" in detail
+    assert page.actions == ["state"]
+
+
+def test_browser_fallback_reports_when_requested_tickets_exceed_visible_limit():
+    engine = make_engine()
+    page = FakeQuantityPage(current=1, maximum=2)
+    engine._page = page
+    engine._api_preparation = NaverSubmitPreparation(
+        False, quantity_mode=True, available_count=2
+    )
+
+    ok, detail = asyncio.run(engine._set_browser_booking_count({"people": "4"}))
+
+    assert ok is False
+    assert "요청 수량 4매" in detail
+    assert page.current == 2

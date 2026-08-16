@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from engines.doomescape_engine import DoomEscapeEngine
+from engines.cgv_engine import CgvEngine
+from engines.dpsnnn_engine import DpsnnnEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.keyescape_engine import KeyescapeEngine
 from engines.naver_engine import NaverEngine
 from engines.zeroworld_gu_engine import ZeroWorldGuEngine
 from engines.zeroworld_shin_engine import ZeroWorldShinEngine
-from pengucro.models import NAVER_MODE
+from pengucro.models import NAVER_MODE, TRIPCOM_MODE
 
 
 class EngineRegistry:
@@ -33,6 +35,12 @@ class EngineRegistry:
         }
         if mode == NAVER_MODE:
             engine = NaverEngine(**common)
+        elif mode == TRIPCOM_MODE:
+            import importlib
+
+            engine = importlib.import_module("engines.tripcom_engine").TripComEngine(**common)
+        elif site_name == "CGV":
+            engine = CgvEngine(**common)
         elif site_name == "제로월드":
             metadata = payload.get("engine_metadata", {})
             engine = ZeroWorldShinEngine(
@@ -58,6 +66,20 @@ class EngineRegistry:
                 engine = KeyescapeEngine(site_url=site.get("base_url"), **common)
             elif engine_id == "doomescape":
                 engine = DoomEscapeEngine(site_url=site.get("base_url") or site.get("url", ""), **common)
+            elif engine_id == "dpsnnn":
+                metadata = payload.get("engine_metadata", {})
+                payload_options = metadata.get("engine_options", {}) if isinstance(metadata, dict) else {}
+                engine = DpsnnnEngine(
+                    site_url=site.get("base_url") or site.get("url", ""),
+                    engine_options=payload_options or site.get("engine_options", {}),
+                    **common,
+                )
+            elif engine_id == "tripcom":
+                import importlib
+
+                engine = importlib.import_module("engines.tripcom_engine").TripComEngine(**common)
+            elif engine_id == "cgv":
+                engine = CgvEngine(**common)
             elif engine_id == "sinbiworld":
                 engine = ZeroWorldShinEngine(
                     site_url=site.get("url", ""),

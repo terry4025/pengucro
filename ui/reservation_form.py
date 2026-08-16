@@ -6,10 +6,19 @@ from data.themes import (
     KEYESCAPE_THEMES, DOOMESCAPE_THEMES
 )
 from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
+from engines.dpsnnn_engine import DPSNNN_DEFAULT_WORKERS, DPSNNN_MAX_WORKERS
+from engines.cgv_client import (
+    CGV_DEFAULT_WORKERS,
+    CGV_MANUAL_SITE_VALUE,
+    CGV_MAX_WORKERS,
+    parse_seat_groups,
+    schedule_items,
+)
 from pengucro.models import (
     LEGACY_MODE_MAP,
     NAVER_MODE,
     STANDARD_MODE,
+    TRIPCOM_MODE,
     ReservationRequest,
     coerce_bool,
 )
@@ -38,9 +47,10 @@ PRESERVED_CONFIG_KEYS = (
 
 
 class DatePickerDialog(ctk.CTkToplevel):
-    def __init__(self, parent, initial_date, on_select):
+    def __init__(self, parent, initial_date, on_select, allowed_dates=None):
         super().__init__(parent)
         self.on_select = on_select
+        self.allowed_dates = {str(value) for value in (allowed_dates or ()) if str(value)}
         try:
             selected = datetime.strptime(initial_date, "%Y-%m-%d")
         except ValueError:
@@ -122,7 +132,9 @@ class DatePickerDialog(ctk.CTkToplevel):
                     corner_radius=theme.ROUNDED_SM,
                     command=lambda chosen=value: self._choose(chosen),
                 )
-                if value < today:
+                if value < today or (
+                    self.allowed_dates and value.isoformat() not in self.allowed_dates
+                ):
                     button.configure(state="disabled")
                 elif value == today:
                     # Mark today so the grid has an orientation point.
@@ -225,10 +237,23 @@ class TimePickerDialog(ctk.CTkToplevel):
         available = [slot for slot in slots if slot.available]
         if estimated:
             source_date = getattr(estimated[0], "source_date", "")
-            source_text = f"{source_date} 같은 요일" if source_date else "같은 요일의 최근"
+            basis = getattr(estimated[0], "estimate_basis", "")
+            reason = getattr(estimated[0], "estimate_reason", "")
+            basis_text = {
+                "same_weekday": "같은 요일",
+                "same_day_type": "같은 주중/주말 유형",
+                "nearest": "가장 가까운 공개 날짜",
+            }.get(basis, "최근 공개 날짜")
+            source_text = f"{source_date} {basis_text}" if source_date else basis_text
+            if reason == "traffic_over":
+                prefix = "둠이스케이프 서버 일일 트래픽 초과 · 저장된 시간표 사용"
+            elif reason == "server_outage":
+                prefix = "둠이스케이프 서버 연결 장애 · 저장된 시간표 사용"
+            else:
+                prefix = "아직 닫힌 날짜"
             self.status.configure(
                 text=(
-                    f"아직 닫힌 날짜 · {source_text} 시간표 {len(slots)}개를 표시합니다. "
+                    f"{prefix} · {source_text}의 예상 시간표 {len(slots)}개를 표시합니다. "
                     "시간은 선택할 수 있으며 오픈 후 실제 상태를 다시 확인합니다."
                 ),
                 text_color=theme.ACCENT_YELLOW,
@@ -337,6 +362,7 @@ class ReservationForm(ctk.CTkFrame):
         self._is_initializing = True
         self._save_after_id = None
         self.secret_store = SecretStore()
+        self.cgv_selection = {}
         
         # Thread memory states.
         #
@@ -346,6 +372,8 @@ class ReservationForm(ctk.CTkFrame):
         self.standard_threads = 30
         self.naver_threads = 1
         self.keyescape_threads = 1
+        self.dpsnnn_threads = DPSNNN_DEFAULT_WORKERS
+        self.cgv_threads = CGV_DEFAULT_WORKERS
         self.last_mode = STANDARD_MODE
 
         # Grid configuration for 2 columns
@@ -377,6 +405,45 @@ class ReservationForm(ctk.CTkFrame):
             anchor="w"
         )
         self.branch_dropdown.pack(fill="x")
+
+        self.cgv_selector_frame = ctk.CTkFrame(self.branch_frame, fg_color="transparent")
+        self.cgv_selector_frame.columnconfigure(0, weight=1)
+        self.cgv_selection_summary = ctk.CTkLabel(
+            self.cgv_selector_frame,
+            text="지점·영화·회차·좌석을 선택해주세요.",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_MUTE,
+            anchor="w",
+            justify="left",
+        )
+        self.cgv_selection_summary.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_2))
+        self.cgv_selector_button = ctk.CTkButton(
+            self.cgv_selector_frame,
+            text="선택",
+            command=self._open_cgv_selector,
+            width=72,
+            height=theme.H_CONTROL,
+            fg_color=theme.ACCENT_BLUE,
+            hover_color=theme.ACCENT_BLUE_HOVER,
+            text_color=theme.TEXT_PRIMARY,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_selector_button.grid(row=0, column=1, sticky="e")
+        self.cgv_selector_frame.pack(fill="x")
+        self.cgv_selector_frame.pack_forget()
+
+        self.cgv_site_no_entry = ctk.CTkEntry(
+            self.branch_frame,
+            placeholder_text="CGV 지점번호 4자리 (예: 0013)",
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_DISABLED,
+            corner_radius=theme.ROUNDED_MD,
+            height=theme.H_CONTROL,
+        )
+        self.cgv_site_no_entry.pack(fill="x", pady=(4, 0))
+        self.cgv_site_no_entry.pack_forget()
 
         self.day_type_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.day_type_label = ctk.CTkLabel(self.day_type_frame, text="요일 구분", font=theme.FONT_BODY_SM, text_color=theme.TEXT_MUTE)
@@ -424,6 +491,19 @@ class ReservationForm(ctk.CTkFrame):
             anchor="w"
         )
         self.theme_dropdown.pack(fill="x")
+
+        self.cgv_movie_entry = ctk.CTkEntry(
+            self.theme_frame,
+            placeholder_text="영화명 일부 또는 전체 (예: 오디세이)",
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_DISABLED,
+            corner_radius=theme.ROUNDED_MD,
+            height=theme.H_CONTROL,
+        )
+        self.cgv_movie_entry.pack(fill="x")
+        self.cgv_movie_entry.pack_forget()
 
         # -------------------------------------------------------------
         # Row 2: Custom Theme Entry (Full Width)
@@ -477,6 +557,51 @@ class ReservationForm(ctk.CTkFrame):
         )
         self.theme_pk_entry.pack(fill="x")
         self.theme_pk_entry.pack_forget()
+
+        self.cgv_options_frame = ctk.CTkFrame(self.custom_theme_frame, fg_color="transparent")
+        self.cgv_options_frame.columnconfigure((0, 1), weight=1, uniform="cgv")
+        self.cgv_auditorium_entry = ctk.CTkEntry(
+            self.cgv_options_frame,
+            placeholder_text="상영관/포맷 (예: IMAX)",
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_DISABLED,
+            corner_radius=theme.ROUNDED_MD,
+            height=theme.H_CONTROL,
+        )
+        self.cgv_auditorium_entry.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self.cgv_seats_entry = ctk.CTkEntry(
+            self.cgv_options_frame,
+            placeholder_text="좌석 우선순위 (A22,A23 | A17,A18)",
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_DISABLED,
+            corner_radius=theme.ROUNDED_MD,
+            height=theme.H_CONTROL,
+        )
+        self.cgv_seats_entry.grid(row=0, column=1, padx=(4, 0), sticky="ew")
+        self.cgv_options_frame.pack(fill="x")
+        self.cgv_options_frame.pack_forget()
+
+        self.tripcom_event_frame = ctk.CTkFrame(
+            self,
+            fg_color=theme.ELEVATED_COLOR,
+            border_width=1,
+            border_color=theme.HAIRLINE_COLOR,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.tripcom_event_label = ctk.CTkLabel(
+            self.tripcom_event_frame,
+            text="고급 설정에서 이벤트 정보를 갱신해주세요.",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+            justify="left",
+            anchor="w",
+        )
+        self.tripcom_event_label.pack(fill="x", padx=10, pady=7)
+        self.tripcom_event_frame.grid_forget()
 
         # -------------------------------------------------------------
         # Row 3: Date & Time (Split row)
@@ -823,6 +948,93 @@ class ReservationForm(ctk.CTkFrame):
         self._setup_entry_focus(self.yescaptcha_client_key_entry)
         self._setup_entry_focus(self.yescaptcha_soft_id_entry)
 
+        self.cgv_auth_frame = ctk.CTkFrame(
+            self.advanced_frame,
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_auth_frame.grid(row=2, column=0, sticky="ew", pady=(0, theme.SPACE_2))
+        self.cgv_auth_frame.grid_remove()
+        self.cgv_auth_frame.columnconfigure((0, 1), weight=1)
+        ctk.CTkLabel(
+            self.cgv_auth_frame,
+            text="CGV 예매 방식",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+        ).grid(row=0, column=0, sticky="w", padx=theme.SPACE_2, pady=(theme.SPACE_2, theme.SPACE_1))
+        self.cgv_booking_mode_var = ctk.StringVar(value="회원")
+        self.cgv_booking_mode = ctk.CTkSegmentedButton(
+            self.cgv_auth_frame,
+            values=["회원", "비회원"],
+            variable=self.cgv_booking_mode_var,
+            command=self._on_cgv_booking_mode_change,
+            fg_color=theme.SURFACE_COLOR,
+            selected_color=theme.ACCENT_BLUE,
+            selected_hover_color=theme.ACCENT_BLUE_HOVER,
+            unselected_color=theme.SURFACE_COLOR,
+            unselected_hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            height=theme.H_CONTROL,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_booking_mode.grid(
+            row=0, column=1, sticky="ew", padx=theme.SPACE_2,
+            pady=(theme.SPACE_2, theme.SPACE_1)
+        )
+        self.cgv_auth_hint = ctk.CTkLabel(
+            self.cgv_auth_frame,
+            text="전용 Chrome의 가장 최근 CGV 로그인 세션을 사용합니다.",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_TERTIARY,
+            anchor="w",
+            justify="left",
+        )
+        self.cgv_auth_hint.grid(
+            row=1, column=0, columnspan=2, sticky="ew",
+            padx=theme.SPACE_2, pady=(theme.SPACE_1, theme.SPACE_2)
+        )
+        self.cgv_nonmember_frame = ctk.CTkFrame(self.cgv_auth_frame, fg_color="transparent")
+        self.cgv_nonmember_frame.columnconfigure((0, 1, 2), weight=1)
+        self.cgv_nonmember_birth_entry = ctk.CTkEntry(
+            self.cgv_nonmember_frame,
+            placeholder_text="생년월일 YYYYMMDD",
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_MUTE,
+            height=theme.H_CONTROL,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_nonmember_birth_entry.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_1))
+        self.cgv_nonmember_phone_entry = ctk.CTkEntry(
+            self.cgv_nonmember_frame,
+            placeholder_text="휴대전화번호",
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_MUTE,
+            height=theme.H_CONTROL,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_nonmember_phone_entry.grid(row=0, column=1, sticky="ew", padx=theme.SPACE_1)
+        self.cgv_nonmember_password_entry = ctk.CTkEntry(
+            self.cgv_nonmember_frame,
+            placeholder_text="예매 비밀번호 8~16자",
+            show="•",
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_MUTE,
+            height=theme.H_CONTROL,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_nonmember_password_entry.grid(row=0, column=2, sticky="ew", padx=(theme.SPACE_1, 0))
+        self._setup_entry_focus(self.cgv_nonmember_birth_entry)
+        self._setup_entry_focus(self.cgv_nonmember_phone_entry)
+        self._setup_entry_focus(self.cgv_nonmember_password_entry)
+
         self.catalog_auto_refresh_var = ctk.BooleanVar(value=True)
         self.catalog_auto_refresh_checkbox = ctk.CTkCheckBox(
             self.advanced_frame,
@@ -835,11 +1047,11 @@ class ReservationForm(ctk.CTkFrame):
             command=self.auto_save,
         )
         self.catalog_auto_refresh_checkbox.grid(
-            row=2, column=0, sticky="w", pady=(theme.SPACE_2, theme.SPACE_2)
+            row=3, column=0, sticky="w", pady=(theme.SPACE_2, theme.SPACE_2)
         )
 
         self.catalog_refresh_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
-        self.catalog_refresh_frame.grid(row=3, column=0, sticky="ew")
+        self.catalog_refresh_frame.grid(row=4, column=0, sticky="ew")
         self.catalog_refresh_frame.columnconfigure(1, weight=1)
         self.catalog_refresh_btn = ctk.CTkButton(
             self.catalog_refresh_frame,
@@ -884,7 +1096,7 @@ class ReservationForm(ctk.CTkFrame):
         # stealing height from the log panel, and the log panel has a floor. A
         # second line pushed past it, so the panel would have been clipped.
         self.dev_mode_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
-        self.dev_mode_frame.grid(row=4, column=0, sticky="ew", pady=(theme.SPACE_2, 0))
+        self.dev_mode_frame.grid(row=5, column=0, sticky="ew", pady=(theme.SPACE_2, 0))
         self.dev_mode_frame.columnconfigure(0, weight=1)
 
         self.dev_mode_var = ctk.BooleanVar(value=False)
@@ -906,6 +1118,10 @@ class ReservationForm(ctk.CTkFrame):
 
         # Setup focus effects for entries
         self._setup_entry_focus(self.theme_pk_entry)
+        self._setup_entry_focus(self.cgv_site_no_entry)
+        self._setup_entry_focus(self.cgv_movie_entry)
+        self._setup_entry_focus(self.cgv_auditorium_entry)
+        self._setup_entry_focus(self.cgv_seats_entry)
         self._setup_entry_focus(self.date_entry)
         self._setup_entry_focus(self.time_entry)
         self._setup_entry_focus(self.name_entry)
@@ -926,14 +1142,110 @@ class ReservationForm(ctk.CTkFrame):
         entry.bind("<FocusOut>", lambda e: self.auto_save(), add="+")
 
     def _open_date_picker(self):
-        DatePickerDialog(self, self.date_entry.get().strip(), self._set_selected_date)
+        metadata = self._selected_theme_metadata()
+        allowed_dates = (
+            metadata.get("allowed_dates", ())
+            if self.engine_mode_btn.get() == TRIPCOM_MODE
+            else ()
+        )
+        DatePickerDialog(
+            self,
+            self.date_entry.get().strip(),
+            self._set_selected_date,
+            allowed_dates=allowed_dates,
+        )
 
     def _set_selected_date(self, value):
         self.date_entry.delete(0, "end")
         self.date_entry.insert(0, value)
+        if self.cgv_selection and self.cgv_selection.get("date") != value:
+            # A CGV selection is date-specific.  Keep the chosen theater, but
+            # require an actual screening/seat selection for the new date.
+            self.cgv_selection = {
+                "site_no": self.cgv_selection.get("site_no", ""),
+                "site_name": self.cgv_selection.get("site_name", ""),
+                "region": self.cgv_selection.get("region", ""),
+            }
+            self._render_cgv_selection_summary()
         self._on_date_change()
 
+    def _open_cgv_selector(self):
+        from tkinter import messagebox
+
+        try:
+            people = int(self.people_entry.get().strip() or "1")
+        except ValueError:
+            messagebox.showwarning(
+                "CGV 예매 대상", "좌석을 고르기 전에 인원 수를 숫자로 입력해주세요.", parent=self
+            )
+            return
+        reservation_date = self.date_entry.get().strip()
+        try:
+            datetime.strptime(reservation_date, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showwarning(
+                "CGV 예매 대상", "먼저 달력에서 목표 날짜를 선택해주세요.", parent=self
+            )
+            return
+        from ui.cgv_booking_dialog import CgvBookingDialog
+
+        return CgvBookingDialog(
+            self,
+            reservation_date=reservation_date,
+            people=people,
+            initial=self.cgv_selection,
+            on_select=self._set_cgv_selection,
+        )
+
+    def _set_cgv_selection(self, selection):
+        self.cgv_selection = dict(selection or {})
+        date_value = str(self.cgv_selection.get("date", ""))
+        time_value = str(self.cgv_selection.get("show_time", ""))
+        if date_value:
+            self.date_entry.delete(0, "end")
+            self.date_entry.insert(0, date_value)
+        if time_value:
+            self.time_entry.delete(0, "end")
+            self.time_entry.insert(0, time_value)
+        self._render_cgv_selection_summary()
+        self.auto_save()
+
+    def _render_cgv_selection_summary(self):
+        selection = self.cgv_selection
+        if not selection.get("site_no"):
+            self.cgv_selection_summary.configure(
+                text="지점·영화·회차·좌석을 선택해주세요.",
+                text_color=theme.TEXT_MUTE,
+            )
+            self.cgv_selector_button.configure(text="선택")
+            return
+        if not selection.get("movie"):
+            self.cgv_selection_summary.configure(
+                text=f"{selection.get('site_name', 'CGV')} · 회차와 좌석을 다시 선택해주세요.",
+                text_color=theme.ACCENT_YELLOW,
+            )
+            self.cgv_selector_button.configure(text="계속")
+            return
+        seats = str(selection.get("seats", ""))
+        seat_preview = seats if len(seats) <= 32 else f"{seats[:29]}..."
+        self.cgv_selection_summary.configure(
+            text=(
+                f"{selection.get('site_name', 'CGV')} · {selection.get('movie', '')}\n"
+                f"{selection.get('auditorium', '')} · {selection.get('show_time', '')} · {seat_preview}"
+            ),
+            text_color=theme.TEXT_BODY,
+        )
+        self.cgv_selector_button.configure(text="변경")
+
     def _open_time_picker(self):
+        if self.engine_mode_btn.get() == TRIPCOM_MODE:
+            open_time = str(self._selected_theme_metadata().get("open_time", ""))[:5]
+            if open_time:
+                self._set_selected_time(open_time)
+            return
+        if getattr(self, "_site_uses_cgv", lambda: False)():
+            self._open_cgv_selector()
+            return
         reservation_date = self.date_entry.get().strip()
         is_naver = self.engine_mode_btn.get() == NAVER_MODE
         lookup_config = self.config
@@ -1028,6 +1340,30 @@ class ReservationForm(ctk.CTkFrame):
         site = self.custom_sites.get(site_name) or {}
         return (site.get("engine_id") or site.get("style")) == "keyescape"
 
+    def _site_uses_dpsnnn(self, site_name=None) -> bool:
+        """Return whether the selected custom site uses the Dpsnnn engine."""
+        site_name = self.current_site if site_name is None else site_name
+        site = self.custom_sites.get(site_name) or {}
+        return site.get("engine_id") == "dpsnnn"
+
+    def _site_uses_cgv(self, site_name=None) -> bool:
+        site_name = self.current_site if site_name is None else site_name
+        if site_name == "CGV":
+            return True
+        site = self.custom_sites.get(site_name) or {}
+        return site.get("engine_id") == "cgv"
+
+    def _selected_cgv_site_no(self) -> str:
+        selected = str(self.cgv_selection.get("site_no", "")).strip()
+        if selected:
+            return selected
+        branch_value = str(
+            self.config.get("branches", {}).get(self.branch_var.get(), "")
+        ).strip()
+        if branch_value == CGV_MANUAL_SITE_VALUE:
+            return self.cgv_site_no_entry.get().strip()
+        return branch_value
+
     def _keyescape_ui_active(self) -> bool:
         return (
             self.engine_mode_btn.get() != NAVER_MODE
@@ -1037,10 +1373,14 @@ class ReservationForm(ctk.CTkFrame):
     def _remember_active_thread_value(self) -> None:
         """Save the slider under the policy that owned it before a mode change."""
         value = int(self.threads_slider.get())
-        if self.last_mode == NAVER_MODE:
+        if self.last_mode in {NAVER_MODE, TRIPCOM_MODE}:
             self.naver_threads = 1
         elif self._site_uses_keyescape():
             self.keyescape_threads = max(1, min(value, 3))
+        elif self._site_uses_dpsnnn():
+            self.dpsnnn_threads = max(1, min(value, DPSNNN_MAX_WORKERS))
+        elif self._site_uses_cgv():
+            self.cgv_threads = max(1, min(value, CGV_MAX_WORKERS))
         else:
             self.standard_threads = max(1, min(value, 50))
 
@@ -1052,6 +1392,18 @@ class ReservationForm(ctk.CTkFrame):
         order without leaking Keyescape's cap into standard sites or unlocking
         Naver's fixed single worker.
         """
+        if self.engine_mode_btn.get() == TRIPCOM_MODE:
+            self.threads_slider.configure(
+                from_=1, to=8, number_of_steps=7, state="disabled"
+            )
+            self.threads_slider.set(1)
+            self.threads_value_label.configure(text="1", text_color=theme.TEXT_DISABLED)
+            self.threads_title_label.configure(
+                text="동시 시도 수 (Trip.com은 1개 고정)",
+                text_color=theme.TEXT_DISABLED,
+            )
+            return
+
         if self.engine_mode_btn.get() == NAVER_MODE:
             self.naver_threads = 1
             self.threads_slider.configure(
@@ -1081,6 +1433,44 @@ class ReservationForm(ctk.CTkFrame):
             )
             return
 
+        if getattr(self, "_site_uses_cgv", lambda: False)():
+            self.cgv_threads = max(1, min(self.cgv_threads, CGV_MAX_WORKERS))
+            self.threads_slider.configure(
+                from_=1,
+                to=CGV_MAX_WORKERS,
+                number_of_steps=CGV_MAX_WORKERS - 1,
+                state="normal",
+            )
+            self.threads_slider.set(self.cgv_threads)
+            self.threads_value_label.configure(
+                text=str(self.cgv_threads), text_color=theme.ACCENT_BLUE
+            )
+            self.threads_title_label.configure(
+                text=f"동시 고속 API 감시 (CGV 안전 상한 {CGV_MAX_WORKERS} · 자동 감속)",
+                text_color=theme.TEXT_MUTE,
+            )
+            return
+
+        if self._site_uses_dpsnnn():
+            self.dpsnnn_threads = max(
+                1, min(self.dpsnnn_threads, DPSNNN_MAX_WORKERS)
+            )
+            self.threads_slider.configure(
+                from_=1,
+                to=DPSNNN_MAX_WORKERS,
+                number_of_steps=DPSNNN_MAX_WORKERS - 1,
+                state="normal",
+            )
+            self.threads_slider.set(self.dpsnnn_threads)
+            self.threads_value_label.configure(
+                text=str(self.dpsnnn_threads), text_color=theme.ACCENT_BLUE
+            )
+            self.threads_title_label.configure(
+                text=f"동시 감시 세션 (단편선 최대 {DPSNNN_MAX_WORKERS})",
+                text_color=theme.TEXT_MUTE,
+            )
+            return
+
         self.standard_threads = max(1, min(self.standard_threads, 50))
         self.threads_slider.configure(
             from_=1, to=50, number_of_steps=49, state="normal"
@@ -1098,7 +1488,7 @@ class ReservationForm(ctk.CTkFrame):
             self._remember_active_thread_value()
 
         self.last_mode = mode
-        if mode == NAVER_MODE:
+        if mode in {NAVER_MODE, TRIPCOM_MODE}:
             self.naver_threads = 1
 
         # MainWindow selects the remembered site for the new mode. set_site()
@@ -1111,13 +1501,13 @@ class ReservationForm(ctk.CTkFrame):
     # Engines that actually honour reservation_data["devMode"]: they drive a real
     # browser, so stopping short of the final click leaves something to inspect.
     # The HTTP engines post a form and have no such halfway point.
-    DEV_MODE_ENGINE_IDS = ("naver", "keyescape")
+    DEV_MODE_ENGINE_IDS = ("naver", "keyescape", "dpsnnn", "tripcom", "cgv")
     DEV_MODE_TEXT_ON = "개발자 테스트 (Npay는 임시 예약 후 결제 직전 정지)"
-    DEV_MODE_TEXT_OFF = "개발자 테스트 모드 (네이버·키이스케이프 전용)"
+    DEV_MODE_TEXT_OFF = "개발자 테스트 모드 (브라우저 예약 엔진 전용)"
 
     def _dev_mode_supported(self) -> bool:
         """Only the browser-driven engines have a halfway point to stop at."""
-        if self.engine_mode_btn.get() == NAVER_MODE:
+        if self.engine_mode_btn.get() in {NAVER_MODE, TRIPCOM_MODE}:
             return True
         if self.current_site == "키이스케이프":
             return True
@@ -1151,6 +1541,8 @@ class ReservationForm(ctk.CTkFrame):
         if getattr(self, "_booking_running", False):
             return
         is_naver = (self.engine_mode_btn.get() == NAVER_MODE)
+        is_tripcom = (self.engine_mode_btn.get() == TRIPCOM_MODE)
+        is_cgv = self._site_uses_cgv() and not is_naver and not is_tripcom
         keyescape_active = self._keyescape_ui_active()
         yescaptcha_on = (
             keyescape_active and bool(self.yescaptcha_enabled_var.get())
@@ -1166,6 +1558,12 @@ class ReservationForm(ctk.CTkFrame):
             )
         else:
             self.yescaptcha_frame.grid_forget()
+        if is_cgv:
+            self.cgv_auth_frame.grid()
+            self._on_cgv_booking_mode_change()
+            self.catalog_auto_refresh_checkbox.configure(state="disabled")
+        else:
+            self.cgv_auth_frame.grid_remove()
         
         if getattr(self, "_advanced_visible", False):
             self.threads_frame.grid(row=8, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
@@ -1198,20 +1596,47 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_label.configure(text_color=theme.TEXT_DISABLED)
 
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
+        elif is_tripcom:
+            self.branch_dropdown.configure(state="normal")
+            self.branch_label.configure(text_color=theme.TEXT_MUTE)
+            self.day_type_segmented.configure(state="disabled")
+            self.day_type_label.configure(text_color=theme.TEXT_DISABLED)
+            self.theme_dropdown.configure(state="normal")
+            self.theme_label.configure(text_color=theme.TEXT_MUTE)
+            self.custom_theme_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            self.theme_pk_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            self.time_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+            self.time_picker_btn.configure(state="disabled")
+            self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.phone_label.configure(text_color=theme.TEXT_MUTE)
+            self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
         else:
             # Enable standard controls
             self.branch_dropdown.configure(state="normal")
             self.branch_label.configure(text_color=theme.TEXT_MUTE)
+            self.cgv_site_no_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             
             self.day_type_segmented.configure(state="normal")
             self.day_type_label.configure(text_color=theme.TEXT_MUTE)
             
             self.theme_label.configure(text_color=theme.TEXT_MUTE)
+            self.cgv_movie_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.cgv_auditorium_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.cgv_seats_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             self.custom_theme_checkbox.configure(state="normal", text_color=theme.TEXT_MUTE)
             self.theme_pk_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.time_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.time_picker_btn.configure(state="normal")
             
+            self.name_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+            self.name_label.configure(text_color=theme.TEXT_MUTE)
             self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             self.phone_label.configure(text_color=theme.TEXT_MUTE)
+            if is_cgv:
+                self.name_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.name_label.configure(text_color=theme.TEXT_DISABLED)
+                self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.phone_label.configure(text_color=theme.TEXT_DISABLED)
             
             self._toggle_custom_theme()
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
@@ -1221,7 +1646,11 @@ class ReservationForm(ctk.CTkFrame):
         # Update Server Time Checkbox state
         current_mode = self.engine_mode_btn.get()
         site_name = self.current_site
-        is_supported_site = (current_mode == NAVER_MODE and site_name != "(네이버 예약을 등록하세요)") or (site_name == "키이스케이프")
+        is_supported_site = (
+            (current_mode == NAVER_MODE and site_name != "(네이버 예약을 등록하세요)")
+            or current_mode == TRIPCOM_MODE
+            or site_name == "키이스케이프"
+        )
 
         if is_supported_site:
             self.show_server_time_checkbox.configure(state="normal", text_color=theme.TEXT_MUTE)
@@ -1236,10 +1665,15 @@ class ReservationForm(ctk.CTkFrame):
         state = "disabled" if running else "normal"
         widgets = (
             self.branch_dropdown,
+            self.cgv_selector_button,
+            self.cgv_site_no_entry,
             self.day_type_segmented,
             self.theme_dropdown,
+            self.cgv_movie_entry,
             self.custom_theme_checkbox,
             self.theme_pk_entry,
+            self.cgv_auditorium_entry,
+            self.cgv_seats_entry,
             self.date_entry,
             self.date_picker_btn,
             self.time_entry,
@@ -1255,6 +1689,10 @@ class ReservationForm(ctk.CTkFrame):
             self.remember_personal_checkbox,
             self.catalog_auto_refresh_checkbox,
             self.catalog_refresh_btn,
+            self.cgv_booking_mode,
+            self.cgv_nonmember_birth_entry,
+            self.cgv_nonmember_phone_entry,
+            self.cgv_nonmember_password_entry,
         )
         for widget in widgets:
             try:
@@ -1289,15 +1727,34 @@ class ReservationForm(ctk.CTkFrame):
 
         # In Naver mode, hide all standard-engine-only form sections entirely, but show theme selection if there are multiple themes
         is_naver = (self.engine_mode_btn.get() == NAVER_MODE)
+        is_tripcom = (self.engine_mode_btn.get() == TRIPCOM_MODE)
+        is_cgv = self._site_uses_cgv() and not is_naver and not is_tripcom
         if is_naver:
             self.custom_theme_frame.grid_forget()
+            self.tripcom_event_frame.grid_forget()
             themes_dict = self.config.get("themes", {}).get("1", {})
             has_themes = len(themes_dict) > 0 and not (len(themes_dict) == 1 and list(themes_dict.keys())[0] == "기본테마")
             if has_themes:
                 self.theme_frame.grid(row=1, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
             else:
                 self.theme_frame.grid_forget()
+        elif is_tripcom:
+            self.custom_theme_frame.grid_forget()
+            self.tripcom_event_frame.grid(
+                row=2, column=0, columnspan=2,
+                padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew"
+            )
+            self.theme_frame.grid(row=1, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
+            self.branch_frame.grid(
+                row=0, column=0, columnspan=2,
+                padx=theme.CARD_PAD, pady=(theme.SPACE_2, theme.ROW_GAP), sticky="ew"
+            )
+            branch_options = list(self.config.get("branches", {}).keys())
+            self.branch_dropdown.configure(values=branch_options)
+            if branch_options and self.branch_var.get() not in branch_options:
+                self.branch_var.set(branch_options[0])
         else:
+            self.tripcom_event_frame.grid_forget()
             # Keep theme and custom theme frames always mapped in grid to prevent vertical jumping
             self.theme_frame.grid(row=1, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
             self.custom_theme_frame.grid(row=2, column=0, columnspan=2, padx=theme.CARD_PAD, pady=theme.ROW_GAP, sticky="ew")
@@ -1344,13 +1801,72 @@ class ReservationForm(ctk.CTkFrame):
                     else:
                         self.branch_var.set(branch_options[0])
 
+        self._configure_cgv_fields(is_cgv)
         self._update_theme_options()
         self._update_widgets_state()
         self._is_initializing = was_initializing
 
     def _on_branch_change(self, value):
+        self._sync_cgv_site_entry_visibility()
         self._update_theme_options()
         self.auto_save()
+
+    def _configure_cgv_fields(self, active: bool) -> None:
+        if active:
+            self.branch_label.configure(text="CGV 예매 대상")
+            self.branch_dropdown.pack_forget()
+            if not self.cgv_selector_frame.winfo_manager():
+                self.cgv_selector_frame.pack(fill="x")
+            self.theme_frame.grid_forget()
+            self.custom_theme_frame.grid_forget()
+            self.name_label.configure(text="이름 (CGV 로그인 정보 사용)")
+            self.phone_label.configure(text="전화번호 (CGV 로그인 정보 사용)")
+            self.cgv_auth_frame.grid()
+            self._on_cgv_booking_mode_change()
+            self.catalog_auto_refresh_checkbox.configure(
+                text="CGV 지점은 선택 창에서 실시간 조회", state="disabled"
+            )
+            self.catalog_refresh_btn.configure(text="CGV 선택 창 열기")
+            self._render_cgv_selection_summary()
+        else:
+            self.branch_label.configure(text="지점")
+            self.cgv_selector_frame.pack_forget()
+            if not self.branch_dropdown.winfo_manager():
+                self.branch_dropdown.pack(fill="x")
+            if not self.theme_frame.winfo_manager():
+                self.theme_frame.grid(
+                    row=1, column=0, columnspan=2, padx=theme.CARD_PAD,
+                    pady=theme.ROW_GAP, sticky="ew"
+                )
+            if not self.custom_theme_frame.winfo_manager():
+                self.custom_theme_frame.grid(
+                    row=2, column=0, columnspan=2, padx=theme.CARD_PAD,
+                    pady=theme.ROW_GAP, sticky="ew"
+                )
+            self.theme_label.configure(text="테마 선택")
+            self.cgv_movie_entry.pack_forget()
+            if not self.theme_dropdown.winfo_manager():
+                self.theme_dropdown.pack(fill="x")
+            self.cgv_options_frame.pack_forget()
+            if not self.checkbox_container.winfo_manager():
+                self.checkbox_container.pack(fill="x", anchor="w", pady=(0, theme.LABEL_GAP))
+            self.name_label.configure(text="이름")
+            self.phone_label.configure(text="전화번호")
+            self.cgv_auth_frame.grid_remove()
+            self.catalog_auto_refresh_checkbox.configure(
+                text="시작 시 사이트 정보 자동 갱신", state="normal"
+            )
+            self.catalog_refresh_btn.configure(text="현재 사이트 갱신")
+        self._sync_cgv_site_entry_visibility()
+
+    def _sync_cgv_site_entry_visibility(self) -> None:
+        if self._site_uses_cgv() and str(
+            self.config.get("branches", {}).get(self.branch_var.get(), "")
+        ) == CGV_MANUAL_SITE_VALUE:
+            if not self.cgv_site_no_entry.winfo_manager():
+                self.cgv_site_no_entry.pack(fill="x", pady=(4, 0))
+        else:
+            self.cgv_site_no_entry.pack_forget()
 
     def _on_day_type_change(self, value):
         self._update_theme_options()
@@ -1358,7 +1874,11 @@ class ReservationForm(ctk.CTkFrame):
 
     def _toggle_custom_theme(self):
         # Only run toggle behavior if not in Naver mode to prevent overriding disabled state
-        if self.engine_mode_btn.get() == NAVER_MODE:
+        if self.engine_mode_btn.get() in {NAVER_MODE, TRIPCOM_MODE}:
+            return
+        if self._site_uses_cgv():
+            self.theme_dropdown.configure(state="disabled")
+            self.theme_pk_entry.pack_forget()
             return
         if self.custom_theme_checkbox.get() == 1:
             self.theme_dropdown.configure(state="disabled")
@@ -1407,7 +1927,7 @@ class ReservationForm(ctk.CTkFrame):
 
     def _on_threads_slider_move(self, value):
         val = int(value)
-        if self.engine_mode_btn.get() == NAVER_MODE:
+        if self.engine_mode_btn.get() in {NAVER_MODE, TRIPCOM_MODE}:
             self.naver_threads = 1
             self.threads_slider.set(1)
             self.threads_value_label.configure(text="1")
@@ -1415,12 +1935,51 @@ class ReservationForm(ctk.CTkFrame):
         self.threads_value_label.configure(text=str(val))
         if self._site_uses_keyescape():
             self.keyescape_threads = max(1, min(val, 3))
+        elif self._site_uses_dpsnnn():
+            self.dpsnnn_threads = max(1, min(val, DPSNNN_MAX_WORKERS))
+        elif self._site_uses_cgv():
+            self.cgv_threads = max(1, min(val, CGV_MAX_WORKERS))
         else:
             self.standard_threads = max(1, min(val, 50))
         self.auto_save()
 
+    def _on_cgv_booking_mode_change(self, _value=None):
+        nonmember = self.cgv_booking_mode_var.get() == "비회원"
+        if nonmember:
+            self.cgv_auth_hint.configure(
+                text=(
+                    "현재 CGV 공식 비회원 예매는 생년월일·예매 비밀번호·휴대전화 인증을 요구합니다. "
+                    "시작 후 열린 Chrome에서 문자 인증번호를 확인합니다."
+                ),
+                text_color=theme.ACCENT_YELLOW,
+                wraplength=420,
+            )
+            self.cgv_nonmember_frame.grid(
+                row=2, column=0, columnspan=2, sticky="ew",
+                padx=theme.SPACE_2, pady=(0, theme.SPACE_2)
+            )
+        else:
+            self.cgv_auth_hint.configure(
+                text="전용 Chrome의 가장 최근 CGV 로그인 세션을 사용합니다.",
+                text_color=theme.TEXT_TERTIARY,
+                wraplength=420,
+            )
+            self.cgv_nonmember_frame.grid_forget()
+        self.auto_save()
+
     def _on_date_change(self, event=None):
         """Auto-detect weekday/weekend from the entered date."""
+        if self._site_uses_cgv():
+            date_str = self.date_entry.get().strip()
+            if self.cgv_selection and self.cgv_selection.get("date") != date_str:
+                self.cgv_selection = {
+                    "site_no": self.cgv_selection.get("site_no", ""),
+                    "site_name": self.cgv_selection.get("site_name", ""),
+                    "region": self.cgv_selection.get("region", ""),
+                }
+                self._render_cgv_selection_summary()
+                self.auto_save()
+            return
         if not self.current_site.startswith("제로월드"):
             return
         date_str = self.date_entry.get().strip()
@@ -1439,7 +1998,79 @@ class ReservationForm(ctk.CTkFrame):
             pass
 
     def _on_theme_change(self, value):
+        if self.engine_mode_btn.get() == TRIPCOM_MODE:
+            self._apply_tripcom_event_selection()
         self.auto_save()
+
+    def _selected_theme_metadata(self):
+        branch_id = self.config.get("branches", {}).get(self.branch_var.get(), "")
+        theme_id = self._theme_id_for_name(branch_id, self.theme_var.get())
+        metadata = self.config.get("theme_metadata", {}).get(branch_id, {}).get(theme_id, {})
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def _apply_tripcom_event_selection(self):
+        metadata = self._selected_theme_metadata()
+        allowed = [str(value) for value in metadata.get("allowed_dates", ()) if str(value)]
+        current = self.date_entry.get().strip()
+        if allowed and current not in allowed:
+            today = datetime.now().date().isoformat()
+            selected = next((value for value in allowed if value >= today), allowed[0])
+            self.date_entry.delete(0, "end")
+            self.date_entry.insert(0, selected)
+        open_time = str(metadata.get("open_time", ""))[:5]
+        if open_time:
+            self.time_entry.configure(state="normal")
+            self.time_entry.delete(0, "end")
+            self.time_entry.insert(0, open_time)
+            self.time_entry.configure(state="disabled")
+        if not metadata:
+            text = "고급 설정에서 이벤트 정보를 갱신해주세요."
+        else:
+            status_labels = {
+                "preheat": "오픈 전 · 상품 정보 확인 완료",
+                "flash_sale": (
+                    "항공 초특가 판매 중"
+                    if metadata.get("action_kind") == "flight_flash_sale"
+                    else "5만원 이벤트 판매 중"
+                ),
+                "backup_sale": "5만원 이벤트 종료 · 일반 특가만 판매",
+                "sold_out": (
+                    "항공 초특가 매진"
+                    if metadata.get("action_kind") == "flight_flash_sale"
+                    else "5만원 이벤트 매진"
+                ),
+                "ended": "이벤트 종료",
+            }
+            availability = status_labels.get(str(metadata.get("sale_status", "")))
+            if not availability:
+                availability = "앱 전용" if metadata.get("app_only") else (
+                    "현재 재고 있음" if metadata.get("in_stock") is True else (
+                        "현재 소진/오픈 전" if metadata.get("in_stock") is False else "재고 확인 필요"
+                    )
+                )
+            dates = " · ".join(allowed[:3])
+            if len(allowed) > 3:
+                dates += f" 외 {len(allowed) - 3}일"
+            detail = ""
+            if metadata.get("action_kind") == "hotel_flash_sale":
+                detail = (
+                    f"\n{metadata.get('hotel_name', '')} · {metadata.get('room_name', '')}"
+                    f" · 체크인 {metadata.get('check_in', '-') }"
+                )
+            elif metadata.get("action_kind") == "flight_flash_sale":
+                detail = (
+                    f"\n{metadata.get('departure_city', '')}→{metadata.get('arrival_city', '')}"
+                    f" · 탑승 {metadata.get('departure_date', '-') }"
+                    f" · {metadata.get('airline_name', '')}"
+                    f" · {metadata.get('event_price', '-') }원"
+                )
+            elif metadata.get("action_kind") == "flight_coupon":
+                detail = (
+                    "\n항공권 선착순 할인코드 · 복사/발급 후 결제 단계에서 사용"
+                    " · 코드 확보만으로 할인 재고가 확정되지는 않음"
+                )
+            text = f"오픈 {open_time or '-'} · {availability}\n가능 날짜 {dates or '-'}{detail}"
+        self.tripcom_event_label.configure(text=text)
 
     def auto_save(self):
         if getattr(self, "_is_initializing", False):
@@ -1457,7 +2088,12 @@ class ReservationForm(ctk.CTkFrame):
             self.save_config(self.current_site)
 
     def _update_theme_options(self):
-        if self.current_site in self.custom_sites:
+        if self.engine_mode_btn.get() == TRIPCOM_MODE:
+            branch_name = self.branch_var.get()
+            branch_id = self.config.get("branches", {}).get(branch_name, "")
+            themes_dict = self.config.get("themes", {}).get(branch_id, {})
+            theme_names = sorted(list(themes_dict.keys()))
+        elif self.current_site in self.custom_sites:
             branch_name = self.branch_var.get()
             branch_id = self.config["branches"].get(branch_name, "1")
             themes_dict = self.config["themes"].get(branch_id, {})
@@ -1497,20 +2133,30 @@ class ReservationForm(ctk.CTkFrame):
                 self.theme_var.set(theme_names[0])
         else:
             self.theme_var.set("")
+        if self.engine_mode_btn.get() == TRIPCOM_MODE:
+            self._apply_tripcom_event_selection()
 
     def get_reservation_data(self):
         is_naver = self.engine_mode_btn.get() == NAVER_MODE
+        is_tripcom = self.engine_mode_btn.get() == TRIPCOM_MODE
+        is_cgv = self._site_uses_cgv() and not is_naver and not is_tripcom
         branch_name = self.branch_var.get()
         branches = self.config.get("branches", {})
         if not branch_name and branches:
             branch_name = next(iter(branches))
         branch_id = "1" if is_naver else branches.get(branch_name, "1")
+        if is_cgv:
+            branch_id = self._selected_cgv_site_no()
 
         theme_name = self.theme_var.get()
         if is_naver:
             theme_pk = self.config.get("themes", {}).get("1", {}).get(theme_name, "")
             if not theme_pk or theme_pk == "naver":
                 theme_pk = self.config.get("url", "")
+        elif is_tripcom:
+            theme_pk = self.config.get("themes", {}).get(branch_id, {}).get(theme_name, "")
+        elif is_cgv:
+            theme_pk = str(self.cgv_selection.get("movie", "")).strip()
         elif self.custom_theme_checkbox.get() == 1:
             theme_pk = self.theme_pk_entry.get().strip()
         elif self.current_site in self.custom_sites:
@@ -1538,7 +2184,13 @@ class ReservationForm(ctk.CTkFrame):
             "phone": self.phone_entry.get().strip(),
             "people": self.people_entry.get().strip(),
             "themePK": theme_pk,
-            "themeLabel": self.theme_var.get() if not self.custom_theme_checkbox.get() else f"직접 입력 ({theme_pk})",
+            "themeLabel": (
+                theme_pk
+                if is_cgv
+                else self.theme_var.get()
+                if not self.custom_theme_checkbox.get()
+                else f"직접 입력 ({theme_pk})"
+            ),
             "reservationTime": self.time_entry.get().strip(),
             "paymentType": "1",
             "policy": "true",
@@ -1562,22 +2214,104 @@ class ReservationForm(ctk.CTkFrame):
                 "engine_options": self.config.get("engine_options", {}),
             },
         }
+        if is_cgv:
+            raw_values["engine_metadata"]["cgv"] = {
+                "site_name": self.cgv_selection.get("site_name", branch_name),
+                "movie": theme_pk,
+                "auditorium": str(self.cgv_selection.get("auditorium", "")).strip(),
+                "format": str(self.cgv_selection.get("format", "")).strip(),
+                "seats": str(self.cgv_selection.get("seats", "")).strip(),
+                "reference_date": str(self.cgv_selection.get("reference_date", "")),
+                "reference_only": bool(self.cgv_selection.get("reference_only", False)),
+                "booking_mode": self.cgv_booking_mode_var.get(),
+                "nonmember_birth": self.cgv_nonmember_birth_entry.get().strip(),
+                "nonmember_phone": self.cgv_nonmember_phone_entry.get().strip(),
+                "nonmember_password": self.cgv_nonmember_password_entry.get(),
+            }
         try:
             request = ReservationRequest.from_mapping(self.current_site, raw_values)
         except ValueError:
             return None, "인원 수를 숫자로 입력해주세요.", 0, False
-        errors = request.validate(phone_required=not is_naver)
+        errors = request.validate(
+            phone_required=not (is_naver or is_cgv),
+            name_required=not is_cgv,
+        )
         if errors:
             return None, errors[0], 0, False
 
-        if is_naver:
+        if is_cgv:
+            import re
+
+            cgv_metadata = raw_values["engine_metadata"]["cgv"]
+            if not re.fullmatch(r"\d{4}", request.branch):
+                return None, "CGV 전용 선택 화면에서 지점을 선택해주세요.", 0, False
+            if not cgv_metadata["movie"]:
+                return None, "CGV 전용 선택 화면에서 영화와 회차를 선택해주세요.", 0, False
+            if not cgv_metadata["auditorium"]:
+                return None, "CGV 전용 선택 화면에서 상영관을 선택해주세요.", 0, False
+            if request.people > 8:
+                return None, "CGV 관람 인원은 최대 8명입니다.", 0, False
+            if not parse_seat_groups(cgv_metadata["seats"], request.people):
+                return (
+                    None,
+                    "CGV 좌석도에서 인원수와 같은 개수의 좌석 우선순위를 선택해주세요.",
+                    0,
+                    False,
+                )
+            if cgv_metadata["booking_mode"] == "비회원":
+                if not re.fullmatch(r"\d{8}", cgv_metadata["nonmember_birth"]):
+                    return None, "CGV 비회원 생년월일을 YYYYMMDD 8자리로 입력해주세요.", 0, False
+                if not re.fullmatch(r"01\d{8,9}", re.sub(r"\D", "", cgv_metadata["nonmember_phone"])):
+                    return None, "CGV 비회원 휴대전화번호를 정확히 입력해주세요.", 0, False
+                password = cgv_metadata["nonmember_password"]
+                if not (
+                    8 <= len(password) <= 16
+                    and re.search(r"[A-Za-z]", password)
+                    and re.search(r"\d", password)
+                    and re.search(r"[^A-Za-z0-9]", password)
+                ):
+                    return None, "CGV 비회원 예매 비밀번호는 영문·숫자·특수문자를 포함한 8~16자여야 합니다.", 0, False
+
+        if is_tripcom:
+            event_metadata = raw_values["engine_metadata"]["theme"]
+            allowed_dates = {str(value) for value in event_metadata.get("allowed_dates", ())}
+            if allowed_dates and request.reservation_date not in allowed_dates:
+                return None, "선택한 이벤트가 열리는 날짜를 달력에서 선택해주세요.", 0, False
+            if event_metadata.get("app_only"):
+                return None, "이 이벤트는 Trip.com 앱 전용이라 PC에서 선점할 수 없습니다.", 0, False
+            if event_metadata.get("action_kind") == "hotel_flash_sale" and str(
+                event_metadata.get("sale_status", "")
+            ) in {"backup_sale", "sold_out", "ended"}:
+                return (
+                    None,
+                    "선택한 5만원 호텔 이벤트는 이미 종료되었거나 매진되었습니다. 이벤트를 갱신해주세요.",
+                    0,
+                    False,
+                )
+            if event_metadata.get("action_kind") == "flight_flash_sale" and str(
+                event_metadata.get("sale_status", "")
+            ) in {"sold_out", "ended"}:
+                return (
+                    None,
+                    "선택한 항공 초특가 이벤트는 이미 종료되었거나 매진되었습니다. 이벤트를 갱신해주세요.",
+                    0,
+                    False,
+                )
+
+        if is_naver or is_tripcom:
             threads = 1
         elif keyescape_active:
             threads = int(self.threads_slider.get())
             threads = max(1, min(threads, 3))
+        elif self._site_uses_dpsnnn():
+            threads = max(
+                1, min(int(self.threads_slider.get()), DPSNNN_MAX_WORKERS)
+            )
+        elif is_cgv:
+            threads = max(1, min(int(self.threads_slider.get()), CGV_MAX_WORKERS))
         else:
             threads = max(1, min(int(self.threads_slider.get()), 50))
-        return request, None, threads, not is_naver
+        return request, None, threads, not (is_naver or is_tripcom)
 
     def _format_phone(self, event=None):
         if event and event.keysym in ("BackSpace", "Delete", "Left", "Right", "Up", "Down"):
@@ -1673,6 +2407,9 @@ class ReservationForm(ctk.CTkFrame):
         config = load_json("config.json", {})
         stored_name = self.secret_store.get("reservation_name")
         stored_phone = self.secret_store.get("reservation_phone")
+        stored_cgv_birth = self.secret_store.get("cgv_nonmember_birth")
+        stored_cgv_phone = self.secret_store.get("cgv_nonmember_phone")
+        stored_cgv_password = self.secret_store.get("cgv_nonmember_password")
         # Drop any captcha key left over from an earlier version so the secret
         # store does not keep a credential nothing uses.
         try:
@@ -1685,6 +2422,12 @@ class ReservationForm(ctk.CTkFrame):
                 self.name_entry.insert(0, stored_name)
             if stored_phone:
                 self.phone_entry.insert(0, stored_phone)
+            if stored_cgv_birth:
+                self.cgv_nonmember_birth_entry.insert(0, stored_cgv_birth)
+            if stored_cgv_phone:
+                self.cgv_nonmember_phone_entry.insert(0, stored_cgv_phone)
+            if stored_cgv_password:
+                self.cgv_nonmember_password_entry.insert(0, stored_cgv_password)
             return
         self._is_initializing = True
         config_migrated = False
@@ -1755,6 +2498,32 @@ class ReservationForm(ctk.CTkFrame):
                 if "theme_pk" in config:
                     self.theme_pk_entry.delete(0, "end")
                     self.theme_pk_entry.insert(0, config["theme_pk"])
+                if self._site_uses_cgv():
+                    saved_selection = config.get("cgv_selection", {})
+                    if isinstance(saved_selection, dict):
+                        self.cgv_selection = dict(saved_selection)
+                    for key, entry in (
+                        ("cgv_site_no", self.cgv_site_no_entry),
+                        ("cgv_movie", self.cgv_movie_entry),
+                        ("cgv_auditorium", self.cgv_auditorium_entry),
+                        ("cgv_seats", self.cgv_seats_entry),
+                    ):
+                        if key in config:
+                            entry.delete(0, "end")
+                            entry.insert(0, str(config[key]))
+                    if not self.cgv_selection and config.get("cgv_site_no"):
+                        self.cgv_selection = {
+                            "site_no": str(config.get("cgv_site_no", "")),
+                            "site_name": self.branch_var.get(),
+                            "movie": str(config.get("cgv_movie", "")),
+                            "auditorium": str(config.get("cgv_auditorium", "")),
+                            "show_time": str(config.get("time", "")),
+                            "seats": str(config.get("cgv_seats", "")),
+                            "date": str(config.get("date", "")),
+                        }
+                        config_migrated = True
+                    self._render_cgv_selection_summary()
+                    self._sync_cgv_site_entry_visibility()
             else:
                 self._update_theme_options()
                 
@@ -1800,9 +2569,20 @@ class ReservationForm(ctk.CTkFrame):
                 self.keyescape_threads = max(
                     1, min(int(config["keyescape_threads"]), 3)
                 )
+            if "dpsnnn_threads" in config:
+                self.dpsnnn_threads = max(
+                    1,
+                    min(int(config["dpsnnn_threads"]), DPSNNN_MAX_WORKERS),
+                )
+            if "cgv_threads" in config:
+                self.cgv_threads = max(
+                    1, min(int(config["cgv_threads"]), CGV_MAX_WORKERS)
+                )
 
             if "engine_mode" in config:
                 mode_val = LEGACY_MODE_MAP.get(config["engine_mode"], config["engine_mode"])
+                if mode_val == TRIPCOM_MODE:
+                    mode_val = STANDARD_MODE
                 self.engine_mode_btn.set(mode_val)
                 self._on_mode_change(mode_val)
             elif "is_async" in config:
@@ -1843,6 +2623,31 @@ class ReservationForm(ctk.CTkFrame):
                 self.yescaptcha_soft_id_entry.insert(0, config["yescaptcha_soft_id"])
 
             self.catalog_auto_refresh_var.set(bool(config.get("catalog_auto_refresh", True)))
+            cgv_mode = str(config.get("cgv_booking_mode", "회원"))
+            self.cgv_booking_mode_var.set(cgv_mode if cgv_mode in {"회원", "비회원"} else "회원")
+            cgv_birth = stored_cgv_birth or str(
+                config.get("cgv_nonmember_birth", "")
+            )
+            cgv_phone = stored_cgv_phone or str(
+                config.get("cgv_nonmember_phone", "")
+            )
+            self.cgv_nonmember_birth_entry.delete(0, "end")
+            self.cgv_nonmember_birth_entry.insert(0, cgv_birth)
+            self.cgv_nonmember_phone_entry.delete(0, "end")
+            self.cgv_nonmember_phone_entry.insert(0, cgv_phone)
+            cgv_password = stored_cgv_password
+            if cgv_password:
+                self.cgv_nonmember_password_entry.delete(0, "end")
+                self.cgv_nonmember_password_entry.insert(0, cgv_password)
+            if "cgv_nonmember_birth" in config or "cgv_nonmember_phone" in config:
+                if cgv_birth:
+                    self.secret_store.set("cgv_nonmember_birth", cgv_birth)
+                if cgv_phone:
+                    self.secret_store.set("cgv_nonmember_phone", cgv_phone)
+                config.pop("cgv_nonmember_birth", None)
+                config.pop("cgv_nonmember_phone", None)
+                config_migrated = True
+            self._on_cgv_booking_mode_change()
             if saved_site == self.current_site:
                 if not config.get("selected_branch_id"):
                     selected_branch_id = self._selected_branch_id()
@@ -1865,11 +2670,20 @@ class ReservationForm(ctk.CTkFrame):
     def save_config(self, site_name):
         try:
             # Sync active memory thread counts before saving
-            if self.engine_mode_btn.get() == NAVER_MODE:
+            if self.engine_mode_btn.get() in {NAVER_MODE, TRIPCOM_MODE}:
                 self.naver_threads = 1
             elif self._site_uses_keyescape():
                 self.keyescape_threads = max(
                     1, min(int(self.threads_slider.get()), 3)
+                )
+            elif self._site_uses_dpsnnn():
+                self.dpsnnn_threads = max(
+                    1,
+                    min(int(self.threads_slider.get()), DPSNNN_MAX_WORKERS),
+                )
+            elif self._site_uses_cgv():
+                self.cgv_threads = max(
+                    1, min(int(self.threads_slider.get()), CGV_MAX_WORKERS)
                 )
             else:
                 self.standard_threads = int(self.threads_slider.get())
@@ -1881,6 +2695,21 @@ class ReservationForm(ctk.CTkFrame):
             else:
                 self.secret_store.delete("reservation_name")
                 self.secret_store.delete("reservation_phone")
+            cgv_password = self.cgv_nonmember_password_entry.get()
+            cgv_birth = self.cgv_nonmember_birth_entry.get().strip()
+            cgv_phone = self.cgv_nonmember_phone_entry.get().strip()
+            if cgv_password:
+                self.secret_store.set("cgv_nonmember_password", cgv_password)
+            else:
+                self.secret_store.delete("cgv_nonmember_password")
+            if cgv_birth:
+                self.secret_store.set("cgv_nonmember_birth", cgv_birth)
+            else:
+                self.secret_store.delete("cgv_nonmember_birth")
+            if cgv_phone:
+                self.secret_store.set("cgv_nonmember_phone", cgv_phone)
+            else:
+                self.secret_store.delete("cgv_nonmember_phone")
 
             config = {
                 "site": site_name,
@@ -1895,6 +2724,10 @@ class ReservationForm(ctk.CTkFrame):
                 "threads": self.standard_threads,
                 "naver_threads": self.naver_threads,
                 "keyescape_threads": self.keyescape_threads,
+                "dpsnnn_threads": self.dpsnnn_threads,
+                "cgv_threads": self.cgv_threads,
+                "cgv_selection": dict(self.cgv_selection),
+                "cgv_booking_mode": self.cgv_booking_mode_var.get(),
                 "is_async": self.engine_mode_btn.get() == STANDARD_MODE,
                 "engine_mode": self.engine_mode_btn.get(),
                 "show_server_time": bool(self.show_server_time_checkbox.get()),
@@ -1926,6 +2759,8 @@ class ReservationForm(ctk.CTkFrame):
         return self._theme_id_for_name(branch_id, self.theme_var.get())
 
     def _selected_branch_id(self):
+        if self._site_uses_cgv():
+            return str(self.cgv_selection.get("site_no", ""))
         branch_name = self.branch_var.get()
         return str(
             self.config.get("branch_ids", {}).get(
@@ -1945,6 +2780,8 @@ class ReservationForm(ctk.CTkFrame):
             return str(ZEROWORLD_THEMES.get(branch_id, {}).get(theme_name, ""))
         if self.current_site == "둠이스케이프":
             return str(DOOMESCAPE_THEMES.get(branch_id, {}).get(theme_name, ""))
+        if self.current_site == "Trip.com 핫딜":
+            return str(self.config.get("themes", {}).get(branch_id, {}).get(theme_name, ""))
         if self.current_site in self.custom_sites:
             return str(self.config.get("themes", {}).get(branch_id, {}).get(theme_name, ""))
         return str(JIGUBYEOL_THEMES.get(branch_id, {}).get(theme_name, ""))

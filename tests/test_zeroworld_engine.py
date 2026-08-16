@@ -1,6 +1,10 @@
+import asyncio
+
 import pytest
 
+import engines.zeroworld_shin_engine as zeroworld_shin
 from engines.zeroworld_shin_engine import ZeroWorldShinEngine
+from pengucro.models import BookingResult
 
 
 def make_engine():
@@ -45,3 +49,145 @@ def test_submission_acceptance_rejects_failure_alert():
         "https://zeroworldkorea.com/layout/res/home.php?go=rev.kcp&code=abc",
         [],
     )
+
+
+class FakeResponse:
+    def __init__(self, status=200, body=b"", url="https://zero.example/response", history=None):
+        self.status = status
+        self._body = body
+        self.url = url
+        self.history = history or []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def read(self):
+        return self._body
+
+
+class SequenceSession:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.posts = []
+
+    def post(self, url, data=None):
+        self.posts.append((url, data))
+        return next(self.responses)
+
+
+def test_blank_exception_is_identifiable_and_sensitive_query_values_are_redacted():
+    assert ZeroWorldShinEngine._format_exception(asyncio.TimeoutError()) == "TimeoutError"
+
+    message = ZeroWorldShinEngine._format_exception(
+        RuntimeError("https://zero.example/pay?code=SECRET&mobile=01012345678")
+    )
+
+    assert message.startswith("RuntimeError:")
+    assert "SECRET" not in message
+    assert "01012345678" not in message
+
+
+def test_slot_http_failure_log_has_worker_status_rtt_and_retry_reason():
+    logs = []
+    engine = ZeroWorldShinEngine(
+        "https://zero.example",
+        lambda message, level: logs.append((message, level)),
+    )
+    context = engine._build_context(
+        {
+            "branch": "1",
+            "reservationDate": "2026-08-14",
+            "reservationTime": "11:00:00",
+            "themePK": "28",
+            "name": "테스트",
+            "phone": "01012345678",
+            "people": "2",
+        }
+    )
+    session = SequenceSession([FakeResponse(status=503, body=b"maintenance")])
+
+    slot_id = asyncio.run(engine._find_slot(session, context, "작업 4"))
+
+    assert slot_id == ""
+    message = logs[-1][0]
+    assert "[작업 4]" in message
+    assert "슬롯 조회 응답" in message
+    assert "HTTP 503" in message
+    assert "RTT" in message
+    assert "재시도" in message
+
+
+def test_submit_log_records_each_stage_and_acceptance_evidence(monkeypatch):
+    logs = []
+    engine = ZeroWorldShinEngine(
+        "https://zero.example",
+        lambda message, level: logs.append((message, level)),
+    )
+    context = engine._build_context(
+        {
+            "branch": "1",
+            "reservationDate": "2026-08-14",
+            "reservationTime": "11:00:00",
+            "themePK": "28",
+            "name": "테스트",
+            "phone": "01012345678",
+            "people": "2",
+        }
+    )
+    session = SequenceSession(
+        [
+            FakeResponse(),
+            FakeResponse(),
+            FakeResponse(),
+            FakeResponse(
+                body=b'<form action="rev.make.mutong.php"><input name="code" value="secret"></form>',
+                url="https://zero.example/rev.make.mutong.php",
+            ),
+        ]
+    )
+
+    async def fake_complete(*_args, **_kwargs):
+        return BookingResult(True, "완료")
+
+    monkeypatch.setattr(engine, "_complete_payment", fake_complete)
+    result = asyncio.run(engine._submit(session, context, "SLOT-17", "작업 2"))
+
+    assert result and result.success
+    text = "\n".join(message for message, _level in logs)
+    for stage in ("테마 목록 준비", "테마 선택 준비", "시간 선택 준비", "예약 제출"):
+        assert stage in text
+    assert "HTTP 200" in text
+    assert "RTT" in text
+    assert "슬롯 ID SLOT-17" in text
+    assert "예약 제출 승인 경로 확인" in text
+    assert "secret" not in text
+
+
+def test_debug_file_contains_structure_summary_without_raw_sensitive_html(tmp_path, monkeypatch):
+    monkeypatch.setattr(zeroworld_shin, "data_path", lambda filename: tmp_path / filename)
+    body = """
+    <html><head><title>예약자 홍길동 010-1234-5678</title></head><body>
+      <form action="/pay?code=SECRET-CODE">
+        <input name="name" value="홍길동">
+        <input name="mobile" value="010-1234-5678">
+        <input name="ck_code" value="SECRET-TOKEN">
+      </form>
+      <script>alert('계좌 123456789012'); location='rev.make.end';</script>
+    </body></html>
+    """
+
+    target = ZeroWorldShinEngine._save_debug("safe-debug.html", body, "결제 결과")
+    saved = target.read_text(encoding="utf-8")
+
+    assert "제로월드 안전 진단 요약" in saved
+    assert "응답 길이" in saved
+    assert "SHA-256" in saved
+    assert "SECRET-CODE" not in saved
+    assert "SECRET-TOKEN" not in saved
+    assert "홍길동" not in saved
+    assert "010-1234-5678" not in saved
+    assert "123456789012" not in saved
+    assert "<input" not in saved

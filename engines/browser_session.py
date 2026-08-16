@@ -38,6 +38,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from pengucro.diagnostics import format_exception
 from pengucro.storage import get_data_dir
 
 
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 # Chrome started with the now-ineffective switch combination.
 DEFAULT_CDP_PORT = 9333
 PROFILE_DIR_NAME = "chrome-profile"
+SESSION_LOCK_DIR_NAME = "chrome-session-locks"
+ISOLATED_SLOT_COUNT = 4
 LAUNCH_TIMEOUT_SECONDS = 25.0
 
 
@@ -70,8 +73,99 @@ def find_chrome() -> Path | None:
     return None
 
 
-def profile_dir() -> Path:
-    return get_data_dir() / PROFILE_DIR_NAME
+def profile_dir(slot: int = 1) -> Path:
+    suffix = "" if int(slot) <= 1 else f"-{int(slot)}"
+    return get_data_dir() / f"{PROFILE_DIR_NAME}{suffix}"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            # Access denied still proves that the process exists.
+            return int(kernel32.GetLastError()) == 5
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+class ChromeSlotLease:
+    """Cross-process ownership of one Chrome port/profile pair."""
+
+    def __init__(self, slot: int, lock_path: Path):
+        self.slot = int(slot)
+        self.port = DEFAULT_CDP_PORT + self.slot - 1
+        self.profile_path = profile_dir(self.slot)
+        self.lock_path = lock_path
+        self.pid = os.getpid()
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            owner = int(self.lock_path.read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            owner = 0
+        if owner != self.pid:
+            return
+        try:
+            self.lock_path.unlink()
+        except OSError:
+            pass
+
+
+def acquire_chrome_slot(slot_count: int = ISOLATED_SLOT_COUNT) -> ChromeSlotLease | None:
+    """Atomically reserve a persistent Chrome slot for this program process."""
+    lock_dir = get_data_dir() / SESSION_LOCK_DIR_NAME
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    for slot in range(1, max(1, int(slot_count)) + 1):
+        port = DEFAULT_CDP_PORT + slot - 1
+        # Do not claim a slot whose port belongs to an unrelated application.
+        if is_port_open(port) and not cdp_descriptor(port):
+            continue
+        lock_path = lock_dir / f"slot-{slot}.lock"
+        for _attempt in range(2):
+            try:
+                handle = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+            except FileExistsError:
+                try:
+                    owner = int(lock_path.read_text(encoding="ascii").strip())
+                except (OSError, ValueError):
+                    owner = 0
+                if _pid_alive(owner):
+                    break
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    break
+                continue
+            try:
+                os.write(handle, str(os.getpid()).encode("ascii"))
+            finally:
+                os.close(handle)
+            return ChromeSlotLease(slot, lock_path)
+    return None
 
 
 def is_port_open(port: int, timeout: float = 0.4) -> bool:
@@ -107,12 +201,24 @@ def free_port(preferred: int) -> int:
 class ChromeSession:
     """A Chrome instance reachable over CDP, plus how it got there."""
 
-    def __init__(self, endpoint: str, port: int, process, launched: bool, first_run: bool):
+    def __init__(
+        self,
+        endpoint: str,
+        port: int,
+        process,
+        launched: bool,
+        first_run: bool,
+        *,
+        profile_path: Path | None = None,
+        lease: ChromeSlotLease | None = None,
+    ):
         self.endpoint = endpoint
         self.port = port
         self.process = process
         self.launched = launched
         self.first_run = first_run
+        self.profile_path = profile_path or profile_dir()
+        self.lease = lease
 
     def close_if_launched(self) -> None:
         """Only terminate Chrome if this object started it."""
@@ -127,8 +233,20 @@ class ChromeSession:
             except Exception:
                 pass
 
+    def release(self) -> None:
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
 
-def start_or_attach(port: int = DEFAULT_CDP_PORT, log=None) -> ChromeSession | None:
+
+def start_or_attach(
+    port: int = DEFAULT_CDP_PORT,
+    log=None,
+    *,
+    profile_path: Path | None = None,
+    allow_port_fallback: bool = True,
+    lease: ChromeSlotLease | None = None,
+) -> ChromeSession | None:
     """Reuse a running CDP-enabled Chrome, or start one on a dedicated profile."""
 
     def emit(message, level="info"):
@@ -136,13 +254,16 @@ def start_or_attach(port: int = DEFAULT_CDP_PORT, log=None) -> ChromeSession | N
             log(message, level)
         logger.info(message)
 
-    port = free_port(port)
+    if allow_port_fallback:
+        port = free_port(port)
 
     existing = cdp_descriptor(port)
     if existing:
         emit(f"실행 중인 Chrome에 연결합니다. ({existing.get('Browser', 'Chrome')})")
         return ChromeSession(
-            f"http://127.0.0.1:{port}", port, None, launched=False, first_run=False
+            f"http://127.0.0.1:{port}", port, None,
+            launched=False, first_run=False,
+            profile_path=profile_path, lease=lease,
         )
 
     if is_port_open(port):
@@ -151,6 +272,8 @@ def start_or_attach(port: int = DEFAULT_CDP_PORT, log=None) -> ChromeSession | N
             "다른 포트로 시도합니다.",
             "warning",
         )
+        if not allow_port_fallback:
+            return None
         port = free_port(port + 1)
 
     executable = find_chrome()
@@ -158,7 +281,7 @@ def start_or_attach(port: int = DEFAULT_CDP_PORT, log=None) -> ChromeSession | N
         emit("[경고] Chrome 실행 파일을 찾지 못했습니다.", "warning")
         return None
 
-    data_dir = profile_dir()
+    data_dir = profile_path or profile_dir()
     first_run = not data_dir.exists()
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -193,7 +316,11 @@ def start_or_attach(port: int = DEFAULT_CDP_PORT, log=None) -> ChromeSession | N
             creationflags=creation_flags,
         )
     except Exception as exc:
-        emit(f"[경고] Chrome 실행 실패: {exc}", "warning")
+        emit(
+            f"[경고] Chrome 실행 실패 · 포트 {port} · "
+            f"{format_exception(exc)}",
+            "warning",
+        )
         return None
 
     deadline = time.monotonic() + LAUNCH_TIMEOUT_SECONDS
@@ -209,16 +336,58 @@ def start_or_attach(port: int = DEFAULT_CDP_PORT, log=None) -> ChromeSession | N
                     "warning",
                 )
             return ChromeSession(
-                f"http://127.0.0.1:{port}", port, process, launched=True, first_run=first_run
+                f"http://127.0.0.1:{port}", port, process,
+                launched=True, first_run=first_run,
+                profile_path=data_dir, lease=lease,
             )
         if process.poll() is not None:
-            emit("[경고] Chrome이 예상보다 빨리 종료되었습니다.", "warning")
+            emit(
+                f"[경고] Chrome이 예상보다 빨리 종료되었습니다 · "
+                f"종료 코드 {process.returncode} · 포트 {port}",
+                "warning",
+            )
             return None
         time.sleep(0.25)
 
-    emit("[경고] Chrome DevTools 연결 시간이 초과되었습니다.", "warning")
+    emit(
+        f"[경고] Chrome DevTools 연결 시간이 초과되었습니다 · "
+        f"{LAUNCH_TIMEOUT_SECONDS:.0f}초 · 포트 {port}",
+        "warning",
+    )
     try:
         process.terminate()
     except Exception:
         pass
     return None
+
+
+def start_isolated(log=None, slot_count: int = ISOLATED_SLOT_COUNT) -> ChromeSession | None:
+    """Start or attach using a slot no other Pengucro process currently owns."""
+
+    def emit(message, level="info"):
+        if log:
+            log(message, level)
+        logger.info(message)
+
+    lease = acquire_chrome_slot(slot_count)
+    if lease is None:
+        emit(
+            f"[경고] 독립 Chrome 슬롯 {slot_count}개가 모두 사용 중입니다.",
+            "warning",
+        )
+        return None
+    emit(
+        f"독립 Chrome 슬롯 {lease.slot}번을 사용합니다. "
+        f"(포트 {lease.port})",
+        "info",
+    )
+    session = start_or_attach(
+        lease.port,
+        log,
+        profile_path=lease.profile_path,
+        allow_port_fallback=False,
+        lease=lease,
+    )
+    if session is None:
+        lease.release()
+    return session

@@ -300,6 +300,21 @@ KEYESCAPE_THEMES = {
 }
 
 SITES_CONFIG = {
+    "CGV": {
+        "url": "https://cgv.co.kr/cnm/movieBook/cinema",
+        # Region, site, movie, screening and seat data are loaded from CGV's
+        # same-origin BFF in the dedicated selector.  No user-facing CGV
+        # catalog is hard-coded here.
+        "branches": {},
+        "themes": {},
+        "has_weekday_weekend": False,
+        "engine_options": {
+            "max_workers": 3,
+            "default_workers": 2,
+            "poll_interval": 0.65,
+            "request_timeout": 10.0,
+        },
+    },
     "제로월드": {
         "url": "https://zeroworldkorea.com/layout/res/home.php?go=main",
         "branches": {

@@ -22,3 +22,11 @@ logs/
 .env
 venv/
 .venv/
+.codex-*
+.impeccable/
+build-*/
+build_*/
+dist-*/
+core/
+live_*
+naver_live_submit_bundle.js

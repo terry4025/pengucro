@@ -19,6 +19,7 @@ import ui.theme as theme
 from ui.main_window import MainWindow
 from ui.log_panel import LogPanel
 from ui.reservation_form import ReservationForm
+from pengucro import __version__
 from pengucro.models import NAVER_MODE, STANDARD_MODE
 
 # Monkey-patch MainWindow to avoid start-up network fetch of themes in background
@@ -43,7 +44,7 @@ class TestUIComponents(unittest.TestCase):
         _TEST_DATA_DIR.cleanup()
 
     def test_1_mainwindow_title_bar(self):
-        print("\n--- Verifying MainWindow Title Bar Traffic Lights & Pin ---")
+        print("\n--- Verifying MainWindow Title Bar Controls ---")
 
         # Borderless Tk windows use a separate native parent for the taskbar.
         # Verify that both icon sizes were loaded for that Win32 window.
@@ -59,6 +60,13 @@ class TestUIComponents(unittest.TestCase):
         self.assertIsNotNone(self.app.title_bar, "Title bar should not be None")
         self.assertEqual(self.app.title_bar.cget("height"), 36, "Title bar height should be 36")
         self.assertEqual(self.app.title_bar.cget("fg_color"), theme.SURFACE_COLOR, f"Title bar fg_color should be theme.SURFACE_COLOR ({theme.SURFACE_COLOR})")
+        self.assertEqual(self.app.title(), f"방탈출 펭크로 {__version__}")
+        self.assertEqual(self.app.title_label.cget("text"), f"방탈출 펭크로 {__version__}")
+        self.assertNotIn(" v", self.app.title_label.cget("text"))
+        self.assertFalse(
+            hasattr(self.app, "big_title_label"),
+            "The duplicate body title must not be created",
+        )
         print("[Pass] MainWindow Title Bar exists with correct height & surface color.")
 
         # Find dots_frame (Mac traffic light container on the left)
@@ -99,6 +107,86 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(self.app.pin_btn.cget("fg_color"), "transparent", "Pin button fg_color must be transparent")
         self.assertEqual(self.app.pin_btn.cget("hover_color"), theme.CARD_COLOR, "Pin button hover_color must be CARD_COLOR")
         print("[Pass] Pin button is verified on the left with correct styling.")
+
+        self.assertIsNotNone(self.app.patch_notes_btn)
+        patch_info = self.app.patch_notes_btn.pack_info()
+        self.assertEqual(patch_info.get("side"), "left")
+        self.assertEqual(self.app.patch_notes_btn.cget("text"), "ⓘ 패치")
+        self.assertEqual(self.app.patch_notes_btn.cget("fg_color"), "transparent")
+        self.assertEqual(self.app.patch_notes_btn.cget("hover_color"), theme.CARD_COLOR)
+        print("[Pass] Patch-note button is visible and uses the title-bar styling.")
+
+        self.app.patch_notes_btn.invoke()
+        self.app.update()
+        dialog = self.app._patch_notes_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(dialog.title(), "패치 내역")
+
+        visible_text = []
+        pending = [dialog]
+        while pending:
+            widget = pending.pop()
+            pending.extend(widget.winfo_children())
+            try:
+                text = widget.cget("text")
+            except Exception:
+                continue
+            if text:
+                visible_text.append(str(text))
+        rendered = "\n".join(visible_text)
+        self.assertIn("6.01", rendered)
+        self.assertNotIn("v6.01", rendered)
+        self.assertIn("6.04", rendered)
+        self.assertNotIn("v6.04", rendered)
+        self.assertIn("상단 예약 상태 표시 디자인 개선", rendered)
+        self.assertIn("5.71", rendered)
+        self.assertNotIn("v5.71", rendered)
+        self.assertIn("네이버 계정 전환 시 현재 로그인 계정 자동 반영", rendered)
+        self.assertIn("5.70", rendered)
+        self.assertNotIn("v5.70", rendered)
+        self.assertIn("네이버 오픈 시간 오계산 및 Duplicated 처리 수정", rendered)
+        self.assertIn("둠이스케이프 서버 장애 복구 후 자동 재시도", rendered)
+        self.assertIn("둠이스케이프 병렬 연결 예열 및 미오픈 시간표 캐시 적용", rendered)
+        dialog._close()
+        self.app.update()
+        print("[Pass] Patch-note dialog opens and renders the bundled current notes.")
+
+        self.assertEqual(self.app.status_stage.cget("fg_color"), "transparent")
+        self.assertEqual(self.app.status_indicator.cget("fg_color"), theme.SURFACE_COLOR)
+        self.assertEqual(self.app.status_indicator.cget("border_color"), theme.HAIRLINE_COLOR)
+        self.assertEqual(self.app.status_indicator.cget("border_width"), 1)
+        self.assertEqual(self.app.status_dot_shell.cget("width"), 14)
+        self.assertEqual(self.app.status_dot_shell.cget("height"), 14)
+        self.assertEqual(self.app.status_dot.cget("width"), 6)
+        self.assertEqual(self.app.status_dot.cget("height"), 6)
+        self.assertEqual(self.app.status_dot.cget("fg_color"), theme.TEXT_MUTE)
+        self.assertEqual(self.app.status_badge.cget("fg_color"), "transparent")
+        self.assertEqual(self.app.status_badge.cget("text"), "준비됨")
+
+        self.app.update_idletasks()
+        stage_center = self.app.status_stage.winfo_rootx() + self.app.status_stage.winfo_width() / 2
+        indicator_center = (
+            self.app.status_indicator.winfo_rootx()
+            + self.app.status_indicator.winfo_width() / 2
+        )
+        self.assertAlmostEqual(stage_center, indicator_center, delta=1.0)
+
+        self.app._set_status_badge("running", "예약 감시 중 · 12회 · 00:03")
+        self.app.update()
+        self.assertEqual(self.app.status_dot.cget("fg_color"), theme.ACCENT_BLUE)
+        self.assertEqual(self.app.status_dot_shell.cget("fg_color"), theme.TINT_INFO_BG)
+        self.assertEqual(self.app.status_badge.cget("text_color"), theme.TEXT_BODY)
+        self.assertEqual(self.app.status_badge.cget("text"), "예약 감시 중 · 12회 · 00:03")
+        self.assertNotIn("●", self.app.status_badge.cget("text"))
+        self.app._set_status_badge("idle", "준비됨")
+        self.app.update_idletasks()
+        self.assertGreaterEqual(
+            self.app.site_select_frame.winfo_y(),
+            120,
+            "The restored header breathing room must keep the form in the legacy visual position",
+        )
+        print("[Pass] Header status uses a quiet dot-and-text indicator without a filled pill.")
 
     def test_2_log_panel(self):
         print("\n--- Verifying LogPanel Background, Scrollbars & Tag config ---")
@@ -532,7 +620,16 @@ class TestUIComponents(unittest.TestCase):
             lambda: completed.append(True),
         )
         overlay.place(x=0, y=36, relwidth=1, relheight=1)
-        self.app.update()
+        for _ in range(5):
+            self.app.update()
+            time.sleep(0.02)
+        splash_text = [
+            overlay.canvas.itemcget(item, "text")
+            for item in overlay.canvas.find_all()
+            if overlay.canvas.type(item) == "text"
+        ]
+        self.assertIn(f"방탈출 펭크로 {__version__}", splash_text)
+        self.assertFalse(any(text.startswith("v") for text in splash_text))
         overlay._fade_out()
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline and not completed:

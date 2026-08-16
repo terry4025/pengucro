@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from engines.site_parser import normalize_naver_url, parse_booking_site
+from engines.cgv_browser_client import CgvBrowserClient
 from engines.zeroworld_catalog import decode_body, parse_theme_list
 from pengucro.catalog import (
     CatalogBranch,
@@ -37,6 +38,11 @@ KNOWN_ENGINES = {
     "keyescape.com": "keyescape",
     "booking.naver.com": "naver",
     "m.booking.naver.com": "naver",
+    "www.dpsnnn.com": "dpsnnn",
+    "dpsnnn.com": "dpsnnn",
+    "dpsnnn-s.imweb.me": "dpsnnn",
+    "cgv.co.kr": "cgv",
+    "www.cgv.co.kr": "cgv",
 }
 
 
@@ -97,6 +103,42 @@ class BaseProvider:
         if candidate.engine_id != self.engine_id:
             return ValidationResult(False, ["엔진 식별자가 일치하지 않습니다."])
         return ValidationResult(True, [])
+
+
+class CgvProvider(BaseProvider):
+    engine_id = "cgv"
+
+    def detect(self, url: str, html: str) -> DetectionResult:
+        host = urllib.parse.urlparse(url).netloc.casefold()
+        score = 100 if KNOWN_ENGINES.get(host) == self.engine_id else 0
+        evidence = ["CGV 공식 예매 도메인"] if score else []
+        if "/cnm/movieBook/" in url:
+            score = min(100, score + 20)
+            evidence.append("CGV 영화 예매 경로")
+        return DetectionResult(self.engine_id, score, evidence)
+
+    def discover(self, site_config: dict[str, Any], target_date: str) -> SiteCatalog:
+        del target_date
+        options = dict(site_config.get("engine_options", {}))
+        snapshot = CgvBrowserClient().fetch_catalog()
+        branches = {
+            site.site_no: CatalogBranch(
+                site.site_no,
+                site.label,
+                site.site_no,
+                metadata={"region_code": site.region_code},
+            )
+            for site in snapshot.sites
+        }
+        return _site_catalog(
+            site_config,
+            self.engine_id,
+            branches,
+            {
+                "base_url": "https://cgv.co.kr",
+                "engine_options": options,
+            },
+        )
 
 
 class SinbiWorldProvider(BaseProvider):
@@ -311,6 +353,85 @@ class KeyescapeProvider(BaseProvider):
         )
 
 
+class DpsnnnProvider(BaseProvider):
+    engine_id = "dpsnnn"
+
+    def detect(self, url: str, html: str) -> DetectionResult:
+        host = urllib.parse.urlparse(url).netloc.casefold()
+        evidence: list[str] = []
+        official = KNOWN_ENGINES.get(host) == self.engine_id
+        score = 100 if official else 0
+        if official:
+            evidence.append("단편선 공식 도메인")
+        for token, points, label in (
+            ("SITE_BOOKING.init_calendar", 45, "아임웹 예약 달력"),
+            ("/js/site_booking.js", 30, "아임웹 예약 모듈"),
+            ('data-widget-type="booking"', 25, "예약 위젯"),
+        ):
+            if token in html:
+                score = min(100 if official else 75, score + points)
+                evidence.append(label)
+        return DetectionResult(self.engine_id, score, evidence)
+
+    def discover(self, site_config: dict[str, Any], target_date: str) -> SiteCatalog:
+        from engines.dpsnnn_engine import DPSNNN_BRANCHES
+
+        host = urllib.parse.urlparse(str(site_config.get("url", ""))).netloc.casefold()
+        if KNOWN_ENGINES.get(host) != self.engine_id:
+            raise ValueError("단편선 공식 예약 도메인이 아닙니다.")
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        branches: dict[str, CatalogBranch] = {}
+        for branch_id, raw in DPSNNN_BRANCHES.items():
+            branch_config = copy.deepcopy(raw)
+            reserve_url = urllib.parse.urljoin(
+                branch_config["base_url"] + "/",
+                branch_config["reserve_path"].lstrip("/"),
+            )
+            response = session.get(reserve_url, timeout=10)
+            response.raise_for_status()
+            if "SITE_BOOKING" not in response.text and "booking" not in response.text.casefold():
+                raise ValueError(f"{branch_config['name']} 예약 페이지를 확인하지 못했습니다.")
+
+            calendar = session.post(
+                urllib.parse.urljoin(branch_config["base_url"] + "/", "booking/html_list.cm"),
+                data={
+                    "target_month": target_date[:7],
+                    "select_day": target_date,
+                    "menu_code": branch_config["menu_code"],
+                },
+                headers={"Referer": reserve_url, "Origin": branch_config["base_url"]},
+                timeout=10,
+            )
+            calendar.raise_for_status()
+            themes: dict[str, CatalogTheme] = {}
+            for alias, full_name in branch_config["themes"].items():
+                themes[alias] = CatalogTheme(
+                    alias,
+                    full_name,
+                    alias,
+                    {"alias": alias, "full_name": full_name},
+                )
+            branches[branch_id] = CatalogBranch(
+                branch_id,
+                branch_config["name"],
+                branch_id,
+                metadata=branch_config,
+                themes=themes,
+            )
+
+        return _site_catalog(
+            site_config,
+            self.engine_id,
+            branches,
+            {
+                "base_url": "https://www.dpsnnn.com",
+                "engine_options": {"branches": copy.deepcopy(DPSNNN_BRANCHES)},
+            },
+        )
+
+
 class DoomescapeProvider(BaseProvider):
     engine_id = "doomescape"
 
@@ -396,6 +517,167 @@ class NaverProvider(BaseProvider):
         return _legacy_result_to_catalog(site_config, result, self.engine_id)
 
 
+class TripComProvider(BaseProvider):
+    """Build a refreshable catalog from Trip.com's public campaign metadata."""
+
+    engine_id = "tripcom"
+
+    def detect(self, url: str, html: str) -> DetectionResult:
+        host = urllib.parse.urlparse(url).netloc.casefold()
+        matched = KNOWN_ENGINES.get(host) == self.engine_id
+        evidence = ["Trip.com 공식 도메인"] if matched else []
+        if "__foxpage_data__" in html and "campaignId" in html:
+            evidence.append("Trip.com 캠페인 데이터")
+        score = 100 if matched else (85 if evidence else 0)
+        return DetectionResult(self.engine_id, score, evidence)
+
+    def discover(self, site_config: dict[str, Any], target_date: str) -> SiteCatalog:
+        import importlib
+
+        tripcom = importlib.import_module("engines.tripcom_client")
+        TripComClient = tripcom.TripComClient
+        TripComError = tripcom.TripComError
+        options = dict(site_config.get("engine_options", {}))
+        max_campaigns = max(1, min(int(options.get("max_campaigns", 3)), 30))
+        client = TripComClient(timeout=float(options.get("request_timeout", 12.0)))
+        events = client.discover_events(max_campaigns=max_campaigns)
+        branches: dict[str, CatalogBranch] = {}
+        for event in events:
+            action_kind = str(event.metadata().get("action_kind", "coupon"))
+            branch_suffix = (
+                f":{event.metadata().get('schema_id', '')}"
+                if action_kind in {"hotel_flash_sale", "flight_flash_sale"}
+                else ":flight-coupon" if action_kind == "flight_coupon" else ""
+            )
+            branch_id = f"campaign:{event.campaign_id}{branch_suffix}"
+            branch = branches.get(branch_id)
+            if branch is None:
+                branch_name = event.campaign_name
+                if action_kind == "hotel_flash_sale":
+                    if event.metadata().get("section_id") == "hotelonepricedeal":
+                        branch_name = "국내 럭셔리 호텔 5만원 찬스"
+                    else:
+                        branch_name = (
+                            f"{event.campaign_name} · 호텔 핫딜 "
+                            f"{event.metadata().get('schema_id', '')}"
+                        )
+                elif action_kind == "flight_flash_sale":
+                    branch_name = (
+                        "항공 1만원 초특가"
+                        if event.metadata().get("section_id") == "flightonepricedeal"
+                        else f"{event.campaign_name} · 항공 초특가"
+                    )
+                elif action_kind == "flight_coupon":
+                    branch_name = f"{event.campaign_name} · 항공 선착순 할인코드"
+                branch = CatalogBranch(
+                    branch_id,
+                    branch_name,
+                    branch_id,
+                    metadata={
+                        "campaign_id": event.campaign_id,
+                        "campaign_url": event.campaign_url,
+                    },
+                    themes={},
+                )
+                branches[branch_id] = branch
+            label_parts = [event.event_name]
+            status = str(event.metadata().get("sale_status", ""))
+            if status == "preheat":
+                label_parts.append("오픈 전")
+            elif status == "flash_sale":
+                label_parts.append(
+                    "초특가 판매 중"
+                    if action_kind == "flight_flash_sale"
+                    else "5만원 판매 중"
+                )
+            elif status == "backup_sale":
+                label_parts.append("5만원 종료 · 일반 특가")
+            elif status == "sold_out":
+                label_parts.append("매진")
+            elif status == "ended":
+                label_parts.append("종료")
+            elif event.app_only:
+                label_parts.append("앱 전용")
+            elif action_kind == "flight_coupon" and event.in_stock is True:
+                label_parts.append("발급 가능")
+            elif event.in_stock is False:
+                label_parts.append("현재 소진")
+            label = " · ".join(label_parts)
+            existing_names = {theme.name for theme in branch.themes.values()}
+            if label in existing_names:
+                event_date = event.allowed_dates[0] if event.allowed_dates else "날짜 미정"
+                label = f"{label} · {event_date} {event.open_time}"
+            if label in existing_names:
+                label = f"{label} · {event.play_id}"
+            branch.themes[event.event_id] = CatalogTheme(
+                event.event_id,
+                label,
+                event.event_id,
+                event.metadata(),
+            )
+        if not branches:
+            raise TripComError("진행 중인 Trip.com 핫딜 이벤트를 찾지 못했습니다.")
+        return _site_catalog(
+            site_config,
+            self.engine_id,
+            branches,
+            {
+                "base_url": "https://kr.trip.com",
+                "server_clock_url": "https://kr.trip.com/",
+                "catalog_model": "tripcom-flash-v2",
+                "authoritative_dynamic_catalog": True,
+                "refresh_interval_seconds": int(options.get("refresh_interval_seconds", 600)),
+                "engine_options": {
+                    "max_campaigns": max_campaigns,
+                    "request_timeout": float(options.get("request_timeout", 12.0)),
+                },
+            },
+        )
+
+    def validate(self, candidate: SiteCatalog) -> ValidationResult:
+        base = super().validate(candidate)
+        errors = list(base.errors)
+        if not candidate.branches:
+            errors.append("Trip.com 이벤트가 없습니다.")
+        for branch in candidate.branches.values():
+            for event in branch.themes.values():
+                metadata = event.metadata
+                if metadata.get("action_kind") == "hotel_flash_sale":
+                    required = (
+                        "campaign_id",
+                        "schema_id",
+                        "product_pk_id",
+                        "hotel_id",
+                        "room_id",
+                        "campaign_url",
+                        "open_at",
+                    )
+                elif metadata.get("action_kind") == "flight_flash_sale":
+                    required = (
+                        "campaign_id",
+                        "schema_id",
+                        "product_pk_id",
+                        "product_id",
+                        "stock_id",
+                        "activity_code",
+                        "campaign_url",
+                        "product_url",
+                        "open_at",
+                    )
+                else:
+                    required = (
+                        "campaign_id",
+                        "play_id",
+                        "prize_id",
+                        "campaign_url",
+                        "open_at",
+                    )
+                missing = [key for key in required if not metadata.get(key)]
+                if missing:
+                    errors.append(f"{event.name}: 필수 정보 누락({', '.join(missing)})")
+        return ValidationResult(not errors, errors)
+
+
 class ZeroWorldLaravelProvider(BaseProvider):
     engine_id = "zeroworld_laravel"
 
@@ -427,10 +709,12 @@ class ZeroWorldLaravelProvider(BaseProvider):
 
 def default_providers() -> dict[str, BaseProvider]:
     providers: list[BaseProvider] = [
+        CgvProvider(),
         SinbiWorldProvider(),
         DoomescapeProvider(),
         JigubyeolProvider(),
         KeyescapeProvider(),
+        DpsnnnProvider(),
         ZeroWorldLaravelProvider(),
         NaverProvider(),
     ]
@@ -597,6 +881,7 @@ def legacy_style_for_engine(engine_id: str) -> str:
         "sinbiworld": "zeroworld",
         "doomescape": "zeroworld",
         "zeroworld_laravel": "zeroworld",
+        "dpsnnn": "zeroworld",
     }.get(engine_id, "zeroworld")
 
 
@@ -670,6 +955,7 @@ def builtin_site_configs() -> dict[str, dict[str, Any]]:
         "지구별방탈출": ("builtin:jigubyeol", "jigubyeol"),
         "키이스케이프": ("builtin:keyescape", "keyescape"),
         "둠이스케이프": ("builtin:doomescape", "doomescape"),
+        "CGV": ("builtin:cgv", "cgv"),
     }
     result: dict[str, dict[str, Any]] = {}
     for name, (catalog_key, engine_id) in definitions.items():
@@ -680,7 +966,7 @@ def builtin_site_configs() -> dict[str, dict[str, Any]]:
                 "catalog_key": catalog_key,
                 "engine_id": engine_id,
                 "base_url": _base_url(source["url"]),
-                "engine_options": {},
+                "engine_options": copy.deepcopy(source.get("engine_options", {})),
             }
         )
         result[name] = source
@@ -702,6 +988,7 @@ def fallback_catalog(site_name: str, site_config: dict[str, Any]) -> SiteCatalog
         "지구별방탈출": JIGUBYEOL_THEMES,
         "키이스케이프": KEYESCAPE_THEMES,
         "둠이스케이프": DOOMESCAPE_THEMES,
+        "CGV": {},
     }
     source_themes = theme_sources.get(site_name, site_config.get("themes", {}))
     branches: dict[str, CatalogBranch] = {}

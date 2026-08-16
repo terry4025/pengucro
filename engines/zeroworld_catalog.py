@@ -23,6 +23,14 @@ class ZeroWorldTimeSlot:
     # the UI never claims the closed target date can already be booked.
     estimated: bool = False
     source_date: str = ""
+    # Why this row is estimated.  Keeping the basis explicit lets the picker
+    # distinguish an exact weekday template from a looser weekday/weekend
+    # fallback instead of presenting every estimate as equally reliable.
+    estimate_basis: str = ""
+    # Optional reason why an estimate was used even though an exact request was
+    # attempted.  The picker uses this to distinguish an unopened date from a
+    # temporary site outage without changing booking availability semantics.
+    estimate_reason: str = ""
 
     @property
     def selectable(self) -> bool:

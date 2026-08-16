@@ -69,8 +69,8 @@ from engines.naver_api import (
     NaverSlot,
     SubmitOutcome,
     parse_ids,
-    participant_option,
 )
+from engines.naver_forms import NaverFormAnswer, prepare_custom_form_answers
 from engines.naver_submit import (
     NaverBrowserSubmitter,
     NaverSubmitPayloadBuilder,
@@ -78,7 +78,9 @@ from engines.naver_submit import (
     PAYMENT_BOOKING,
     PAYMENT_NPAY_PREPAID,
     PAYMENT_POSTPAID,
+    resolve_booking_quantity,
 )
+from pengucro.diagnostics import format_exception, write_redacted_debug_text
 from pengucro.models import parse_bool_flag
 from pengucro.storage import SecretStore, data_path, load_json
 
@@ -200,18 +202,16 @@ NEXT_BUTTON_SCRIPT = r"""() => {
 # Reader details come from the account rather than form fields (there is a 변경
 # button to change them), and consent is carried by the submit button's own label,
 # which is why no checkbox exists to tick.
-OPEN_SELECT_SCRIPT = r"""() => {
-    const trigger = document.querySelector('button.select_btn, button[class*="select_btn"]');
-    if (!trigger) return null;
-    trigger.click();
-    return (trigger.innerText || '').replace(/\s+/g, ' ').slice(0, 40);
-}"""
-
 PICK_OPTION_SCRIPT = r"""(wanted) => {
     const items = Array.from(document.querySelectorAll(
         'button.select_item, button[class*="select_item"], [role="option"]'));
     for (const item of items) {
-        if ((item.innerText || '').trim() === wanted) {
+        const shown = (item.innerText || '').replace(/\s+/g, ' ').trim();
+        const wantedText = String(wanted || '').trim();
+        const shownDigits = shown.replace(/\D/g, '');
+        const wantedDigits = wantedText.replace(/\D/g, '');
+        if (shown === wantedText ||
+                (wantedDigits && shownDigits === wantedDigits)) {
             item.click();
             return true;
         }
@@ -219,9 +219,123 @@ PICK_OPTION_SCRIPT = r"""(wanted) => {
     return items.map(i => (i.innerText || '').trim()).slice(0, 12);
 }"""
 
-SELECTED_OPTION_SCRIPT = r"""() => {
-    const trigger = document.querySelector('button.select_btn, button[class*="select_btn"]');
-    return trigger ? (trigger.innerText || '').replace(/\s+/g, ' ').slice(0, 40) : null;
+CUSTOM_FORM_CONTROL_SCRIPT = r"""(payload) => {
+    const norm = value => String(value || '').replace(/\s+/g, '').toLowerCase();
+    const title = norm(payload.title);
+    const headings = Array.from(document.querySelectorAll(
+        '.form_title, label.form_title, [class*="form_title"]'));
+    const matches = headings.filter(el => {
+        const own = Array.from(el.childNodes)
+            .filter(node => node.nodeType === Node.TEXT_NODE)
+            .map(node => node.textContent || '').join('');
+        const text = norm(own || el.innerText || '');
+        return text === title || text.startsWith(title) || title.startsWith(text);
+    });
+    const heading = matches[Math.max(0, Number(payload.occurrence) || 0)] || null;
+    let scope = heading && (heading.parentElement || heading);
+    if (!scope) {
+        const direct = document.querySelector(
+            '#extra' + payload.index + ', [name="extra' + payload.index + '"]');
+        scope = direct && (direct.parentElement || direct);
+    }
+    if (!scope) return {state: 'missing', title: payload.title};
+
+    const kind = String(payload.kind || '').toUpperCase();
+    const values = Array.isArray(payload.values) ? payload.values : [];
+    if (kind === 'CHECKBOX') {
+        let checked = 0;
+        for (const box of scope.querySelectorAll('input[type="checkbox"]')) {
+            const label = box.closest('label') || box.parentElement;
+            const labelText = norm(label && label.innerText);
+            const wanted = values.some(value => labelText.includes(norm(value)));
+            if (wanted && !box.checked) box.click();
+            if (!wanted && box.checked) box.click();
+            if (box.checked) checked += 1;
+        }
+        return {state: checked ? 'filled' : 'missing', checked};
+    }
+
+    if (kind === 'TEXT' || kind === 'TEXTAREA' ||
+            !['SELECT', 'RADIO', 'GENDER', 'BIRTH'].includes(kind)) {
+        const field = scope.querySelector('input:not([type="checkbox"]):not([type="radio"]), textarea') ||
+            document.querySelector('#extra' + payload.index + ', [name="extra' + payload.index + '"]');
+        if (!field) return {state: 'missing'};
+        const prototype = field.tagName === 'TEXTAREA' ?
+            HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
+        setter.call(field, String(payload.value || ''));
+        field.dispatchEvent(new Event('input', {bubbles: true}));
+        field.dispatchEvent(new Event('change', {bubbles: true}));
+        return {state: 'filled', value: field.value};
+    }
+
+    const selects = Array.from(scope.querySelectorAll('select'));
+    if (selects.length) {
+        const select = selects[Math.min(Number(payload.part) || 0, selects.length - 1)];
+        const wanted = norm(values[Number(payload.part) || 0] || payload.value);
+        const option = Array.from(select.options).find(option => {
+            const shown = norm(option.textContent);
+            const shownDigits = shown.replace(/\D/g, '');
+            const wantedDigits = wanted.replace(/\D/g, '');
+            return shown === wanted || (wantedDigits && shownDigits === wantedDigits);
+        });
+        if (!option) return {state: 'missing'};
+        select.value = option.value;
+        select.dispatchEvent(new Event('input', {bubbles: true}));
+        select.dispatchEvent(new Event('change', {bubbles: true}));
+        return {state: 'filled', value: option.textContent || option.value};
+    }
+
+    const triggers = Array.from(scope.querySelectorAll(
+        'button.select_btn, button[class*="select_btn"]'));
+    const trigger = triggers[Number(payload.part) || 0];
+    if (!trigger) return {state: 'missing', triggers: triggers.length};
+    trigger.click();
+    return {state: 'opened', current: (trigger.innerText || '').trim()};
+}"""
+
+# Quantity is a separate control on performance/ticket products.  It appears on
+# the timetable after a slot is selected and before the "다음" button.  Hashed
+# class suffixes change, but the stable Count component prefixes and plus/minus
+# button names are shared across Naver performance products.
+BOOKING_QUANTITY_SCRIPT = r"""(action) => {
+    const controls = Array.from(document.querySelectorAll(
+        'div[class*="count_control"], div[class*="Count__count_control"]'))
+        .filter(group => group.querySelector(
+            'button[class*="btn_plus"], button[data-click-code*="plusbookingcount"]'));
+    if (!controls.length) return {present: false};
+    const read = group => {
+        const number = group.querySelector(
+            'span[class*="Count__num"], span[class*="count_num"]');
+        const current = Number((number && number.textContent || '').replace(/\D/g, ''));
+        const plus = group.querySelector(
+            'button[class*="btn_plus"], button[data-click-code*="plusbookingcount"]');
+        const minus = group.querySelector(
+            'button[class*="btn_minus"], button[data-click-code*="minusbookingcount"]');
+        const disabled = button => !button || button.disabled ||
+            button.getAttribute('aria-disabled') === 'true' ||
+            /disabled/i.test(button.className || '');
+        return {group, current, plus, minus,
+                plusDisabled: disabled(plus), minusDisabled: disabled(minus)};
+    };
+    const states = controls.map(read);
+    const selected = states.find(state => state.current > 0) || states[0];
+    if (!action || action === 'state') {
+        return {present: true, current: selected.current,
+                plusDisabled: selected.plusDisabled,
+                minusDisabled: selected.minusDisabled,
+                groups: states.length};
+    }
+    const button = action === 'plus' ? selected.plus : selected.minus;
+    const isDisabled = action === 'plus' ?
+        selected.plusDisabled : selected.minusDisabled;
+    if (!button || isDisabled) {
+        return {present: true, current: selected.current, disabled: true,
+                groups: states.length};
+    }
+    button.click();
+    return {present: true, current: selected.current, clicked: true,
+            groups: states.length};
 }"""
 
 # Consent is granted deliberately, not by sweeping the page. An "agree to all"
@@ -264,31 +378,18 @@ CONSENT_SCRIPT = r"""() => {
     };
 }"""
 
-# Native <select> first: it is what the sample business renders, and setting it
-# directly is both faster and immune to dropdown markup changes.
-SELECT_OPTION_SCRIPT = r"""(wanted) => {
-    for (const select of document.querySelectorAll('select')) {
-        for (const option of Array.from(select.options)) {
-            if ((option.textContent || '').trim() === wanted) {
-                select.value = option.value;
-                select.dispatchEvent(new Event('input', { bubbles: true }));
-                select.dispatchEvent(new Event('change', { bubbles: true }));
-                return true;
-            }
-        }
-    }
-    return false;
-}"""
-
 # Account state is published in the page's own Apollo cache, so login can be
 # confirmed from a page we were going to load anyway.
 LOGIN_STATE_SCRIPT = r"""() => {
     const state = window.__APOLLO_STATE__ || {};
+    let found = null;
     for (const key of Object.keys(state)) {
         const entry = state[key];
-        if (entry && entry.__typename === 'Account') return !!entry.isLoggedIn;
+        if (!entry || entry.__typename !== 'Account') continue;
+        found = found || !!entry.isLoggedIn;
+        if (entry.isLoggedIn) return true;
     }
-    return null;
+    return found;
 }"""
 
 
@@ -320,6 +421,10 @@ class NaverEngine(BaseEngine):
     RELAX_AFTER_SECONDS = 1800.0
     BURST_WINDOW_SECONDS = 120.0
     CLOCK_RESYNC_SECONDS = 300.0
+    OPEN_SCHEDULE_REFRESH_FAR_SECONDS = 300.0
+    OPEN_SCHEDULE_REFRESH_NEAR_SECONDS = 30.0
+    OPEN_SCHEDULE_NEAR_WINDOW_SECONDS = 3600.0
+    OPEN_SCHEDULE_FINAL_REFRESH_LEAD = 30.0
 
     # The parked tab is reloaded in two situations.
     #
@@ -353,6 +458,12 @@ class NaverEngine(BaseEngine):
     API_NOT_OPEN_RETRY_SECONDS = 0.01
     API_PREFLIGHT_MIN_SECONDS = 2.0
     API_PREFLIGHT_SLOT_TIMEOUT_SECONDS = 0.75
+    # Install one same-origin browser timer before the boundary so the final
+    # booking fetch does not wait for a Python -> CDP wake-up at open time.
+    API_BROWSER_ARM_MIN_SECONDS = 0.30
+    API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
+    API_BROWSER_ARM_STATUS_SECONDS = 0.025
+    API_SEND_JITTER_SECONDS = 0.035
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -431,12 +542,15 @@ class NaverEngine(BaseEngine):
         self._owns_browser = False
         self._chrome_session = None
         self._playwright = None
-        self._participant: tuple[str, str] | None = None
+        self._custom_form_answers: list[NaverFormAnswer] = []
         self._item_url = ""
         self._log_marks: dict[str, float] = {}
         self._dialog_state: dict[str, str] = {"message": ""}
         self._open_at_epoch: float | None = None
         self._open_strike_pending = False
+        self._uses_open_schedule = False
+        self._last_open_schedule_refresh = 0.0
+        self._final_open_schedule_refresh = False
         self._notready_until = 0.0
         self._last_warm = 0.0
         self._warmed_for_date = False
@@ -452,6 +566,7 @@ class NaverEngine(BaseEngine):
         self._slot_post_payment: dict[str, bool] = {}
         self._api_payment_signature: tuple[str, str, bool] | None = None
         self._npay_booking_id = ""
+        self._recent_submit_rtt: list[float] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -567,6 +682,9 @@ class NaverEngine(BaseEngine):
             target_open_at.timestamp()
             if (meta.uses_open_schedule and target_open_at) else None
         )
+        self._uses_open_schedule = bool(meta.uses_open_schedule)
+        self._last_open_schedule_refresh = time.monotonic()
+        self._final_open_schedule_refresh = False
         self._open_strike_pending = False
         if meta.uses_open_schedule and target_open_at:
             remaining = self.clock.seconds_until(target_open_at.timestamp())
@@ -586,25 +704,52 @@ class NaverEngine(BaseEngine):
                     f"{target_open_at:%Y-%m-%d %H:%M} (이미 지남)", "info"
                 )
 
-        form = meta.custom_form or await asyncio.to_thread(self.api.fetch_business_form)
-        people = str(reservation_data.get("people") or "").strip()
-        self._participant = participant_option(form, people) if people else None
-        if form and people and not self._participant:
-            available = [
-                option.get("value")
-                for question in form
-                if isinstance(question, dict)
-                for option in (question.get("options") or [])
-                if isinstance(option, dict)
-            ]
-            self.log(
-                f"[경고] 인원 '{people}'에 해당하는 선택지를 찾지 못했습니다. "
-                f"선택 가능: {', '.join(str(v) for v in available if v) or '없음'}",
-                "warning",
+        if self._api_business is None:
+            business = await asyncio.to_thread(self.api.fetch_business)
+            self._api_business = business or None
+        business_form = (
+            (self._api_business or {}).get("customFormJson")
+            if self._api_business else []
+        )
+        form = meta.custom_form or (
+            business_form if isinstance(business_form, list) else []
+        )
+        business_type_id = int(
+            (self._api_business or {}).get("businessTypeId") or 0
+        )
+        form_item_count = (
+            int(re.sub(r"\D", "", str(reservation_data.get("people") or "")) or 1)
+            if business_type_id and business_type_id != 12
+            else 1
+        )
+        _prepared_form, self._custom_form_answers, form_error = (
+            prepare_custom_form_answers(
+                form,
+                reservation_data,
+                item_count=form_item_count,
             )
-        elif self._participant:
-            self.log(f"[정보] 추가 입력 '{self._participant[0]}' → "
-                     f"'{self._participant[1]}' 로 채웁니다.", "info")
+        )
+        if form_error:
+            raise NaverApiError(form_error)
+        if self._custom_form_answers:
+            self.log(
+                f"[정보] 동적 추가정보 {len(self._custom_form_answers)}개 자동 준비 완료 · "
+                "문항 수와 유형을 서버 폼 기준으로 처리합니다.",
+                "info",
+            )
+            for answer in self._custom_form_answers:
+                item = f" · {answer.item_order}번째 관람자" if answer.item_order else ""
+                sensitive = re.search(
+                    r"이름|성명|연락처|전화|휴대폰|이메일|생년월일|birth|phone|name|email",
+                    answer.title,
+                    re.I,
+                )
+                shown_value = "개인정보 입력 완료" if sensitive else answer.value
+                self.log(
+                    f"[정보] 추가 입력 '{answer.title}'{item} → "
+                    f"'{shown_value}' ({answer.strategy})",
+                    "info",
+                )
 
         self.log(
             f"[정보] 스캔 주기 기본 {self._poll_base:.2f}초({1 / self._poll_base:.1f}회/초) · "
@@ -850,6 +995,22 @@ class NaverEngine(BaseEngine):
             )
             return
 
+        quantity = resolve_booking_quantity(slot, reservation_data)
+        item_form = (self._api_biz_item or {}).get("customFormJson")
+        business_form = (self._api_business or {}).get("customFormJson")
+        form = (
+            item_form
+            if isinstance(item_form, list) and item_form
+            else business_form if isinstance(business_form, list) else []
+        )
+        _prepared_form, refreshed_answers, form_error = prepare_custom_form_answers(
+            form,
+            reservation_data,
+            item_count=quantity.count,
+        )
+        if not form_error:
+            self._custom_form_answers = refreshed_answers
+
         preparation = NaverSubmitPayloadBuilder().prepare(
             business=self._api_business or {},
             biz_item=self._api_biz_item or {},
@@ -867,6 +1028,17 @@ class NaverEngine(BaseEngine):
             )
             return
         self._log_payment_preparation(preparation)
+        if preparation.quantity_mode:
+            self.log(
+                f"[정보] 수량 선택형 예매 확인 · 티켓 "
+                f"{preparation.payload.get('bookingCount')}매 · 예상 결제금액 "
+                f"{int(preparation.payload.get('price') or 0):,}원"
+                + (
+                    f" · 현재 잔여 {preparation.available_count}매"
+                    if preparation.available_count is not None else ""
+                ),
+                "success",
+            )
         if dev_mode and not preparation.requires_checkout:
             field_names = ", ".join(sorted(preparation.payload))
             self.log(
@@ -963,7 +1135,7 @@ class NaverEngine(BaseEngine):
             != self._api_preparation.payload.get("price")
             or preparation.payment_mode != self._api_preparation.payment_mode
         )
-        self._api_account = account
+        self._adopt_browser_account(account, invalidate_preparation=False)
         self._api_preparation = preparation
         self._log_payment_preparation(preparation)
         if changed:
@@ -989,6 +1161,35 @@ class NaverEngine(BaseEngine):
 
         while not self.stop_event.is_set():
             until_open = self._seconds_until_open()
+            if self._uses_open_schedule:
+                near_open = (
+                    until_open is not None
+                    and abs(until_open) <= self.OPEN_SCHEDULE_NEAR_WINDOW_SECONDS
+                )
+                refresh_interval = (
+                    self.OPEN_SCHEDULE_REFRESH_NEAR_SECONDS
+                    if near_open else self.OPEN_SCHEDULE_REFRESH_FAR_SECONDS
+                )
+                final_due = (
+                    until_open is not None
+                    and self.OPEN_BLACKOUT_SECONDS < until_open
+                    <= self.OPEN_SCHEDULE_FINAL_REFRESH_LEAD
+                    and not self._final_open_schedule_refresh
+                )
+                periodic_due = (
+                    time.monotonic() - self._last_open_schedule_refresh
+                    >= refresh_interval
+                )
+                outside_refresh_blackout = (
+                    until_open is None
+                    or until_open > self.OPEN_BLACKOUT_SECONDS
+                    or until_open < -self.OPEN_BLACKOUT_SECONDS
+                )
+                if final_due or (periodic_due and outside_refresh_blackout):
+                    refreshed = await self._refresh_open_schedule(target_date)
+                    if final_due and refreshed is not None:
+                        self._final_open_schedule_refresh = True
+                    until_open = self._seconds_until_open()
             outside_blackout = (
                 until_open is None
                 or until_open > self.OPEN_BLACKOUT_SECONDS
@@ -1200,6 +1401,14 @@ class NaverEngine(BaseEngine):
                 self.log(
                     f"[경고] 제출 결과를 확인할 수 없습니다. {detail} "
                     "중복 제출을 막기 위해 자동 시도를 중지합니다.",
+                    "warning",
+                )
+                return
+            if outcome == "duplicate":
+                self.log(
+                    f"[경고] 네이버가 동일 계정의 중복 예약으로 응답했습니다. "
+                    f"{detail} · 추가 제출은 하지 않습니다. 네이버 예약내역에서 "
+                    "접수 여부를 확인해주세요.",
                     "warning",
                 )
                 return
@@ -1480,6 +1689,48 @@ class NaverEngine(BaseEngine):
             return None
         return self.clock.seconds_until(self._open_at_epoch)
 
+    async def _refresh_open_schedule(self, target_date: str) -> bool | None:
+        """Re-resolve rolling opening metadata instead of freezing startup data."""
+        if self.api is None or self.clock is None:
+            return None
+        self._last_open_schedule_refresh = time.monotonic()
+        try:
+            meta = await asyncio.to_thread(self.api.fetch_item_meta)
+            resolved = await asyncio.to_thread(
+                self.api.resolve_target_open_at, target_date, meta
+            )
+        except (NaverApiError, TypeError, ValueError) as exc:
+            self._log_throttled(
+                "open_schedule_refresh",
+                f"[경고] 네이버 오픈 일정 재확인 실패: {exc}",
+                "warning", 30.0,
+            )
+            return None
+
+        self._uses_open_schedule = bool(meta.uses_open_schedule)
+        new_epoch = (
+            resolved.timestamp()
+            if meta.uses_open_schedule and resolved is not None else None
+        )
+        old_epoch = self._open_at_epoch
+        if new_epoch is None:
+            self._open_at_epoch = None
+            self._open_strike_pending = False
+            return old_epoch is not None
+        if old_epoch is not None and abs(new_epoch - old_epoch) < 0.5:
+            return False
+
+        self._open_at_epoch = new_epoch
+        remaining = self.clock.seconds_until(new_epoch)
+        self._open_strike_pending = remaining > 0
+        self.log(
+            f"[정보] 네이버 오픈 일정을 최신 공개 시간표 기준으로 갱신했습니다 · "
+            f"{resolved:%Y-%m-%d %H:%M:%S} · "
+            f"{'오픈까지 ' + self._format_remaining(remaining) if remaining > 0 else '이미 오픈 시각 경과'}",
+            "info",
+        )
+        return True
+
     def _claim_open_strike(self, until_open: float | None) -> bool:
         """Claim the one-shot opening turn once the boundary is within reach."""
         if not self._open_strike_pending or self._page is None:
@@ -1515,7 +1766,11 @@ class NaverEngine(BaseEngine):
             estimate = float(rtt) / 2 if rtt else 0.05
         except (TypeError, ValueError):
             estimate = 0.05
-        return min(0.25, max(0.01, estimate))
+        if self._recent_submit_rtt:
+            # The preflight account query is usually faster than a real booking
+            # mutation. Prefer recent observed submission latency when present.
+            estimate = max(estimate, max(self._recent_submit_rtt[-3:]) / 2)
+        return min(0.25, max(0.05, estimate + self.API_SEND_JITTER_SECONDS))
 
     async def _wait_for_api_send(self) -> None:
         """Start the fetch early enough for it to reach Naver near the boundary."""
@@ -1534,6 +1789,152 @@ class NaverEngine(BaseEngine):
             "브라우저 제출로 전환합니다.",
             "warning",
         )
+
+    def _record_submit_rtt(self, elapsed_ms: float | None) -> None:
+        if elapsed_ms is None:
+            return
+        try:
+            seconds = float(elapsed_ms) / 1000
+        except (TypeError, ValueError):
+            return
+        if 0.005 <= seconds <= 3.0:
+            self._recent_submit_rtt.append(seconds)
+            del self._recent_submit_rtt[:-5]
+
+    async def _handle_api_submit_result(
+        self,
+        result,
+        *,
+        signature: tuple[Any, ...] | None,
+        reservation_data: dict[str, Any] | None,
+        dev_mode: bool,
+    ) -> tuple[str, str]:
+        """Handle one known result without issuing any additional mutation."""
+        if result.outcome == SubmitOutcome.SUCCESS:
+            if self._api_preparation is not None and self._api_preparation.requires_checkout:
+                return await self._continue_npay_checkout(
+                    booking_id=result.booking_id,
+                    payment_url=self._normalize_payment_url(result.url),
+                    dev_mode=dev_mode,
+                    navigate_immediately=True,
+                )
+            return (
+                "success",
+                f"예약번호 {result.booking_id}"
+                + (f" · {result.url}" if result.url else ""),
+            )
+        if result.outcome == SubmitOutcome.REFUSED:
+            self._api_refused_signature = (
+                signature if signature is not None else getattr(self, "_last_signature", None)
+            )
+            return "taken", result.detail
+        if result.outcome == SubmitOutcome.DUPLICATED:
+            self._api_submit_enabled = False
+            self._api_submit_blocked = True
+            return "duplicate", result.detail
+        if result.outcome == SubmitOutcome.NOT_OPEN:
+            return "notopen", result.detail
+        if result.outcome == SubmitOutcome.UNKNOWN:
+            self._api_submit_enabled = False
+            self._api_submit_blocked = True
+            return "unknown", result.detail
+        self._disable_api_submit(result.detail)
+        return "fallback", result.detail
+
+    async def _submit_api_armed(
+        self,
+        signature: tuple[Any, ...] | None = None,
+        *,
+        reservation_data: dict[str, Any] | None = None,
+        dev_mode: bool = False,
+    ) -> tuple[str, str]:
+        """Arm one browser-internal mutation before the published opening time."""
+        if (
+            not self._api_submit_enabled
+            or self._api_submitter is None
+            or self._api_preparation is None
+            or not self._api_preparation.ready
+        ):
+            return "fallback", "API 직접 제출이 준비되지 않았습니다"
+        if not hasattr(self._api_submitter, "arm_submit_at"):
+            return await self._submit_api_first(
+                signature,
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
+        remaining = self._seconds_until_open()
+        if remaining is None or remaining < self.API_BROWSER_ARM_MIN_SECONDS:
+            return await self._submit_api_first(
+                signature,
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
+        lead = self._api_one_way_seconds()
+        delay = max(0.0, remaining - lead)
+        try:
+            arm_id = await self._api_submitter.arm_submit_at(
+                self._api_preparation.payload, delay
+            )
+        except Exception as exc:
+            self.log(
+                f"[정보] 브라우저 내부 예약 타이머 준비 실패 ({type(exc).__name__}) · "
+                "기존 직접 제출로 진행합니다.",
+                "info",
+            )
+            return await self._submit_api_first(
+                signature,
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
+        self.log(
+            f"[정보] 브라우저 내부 API 제출 예약 · 오픈 대비 {-lead:+.3f}초 · "
+            "단일 요청으로 대기합니다.",
+            "warning",
+        )
+        due = time.monotonic() + delay
+        while (
+            not self.stop_event.is_set()
+            and time.monotonic() < due - self.API_BROWSER_ARM_FINAL_QUIET_SECONDS
+        ):
+            wait_for = due - time.monotonic() - self.API_BROWSER_ARM_FINAL_QUIET_SECONDS
+            await asyncio.sleep(min(0.10, max(0.01, wait_for)))
+        if self.stop_event.is_set():
+            await self._api_submitter.cancel_armed_submit(arm_id)
+            return "stopped", "중지됨"
+        # Keep CDP traffic out of the final timer window; Chrome owns the exact
+        # dispatch and Python reads the result only afterwards.
+        await asyncio.sleep(max(0.0, due - time.monotonic() + self.API_BROWSER_ARM_FINAL_QUIET_SECONDS))
+        while not self.stop_event.is_set():
+            state, result, elapsed_ms = await self._api_submitter.read_armed_submit(
+                arm_id, self._api_preparation.payload
+            )
+            if result is not None:
+                self._record_submit_rtt(elapsed_ms)
+                if elapsed_ms is not None:
+                    self.log(
+                        f"[정보] 브라우저 내부 API 제출 응답 · {result.outcome} · RTT {elapsed_ms:.0f}ms",
+                        "success" if result.outcome == SubmitOutcome.SUCCESS else "info",
+                    )
+                outcome, detail = await self._handle_api_submit_result(
+                    result,
+                    signature=signature,
+                    reservation_data=reservation_data,
+                    dev_mode=dev_mode,
+                )
+                if outcome == "notopen":
+                    # Existing policy: only an explicit not-open response gets a
+                    # bounded retry; no parallel or duplicate submission occurs.
+                    return await self._submit_api_first(
+                        signature,
+                        reservation_data=reservation_data,
+                        dev_mode=dev_mode,
+                    )
+                return outcome, detail
+            if state == "cancelled":
+                return "stopped", "중지됨"
+            await asyncio.sleep(self.API_BROWSER_ARM_STATUS_SECONDS)
+        await self._api_submitter.cancel_armed_submit(arm_id)
+        return "stopped", "중지됨"
 
     async def _submit_api_first(
         self,
@@ -1569,48 +1970,28 @@ class NaverEngine(BaseEngine):
                 self._api_preparation.payload
             )
             elapsed_ms = (time.monotonic() - sent_at) * 1000
+            self._record_submit_rtt(elapsed_ms)
             self.log(
                 f"[정보] API 직접 제출 응답 · {result.outcome} · "
                 f"RTT {elapsed_ms:.0f}ms",
                 "success" if result.outcome == SubmitOutcome.SUCCESS else "info",
             )
 
-            if result.outcome == SubmitOutcome.SUCCESS:
-                if self._api_preparation.requires_checkout:
-                    return await self._continue_npay_checkout(
-                        booking_id=result.booking_id,
-                        payment_url=self._normalize_payment_url(result.url),
-                        dev_mode=dev_mode,
-                        navigate_immediately=True,
-                    )
-                return (
-                    "success",
-                    f"예약번호 {result.booking_id}"
-                    + (f" · {result.url}" if result.url else ""),
-                )
-            if result.outcome == SubmitOutcome.REFUSED:
-                self._api_refused_signature = (
-                    signature
-                    if signature is not None
-                    else getattr(self, "_last_signature", None)
-                )
-                return "taken", result.detail
-            if result.outcome == SubmitOutcome.NOT_OPEN:
+            outcome, detail = await self._handle_api_submit_result(
+                result,
+                signature=signature,
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
+            if outcome == "notopen":
                 if (
                     attempt < self.API_SUBMIT_MAX_ATTEMPTS
                     and time.monotonic() < deadline
                 ):
                     await asyncio.sleep(self.API_NOT_OPEN_RETRY_SECONDS)
                     continue
-                return "fallback", result.detail
-
-            if result.outcome == SubmitOutcome.UNKNOWN:
-                self._api_submit_enabled = False
-                self._api_submit_blocked = True
-                return "unknown", result.detail
-
-            self._disable_api_submit(result.detail)
-            return "fallback", result.detail
+                return "fallback", detail
+            return outcome, detail
 
         return "fallback", "API 직접 제출 제한 시간 초과"
 
@@ -1642,14 +2023,13 @@ class NaverEngine(BaseEngine):
             if remaining is not None and remaining > 0:
                 self.log(
                     f"[정보] 오픈 {remaining * 1000:.0f}ms 전 · "
-                    "API 직접 제출 시각까지 대기합니다.",
+                    "브라우저 내부 API 제출 시각을 준비합니다.",
                     "warning",
                 )
-                await self._wait_for_api_send()
             if self.stop_event.is_set():
                 return "error", "중지됨"
 
-            outcome, detail = await self._submit_api_first(
+            outcome, detail = await self._submit_api_armed(
                 reservation_data=reservation_data,
                 dev_mode=dev_mode,
             )
@@ -1720,7 +2100,81 @@ class NaverEngine(BaseEngine):
         except Exception:
             pass
 
+    def _adopt_browser_account(
+        self,
+        account: NaverAccount,
+        *,
+        invalidate_preparation: bool = True,
+    ) -> None:
+        """Make the active Chrome account authoritative for future submits."""
+        previous = self._api_account
+        previous_identity = (
+            previous.user_id or previous.csrf_token
+            if previous is not None and previous.is_logged_in
+            else ""
+        )
+        current_identity = account.user_id or account.csrf_token
+        changed = bool(
+            previous is not None
+            and previous.is_logged_in
+            and account.is_logged_in
+            and (
+                previous_identity != current_identity
+                or previous.csrf_token != account.csrf_token
+            )
+        )
+        self._api_account = account
+        if not changed:
+            return
+
+        self._api_submit_blocked = False
+        self._api_refused_signature = None
+        self._npay_booking_id = ""
+        if invalidate_preparation:
+            self._api_submit_enabled = False
+            self._api_preparation = None
+            self._api_prepare_pending = True
+
+        account_changed = bool(
+            previous is not None
+            and previous.user_id
+            and account.user_id
+            and previous.user_id != account.user_id
+        )
+        self.log(
+            "[정보] 현재 Chrome의 네이버 계정 변경을 반영했습니다. "
+            "이전 제출 준비값을 새 로그인 기준으로 갱신합니다."
+            if account_changed
+            else "[정보] 네이버 로그인 세션 갱신을 반영했습니다.",
+            "success",
+        )
+
+    async def _live_browser_account(self) -> NaverAccount | None:
+        if self._page is None:
+            return None
+        try:
+            url = self._page.url or ""
+        except Exception:
+            return None
+        if "booking.naver.com" not in url:
+            return None
+
+        submitter = NaverBrowserSubmitter(self._page)
+        account = await submitter.fetch_account()
+        if not submitter.last_account_fetch_ok:
+            return None
+        return account
+
     async def _login_state(self) -> bool | None:
+        # The Apollo cache is only a page-load snapshot. After logout/login in
+        # the same Chrome window it can still describe the old account forever.
+        # Naver's live account query uses the current browser cookie jar and is
+        # therefore authoritative whenever it answers successfully.
+        account = await self._live_browser_account()
+        if account is not None:
+            if account.is_logged_in:
+                self._adopt_browser_account(account)
+            return account.is_logged_in
         try:
             return await self._page.evaluate(LOGIN_STATE_SCRIPT)
         except Exception:
@@ -1773,12 +2227,20 @@ class NaverEngine(BaseEngine):
         raise NaverApiError("로그인 제한시간이 초과되었습니다. 다시 시도해주세요.")
 
     async def _persist_cookies(self) -> None:
-        # Only meaningful for the bundled-browser fallback; the real-Chrome
-        # profile already keeps its own cookie jar on disk.
-        if not self._owns_browser or self._context is None:
+        if self._context is None:
             return
         try:
-            self._save_cookies(await self._context.cookies())
+            cookies = await self._context.cookies()
+            # Keep the requests-side reader aligned with the account currently
+            # active in Chrome. The direct mutation itself still runs inside the
+            # browser and therefore uses that same cookie jar automatically.
+            replacer = getattr(self.api, "replace_cookies", None)
+            if callable(replacer):
+                replacer(cookies)
+            # A dedicated real-Chrome profile persists its own cookies. Only the
+            # bundled fallback needs the encrypted application copy.
+            if self._owns_browser:
+                self._save_cookies(cookies)
         except Exception:
             pass
 
@@ -1931,6 +2393,13 @@ class NaverEngine(BaseEngine):
             if not selected:
                 return "retry", f"{target_time} 클릭이 반영되지 않았습니다"
             timing.mark("슬롯선택")
+
+            quantity_ok, quantity_detail = await self._set_browser_booking_count(
+                reservation_data
+            )
+            if not quantity_ok:
+                return "taken", quantity_detail
+            timing.mark("수량선택")
 
             if not await self._click_next():
                 if dev_mode:
@@ -2593,6 +3062,78 @@ class NaverEngine(BaseEngine):
             pass
         return (self._dialog_state.get("message") or "").strip()[:140]
 
+    async def _set_browser_booking_count(
+        self, reservation_data
+    ) -> tuple[bool, str]:
+        """Match Naver's visible +/- ticket control to the requested people."""
+        page = self._page
+        if page is None:
+            return False, "브라우저가 준비되지 않았습니다"
+
+        expected_quantity = bool(
+            self._api_preparation and self._api_preparation.quantity_mode
+        )
+        try:
+            state = await page.evaluate(BOOKING_QUANTITY_SCRIPT, "state")
+        except Exception:
+            state = None
+
+        if (not state or not state.get("present")) and expected_quantity:
+            state = await self._poll_for(
+                lambda: page.evaluate(BOOKING_QUANTITY_SCRIPT, "state"),
+                timeout=1.0,
+                interval=0.02,
+            )
+        if not state or not state.get("present"):
+            return True, "수량 선택이 없는 단일 슬롯 상품"
+
+        desired = max(
+            1,
+            int(re.sub(r"\D", "", str(reservation_data.get("people") or "")) or 1),
+        )
+        current = int(state.get("current") or 0)
+        if current <= 0:
+            return False, "티켓 수량 선택기의 현재 값을 확인하지 못했습니다"
+
+        for _ in range(100):
+            if current == desired:
+                groups = int(state.get("groups") or 1)
+                suffix = f" · 가격 종류 {groups}개 중 기본 항목" if groups > 1 else ""
+                self.log(
+                    f"[정보] 예매 티켓 수량 {desired}매 설정 완료{suffix}",
+                    "success",
+                )
+                return True, f"티켓 수량 {desired}매"
+
+            action = "plus" if current < desired else "minus"
+            disabled_key = "plusDisabled" if action == "plus" else "minusDisabled"
+            if state.get(disabled_key):
+                return False, (
+                    f"요청 수량 {desired}매를 설정할 수 없습니다 · "
+                    f"화면에서 가능한 현재 수량 {current}매"
+                )
+            try:
+                clicked = await page.evaluate(BOOKING_QUANTITY_SCRIPT, action)
+            except Exception:
+                clicked = None
+            if not clicked or not clicked.get("clicked"):
+                return False, f"티켓 수량 {desired}매 조정 버튼을 누르지 못했습니다"
+
+            previous = current
+
+            async def changed():
+                updated = await page.evaluate(BOOKING_QUANTITY_SCRIPT, "state")
+                if updated and int(updated.get("current") or 0) != previous:
+                    return updated
+                return None
+
+            state = await self._poll_for(changed, timeout=0.8, interval=0.015)
+            if not state:
+                return False, "티켓 수량 변경이 화면에 반영되지 않았습니다"
+            current = int(state.get("current") or 0)
+
+        return False, "티켓 수량 조정 횟수가 안전 제한을 초과했습니다"
+
     async def _fill_request_form(self, reservation_data) -> None:
         page = self._page
 
@@ -2621,44 +3162,71 @@ class NaverEngine(BaseEngine):
                 except Exception:
                     continue
 
-        if not self._participant:
-            return
-        title, option_value = self._participant
-
-        # A native <select> is tried first because other businesses may use one.
-        try:
-            if await page.evaluate(SELECT_OPTION_SCRIPT, option_value):
-                self.log(f"[정보] '{title}' → '{option_value}' 선택 완료", "info")
-                return
-        except Exception:
-            pass
-
-        try:
-            opened = await page.evaluate(OPEN_SELECT_SCRIPT)
-        except Exception:
-            opened = None
-        if opened is None:
-            self.log(f"[경고] '{title}' 선택 컨트롤을 찾지 못했습니다.", "warning")
+        if not self._custom_form_answers:
             return
 
-        # Poll for the option list rather than sleeping a fixed 250 ms: the list
-        # is client-side and usually up within a few tens of milliseconds.
-        picked = await self._poll_for(
-            lambda: page.evaluate(PICK_OPTION_SCRIPT, option_value),
-            timeout=2.0, interval=0.02,
-        )
-        if picked is not True:
-            self.log(
-                f"[경고] '{option_value}' 선택지를 찾지 못했습니다. "
-                f"화면 선택지: {picked}",
-                "warning",
-            )
-            return
+        occurrences: dict[str, int] = {}
+        for answer in self._custom_form_answers:
+            occurrence = occurrences.get(answer.title, 0)
+            occurrences[answer.title] = occurrence + 1
+            values = list(answer.selected_values) or [answer.value]
+            parts = range(len(values)) if answer.kind == "BIRTH" else range(1)
+            completed = True
 
-        current = await self._poll_for(
-            lambda: page.evaluate(SELECTED_OPTION_SCRIPT), timeout=1.0, interval=0.02
-        )
-        self.log(f"[정보] '{title}' → '{current or option_value}' 선택 완료", "info")
+            for part in parts:
+                payload = {
+                    "index": answer.index,
+                    "title": answer.title,
+                    "kind": answer.kind,
+                    "value": answer.value,
+                    "values": values,
+                    "occurrence": occurrence,
+                    "part": part,
+                }
+                try:
+                    result = await page.evaluate(CUSTOM_FORM_CONTROL_SCRIPT, payload)
+                except Exception as exc:
+                    result = {"state": "error", "detail": type(exc).__name__}
+
+                state = result.get("state") if isinstance(result, dict) else "missing"
+                if state == "filled":
+                    continue
+                if state != "opened":
+                    self.log(
+                        f"[경고] 추가 입력 '{answer.title}' 화면 컨트롤을 "
+                        f"채우지 못했습니다. ({state})",
+                        "warning",
+                    )
+                    completed = False
+                    break
+
+                wanted = values[min(part, len(values) - 1)]
+                picked = await self._poll_for(
+                    lambda wanted=wanted: page.evaluate(PICK_OPTION_SCRIPT, wanted),
+                    timeout=2.0,
+                    interval=0.02,
+                )
+                if picked is not True:
+                    self.log(
+                        f"[경고] 추가 입력 '{answer.title}'의 '{wanted}' "
+                        f"선택지를 찾지 못했습니다. 화면 선택지: {picked}",
+                        "warning",
+                    )
+                    completed = False
+                    break
+
+            if completed:
+                sensitive = re.search(
+                    r"이름|성명|연락처|전화|휴대폰|이메일|생년월일|birth|phone|name|email",
+                    answer.title,
+                    re.I,
+                )
+                shown_value = "개인정보" if sensitive else answer.value
+                self.log(
+                    f"[정보] 추가 입력 '{answer.title}' → "
+                    f"'{shown_value}' 화면 입력 완료",
+                    "info",
+                )
 
     async def _verify_result(self) -> tuple[str, str]:
         page = self._page
@@ -2705,11 +3273,16 @@ class NaverEngine(BaseEngine):
     async def _dump_debug(self, page, filename="naver_request_debug.html") -> None:
         try:
             path = data_path(filename)
-            with path.open("w", encoding="utf-8") as stream:
-                stream.write(await page.content())
-            self.log(f"[정보] [디버그] 요청 페이지 HTML 저장: {path}", "info")
+            write_redacted_debug_text(path, await page.content())
+            self.log(
+                f"[정보] [디버그] 민감정보 제거 요청 페이지 HTML 저장: {path}",
+                "info",
+            )
         except Exception as exc:
-            self.log(f"[경고] 디버그 HTML 저장 실패: {exc}", "warning")
+            self.log(
+                f"[경고] 디버그 HTML 저장 실패: {format_exception(exc)}",
+                "warning",
+            )
 
     # ------------------------------------------------------------------
     # Helpers

@@ -2,6 +2,8 @@ import pytest
 
 import engines.catalog_providers as provider_module
 from engines.catalog_providers import (
+    CgvProvider,
+    DpsnnnProvider,
     DoomescapeProvider,
     JigubyeolProvider,
     KeyescapeProvider,
@@ -14,6 +16,8 @@ from engines.catalog_providers import (
     engine_id_for_legacy_style,
     migrate_custom_sites,
 )
+from engines.cgv_browser_client import CgvCatalogSnapshot
+from engines.cgv_client import CgvRegion, CgvSite
 from pengucro.catalog import (
     CatalogBranch,
     CatalogTheme,
@@ -37,6 +41,10 @@ class FakeResponse:
 
 
 def test_engine_fingerprints_recognize_supported_templates():
+    assert DpsnnnProvider().detect(
+        "https://www.dpsnnn.com/main",
+        'SITE_BOOKING.init_calendar /js/site_booking.js data-widget-type="booking"',
+    ).confidence == 100
     assert SinbiWorldProvider().detect(
         "https://example.com/reservation",
         "rev.make.sel.php fun_theme_time_list s_subj zizum_num",
@@ -53,6 +61,26 @@ def test_engine_fingerprints_recognize_supported_templates():
         "https://example.com/layout/res/home.php",
         'name="s_zizum" tm_box rev.make rev.act.php',
     ).confidence == 100
+
+
+def test_cgv_provider_uses_browser_bff_catalog_without_manual_site(monkeypatch):
+    class BrowserClient:
+        def fetch_catalog(self):
+            return CgvCatalogSnapshot(
+                (CgvRegion("01", "서울", 1),),
+                (CgvSite("0013", "용산아이파크몰", "01"),),
+            )
+
+    monkeypatch.setattr(provider_module, "CgvBrowserClient", BrowserClient)
+
+    catalog = CgvProvider().discover(
+        {"catalog_key": "builtin:cgv", "name": "CGV", "url": "https://cgv.co.kr"},
+        "2026-08-18",
+    )
+
+    assert set(catalog.branches) == {"0013"}
+    assert catalog.branches["0013"].name == "CGV 용산아이파크몰"
+    assert catalog.branches["0013"].metadata["region_code"] == "01"
 
 
 def test_keyescape_projection_keeps_both_theme_identifiers():

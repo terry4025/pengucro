@@ -2,6 +2,8 @@ import customtkinter as ctk
 import ui.theme as theme
 import re
 
+from pengucro import logging_setup
+
 # Compiled once at import instead of on every append. The old code rebuilt this
 # pattern for each batch of log lines.
 # Matches an optional [HH:MM:SS] timestamp followed by an optional [Category].
@@ -191,14 +193,21 @@ class LogPanel(ctk.CTkFrame):
     def append_log(self, message, log_type="info"):
         self.append_logs_batch([(message, log_type)])
 
-    def append_logs_batch(self, logs_list):
-        if not logs_list:
+    def append_logs_batch(self, logs_list, *, persist=True):
+        logs = list(logs_list)
+        if not logs:
             return
+
+        # UI-originated diagnostics are persisted here. Engine-originated
+        # lines set persist=False because BaseEngine already wrote them with
+        # the concrete engine class, off the Tk thread.
+        if persist:
+            logging_setup.persist_ui_lines(logs)
 
         was_pinned = self._is_pinned_to_bottom()
         self.textbox.configure(state="normal")
 
-        for message, log_type in logs_list:
+        for message, log_type in logs:
             match = LOG_PATTERN.match(message)
             if match:
                 ts_part = match.group(1)

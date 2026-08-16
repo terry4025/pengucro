@@ -329,6 +329,35 @@ def test_target_open_time_is_shifted_from_latest_published_schedule(monkeypatch)
     assert resolved == datetime(2026, 8, 2, 22, 0, tzinfo=KST)
 
 
+def test_published_target_never_moves_before_announced_open_time(monkeypatch):
+    """A target already returned by Naver uses the announced opening marker.
+
+    Channel 27 exposed 2026-08-17 in its public schedule while also publishing
+    later days through 2026-08-26.  Treating the latest day as the target's
+    anchor moved the opening nine days into the past and caused an early submit.
+    """
+    api = NaverBookingApi("1498729", "7193259", "12")
+    announced = datetime(2026, 8, 11, 0, 0, tzinfo=KST)
+    meta = NaverItemMeta(
+        name="붐붐박사의 폭죽놀이 유토피아",
+        server_time=datetime(2026, 8, 10, 23, 57, tzinfo=KST),
+        is_closed_booking=False,
+        is_closed_for_user=False,
+        open_at=announced,
+        is_opened=True,
+        uses_open_schedule=True,
+        is_paused=False,
+        custom_form=[],
+    )
+    published = [
+        NaverSlot.from_payload(slot_payload(unitStartTime="2026-08-17 14:10:00")),
+        NaverSlot.from_payload(slot_payload(unitStartTime="2026-08-26 14:10:00")),
+    ]
+    monkeypatch.setattr(api, "fetch_slots", lambda *_args, **_kwargs: published)
+
+    assert api.resolve_target_open_at("2026-08-17", meta) == announced
+
+
 def test_unopened_one_time_item_keeps_its_announced_open_time(monkeypatch):
     api = NaverBookingApi("1498729", "7531350", "12")
     announced = datetime(2026, 11, 27, 0, 0, tzinfo=KST)
@@ -346,10 +375,34 @@ def test_unopened_one_time_item_keeps_its_announced_open_time(monkeypatch):
     monkeypatch.setattr(
         api,
         "fetch_slots",
-        lambda *_args, **_kwargs: pytest.fail("아직 한 번도 열린 적 없는 상품은 보정하지 않아야 합니다"),
+        lambda *_args, **_kwargs: [],
     )
 
     assert api.resolve_target_open_at("2026-12-01", meta) == announced
+
+
+def test_unopened_flag_with_published_history_is_still_treated_as_rolling(monkeypatch):
+    """isOpened can be false early while an established rolling calendar exists."""
+    api = NaverBookingApi("1325520", "6446475", "12")
+    meta = NaverItemMeta(
+        name="버디",
+        server_time=datetime(2026, 8, 2, 9, 0, tzinfo=KST),
+        is_closed_booking=False,
+        is_closed_for_user=False,
+        open_at=datetime(2026, 8, 1, 22, 0, tzinfo=KST),
+        is_opened=False,
+        uses_open_schedule=True,
+        is_paused=False,
+        custom_form=[],
+    )
+    published = [
+        NaverSlot.from_payload(slot_payload(unitStartTime="2026-08-08 22:40:00")),
+    ]
+    monkeypatch.setattr(api, "fetch_slots", lambda *_args, **_kwargs: published)
+
+    assert api.resolve_target_open_at("2026-08-09", meta) == datetime(
+        2026, 8, 2, 22, 0, tzinfo=KST
+    )
 
 
 @pytest.mark.parametrize(
@@ -497,6 +550,22 @@ def test_submit_booking_abuse_rt98(monkeypatch):
     assert res.outcome == SubmitOutcome.ABUSE
 
 
+def test_submit_booking_duplicate_is_not_misclassified_as_sold_out(monkeypatch):
+    from engines.naver_api import SubmitOutcome
+
+    body = {
+        "errors": [
+            {
+                "message": "Duplicated",
+                "extensions": {"code": "BAD_USER_INPUT"},
+            }
+        ]
+    }
+    api, _ = api_with(monkeypatch, body)
+
+    assert api.submit_booking({"businessId": "1498729"}).outcome == SubmitOutcome.DUPLICATED
+
+
 def test_specific_submit_reason_beats_generic_graphql_code():
     from engines.naver_api import SubmitOutcome, classify_submit_error
 
@@ -519,6 +588,10 @@ def test_specific_submit_reason_beats_generic_graphql_code():
         )
         == SubmitOutcome.REFUSED
     )
+    assert (
+        classify_submit_error("BAD_USER_INPUT", "Duplicated")
+        == SubmitOutcome.DUPLICATED
+    )
 
 
 def test_attach_cookies():
@@ -531,3 +604,21 @@ def test_attach_cookies():
     added = api.attach_cookies(cookies)
     assert added == 2
     assert api.session.cookies.get("NID_AUT") == "secret_aut"
+
+
+def test_replace_cookies_removes_previous_naver_account():
+    api = NaverBookingApi("1498729", "7094790", "12")
+    api.attach_cookies([
+        {"name": "NID_AUT", "value": "old", "domain": ".naver.com", "path": "/"},
+    ])
+    api.session.cookies.set("KEEP", "other", domain="example.com", path="/")
+
+    added = api.replace_cookies([
+        {"name": "NID_SES", "value": "new", "domain": ".naver.com", "path": "/"},
+    ])
+
+    names = {(cookie.domain, cookie.name, cookie.value) for cookie in api.session.cookies}
+    assert added == 1
+    assert (".naver.com", "NID_AUT", "old") not in names
+    assert (".naver.com", "NID_SES", "new") in names
+    assert ("example.com", "KEEP", "other") in names

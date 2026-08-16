@@ -11,6 +11,7 @@ from engines.keyescape_engine import (
     FALLBACK_SITEKEY,
     KeyescapeEngine,
 )
+from engines.keyescape_coordination import SharedServerClock, SharedSlotLookup
 from engines.yescaptcha_client import DEFAULT_SOFT_ID
 
 
@@ -181,6 +182,22 @@ def test_prepare_page_captures_booking_response_before_navigation():
     assert engine._page_success_event.is_set()
 
 
+def test_prepare_page_captures_success_without_post_data_or_check_code():
+    engine = make_engine()
+    page = FakePage()
+    state = engine._new_submission_state()
+    run(engine._prepare_page(page, state))
+
+    run(page.handlers["response"](FakeResponse({
+        "status": True,
+        "msg": "입금확인이 되면 예약확정 문자가 발송됩니다.",
+        "data": {"num": "95883"},
+    }, post_data="")))
+
+    assert state["submission_status"] == "success"
+    assert state["booking_number"] == "95883"
+
+
 def test_prepare_page_ignores_other_run_proc_actions():
     engine = make_engine()
     page = FakePage()
@@ -335,6 +352,30 @@ def test_booking_number_falls_back_to_body_text():
     assert run(engine._extract_booking_number(page)) == "15490"
 
 
+def test_booking_number_waits_for_late_ajax_response():
+    async def scenario():
+        engine = make_engine()
+        page = FakePage(evaluate_map={"resrv_info_list": ""})
+        state = engine._new_submission_state()
+
+        async def publish_number():
+            await asyncio.sleep(0.03)
+            state["booking_number"] = "95884"
+
+        task = asyncio.create_task(publish_number())
+        number = await engine._resolve_booking_number(page, state, timeout=0.2)
+        await task
+        return number
+
+    assert run(scenario()) == "95884"
+
+
+def test_driver_connection_error_is_recognized():
+    assert KeyescapeEngine._is_browser_connection_error(
+        RuntimeError("Page.evaluate: Connection closed while reading from the driver")
+    )
+
+
 # ------------------------------------------------------- failure classification
 
 
@@ -342,13 +383,399 @@ def test_booking_number_falls_back_to_body_text():
     ("message", "expected"),
     [
         ("[예약불가] 예약이 이미 완료되었습니다.", "capacity"),
-        ("[에러] 잘못된 접근입니다.", "captcha_consumed"),
+        ("[에러] 잘못된 접근입니다.", "invalid_request"),
         ("예약가능시간이 아닙니다. 예약오픈시간 : 11:00", "not_open"),
         ("", "retry"),
     ],
 )
 def test_classify_failure(message, expected):
     assert KeyescapeEngine._classify_failure(message) == expected
+
+
+def test_submit_refuses_blank_or_placeholder_slot_id():
+    engine = make_engine()
+    page = RecordingPage()
+    for slot_id in ("", engine.PLACEHOLDER_SLOT_ID):
+        assert run(engine._submit(
+            page, {"message": ""}, slot_id, "테마",
+            "2026-08-15", "09:50", "22", False,
+        )) == "slot_not_ready"
+    assert page.calls == []
+
+
+def test_submit_updates_slot_and_clicks_in_one_playwright_call():
+    engine = make_engine()
+    page = RecordingPage(results={
+        "const slotId": {
+            "written": 1,
+            "captchaReady": True,
+            "buttonFound": True,
+            "clicked": True,
+        }
+    })
+
+    async def no_completion(*_args, **_kwargs):
+        return None
+
+    engine._await_completion = no_completion
+    result = run(engine._submit(
+        page, {"message": ""}, "2301", "테마",
+        "2026-08-15", "09:50", "22", False,
+    ))
+
+    assert result == "retry"
+    assert len(page.calls) == 1
+    assert page.calls[0][1][0]["slotId"] == "2301"
+    assert "button.click()" in page.calls[0][0]
+
+
+def test_manual_captcha_age_uses_safety_ttl():
+    engine = make_engine()
+    now = time.monotonic()
+    assert engine._manual_captcha_expired(now - engine.CAPTCHA_TTL_SECONDS + 1) is False
+    assert engine._manual_captcha_expired(now - engine.CAPTCHA_TTL_SECONDS - 1) is True
+
+
+def test_live_slot_resolution_uses_target_date_id_and_shares_result():
+    engine = make_engine()
+    calls = []
+
+    async def fetch(date_str, branch, theme):
+        calls.append((date_str, branch, theme))
+        return [{"num": "2301", "hh": "9", "mm": "50", "enable": "Y"}]
+
+    engine._fetch_slots = fetch
+    engine._live_slot_state = {
+        "slot_id": "", "status": "pending", "last_probe": 0.0,
+        "lock": asyncio.Lock(),
+    }
+
+    async def scenario():
+        first = await engine._resolve_live_slot(
+            "2026-08-15", "09:50", "22", "65", ""
+        )
+        second = await engine._resolve_live_slot(
+            "2026-08-15", "09:50", "22", "65", ""
+        )
+        return first, second
+
+    first, second = run(scenario())
+    assert first == ("2301", "ready")
+    assert second == first
+    assert calls == [("2026-08-15", "22", "65")]
+
+
+def test_timing_parameters_adapt_to_observed_slot_read_rtt():
+    hedge, retry, read_lead = KeyescapeEngine._timing_parameters([
+        {"read_rtt_ms": 80},
+        {"read_rtt_ms": 100},
+        {"read_rtt_ms": 120},
+    ])
+
+    assert hedge == pytest.approx(0.035)
+    assert retry == pytest.approx(0.1)
+    assert read_lead == pytest.approx(0.05)
+
+
+def test_first_live_slot_read_uses_faster_valid_hedge():
+    engine = make_engine()
+    secondary_session = object()
+    engine._slot_hedge_session = secondary_session
+    calls = []
+
+    async def fetch(session, date_str, branch, theme, end_day=0):
+        calls.append(session)
+        if session is engine._session:
+            await asyncio.sleep(0.05)
+            return [{"num": "9999", "hh": "9", "mm": "50", "enable": "Y"}]
+        await asyncio.sleep(0.001)
+        return [{"num": "2301", "hh": "9", "mm": "50", "enable": "Y"}]
+
+    engine._fetch_slots_with_session = fetch
+    engine._live_slot_state = {
+        "hedges_remaining": 1,
+        "hedge_delay": 0.001,
+        "last_rtt": 0.0,
+    }
+
+    slots = run(engine._fetch_live_slots("2026-08-15", "22", "65", "09:50"))
+
+    assert engine._match_slot(slots, "09:50") == ("2301", True)
+    assert calls == [engine._session, secondary_session]
+    assert engine._live_slot_state["hedges_remaining"] == 0
+    assert engine._live_slot_state["last_rtt"] > 0
+
+
+def test_fast_primary_live_slot_read_does_not_send_hedge():
+    engine = make_engine()
+    calls = []
+
+    async def fetch(session, date_str, branch, theme, end_day=0):
+        calls.append(session)
+        return [{"num": "2301", "hh": "9", "mm": "50", "enable": "Y"}]
+
+    engine._fetch_slots_with_session = fetch
+    engine._live_slot_state = {
+        "hedges_remaining": 1,
+        "hedge_delay": 0.001,
+        "last_rtt": 0.0,
+    }
+
+    slots = run(engine._fetch_live_slots("2026-08-15", "22", "65", "09:50"))
+
+    assert engine._match_slot(slots, "09:50") == ("2301", True)
+    assert calls == [engine._session]
+
+
+def test_quiet_wait_scopes_high_resolution_timer():
+    engine = make_engine()
+    engine.open_at = time.time() + 0.01
+    engine._live_slot_state = {"read_lead": 0.001}
+    events = []
+    engine._begin_high_resolution_timer = lambda: events.append("begin") or True
+    engine._end_high_resolution_timer = lambda: events.append("end")
+
+    run(engine._wait_for_open_quiet())
+
+    assert events == ["begin", "end"]
+
+
+def _template_slots(first="2827", second="2828", gubun=""):
+    return [
+        {"num": first, "hh": "19", "mm": "50", "enable": "Y", "gubun": gubun},
+        {"num": second, "hh": "20", "mm": "45", "enable": "Y", "gubun": gubun},
+    ]
+
+
+def test_trusted_slot_requires_two_distinct_matching_published_dates(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+
+    engine._remember_slot_template("2026-08-12", "23", "69", _template_slots())
+    assert engine._trusted_slot_from_cache(
+        "2026-08-18", "20:45", "23", "69"
+    ) == ("", ())
+
+    engine._remember_slot_template("2026-08-13", "23", "69", _template_slots())
+    slot_id, sources = engine._trusted_slot_from_cache(
+        "2026-08-18", "20:45", "23", "69"
+    )
+
+    assert slot_id == "2828"
+    assert sources == ("2026-08-13", "2026-08-12")
+
+
+def test_trusted_slot_is_disabled_when_latest_schedule_signature_changes(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    engine._remember_slot_template("2026-08-12", "23", "69", _template_slots())
+    engine._remember_slot_template(
+        "2026-08-13", "23", "69", _template_slots(second="9998")
+    )
+
+    assert engine._trusted_slot_from_cache(
+        "2026-08-18", "20:45", "23", "69"
+    ) == ("", ())
+
+
+def test_fresh_weekend_schedule_group_can_arm_only_one_fast_page(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    engine._remember_slot_template(
+        "2026-08-15", "23", "69", _template_slots(gubun="C")
+    )
+
+    assert engine._trusted_slot_from_cache(
+        "2026-08-22", "20:45", "23", "69"
+    ) == ("2828", ("2026-08-15",))
+
+
+def test_weekend_single_schedule_rejects_wrong_server_group(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    engine._remember_slot_template(
+        "2026-08-15", "23", "69", _template_slots(gubun="B")
+    )
+
+    assert engine._trusted_slot_from_cache(
+        "2026-08-22", "20:45", "23", "69"
+    ) == ("", ())
+
+
+def test_only_first_standby_page_receives_trusted_fast_slot():
+    engine = make_engine()
+    engine._trusted_slot_id = "2828"
+    engine._trusted_slot_sources = ("2026-08-12", "2026-08-13")
+
+    first = engine._make_page_worker(1)
+    second = engine._make_page_worker(2)
+
+    assert first._trusted_slot_id == "2828"
+    assert first._trusted_slot_sources == engine._trusted_slot_sources
+    assert second._trusted_slot_id == ""
+
+
+def test_trusted_first_page_and_live_fallback_page_use_separate_slot_paths():
+    async def scenario():
+        coordinator = make_engine()
+        coordinator._page_count = 2
+        coordinator._trusted_slot_id = "2828"
+        coordinator._trusted_slot_sources = ("2026-08-12", "2026-08-13")
+        coordinator._live_slot_state = {
+            "slot_id": "2301",
+            "status": "ready",
+            "last_probe": 0.0,
+            "lock": asyncio.Lock(),
+        }
+        first = coordinator._make_page_worker(1)
+        second = coordinator._make_page_worker(2)
+        submitted = {}
+
+        def configure(worker):
+            worker.open_at = None
+            worker._is_blocked = lambda _page: asyncio.sleep(0, result=False)
+            worker._captcha_token_value = lambda _page: asyncio.sleep(
+                0, result="manual-token"
+            )
+            worker._ensure_yescaptcha_token = lambda *_args: None
+
+            async def submit(_page, _state, slot_id, *_args, **_kwargs):
+                submitted[worker._page_index] = slot_id
+                return "success"
+
+            worker._submit = submit
+            return worker._watch_and_submit(
+                RecordingPage(),
+                {"message": ""},
+                {"devMode": False, "yescaptcha_enabled": False},
+                "2026-08-18",
+                "20:45",
+                "23",
+                "69",
+                "투투 어드벤쳐",
+                "9999",
+            )
+
+        await asyncio.gather(configure(first), configure(second))
+        return submitted
+
+    assert run(scenario()) == {1: "2828", 2: "2301"}
+
+
+def test_trusted_fire_wait_includes_server_clock_precision_margin():
+    engine = make_engine()
+    engine.open_at = 1000.0
+    values = iter((999.9, 1000.07))
+    last = [1000.07]
+
+    def now():
+        try:
+            last[0] = next(values)
+        except StopIteration:
+            pass
+        return last[0]
+
+    engine.clock = type(
+        "Clock", (), {"last_precision": 0.06, "now": staticmethod(now)}
+    )()
+    events = []
+    engine._begin_high_resolution_timer = lambda: events.append("begin") or True
+    engine._end_high_resolution_timer = lambda: events.append("end")
+
+    run(engine._wait_for_trusted_fire())
+
+    assert events == ["begin", "end"]
+    assert last[0] >= 1000.065
+
+
+def test_shared_slot_lookup_publishes_only_public_timetable_rows(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    owner = SharedSlotLookup("site|23|69|2026-08-18", time.time())
+    assert owner.prepare() is True
+    owner.mark_started()
+    rows = _template_slots()
+    owner.publish(rows)
+
+    follower = SharedSlotLookup("site|23|69|2026-08-18", owner.open_at)
+    follower.owner = False
+
+    assert follower.wait_for_result(0.1) == rows
+
+
+def test_shared_server_clock_reuses_one_local_measurement(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+
+    class Clock:
+        def __init__(self):
+            self.sync_calls = 0
+            self.applied = False
+            self.shared_announced = False
+
+        def apply_snapshot(self, value, max_age):
+            del max_age
+            self.applied = bool(value.get("mapping"))
+            return self.applied
+
+        def sync(self, announce=False):
+            del announce
+            self.sync_calls += 1
+            return True
+
+        @staticmethod
+        def snapshot():
+            return {
+                "mapping": 100.0,
+                "precision": 0.03,
+                "captured_monotonic": time.monotonic(),
+            }
+
+        def announce_sync(self, shared=False):
+            self.shared_announced = shared
+
+    first_clock = Clock()
+    assert SharedServerClock("site").sync(first_clock) is True
+    assert first_clock.sync_calls == 1
+
+    second_clock = Clock()
+    assert SharedServerClock("site").sync(second_clock, announce=True) is True
+    assert second_clock.sync_calls == 0
+    assert second_clock.applied is True
+    assert second_clock.shared_announced is True
+
+
+def test_coordinated_slot_read_uses_other_process_result_without_network():
+    engine = make_engine()
+    rows = _template_slots()
+    calls = []
+
+    class Share:
+        owner = False
+
+        def wait_for_result(self, _timeout):
+            return rows
+
+    async def network(*_args):
+        calls.append(True)
+        return []
+
+    engine._slot_share = Share()
+    engine._live_slot_state = {}
+    engine._fetch_live_slots = network
+
+    result = run(engine._fetch_coordinated_live_slots(
+        "2026-08-18", "23", "69", "20:45"
+    ))
+
+    assert result == rows
+    assert calls == []
+
+
+def test_browser_submission_connection_prewarm_uses_same_origin_head():
+    page = RecordingPage(results={"pg_prewarm": True})
+    engine = make_engine()
+
+    assert run(engine._prewarm_browser_connection(page)) is True
+    assert any("method: 'HEAD'" in script for script, _args in page.calls)
 
 
 
@@ -978,6 +1405,20 @@ def test_immediate_test_token_stays_active_like_a_booking_token():
 def test_token_is_bought_once_inside_the_lead_window():
     engine = scheduling_engine()
     drive(engine, engine.CAPTCHA_SOLVE_LEAD - 1)
+    assert engine.solve_calls == 1
+
+
+def test_captcha_lead_adapts_to_recent_slow_solves(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = scheduling_engine()
+    engine._yc_profile_key = engine._captcha_profile_id("key")
+    for seconds in (50.0, 55.0, 60.0):
+        engine._remember_captcha_solve_time(seconds)
+
+    assert engine._captcha_lead_seconds() == 85.0
+    drive(engine, 86.0)
+    assert engine.solve_calls == 0
+    drive(engine, 84.0)
     assert engine.solve_calls == 1
 
 

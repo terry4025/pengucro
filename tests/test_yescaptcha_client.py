@@ -93,3 +93,16 @@ def test_poll_uses_official_three_second_interval(monkeypatch):
     )
     assert sleeps == [POLL_INTERVAL_SECONDS]
     assert POLL_INTERVAL_SECONDS == 3.0
+
+
+def test_blank_network_exception_still_returns_useful_type(monkeypatch):
+    monkeypatch.setattr(
+        yescaptcha_client.requests,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()),
+    )
+
+    ok, _balance, message = YesCaptchaClient("client-key").get_balance()
+
+    assert ok is False
+    assert "TimeoutError" in message

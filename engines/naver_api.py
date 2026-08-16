@@ -223,9 +223,10 @@ SUBMIT_BOOKING_MUTATION = """mutation submitBooking($input: SubmitBookingParams)
 # deliberately not been probed because even a "safe" target could create a
 # booking if its state changed.
 SUBMIT_REFUSED_CODES = frozenset({
-    "RT25", "RT37", "RT47", "RT71", "RT77", "BOOKING_NOT_AVAILABLE", "Duplicated",
+    "RT25", "RT37", "RT47", "RT71", "RT77", "BOOKING_NOT_AVAILABLE",
     "STALE_DATA", "EXCEEDED_AGENCY_BOOKING_LIMIT",
 })
+SUBMIT_DUPLICATE_CODES = frozenset({"Duplicated", "DUPLICATED_BOOKING"})
 SUBMIT_NOT_OPEN_CODES = frozenset({"BizItem is not opened."})
 SUBMIT_AUTH_CODES = frozenset({"UNAUTHENTICATED", "Authentication failed"})
 # Naver's own "this looks automated" judgement. Treated as a hard stop for the API
@@ -420,11 +421,14 @@ class SubmitOutcome:
 
     The engine branches on these rather than on message text: ``NOT_OPEN`` means
     fire again in a moment, ``REFUSED`` means someone else got there, and
-    ``ABUSE``/``PAYLOAD`` mean stop using the API path and let the page do it.
+    ``DUPLICATED`` means Naver believes this account already sent or owns the
+    same reservation, and ``ABUSE``/``PAYLOAD`` mean stop using the API path and
+    let the page do it.
     """
 
     SUCCESS = "success"
     NOT_OPEN = "notopen"
+    DUPLICATED = "duplicated"
     REFUSED = "refused"
     AUTH = "auth"
     ABUSE = "abuse"
@@ -462,6 +466,8 @@ def classify_submit_error(code: str, message: str, reason: str = "") -> str:
             return SubmitOutcome.NOT_OPEN
         if text in SUBMIT_AUTH_CODES:
             return SubmitOutcome.AUTH
+        if text in SUBMIT_DUPLICATE_CODES:
+            return SubmitOutcome.DUPLICATED
         if text in SUBMIT_REFUSED_CODES:
             return SubmitOutcome.REFUSED
     for token in (code, message, reason):
@@ -595,6 +601,23 @@ class NaverBookingApi:
                 continue
         return added
 
+    def replace_cookies(self, cookies) -> int:
+        """Replace only Naver cookies, preserving unrelated session cookies.
+
+        Account switching can leave the requests cookie jar holding identifiers
+        from the previous browser login.  Clearing that subset before copying the
+        active Chrome jar guarantees subsequent authenticated reads describe the
+        account the user most recently selected.
+        """
+        for cookie in list(self.session.cookies):
+            if "naver" not in (cookie.domain or ""):
+                continue
+            try:
+                self.session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+            except (KeyError, ValueError):
+                continue
+        return self.attach_cookies(cookies)
+
     def close(self) -> None:
         if self._owns_session:
             try:
@@ -677,16 +700,15 @@ class NaverBookingApi:
         us which date that marker belongs to: take its latest published day and
         shift the marker by the calendar-day distance to ``date_str``.
 
-        Items that have never opened (``isOpened == false``) are one-shot/future
-        announcements, so their timestamp is already authoritative and must not
-        be shifted.  Any lookup/parsing failure also keeps Naver's raw value; a
-        conservative fallback is safer than inventing an opening time.
+        ``isOpened`` alone cannot distinguish a one-shot announcement from a
+        rolling calendar observed early.  Published schedule history is the
+        discriminator: history means rolling; no history keeps Naver's raw value.
+        Any lookup/parsing failure also keeps Naver's raw value.
         """
         announced = meta.open_at
         if (
             announced is None
             or not meta.uses_open_schedule
-            or not meta.is_opened
         ):
             return announced
 
@@ -713,8 +735,18 @@ class NaverBookingApi:
         if not published_days:
             return announced
 
+        # If the requested date is already in Naver's schedule response, the
+        # announced marker already applies.  Using a later published day as the
+        # anchor would move this target into the past (the live Channel 27 case
+        # moved 2026-08-17 nine days early because 2026-08-26 was also visible).
+        if target_day in published_days:
+            return announced
+
         anchor_day = max(published_days)
-        return announced + timedelta(days=(target_day - anchor_day).days)
+        projected = announced + timedelta(days=(target_day - anchor_day).days)
+        # A rolling projection may move an unopened future date later, but it
+        # must never authorize a submit before Naver's explicit opening marker.
+        return max(announced, projected)
 
     def fetch_item_meta(self) -> NaverItemMeta:
         data = self._post("bizItem", BIZ_ITEM_QUERY, {

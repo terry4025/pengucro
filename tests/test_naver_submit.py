@@ -248,6 +248,102 @@ def test_builder_rejects_unanswered_required_custom_form():
     assert "01012345678" not in result.reason
 
 
+def test_builder_supports_ticketing_business_and_all_dynamic_questions():
+    business = deepcopy(BUSINESS)
+    business["businessTypeId"] = 99
+    business["customFormJson"] = [
+        {
+            "type": "SELECT",
+            "title": "예약 매수",
+            "required": "y",
+            "options": [{"value": "2매"}, {"value": "3매"}],
+        },
+        {
+            "type": "SELECT",
+            "title": "주의사항",
+            "required": "y",
+            "options": [{"value": "확인했습니다"}, {"value": "미동의"}],
+        },
+        {"type": "TEXTAREA", "title": "필수 답변", "required": "y"},
+    ]
+    slot = deepcopy(SLOT)
+    slot["maxBookingCount"] = 10
+    slot["unitStock"] = 10
+
+    result = prepare(business=business, slot=slot)
+
+    assert result.ready is True
+    assert result.payload["businessTypeId"] == 99
+    assert result.payload["bookingCount"] == 3
+    assert result.payload["price"] == 99000
+    assert [question["value"] for question in result.payload["customFormInputJson"]] == [
+        "3매", "확인했습니다", "확인했습니다"
+    ]
+
+
+def test_builder_uses_item_level_form_before_business_form():
+    item = deepcopy(BIZ_ITEM)
+    item["customFormJson"] = [{
+        "type": "TEXT", "title": "관람자 이름", "required": "y"
+    }]
+
+    result = prepare(biz_item=item)
+
+    assert result.ready is True
+    assert len(result.payload["customFormInputJson"]) == 1
+    assert result.payload["customFormInputJson"][0]["value"] == "홍길동"
+
+
+def test_builder_uses_people_as_ticket_count_for_type_12_quantity_slot():
+    business = deepcopy(BUSINESS)
+    business["customFormJson"] = [{
+        "type": "SELECT",
+        "title": "1매예약은 1명예약 입니다. 즉 2명일경우 최소2매 예약",
+        "required": "y",
+        "options": [{"value": "네 확인했습니다"}],
+    }]
+    slot = deepcopy(SLOT)
+    slot["minBookingCount"] = None
+    slot["maxBookingCount"] = None
+    slot["unitStock"] = 8
+    slot["unitBookingCount"] = 0
+
+    result = prepare(business=business, slot=slot)
+
+    assert result.ready is True
+    assert result.quantity_mode is True
+    assert result.available_count == 8
+    assert result.payload["businessTypeId"] == 12
+    assert result.payload["bookingCount"] == 3
+    assert result.payload["priceTypeJson"][0]["bookingCount"] == 3
+    assert result.payload["price"] == 99000
+    assert result.payload["customFormInputJson"][0]["value"] == "네 확인했습니다"
+
+
+def test_builder_keeps_people_separate_from_fixed_single_slot_booking():
+    result = prepare()
+
+    assert result.ready is True
+    assert result.quantity_mode is False
+    assert result.payload["bookingCount"] == 1
+    assert result.payload["priceTypeJson"][0]["bookingCount"] == 1
+
+
+def test_builder_rejects_ticket_count_above_remaining_stock():
+    slot = deepcopy(SLOT)
+    slot["minBookingCount"] = None
+    slot["maxBookingCount"] = None
+    slot["unitStock"] = 8
+    slot["unitBookingCount"] = 7
+
+    result = prepare(slot=slot)
+
+    assert result.ready is False
+    assert result.quantity_mode is True
+    assert result.available_count == 1
+    assert "잔여 수량" in result.reason
+
+
 class FakePage:
     def __init__(self, body, status=200):
         self.body = body
@@ -273,6 +369,29 @@ class DelayedPage(FakePage):
     async def evaluate(self, script, argument=None):
         await asyncio.sleep(0.02)
         return await super().evaluate(script, argument)
+
+
+class ArmedPage:
+    def __init__(self):
+        self.calls = []
+        self.arm_id = ""
+
+    async def evaluate(self, _script, argument=None):
+        self.calls.append(argument)
+        if "delayMs" in argument:
+            self.arm_id = argument["armId"]
+            return {"id": self.arm_id, "status": "armed", "delayMs": argument["delayMs"]}
+        if set(argument) == {"armId"}:
+            return {
+                "status": "complete",
+                "response": {"status": 200, "body": {"data": {"submitBooking": {
+                    "bookingId": "999888", "url": "/my/bookings/999888",
+                }}}},
+                "startedAt": 1000,
+                "completedAt": 1042,
+                "error": "",
+            }
+        return True
 
 
 def test_browser_submitter_classifies_success():
@@ -356,6 +475,27 @@ def test_browser_submitter_measures_the_actual_browser_round_trip():
 
     assert account.is_logged_in is True
     assert submitter.last_rtt >= 0.015
+
+
+def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = ArmedPage()
+    submitter = NaverBrowserSubmitter(page)
+    payload = {"slotId": "1331382668", "csrfToken": "csrf-secret"}
+
+    arm_id = asyncio.run(submitter.arm_submit_at(payload, 0.125))
+    state, result, elapsed_ms = asyncio.run(
+        submitter.read_armed_submit(arm_id, payload)
+    )
+
+    assert state == "complete"
+    assert result is not None and result.outcome == SubmitOutcome.SUCCESS
+    assert result.booking_id == "999888"
+    assert elapsed_ms == 42
+    assert submitter.last_rtt == 0.042
+    assert page.calls[0]["delayMs"] == 125
+    assert page.calls[0]["input"]["slotId"] == "1331382668"
 
 
 def test_browser_submitter_classifies_the_resolver_reason():
@@ -443,3 +583,31 @@ def test_browser_submitter_fetches_account_from_same_session():
     assert account.csrf_token == "csrf-secret"
     assert account.is_sms_alarm is True
     assert page.calls[0]["operationName"] == "account"
+    assert NaverBrowserSubmitter(page).last_account_fetch_ok is False
+
+
+def test_browser_submitter_marks_live_account_query_as_authoritative():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    submitter = NaverBrowserSubmitter(FakePage({"data": {"account": {
+        "isLoggedIn": True,
+        "csrfToken": "csrf-new-account",
+        "isSmsAlarm": False,
+        "userId": "new-user",
+    }}}))
+
+    account = asyncio.run(submitter.fetch_account())
+
+    assert account.user_id == "new-user"
+    assert submitter.last_account_fetch_ok is True
+
+
+def test_browser_submitter_distinguishes_query_failure_from_logged_out():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    submitter = NaverBrowserSubmitter(RaisingPage())
+
+    account = asyncio.run(submitter.fetch_account())
+
+    assert account.is_logged_in is False
+    assert submitter.last_account_fetch_ok is False

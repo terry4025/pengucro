@@ -8,10 +8,12 @@ from typing import Any, Mapping
 
 STANDARD_MODE = "일반 사이트"
 NAVER_MODE = "네이버 예약"
+TRIPCOM_MODE = "Trip.com 이벤트"
 LEGACY_MODE_MAP = {
     "고속 (Async)": STANDARD_MODE,
     "일반 (Sync)": STANDARD_MODE,
     "네이버 (Playwright)": NAVER_MODE,
+    "Trip.com 핫딜": TRIPCOM_MODE,
 }
 
 
@@ -123,7 +125,9 @@ class ReservationRequest:
             engine_metadata=dict(values.get("engine_metadata", {})),
         )
 
-    def validate(self, *, phone_required: bool = True) -> list[str]:
+    def validate(
+        self, *, phone_required: bool = True, name_required: bool = True
+    ) -> list[str]:
         errors: list[str] = []
         if not self.theme_pk:
             errors.append("테마를 선택해주세요.")
@@ -137,7 +141,7 @@ class ReservationRequest:
             datetime.strptime(self.reservation_time, "%H:%M:%S")
         except ValueError:
             errors.append("시간을 HH:MM 형식으로 입력해주세요.")
-        if not self.name:
+        if name_required and not self.name:
             errors.append("예약자 이름을 입력해주세요.")
         phone_digits = "".join(ch for ch in self.phone if ch.isdigit())
         if phone_required and len(phone_digits) not in (10, 11):

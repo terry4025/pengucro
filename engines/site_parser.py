@@ -1,5 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
+import html
 import re
 import urllib.parse
 from datetime import datetime, timedelta
@@ -29,6 +30,12 @@ def extract_place_id_and_product_id(url):
     query_params = urllib.parse.parse_qs(parsed.query)
     
     product_id = query_params.get("bookingProductId", [None])[0]
+    if not product_id:
+        nested_path = query_params.get("placePath", [""])[0]
+        nested_query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(urllib.parse.unquote(nested_path)).query
+        )
+        product_id = nested_query.get("bookingProductId", [None])[0]
     
     place_id = query_params.get("id", [None])[0]
     if not place_id:
@@ -67,14 +74,59 @@ def get_booking_url_from_map_api(place_id):
         pass
     return None
 
-def get_booking_url_from_place_html(place_id):
+def _extract_booking_url_from_text(raw_text):
+    """Extract a booking URL from plain, escaped or percent-encoded page data."""
+    candidates = [str(raw_text or "")]
+    for _ in range(3):
+        decoded = html.unescape(candidates[-1])
+        decoded = decoded.replace(r"\/", "/").replace(r"\u002F", "/")
+        decoded = urllib.parse.unquote(decoded)
+        if decoded == candidates[-1]:
+            break
+        candidates.append(decoded)
+
+    pattern = re.compile(
+        r'(?:https?:)?//(?:m\.)?booking\.naver\.com/booking/\d+/bizes/\d+'
+        r'(?:/items/\d+)?',
+        re.I,
+    )
+    no_proto = re.compile(
+        r'(?:m\.)?booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?',
+        re.I,
+    )
+    for text in candidates:
+        match = pattern.search(text)
+        if match:
+            value = match.group(0)
+            return "https:" + value if value.startswith("//") else value
+        match = no_proto.search(text)
+        if match:
+            return "https://" + match.group(0)
+    return None
+
+
+def get_booking_url_from_place_html(place_id, source_url=""):
     """
     플레이스 HTML 페이지를 크롤링하여 예약 링크나 스크립트 데이터 내 예약 주소를 파싱합니다.
     """
-    urls = [
+    urls = []
+    if source_url:
+        urls.append(source_url)
+        parsed_source = urllib.parse.urlparse(source_url)
+        place_path = urllib.parse.parse_qs(parsed_source.query).get("placePath", [""])[0]
+        if place_path:
+            nested = urllib.parse.urljoin(
+                f"https://pcmap.place.naver.com/place/{place_id}/",
+                place_path.lstrip("/"),
+            )
+            urls.append(nested)
+    urls.extend([
+        f"https://pcmap.place.naver.com/place/{place_id}/festivalPerformance/performance",
+        f"https://pcmap.place.naver.com/place/{place_id}/festivalPerformance",
         f"https://m.place.naver.com/place/{place_id}/ticket",
         f"https://m.place.naver.com/place/{place_id}/home"
-    ]
+    ])
+    urls = list(dict.fromkeys(urls))
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
@@ -85,12 +137,9 @@ def get_booking_url_from_place_html(place_id):
             response = requests.get(url, headers=headers, timeout=5)
             if response.status_code == 200:
                 # 1. Regex search on full raw HTML text first (simplest and fastest)
-                match = re.search(r'https://booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?', response.text)
-                if match:
-                    return match.group(0)
-                match_no_proto = re.search(r'booking\.naver\.com/booking/\d+/bizes/\d+(?:/items/\d+)?', response.text)
-                if match_no_proto:
-                    return "https://" + match_no_proto.group(0)
+                extracted = _extract_booking_url_from_text(response.text)
+                if extracted:
+                    return extracted
                 
                 # 2. Fallback to anchor tags parsing
                 soup = BeautifulSoup(response.text, "html.parser")
@@ -119,7 +168,7 @@ def normalize_naver_url(url):
     place_id, item_id = extract_place_id_and_product_id(url)
     
     booking_match = re.search(
-        r'booking\.naver\.com/booking/(?P<service_id>\d+)/bizes/(?P<bizes_id>\d+)(/items/(?P<item_id>\d+))?',
+        r'(?:m\.)?booking\.naver\.com/booking/(?P<service_id>\d+)/bizes/(?P<bizes_id>\d+)(/items/(?P<item_id>\d+))?',
         url
     )
     
@@ -136,7 +185,7 @@ def normalize_naver_url(url):
     if place_id:
         booking_url = get_booking_url_from_map_api(place_id)
         if not booking_url:
-            booking_url = get_booking_url_from_place_html(place_id)
+            booking_url = get_booking_url_from_place_html(place_id, url)
             
         if booking_url:
             normalized_base = normalize_naver_url(booking_url)

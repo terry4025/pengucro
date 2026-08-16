@@ -1,7 +1,7 @@
 """Build and send Naver's direct ``submitBooking`` request.
 
-The page itself still owns authentication. This module supports the EPISODE
-shape used by escape-room products, including ordinary completion, Npay
+The page itself still owns authentication. This module supports ordinary
+single-slot reservations and multi-unit performance tickets, including Npay
 pre-payment and post-payment. Seat and fixed-period products still fall back to
 the browser because their payloads have materially different state.
 """
@@ -26,9 +26,9 @@ from engines.naver_api import (
     SubmitResult,
     classify_submit_error,
 )
+from engines.naver_forms import prepare_custom_form_answers
 
 
-EPISODE_BUSINESS_TYPE_ID = 12
 TERMS_VERSION = "20251030"
 PAYMENT_BOOKING = "booking"
 PAYMENT_NPAY_PREPAID = "npay_prepaid"
@@ -43,6 +43,8 @@ class NaverSubmitPreparation:
     slot_id: str = ""
     payment_mode: str = PAYMENT_BOOKING
     payment_source: str = ""
+    quantity_mode: bool = False
+    available_count: int | None = None
 
     @property
     def requires_checkout(self) -> bool:
@@ -80,6 +82,72 @@ def _iso_millis_utc(value: datetime) -> str:
 
 def _digits(value: Any) -> str:
     return re.sub(r"\D", "", str(value or ""))
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+@dataclass(frozen=True)
+class NaverBookingQuantity:
+    count: int
+    minimum: int
+    maximum: int
+    available: int | None
+    quantity_mode: bool
+
+
+def resolve_booking_quantity(
+    slot: Mapping[str, Any], reservation: Mapping[str, Any]
+) -> NaverBookingQuantity:
+    """Distinguish one-slot reservations from per-person ticket quantities.
+
+    Both ordinary escape rooms and immersive performances use Naver business
+    type 12, so business type is not a useful discriminator.  The official page
+    renders its +/- quantity control when a slot can sell multiple units: the
+    explicit maximum exceeds one, or min/max are absent while unit stock exceeds
+    one.  Fixed 1..1 slots remain a single reservation even when the form asks
+    for several participants.
+    """
+    raw_minimum = _optional_positive_int(slot.get("minBookingCount"))
+    raw_maximum = _optional_positive_int(slot.get("maxBookingCount"))
+    unit_stock = _optional_positive_int(slot.get("unitStock"))
+    unit_booked = _optional_positive_int(slot.get("unitBookingCount"))
+    requested = max(1, int(_digits(reservation.get("people")) or 1))
+    minimum = max(1, raw_minimum or 1)
+
+    quantity_mode = bool(
+        (raw_maximum is not None and raw_maximum > 1)
+        or (
+            raw_maximum is None
+            and unit_stock is not None
+            and unit_stock > 1
+            and (raw_minimum is None or raw_minimum <= 1)
+        )
+    )
+    if quantity_mode:
+        maximum = max(minimum, raw_maximum or unit_stock or requested)
+        count = max(minimum, requested)
+    else:
+        maximum = max(minimum, raw_maximum or minimum)
+        count = minimum
+
+    available = None
+    if unit_stock is not None and unit_booked is not None:
+        available = max(0, unit_stock - unit_booked)
+    return NaverBookingQuantity(
+        count=count,
+        minimum=minimum,
+        maximum=maximum,
+        available=available,
+        quantity_mode=quantity_mode,
+    )
 
 
 def _bool_flag(value: Any) -> bool:
@@ -138,49 +206,6 @@ def _first_resource(resources: Any) -> str | None:
     return str(first.get("resourceUrl") or "") or None
 
 
-def _custom_form_input(
-    form: Any, people: Any
-) -> tuple[list[dict[str, Any]], str | None]:
-    if not isinstance(form, list):
-        return [], None
-    wanted = str(people or "").strip()
-    wanted_digits = _digits(wanted)
-    output: list[dict[str, Any]] = []
-    for raw_question in form:
-        if not isinstance(raw_question, dict):
-            continue
-        question = copy.deepcopy(raw_question)
-        required = str(question.get("required") or "").lower() == "y"
-        question_type = str(question.get("type") or "").upper()
-        if question_type != "SELECT":
-            if required:
-                return [], "지원하지 않는 필수 추가 입력 항목이 있습니다"
-            output.append(question)
-            continue
-
-        selected = None
-        for option in question.get("options") or []:
-            if not isinstance(option, dict):
-                continue
-            value = str(option.get("value") or "")
-            if value == wanted or (
-                wanted_digits and _digits(value) == wanted_digits
-            ):
-                selected = option
-                break
-        if selected is None:
-            if required:
-                return [], "예약 인원에 맞는 필수 추가 입력 선택지가 없습니다"
-            output.append(question)
-            continue
-        question["value"] = selected.get("value")
-        question["originalValue"] = (
-            selected.get("originalValue") or selected.get("value")
-        )
-        output.append(question)
-    return output, None
-
-
 class NaverSubmitPayloadBuilder:
     """Convert the public GraphQL records into the page's supported payload."""
 
@@ -199,9 +224,10 @@ class NaverSubmitPayloadBuilder:
             return NaverSubmitPreparation(
                 False, reason="네이버 로그인 또는 CSRF 확인에 실패했습니다"
             )
-        if int(business.get("businessTypeId") or 0) != EPISODE_BUSINESS_TYPE_ID:
+        business_type_id = int(business.get("businessTypeId") or 0)
+        if business_type_id <= 0:
             return NaverSubmitPreparation(
-                False, reason="이 상품 유형의 API 직접 제출은 지원하지 않습니다"
+                False, reason="상품 유형 정보를 확인하지 못했습니다"
             )
         if biz_item.get("isSeatUsed") or biz_item.get("isPeriodFixed"):
             return NaverSubmitPreparation(
@@ -252,34 +278,63 @@ class NaverSubmitPayloadBuilder:
                 False, reason="예약자 이름 또는 연락처가 비어 있습니다"
             )
 
-        custom_form, form_error = _custom_form_input(
-            business.get("customFormJson"), reservation.get("people")
-        )
-        if form_error:
-            return NaverSubmitPreparation(False, reason=form_error)
-
         prices = [
             copy.deepcopy(price)
             for price in (slot.get("prices") or [])
             if isinstance(price, dict)
             and price.get("isImp", True) is not False
         ]
-        if len(prices) != 1:
+        if not prices:
             return NaverSubmitPreparation(
-                False, reason="가격 선택지가 한 개가 아닌 상품은 지원하지 않습니다"
+                False, reason="예약 가능한 가격 선택지가 없습니다"
             )
-        booking_count = max(1, int(slot.get("minBookingCount") or 1))
-        max_count = int(slot.get("maxBookingCount") or booking_count)
-        if booking_count > max_count:
+        quantity = resolve_booking_quantity(slot, reservation)
+        booking_count = quantity.count
+        if booking_count > quantity.maximum:
             return NaverSubmitPreparation(
-                False, reason="슬롯의 최소·최대 예약 수량이 올바르지 않습니다"
+                False,
+                reason=(
+                    f"예약 수량 {booking_count}개가 상품 최대 수량 "
+                    f"{quantity.maximum}개를 초과합니다"
+                ),
+                quantity_mode=quantity.quantity_mode,
+                available_count=quantity.available,
             )
-        prices[0]["bookingCount"] = booking_count
-        base_price = int(prices[0].get("price") or 0) * booking_count
+        if quantity.available is not None and booking_count > quantity.available:
+            return NaverSubmitPreparation(
+                False,
+                reason=(
+                    f"예약 수량 {booking_count}개에 비해 현재 잔여 수량이 "
+                    f"{quantity.available}개뿐입니다"
+                ),
+                quantity_mode=quantity.quantity_mode,
+                available_count=quantity.available,
+            )
+        selected_price_index = next(
+            (index for index, price in enumerate(prices) if price.get("isDefault")),
+            0,
+        )
+        for index, price in enumerate(prices):
+            price["bookingCount"] = booking_count if index == selected_price_index else 0
+        base_price = int(prices[selected_price_index].get("price") or 0) * booking_count
         if base_price < 0:
             return NaverSubmitPreparation(
                 False, reason="슬롯 가격이 올바르지 않습니다"
             )
+
+        item_form = biz_item.get("customFormJson")
+        form = (
+            item_form
+            if isinstance(item_form, list) and item_form
+            else business.get("customFormJson")
+        )
+        custom_form, _answers, form_error = prepare_custom_form_answers(
+            form,
+            reservation,
+            item_count=booking_count,
+        )
+        if form_error:
+            return NaverSubmitPreparation(False, reason=form_error)
 
         raw_names = business.get("rawNames")
         raw_names = raw_names if isinstance(raw_names, dict) else {}
@@ -293,7 +348,7 @@ class NaverSubmitPayloadBuilder:
 
         payload: dict[str, Any] = {
             "bookingId": None,
-            "businessTypeId": EPISODE_BUSINESS_TYPE_ID,
+            "businessTypeId": business_type_id,
             "isNPayUsed": is_npay_used,
             "businessId": str(business.get("businessId") or ""),
             "businessName": str(
@@ -398,6 +453,8 @@ class NaverSubmitPayloadBuilder:
             slot_id=str(payload["slotId"]),
             payment_mode=payment_mode,
             payment_source=payment_source,
+            quantity_mode=quantity.quantity_mode,
+            available_count=quantity.available,
         )
 
 
@@ -463,6 +520,135 @@ BROWSER_GRAPHQL_SCRIPT = r"""async request => {
     } finally {
         clearTimeout(timeout);
     }
+}"""
+
+
+# This is intentionally a single, pre-armed request.  It is installed while the
+# page is idle several seconds before the published opening time, then Chrome's
+# own event loop starts the same GraphQL mutation at the calculated moment.  That
+# removes the last Python -> CDP scheduling hop without multiplying requests.
+BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
+    const stateKey = "__pengucroNaverArmedSubmit";
+    const existing = window[stateKey];
+    if (existing && (existing.status === "armed" || existing.status === "submitting")) {
+        return {error: "active"};
+    }
+    const input = structuredClone(request.input || {});
+    if (input.userAgentJson) {
+        const ua = navigator.userAgent || "";
+        let os = (navigator.userAgentData && navigator.userAgentData.platform) ||
+            navigator.platform || "";
+        let osVersion = "";
+        let device = "none";
+        const windows = ua.match(/Windows NT ([0-9.]+)/i);
+        const android = ua.match(/Android\s+([0-9.]+)/i);
+        const ios = ua.match(/(?:iPhone OS|CPU OS)\s+([0-9_]+)/i);
+        const mac = ua.match(/Mac OS X\s+([0-9_]+)/i);
+        if (windows) {
+            os = "Windows";
+            osVersion = windows[1] === "10.0" ? "10" : windows[1];
+        } else if (android) {
+            os = "Android";
+            osVersion = android[1];
+        } else if (ios) {
+            os = "iOS";
+            osVersion = ios[1].replace(/_/g, ".");
+            device = /iPad/i.test(ua) ? "iPad" : "iPhone";
+        } else if (mac) {
+            os = "Mac OS";
+            osVersion = mac[1].replace(/_/g, ".");
+        }
+        input.userAgentJson = {
+            ...input.userAgentJson,
+            raw: ua,
+            os,
+            os_version: osVersion,
+            device,
+        };
+    }
+    const delayMs = Math.max(0, Number(request.delayMs) || 0);
+    const timeoutMs = Math.max(100, Number(request.timeoutMs) || 3000);
+    const state = {
+        id: String(request.armId || ""),
+        status: "armed",
+        dueAt: performance.now() + delayMs,
+        startedAt: 0,
+        completedAt: 0,
+        response: null,
+        error: "",
+        timer: 0,
+        controller: null,
+    };
+    window[stateKey] = state;
+    const pause = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+    const run = async () => {
+        try {
+            // Timer wakeups can be a few milliseconds late.  Keep the final
+            // spin tiny so the booking page remains responsive.
+            const quietUntil = state.dueAt - 6;
+            if (performance.now() < quietUntil) {
+                await pause(quietUntil - performance.now());
+            }
+            while (performance.now() < state.dueAt) {}
+            if (state.status !== "armed") return;
+            state.status = "submitting";
+            state.startedAt = performance.now();
+            const controller = new AbortController();
+            state.controller = controller;
+            const timeout = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch("/graphql?opName=submitBooking", {
+                    method: "POST",
+                    credentials: "include",
+                    signal: controller.signal,
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        operationName: "submitBooking",
+                        query: request.query,
+                        variables: {input},
+                    }),
+                });
+                let body = null;
+                try { body = await response.json(); } catch (_) {}
+                state.response = {status: response.status, body};
+            } finally {
+                clearTimeout(timeout);
+                state.controller = null;
+            }
+            state.status = "complete";
+        } catch (error) {
+            state.error = String((error && error.name) || "browser-fetch-error");
+            state.status = "error";
+        } finally {
+            state.completedAt = performance.now();
+        }
+    };
+    state.timer = setTimeout(() => { void run(); }, Math.max(0, delayMs - 8));
+    return {id: state.id, status: state.status, delayMs};
+}"""
+
+
+BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
+    const state = window.__pengucroNaverArmedSubmit;
+    if (!state || state.id !== String(request.armId || "")) return {status: "missing"};
+    return {
+        status: state.status,
+        response: state.response,
+        error: state.error || "",
+        startedAt: Number(state.startedAt) || 0,
+        completedAt: Number(state.completedAt) || 0,
+    };
+}"""
+
+
+BROWSER_CANCEL_ARMED_SUBMIT_SCRIPT = r"""request => {
+    const state = window.__pengucroNaverArmedSubmit;
+    if (!state || state.id !== String(request.armId || "")) return false;
+    if (state.status !== "armed") return false;
+    clearTimeout(state.timer);
+    state.status = "cancelled";
+    state.completedAt = performance.now();
+    return true;
 }"""
 
 
@@ -556,6 +742,9 @@ class NaverBrowserSubmitter:
         self.page = page
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.last_rtt: float | None = None
+        # ``False`` distinguishes a failed GraphQL request from a successful
+        # response that explicitly says the current browser is logged out.
+        self.last_account_fetch_ok = False
 
     async def _graphql(
         self, operation_name: str, query: str, variables: dict[str, Any]
@@ -578,6 +767,7 @@ class NaverBrowserSubmitter:
             self.last_rtt = time.monotonic() - started
 
     async def fetch_account(self) -> NaverAccount:
+        self.last_account_fetch_ok = False
         try:
             response = await self._graphql("account", ACCOUNT_QUERY, {})
         except Exception:
@@ -587,6 +777,7 @@ class NaverBrowserSubmitter:
         account = data.get("account") if isinstance(data, dict) else None
         if not isinstance(account, dict):
             return NaverAccount(False, "", False)
+        self.last_account_fetch_ok = True
         return NaverAccount(
             is_logged_in=bool(account.get("isLoggedIn")),
             csrf_token=str(account.get("csrfToken") or ""),
@@ -623,3 +814,75 @@ class NaverBrowserSubmitter:
             booking_id=result.booking_id,
             url=result.url,
         )
+
+    async def arm_submit_at(self, payload: dict[str, Any], delay_seconds: float) -> str:
+        """Arm exactly one browser-internal submit and return its opaque id."""
+        arm_id = f"naver-{time.monotonic_ns()}"
+        try:
+            response = await asyncio.wait_for(
+                self.page.evaluate(
+                    BROWSER_ARMED_SUBMIT_SCRIPT,
+                    {
+                        "armId": arm_id,
+                        "input": copy.deepcopy(payload),
+                        "query": SUBMIT_BOOKING_MUTATION,
+                        "delayMs": round(max(0.0, float(delay_seconds)) * 1000),
+                        "timeoutMs": round(self.timeout_seconds * 1000),
+                    },
+                ),
+                timeout=1.5,
+            )
+        except Exception as exc:
+            raise RuntimeError("브라우저 내부 예약 타이머를 준비하지 못했습니다") from exc
+        if not isinstance(response, dict) or response.get("id") != arm_id:
+            raise RuntimeError("브라우저 내부 예약 타이머 응답이 올바르지 않습니다")
+        return arm_id
+
+    async def read_armed_submit(self, arm_id: str, payload: Mapping[str, Any]) -> tuple[str, SubmitResult | None, float | None]:
+        """Read one armed request without sending another booking mutation."""
+        try:
+            state = await self.page.evaluate(
+                BROWSER_ARMED_SUBMIT_STATE_SCRIPT, {"armId": arm_id}
+            )
+        except Exception:
+            return "error", SubmitResult(
+                SubmitOutcome.UNKNOWN,
+                message="브라우저 내부 예약 결과를 읽지 못했습니다. 예약내역을 확인해주세요.",
+            ), None
+        if not isinstance(state, dict):
+            return "error", SubmitResult(
+                SubmitOutcome.UNKNOWN,
+                message="브라우저 내부 예약 상태 형식이 올바르지 않습니다.",
+            ), None
+        status = str(state.get("status") or "error")
+        elapsed_ms: float | None = None
+        started = state.get("startedAt")
+        completed = state.get("completedAt")
+        if isinstance(started, (int, float)) and isinstance(completed, (int, float)) and completed >= started > 0:
+            elapsed_ms = float(completed - started)
+            self.last_rtt = elapsed_ms / 1000
+        if status == "complete":
+            result = _submit_result_from_response(state.get("response"))
+            return status, SubmitResult(
+                result.outcome,
+                code=_redact_payload_values(result.code, payload),
+                message=_redact_payload_values(result.message, payload),
+                booking_id=result.booking_id,
+                url=result.url,
+            ), elapsed_ms
+        if status in {"error", "missing"}:
+            return status, SubmitResult(
+                SubmitOutcome.UNKNOWN,
+                message="브라우저 내부 예약 전송 결과를 확인할 수 없습니다. 예약내역을 확인해주세요.",
+            ), elapsed_ms
+        if status == "cancelled":
+            return status, None, elapsed_ms
+        return status, None, elapsed_ms
+
+    async def cancel_armed_submit(self, arm_id: str) -> bool:
+        try:
+            return bool(await self.page.evaluate(
+                BROWSER_CANCEL_ARMED_SUBMIT_SCRIPT, {"armId": arm_id}
+            ))
+        except Exception:
+            return False

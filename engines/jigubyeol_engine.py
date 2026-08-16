@@ -1,7 +1,14 @@
+import json
+import re
+import threading
+import time
+
 import requests
 from bs4 import BeautifulSoup
-import json
+
 from engines.base_engine import BaseEngine
+from pengucro.diagnostics import format_exception
+
 
 class JigubyeolEngine(BaseEngine):
     # Every HTTP call must be bounded. Without a timeout a worker that hits a
@@ -15,8 +22,98 @@ class JigubyeolEngine(BaseEngine):
         super().__init__(log_callback, success_callback)
         self.base_url = site_url if site_url else 'https://www.xn--2e0b040a4xj.com'
 
-    def get_csrf_token(self, session):
+    @staticmethod
+    def _worker_name(task_idx=None):
+        if task_idx is not None:
+            return f"태스크 {task_idx + 1}"
+        thread_name = threading.current_thread().name
+        if thread_name.startswith("BookingThread-"):
+            return f"작업 {thread_name.rsplit('-', 1)[-1]}"
+        return "작업 1"
+
+    @staticmethod
+    def _elapsed_ms(started):
+        return max(0.0, (time.perf_counter() - started) * 1000.0)
+
+    @staticmethod
+    def _redact_sensitive_text(value, reservation_data=None):
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if reservation_data:
+            for key in ("name", "phone"):
+                raw = str(reservation_data.get(key, "")).strip()
+                if raw:
+                    text = text.replace(raw, "[숨김]")
+                digits = "".join(character for character in raw if character.isdigit())
+                if len(digits) >= 7:
+                    text = text.replace(digits, "[숨김]")
+        text = re.sub(r"(?i)\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", "[이메일 숨김]", text)
+        text = re.sub(r"(?<!\d)01[016789][ -]?\d{3,4}[ -]?\d{4}(?!\d)", "[전화번호 숨김]", text)
+        text = re.sub(r"(?<!\d)\d{7,}(?!\d)", "[긴 숫자 숨김]", text)
+        text = re.sub(
+            r"(?i)\b(token|csrf|cookie|session|name|phone|mobile|account|amount)\s*[=:]\s*[^\s,;]+",
+            lambda match: f"{match.group(1)}=[숨김]",
+            text,
+        )
+        return text[:240]
+
+    @classmethod
+    def _format_exception(cls, exc, reservation_data=None):
+        return cls._redact_sensitive_text(format_exception(exc), reservation_data)
+
+    @classmethod
+    def _safe_error_message(cls, decoded_text, reservation_data=None):
+        try:
+            error_data = json.loads(decoded_text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            error_data = None
+
+        if isinstance(error_data, dict):
+            if isinstance(error_data.get('errors'), dict):
+                err_details = []
+                for field, messages in error_data['errors'].items():
+                    if isinstance(messages, list):
+                        message_text = ", ".join(str(message) for message in messages)
+                    else:
+                        message_text = str(messages)
+                    err_details.append(f"{field}: {message_text}")
+                main_message = error_data.get('message', '입력값 검증 실패')
+                message = f"{main_message} ({'; '.join(err_details)})"
+            else:
+                message = error_data.get('Message') or error_data.get('message') or "JSON 오류 응답"
+        else:
+            soup = BeautifulSoup(str(decoded_text or ""), 'html.parser')
+            message = soup.get_text(" ", strip=True) or "응답 본문에 오류 설명 없음"
+        return cls._redact_sensitive_text(message, reservation_data)
+
+    @staticmethod
+    def _success_message(done_text):
+        soup = BeautifulSoup(done_text, 'html.parser')
+        booking_id = ""
+        for row in soup.select('table tr'):
+            heading = row.find('th')
+            value = row.find('td')
+            if heading and value and '예약번호' in heading.get_text(" ", strip=True):
+                booking_id = value.get_text(" ", strip=True)
+                break
+
+        if "임시로" in done_text or "입금전" in done_text:
+            message = "예약 성공! (가상계좌 임시 예약 완료 · 결제 정보는 사이트에서 확인)"
+        else:
+            message = "예약 성공! (예약 확정 완료)"
+        if booking_id:
+            message += f" · 예약번호 {booking_id}"
+        return message
+
+    def _log_http(self, worker_name, stage, status, rtt_ms):
+        self.log(
+            f"[{worker_name}] {stage} 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms",
+            "info",
+        )
+
+    def get_csrf_token(self, session, worker_name="작업 1"):
+        started = time.perf_counter()
         response = session.get(f'{self.base_url}/reservation', timeout=self.LOOKUP_TIMEOUT)
+        self._log_http(worker_name, "CSRF 준비", response.status_code, self._elapsed_ms(started))
         soup = BeautifulSoup(response.text, 'html.parser')
         meta = soup.find('meta', {'name': 'csrf-token'})
         if meta is None or not meta.get('content'):
@@ -89,11 +186,20 @@ class JigubyeolEngine(BaseEngine):
     def make_reservation_thread(self, reservation_data):
         session = requests.Session()
         csrf_token = None
+        worker_name = self._worker_name()
+        target_time = reservation_data['reservationTime'][:5]
+        self.log(
+            f"[{worker_name}] 지구별 예약 감시 시작 · 지점 {reservation_data.get('branch', '')} · "
+            f"테마 {reservation_data.get('themePK', '')} · {reservation_data.get('reservationDate', '')} "
+            f"{target_time}",
+            "info",
+        )
         
         while not self.stop_event.is_set():
+            stage = "CSRF 준비"
             try:
                 if not csrf_token:
-                    csrf_token = self.get_csrf_token(session)
+                    csrf_token = self.get_csrf_token(session, worker_name)
                 
                 if self.stop_event.is_set():
                     break
@@ -102,12 +208,28 @@ class JigubyeolEngine(BaseEngine):
                         break
                     
                     # Step 1: 시간 선택 선등록
+                    stage = "시간 선택"
+                    started = time.perf_counter()
                     step1_response = self.submit_time_selection(session, csrf_token, reservation_data)
+                    step1_rtt = self._elapsed_ms(started)
+                    if step1_response.status_code in (200, 201):
+                        self._log_http(worker_name, stage, step1_response.status_code, step1_rtt)
                     if step1_response.status_code == 419:
+                        self.log(
+                            f"[{worker_name}] {target_time} 시도 중... "
+                            f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                            "warning",
+                        )
                         csrf_token = None
                         continue
                     if step1_response.status_code not in (200, 201):
-                        self.handle_error(step1_response, reservation_data, '시간선택')
+                        self.handle_error(
+                            step1_response,
+                            reservation_data,
+                            stage,
+                            worker_name=worker_name,
+                            rtt_ms=step1_rtt,
+                        )
                         continue
                     
                     # Step 2: 최종 예약 완료
@@ -120,68 +242,72 @@ class JigubyeolEngine(BaseEngine):
                     payment_input = soup.find('input', {'name': 'payment_method'})
                     payment_method = payment_input.get('value', '1') if payment_input else '1'
                     
+                    stage = "최종 예약"
+                    started = time.perf_counter()
                     step2_response = self.submit_reservation(session, csrf_token, reservation_data, payment_method)
+                    step2_rtt = self._elapsed_ms(started)
+                    if step2_response.status_code in (200, 201):
+                        self._log_http(worker_name, stage, step2_response.status_code, step2_rtt)
                     
                     if step2_response.status_code == 419:
+                        self.log(
+                            f"[{worker_name}] {target_time} 시도 중... "
+                            f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                            "warning",
+                        )
                         csrf_token = None
                         continue
                         
                     if step2_response.status_code in (200, 201):
                         try:
+                            stage = "완료 정보 확인"
                             done_url = f"{self.base_url}/reservation/done"
+                            started = time.perf_counter()
                             done_res = session.get(done_url, timeout=self.LOOKUP_TIMEOUT)
+                            self._log_http(
+                                worker_name,
+                                stage,
+                                done_res.status_code,
+                                self._elapsed_ms(started),
+                            )
                             done_res.encoding = 'utf-8'
-                            done_soup = BeautifulSoup(done_res.text, 'html.parser')
-                            
-                            vbank_num = ""
-                            vbank_deadline = ""
-                            vbank_amount = ""
-                            booking_id = ""
-                            
-                            tables = done_soup.find_all('table')
-                            for table in tables:
-                                for row in table.find_all('tr'):
-                                    th = row.find('th')
-                                    td = row.find('td')
-                                    if th and td:
-                                        th_text = th.text.strip()
-                                        td_text = td.text.strip()
-                                        if '계좌' in th_text or '가상계좌' in th_text:
-                                            vbank_num = td_text
-                                        elif '기한' in th_text or '만료' in th_text:
-                                            vbank_deadline = td_text
-                                        elif '금액' in th_text or '입금액' in th_text:
-                                            vbank_amount = td_text
-                                        elif '예약번호' in th_text:
-                                            booking_id = td_text
-                                            
-                            success_msg = "예약 성공!"
-                            if "임시로" in done_res.text or "입금전" in done_res.text:
-                                success_msg += " (가상계좌 임시 예약 완료)"
-                                if vbank_num:
-                                    success_msg += f" 계좌: {vbank_num}"
-                                if vbank_amount:
-                                    success_msg += f", 금액: {vbank_amount}"
-                                if vbank_deadline:
-                                    success_msg += f", 기한: {vbank_deadline}"
-                            else:
-                                success_msg += " (예약 확정 완료)"
-                                if booking_id:
-                                    success_msg += f" 예약번호: {booking_id}"
-                                    
-                            self.log(success_msg, "success")
+                            self.log(
+                                f"[{worker_name}] {self._success_message(done_res.text)}",
+                                "success",
+                            )
                         except Exception as e:
-                            self.log(f"예약 성공! (상세 정보 파싱 실패: {e})", "success")
+                            self.log(
+                                f"[{worker_name}] 예약 성공! (완료 정보 확인 실패 · "
+                                f"{self._format_exception(e, reservation_data)})",
+                                "success",
+                            )
                             
                         self.notify_success()
                         break
                     else:
-                        self.handle_error(step2_response, reservation_data, '최종예약')
+                        self.handle_error(
+                            step2_response,
+                            reservation_data,
+                            stage,
+                            worker_name=worker_name,
+                            rtt_ms=step2_rtt,
+                        )
             except Exception as e:
                 csrf_token = None
-                self.log(f"{reservation_data['reservationTime'][:5]} 시도 중... (연결 오류 - 재시도)", "info")
+                self.log(
+                    f"[{worker_name}] {target_time} 시도 중... ({stage} 오류 · "
+                    f"{self._format_exception(e, reservation_data)} · CSRF 초기화 후 재시도)",
+                    "warning",
+                )
 
-    def handle_error(self, response, reservation_data, step_name):
+    def handle_error(
+        self,
+        response,
+        reservation_data,
+        step_name,
+        worker_name="작업 1",
+        rtt_ms=0.0,
+    ):
         time_slot = reservation_data['reservationTime'][:5]
 
         try:
@@ -189,40 +315,34 @@ class JigubyeolEngine(BaseEngine):
         except Exception:
             decoded_text = response.text
 
-        try:
-            error_data = json.loads(decoded_text)
-            if 'errors' in error_data and isinstance(error_data['errors'], dict):
-                err_details = []
-                for field, msgs in error_data['errors'].items():
-                    if isinstance(msgs, list):
-                        msg_str = ", ".join(msgs)
-                    else:
-                        msg_str = str(msgs)
-                    err_details.append(f"{field}: {msg_str}")
-                main_msg = error_data.get('message', 'The given data was invalid.')
-                error_message = f"{main_msg} ({'; '.join(err_details)})"
-            elif 'Message' in error_data:
-                error_message = error_data['Message']
-            elif 'message' in error_data:
-                error_message = error_data['message']
-            else:
-                error_message = decoded_text[:200]
-        except (json.JSONDecodeError, ValueError):
-            error_message = decoded_text[:200]
+        error_message = self._safe_error_message(decoded_text, reservation_data)
+        response_meta = f"{step_name} 거절 · HTTP {response.status_code} · RTT {rtt_ms:.0f}ms"
 
         if "이미 예약" in error_message:
-            self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대, 해당 시간대 예약이 다시 열릴때까지 재시도)", "info")
+            retry_reason = "이미 예약된 시간대 · 다시 열릴 때까지 재시도"
         elif "결제 수단" in error_message or "결제수단" in error_message:
-            self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대이거나 결제수단 오류 - 재시도)", "info")
+            retry_reason = "이미 예약되었거나 결제 수단 오류 · 재시도"
         else:
-            self.log(f"{time_slot} 시도 중... ({error_message}, 재시도)", "info")
+            retry_reason = f"{error_message} · 재시도"
+        self.log(
+            f"[{worker_name}] {time_slot} 시도 중... ({response_meta} · {retry_reason})",
+            "warning",
+        )
 
     async def make_reservation_async_task(self, reservation_data, task_idx):
-        import aiohttp
         import asyncio
+        import aiohttp
         
         session = None
         csrf_token = None
+        worker_name = self._worker_name(task_idx)
+        target_time = reservation_data['reservationTime'][:5]
+        self.log(
+            f"[{worker_name}] 지구별 예약 감시 시작 · 지점 {reservation_data.get('branch', '')} · "
+            f"테마 {reservation_data.get('themePK', '')} · {reservation_data.get('reservationDate', '')} "
+            f"{target_time}",
+            "info",
+        )
         
         if hasattr(self, "session_pool") and len(self.session_pool) > 0:
             local_idx = task_idx % len(self.session_pool)
@@ -241,9 +361,10 @@ class JigubyeolEngine(BaseEngine):
             
         try:
             while not self.stop_event.is_set():
+                stage = "CSRF 준비"
                 try:
                     if not csrf_token:
-                        csrf_token = await self.get_csrf_token_async(session)
+                        csrf_token = await self.get_csrf_token_async(session, worker_name)
                     
                     if self.stop_event.is_set():
                         break
@@ -253,12 +374,28 @@ class JigubyeolEngine(BaseEngine):
                             break
                         
                         # Step 1: 시간 선택 선등록
+                        stage = "시간 선택"
+                        started = time.perf_counter()
                         step1_response = await self.submit_time_selection_async(session, csrf_token, reservation_data)
+                        step1_rtt = self._elapsed_ms(started)
+                        if step1_response.status in (200, 201):
+                            self._log_http(worker_name, stage, step1_response.status, step1_rtt)
                         if step1_response.status == 419:
+                            self.log(
+                                f"[{worker_name}] {target_time} 시도 중... "
+                                f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                                "warning",
+                            )
                             csrf_token = None
                             continue
                         if step1_response.status not in (200, 201):
-                            await self.handle_error_async(step1_response, reservation_data, '시간선택')
+                            await self.handle_error_async(
+                                step1_response,
+                                reservation_data,
+                                stage,
+                                worker_name=worker_name,
+                                rtt_ms=step1_rtt,
+                            )
                             continue
                         
                         # Step 2: 최종 예약 완료
@@ -272,77 +409,76 @@ class JigubyeolEngine(BaseEngine):
                         payment_input = soup.find('input', {'name': 'payment_method'})
                         payment_method = payment_input.get('value', '1') if payment_input else '1'
                         
+                        stage = "최종 예약"
+                        started = time.perf_counter()
                         step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
+                        step2_rtt = self._elapsed_ms(started)
+                        if step2_response.status in (200, 201):
+                            self._log_http(worker_name, stage, step2_response.status, step2_rtt)
                         
                         if step2_response.status == 419:
+                            self.log(
+                                f"[{worker_name}] {target_time} 시도 중... "
+                                f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                                "warning",
+                            )
                             csrf_token = None
                             continue
                             
                         if step2_response.status in (200, 201):
                             try:
+                                stage = "완료 정보 확인"
                                 done_url = f"{self.base_url}/reservation/done"
+                                started = time.perf_counter()
                                 async with session.get(done_url) as done_res:
                                     done_text = await done_res.text()
-                                    done_soup = BeautifulSoup(done_text, 'html.parser')
-                                    
-                                    vbank_num = ""
-                                    vbank_deadline = ""
-                                    vbank_amount = ""
-                                    booking_id = ""
-                                    
-                                    tables = done_soup.find_all('table')
-                                    for table in tables:
-                                        for row in table.find_all('tr'):
-                                            th = row.find('th')
-                                            td = row.find('td')
-                                            if th and td:
-                                                th_text = th.text.strip()
-                                                td_text = td.text.strip()
-                                                if '계좌' in th_text or '가상계좌' in th_text:
-                                                    vbank_num = td_text
-                                                elif '기한' in th_text or '만료' in th_text:
-                                                    vbank_deadline = td_text
-                                                elif '금액' in th_text or '입금액' in th_text:
-                                                    vbank_amount = td_text
-                                                elif '예약번호' in th_text:
-                                                    booking_id = td_text
-                                                    
-                                    success_msg = "예약 성공!"
-                                    if "임시로" in done_text or "입금전" in done_text:
-                                        success_msg += " (가상계좌 임시 예약 완료)"
-                                        if vbank_num:
-                                            success_msg += f" 계좌: {vbank_num}"
-                                        if vbank_amount:
-                                            success_msg += f", 금액: {vbank_amount}"
-                                        if vbank_deadline:
-                                            success_msg += f", 기한: {vbank_deadline}"
-                                    else:
-                                        success_msg += " (예약 확정 완료)"
-                                        if booking_id:
-                                            success_msg += f" 예약번호: {booking_id}"
-                                            
-                                    self.log(success_msg, "success")
+                                    self._log_http(
+                                        worker_name,
+                                        stage,
+                                        done_res.status,
+                                        self._elapsed_ms(started),
+                                    )
+                                    self.log(
+                                        f"[{worker_name}] {self._success_message(done_text)}",
+                                        "success",
+                                    )
                             except Exception as e:
-                                self.log(f"예약 성공! (상세 정보 파싱 실패: {e})", "success")
+                                self.log(
+                                    f"[{worker_name}] 예약 성공! (완료 정보 확인 실패 · "
+                                    f"{self._format_exception(e, reservation_data)})",
+                                    "success",
+                                )
                                 
                             self.notify_success()
                             break
                         else:
-                            await self.handle_error_async(step2_response, reservation_data, '최종예약')
+                            await self.handle_error_async(
+                                step2_response,
+                                reservation_data,
+                                stage,
+                                worker_name=worker_name,
+                                rtt_ms=step2_rtt,
+                            )
                 except Exception as e:
                     if self.stop_event.is_set():
                         break
                     csrf_token = None
-                    self.log(f"{reservation_data['reservationTime'][:5]} 시도 중... (연결 오류 - 재시도)", "info")
+                    self.log(
+                        f"[{worker_name}] {target_time} 시도 중... ({stage} 오류 · "
+                        f"{self._format_exception(e, reservation_data)} · CSRF 초기화 후 재시도)",
+                        "warning",
+                    )
                     await asyncio.sleep(0.1)
         finally:
             is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
             if not is_pooled:
                 await session.close()
 
-    async def get_csrf_token_async(self, session):
+    async def get_csrf_token_async(self, session, worker_name="작업 1"):
+        started = time.perf_counter()
         async with session.get(f'{self.base_url}/reservation') as resp:
             text = await resp.text()
+            self._log_http(worker_name, "CSRF 준비", resp.status, self._elapsed_ms(started))
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(text, 'html.parser')
             meta = soup.find('meta', {'name': 'csrf-token'})
@@ -405,46 +541,38 @@ class JigubyeolEngine(BaseEngine):
             
         return await session.post(endpoint, data=form_data, headers=headers)
 
-    async def handle_error_async(self, response, reservation_data, step_name):
-        import json
+    async def handle_error_async(
+        self,
+        response,
+        reservation_data,
+        step_name,
+        worker_name="작업 1",
+        rtt_ms=0.0,
+    ):
         time_slot = reservation_data['reservationTime'][:5]
         try:
             decoded_text = await response.text()
         except Exception:
             decoded_text = str(response)
             
-        try:
-            error_data = json.loads(decoded_text)
-            if 'errors' in error_data and isinstance(error_data['errors'], dict):
-                err_details = []
-                for field, msgs in error_data['errors'].items():
-                    if isinstance(msgs, list):
-                        msg_str = ", ".join(msgs)
-                    else:
-                        msg_str = str(msgs)
-                    err_details.append(f"{field}: {msg_str}")
-                main_msg = error_data.get('message', 'The given data was invalid.')
-                error_message = f"{main_msg} ({'; '.join(err_details)})"
-            elif 'Message' in error_data:
-                error_message = error_data['Message']
-            elif 'message' in error_data:
-                error_message = error_data['message']
-            else:
-                error_message = decoded_text[:200]
-        except Exception:
-            error_message = decoded_text[:200]
+        error_message = self._safe_error_message(decoded_text, reservation_data)
+        response_meta = f"{step_name} 거절 · HTTP {response.status} · RTT {rtt_ms:.0f}ms"
             
         if "이미 예약" in error_message:
-            self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대, 해당 시간대 예약이 다시 열릴때까지 재시도)", "info")
+            retry_reason = "이미 예약된 시간대 · 다시 열릴 때까지 재시도"
         elif "결제 수단" in error_message or "결제수단" in error_message:
-            self.log(f"{time_slot} 시도 중... (이미 예약이 완료된 시간대이거나 결제수단 오류 - 재시도)", "info")
+            retry_reason = "이미 예약되었거나 결제 수단 오류 · 재시도"
         else:
-            self.log(f"{time_slot} 시도 중... ({error_message}, 재시도)", "info")
+            retry_reason = f"{error_message} · 재시도"
+        self.log(
+            f"[{worker_name}] {time_slot} 시도 중... ({response_meta} · {retry_reason})",
+            "warning",
+        )
 
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
         import aiohttp
         import asyncio
-        self.log(f"Pre-fetching {num_sessions} sessions and CSRF tokens...", "info")
+        self.log(f"지구별 연결 예열 시작 · 세션 {num_sessions}개", "info")
         
         self.session_pool = []
         
@@ -457,11 +585,15 @@ class JigubyeolEngine(BaseEngine):
                 timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT),
             )
             try:
-                csrf = await self.get_csrf_token_async(session)
+                csrf = await self.get_csrf_token_async(session, f"예열 {idx + 1}")
                 return session, csrf
             except Exception as e:
                 await session.close()
-                self.log(f"Pre-fetch session {idx} failed: {e}", "warning")
+                self.log(
+                    f"[예열 {idx + 1}] CSRF 준비 실패 · {self._format_exception(e)} · "
+                    "해당 세션 제외",
+                    "warning",
+                )
                 return None
                 
         tasks = [fetch_one(i) for i in range(num_sessions)]
@@ -471,4 +603,7 @@ class JigubyeolEngine(BaseEngine):
             if res:
                 self.session_pool.append(res)
                 
-        self.log(f"Pre-fetched {len(self.session_pool)}/{num_sessions} sessions successfully.", "info")
+        self.log(
+            f"지구별 연결 예열 완료 · 성공 {len(self.session_pool)}/{num_sessions}",
+            "info",
+        )

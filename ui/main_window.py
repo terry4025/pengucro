@@ -5,6 +5,7 @@ from ui.reservation_form import ReservationForm
 from ui.log_panel import LogPanel
 from ui.repaint import install_scroll_repaint_guard
 from ui.scrollable import SafeScrollableFrame
+from ui.update_dialog import UpdateDialog
 from engines.registry import EngineRegistry
 from engines.catalog_providers import (
     builtin_site_configs,
@@ -14,9 +15,11 @@ from engines.catalog_providers import (
     migrate_custom_sites,
 )
 from pengucro.catalog import CatalogService
-from pengucro.models import LEGACY_MODE_MAP, NAVER_MODE, STANDARD_MODE, ReservationRequest
+from pengucro.models import LEGACY_MODE_MAP, NAVER_MODE, STANDARD_MODE, TRIPCOM_MODE, ReservationRequest
 from pengucro.storage import load_json, save_json
+from pengucro import logging_setup
 from pengucro import __version__
+from pengucro.patch_notes import PATCH_NOTES
 import logging
 import os
 import queue
@@ -137,6 +140,144 @@ class SuccessDialog(ctk.CTkToplevel):
             pass
         self.destroy()
 
+
+class PatchNotesDialog(ctk.CTkToplevel):
+    """Offline release history bundled with the exact executable version."""
+
+    WIDTH = 440
+    HEIGHT = 420
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("패치 내역")
+        self.resizable(False, False)
+        self.configure(fg_color=theme.CANVAS_COLOR)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        parent.update_idletasks()
+        physical_width = parent._to_physical(self.WIDTH)
+        physical_height = parent._to_physical(self.HEIGHT)
+        x = parent.winfo_x() + max(0, (parent.winfo_width() - physical_width) // 2)
+        y = parent.winfo_y() + max(0, (parent.winfo_height() - physical_height) // 2)
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(
+            fill="both",
+            expand=True,
+            padx=theme.SPACE_5,
+            pady=theme.SPACE_4,
+        )
+
+        ctk.CTkLabel(
+            content,
+            text="패치 내역",
+            font=theme.FONT_DISPLAY,
+            text_color=theme.TEXT_PRIMARY,
+            anchor="w",
+        ).pack(fill="x")
+        ctk.CTkLabel(
+            content,
+            text="이 실행 파일에 포함된 변경 사항입니다.",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_MUTE,
+            anchor="w",
+        ).pack(fill="x", pady=(theme.SPACE_1, theme.SPACE_3))
+
+        notes_frame = SafeScrollableFrame(
+            content,
+            fg_color="transparent",
+            corner_radius=0,
+            scrollbar_button_color=theme.HAIRLINE_COLOR,
+            scrollbar_button_hover_color=theme.CARD_COLOR,
+        )
+        notes_frame.pack(fill="both", expand=True)
+
+        for index, note in enumerate(PATCH_NOTES):
+            card = ctk.CTkFrame(
+                notes_frame,
+                fg_color=theme.SURFACE_COLOR,
+                border_color=theme.HAIRLINE_COLOR,
+                border_width=1,
+                corner_radius=theme.ROUNDED_LG,
+            )
+            card.pack(fill="x", pady=(0, theme.SPACE_3))
+
+            version_row = ctk.CTkFrame(card, fg_color="transparent")
+            version_row.pack(
+                fill="x",
+                padx=theme.SPACE_3,
+                pady=(theme.SPACE_3, theme.SPACE_2),
+            )
+            ctk.CTkLabel(
+                version_row,
+                text=str(note.version).strip().lstrip("vV"),
+                font=theme.FONT_HEADING,
+                text_color=theme.TEXT_PRIMARY,
+            ).pack(side="left")
+            if index == 0:
+                ctk.CTkLabel(
+                    version_row,
+                    text="현재 버전",
+                    font=theme.FONT_CAPTION,
+                    text_color=theme.TINT_INFO_FG,
+                    fg_color=theme.TINT_INFO_BG,
+                    corner_radius=theme.ROUNDED_PILL,
+                    padx=theme.SPACE_2,
+                    pady=2,
+                ).pack(side="right")
+
+            for change in note.changes:
+                ctk.CTkLabel(
+                    card,
+                    text=f"• {change}",
+                    font=theme.FONT_BODY_MD,
+                    text_color=theme.TEXT_BODY,
+                    justify="left",
+                    anchor="w",
+                    wraplength=350,
+                ).pack(
+                    fill="x",
+                    padx=theme.SPACE_3,
+                    pady=(0, theme.SPACE_2),
+                )
+            ctk.CTkFrame(card, fg_color="transparent", height=theme.SPACE_1).pack()
+
+        ctk.CTkButton(
+            content,
+            text="닫기",
+            font=(theme.FONT_FAMILY, 12, "bold"),
+            text_color=theme.TEXT_DARK,
+            fg_color=theme.ACCENT_WHITE,
+            hover_color=theme.TEXT_BODY,
+            corner_radius=theme.ROUNDED_MD,
+            command=self._close,
+            height=theme.H_BUTTON,
+            width=104,
+        ).pack(anchor="e", pady=(theme.SPACE_3, 0))
+
+        self.bind("<Escape>", lambda _event: self._close())
+        self.bind("<Return>", lambda _event: self._close())
+        self.after(50, self._grab_focus)
+
+    def _grab_focus(self):
+        try:
+            self.grab_set()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        if getattr(self.parent, "_patch_notes_dialog", None) is self:
+            self.parent._patch_notes_dialog = None
+        self.destroy()
+
 class AddSiteDialog(ctk.CTkToplevel):
     def __init__(self, parent, success_callback):
         super().__init__(parent)
@@ -145,7 +286,9 @@ class AddSiteDialog(ctk.CTkToplevel):
         self._parse_outcome = None
         
         self.title("커스텀 사이트 추가")
-        self.geometry("380x250")
+        dialog_width = 380
+        dialog_height = 320
+        self.geometry(f"{dialog_width}x{dialog_height}")
         self.resizable(False, False)
         self.configure(fg_color=theme.CANVAS_COLOR)
         
@@ -159,8 +302,8 @@ class AddSiteDialog(ctk.CTkToplevel):
         parent_width = parent.winfo_width()
         parent_height = parent.winfo_height()
         
-        x = parent_x + (parent_width - 380) // 2
-        y = parent_y + (parent_height - 250) // 2
+        x = parent_x + (parent_width - dialog_width) // 2
+        y = parent_y + (parent_height - dialog_height) // 2
         self.geometry(f"+{x}+{y}")
         
         # Content frame
@@ -252,7 +395,9 @@ class AddSiteDialog(ctk.CTkToplevel):
             font=theme.FONT_LABEL,
             text_color=theme.ACCENT_YELLOW,
             wraplength=330,
-            justify="left"
+            justify="left",
+            anchor="w",
+            height=82,
         )
         self.status_label.pack(side="bottom", fill="x", pady=(0, theme.SPACE_3))
         
@@ -356,6 +501,7 @@ class AddSiteDialog(ctk.CTkToplevel):
             "doomescape": "둠이스케이프 계열",
             "keyescape": "키이스케이프 계열",
             "zeroworld_laravel": "Laravel 제로월드 계열",
+            "cgv": "CGV 영화 예매",
         }
         engine_id = result.get("engine_id", "")
         style = engine_names.get(engine_id, engine_id or "알 수 없음")
@@ -496,7 +642,7 @@ class MainWindow(ctk.CTk):
         super().__init__()
 
         # Window Config
-        self.title(f"방탈출 펭크로 v{__version__}")
+        self.title(f"방탈출 펭크로 {__version__}")
 
         self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.geometry(self._centered_geometry(self.DEFAULT_WIDTH, self.DEFAULT_HEIGHT))
@@ -509,6 +655,17 @@ class MainWindow(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         
         self._is_maximized = False
+        self._patch_notes_dialog = None
+        self._update_dialog = None
+        self._update_action_handler = None
+        self._update_state = "hidden"
+        self._update_details = {
+            "version": "",
+            "notes": (),
+            "size_bytes": None,
+            "progress": None,
+            "message": "",
+        }
 
         # Active engine tracking
         self.active_engine = None
@@ -566,7 +723,7 @@ class MainWindow(ctk.CTk):
         # Title Label in the Center
         self.title_label = ctk.CTkLabel(
             self.title_bar,
-            text=f"방탈출 펭크로 v{__version__}",
+            text=f"방탈출 펭크로 {__version__}",
             font=(theme.FONT_FAMILY, 11, "bold"),
             text_color=theme.TEXT_BODY
         )
@@ -589,9 +746,57 @@ class MainWindow(ctk.CTk):
         )
         self.pin_btn.pack(side="left", padx=(theme.SPACE_3, 0))
 
+        # Visible text keeps the icon-like control understandable without a
+        # tooltip and gives keyboard users a meaningful focused label.
+        self.patch_notes_btn = ctk.CTkButton(
+            self.title_bar,
+            text="ⓘ 패치",
+            width=58,
+            height=22,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=theme.CARD_COLOR,
+            font=(theme.FONT_FAMILY, 10, "bold"),
+            text_color=theme.TEXT_MUTE,
+            command=self._show_patch_notes,
+        )
+        self.patch_notes_btn.pack(side="left", padx=(theme.SPACE_1, 0))
+
+        # Update availability is intentionally quiet until action is useful.
+        # A real 6px status light carries the semantic colour; the adjacent
+        # label remains compact enough to avoid the centred title at 480px.
+        self.update_indicator = ctk.CTkFrame(
+            self.title_bar,
+            fg_color="transparent",
+            height=22,
+        )
+        self.update_dot = ctk.CTkFrame(
+            self.update_indicator,
+            width=6,
+            height=6,
+            fg_color=theme.ACCENT_BLUE,
+            corner_radius=3,
+        )
+        self.update_dot.pack(side="left", padx=(0, 3))
+        self.update_dot.pack_propagate(False)
+        self.update_btn = ctk.CTkButton(
+            self.update_indicator,
+            text="업데이트",
+            width=48,
+            height=22,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=theme.CARD_COLOR,
+            font=(theme.FONT_FAMILY, 10, "bold"),
+            text_color=theme.TINT_INFO_FG,
+            command=self._show_update_dialog,
+        )
+        self.update_btn.pack(side="left")
+
         # Accessible window controls
         dots_frame = ctk.CTkFrame(self.title_bar, fg_color="transparent")
         dots_frame.pack(side="right", padx=theme.SPACE_2, pady=theme.SPACE_1)
+        self.window_controls_frame = dots_frame
 
         self.min_btn = ctk.CTkButton(
             dots_frame,
@@ -638,35 +843,79 @@ class MainWindow(ctk.CTk):
         title_divider.pack(fill="x", side="top")
 
         # -------------------------------------------------------------
-        # 2. Main Title Header Block (Tighter Padding)
+        # 2. Reservation Status Header
         # -------------------------------------------------------------
         header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        # Keep the visual rhythm of the former two-line header after removing
+        # the duplicate body title.  The title remains available in the
+        # window title bar; this reserved block restores the breathing room
+        # that made the form easier to scan without rendering the title twice.
         header_frame.pack(fill="x", padx=theme.GUTTER, pady=(theme.SPACE_3, theme.SPACE_1))
 
-        # Big Title
-        self.big_title_label = ctk.CTkLabel(
+        # A fixed-width stage makes the visual centre independent of the dot,
+        # label length, and internal padding.  The stage preserves the vertical
+        # rhythm of the removed duplicate title while the indicator itself is
+        # placed precisely in the centre column.
+        self.status_stage = ctk.CTkFrame(
             header_frame,
-            text=f"방탈출 펭크로 v{__version__}",
-            font=theme.FONT_DISPLAY,
-            text_color=theme.TEXT_PRIMARY
+            fg_color="transparent",
+            height=theme.SPACE_6 + theme.H_BUTTON,
         )
-        self.big_title_label.pack(anchor="center", pady=(0, theme.SPACE_1))
+        self.status_stage.pack(fill="x")
+        self.status_stage.pack_propagate(False)
+        self.status_stage.grid_columnconfigure(0, weight=1)
+        self.status_stage.grid_rowconfigure(0, weight=1)
 
-        # Status Pill Badge. Colours come from _set_status_badge so that every
-        # state uses a tinted surface with a readable foreground instead of a
-        # saturated fill (white on ACCENT_RED is only ~3.4:1).
-        self.status_badge = ctk.CTkLabel(
-            header_frame,
-            text="● 대기 중",
-            font=theme.FONT_BODY_SM,
-            text_color=theme.TINT_NEUTRAL_FG,
-            fg_color=theme.TINT_NEUTRAL_BG,
+        self.status_indicator = ctk.CTkFrame(
+            self.status_stage,
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
             corner_radius=theme.ROUNDED_PILL,
-            padx=theme.SPACE_3,
-            pady=3,
-            height=theme.H_BADGE
+            height=theme.H_CONTROL,
         )
-        self.status_badge.pack(anchor="center")
+        self.status_indicator.grid(
+            row=0,
+            column=0,
+            # Keep the form below at the same Y position, but redistribute the
+            # reserved header space so less of it sits above the indicator.
+            pady=(theme.SPACE_4, theme.SPACE_3 + theme.ROW_GAP),
+        )
+
+        # The muted halo gives the small semantic dot enough visual weight
+        # without turning the entire indicator into a saturated status pill.
+        self.status_dot_shell = ctk.CTkFrame(
+            self.status_indicator,
+            width=14,
+            height=14,
+            fg_color=theme.ELEVATED_COLOR,
+            corner_radius=7,
+        )
+        self.status_dot_shell.pack(side="left", padx=(10, 7))
+        self.status_dot_shell.pack_propagate(False)
+
+        self.status_dot = ctk.CTkFrame(
+            self.status_dot_shell,
+            width=6,
+            height=6,
+            fg_color=theme.TEXT_MUTE,
+            corner_radius=3,
+        )
+        self.status_dot.place(relx=0.5, rely=0.5, anchor="center")
+        self.status_dot.pack_propagate(False)
+
+        # Keep the historical attribute name because UI integrations may refer
+        # to it, although it is now plain status text rather than a badge.
+        self.status_badge = ctk.CTkLabel(
+            self.status_indicator,
+            text="준비됨",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+            fg_color="transparent",
+            height=theme.H_CONTROL - 2,
+            padx=0,
+        )
+        self.status_badge.pack(side="left", padx=(0, theme.SPACE_3))
 
         # Digital server time card (initially hidden). A hairline border reads
         # calmer than the previous saturated blue outline.
@@ -737,6 +986,8 @@ class MainWindow(ctk.CTk):
 
         self.catalog_service = CatalogService(default_providers())
         self._catalog_refresh_running = False
+        self._tripcom_refresh_after_id = None
+        self._tripcom_refresh_failures = 0
         self._catalog_applied_counts = {}
         self.catalog_configs = builtin_site_configs()
         for site_name, site_config in self.custom_sites.items():
@@ -764,10 +1015,15 @@ class MainWindow(ctk.CTk):
         self.last_logged_mode = None
         self.last_standard_site = saved_site
         self.last_naver_site = None
+        self.last_tripcom_site = None
         
         # Build options list
-        self.default_site_names = ["제로월드", "지구별방탈출", "키이스케이프", "둠이스케이프"]
-        site_options = self.default_site_names + list(self.custom_sites.keys())
+        self.default_site_names = ["제로월드", "지구별방탈출", "키이스케이프", "둠이스케이프", "CGV"]
+        site_options = self.default_site_names + [
+            name
+            for name, config in self.custom_sites.items()
+            if config.get("style") != "naver" and config.get("engine_id") != "tripcom"
+        ]
         
         # Fallback if saved site is no longer in options
         if saved_site not in site_options:
@@ -1163,6 +1419,149 @@ class MainWindow(ctk.CTk):
         except Exception:
             self.iconify()
 
+    def _show_patch_notes(self):
+        dialog = getattr(self, "_patch_notes_dialog", None)
+        try:
+            if dialog is not None and dialog.winfo_exists():
+                dialog.lift()
+                dialog.focus_force()
+                return
+        except Exception:
+            pass
+        self._patch_notes_dialog = PatchNotesDialog(self)
+
+    _UPDATE_INDICATOR_STYLES = {
+        "available": (theme.ACCENT_BLUE, theme.TINT_INFO_FG, "업데이트"),
+        "downloading": (theme.ACCENT_BLUE, theme.TINT_INFO_FG, "0%"),
+        "ready": (theme.ACCENT_GREEN, theme.TINT_SUCCESS_FG, "재시작"),
+        "deferred": (theme.ACCENT_YELLOW, theme.ACCENT_YELLOW, "예약 후"),
+        "error": (theme.TINT_ERROR_FG, theme.TINT_ERROR_FG, "재시도"),
+    }
+    _HIDDEN_UPDATE_STATES = {
+        "hidden",
+        "idle",
+        "checking",
+        "current",
+        "up_to_date",
+        "background_error",
+    }
+
+    def set_update_action_handler(self, callback):
+        """Register ``callback(action)`` without coupling the UI to updater I/O."""
+        self._update_action_handler = callback
+
+    def set_update_state(
+        self,
+        state,
+        *,
+        version="",
+        notes=(),
+        size_bytes=None,
+        progress=None,
+        message="",
+    ):
+        """Render an updater state; safe to call from a worker thread.
+
+        ``progress`` is a percentage in the inclusive range 0..100. Routine
+        checks and background failures intentionally remain invisible.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.after(
+                    0,
+                    lambda: self.set_update_state(
+                        state,
+                        version=version,
+                        notes=notes,
+                        size_bytes=size_bytes,
+                        progress=progress,
+                        message=message,
+                    ),
+                )
+            except Exception:
+                pass
+            return
+
+        raw_state = getattr(state, "value", state)
+        normalized_state = str(raw_state or "hidden").strip().lower()
+        if isinstance(notes, str):
+            normalized_notes = (notes,) if notes.strip() else ()
+        else:
+            normalized_notes = tuple(notes or ())
+        self._update_state = normalized_state
+        self._update_details = {
+            "version": str(version or "").strip(),
+            "notes": normalized_notes,
+            "size_bytes": size_bytes,
+            "progress": progress,
+            "message": str(message or "").strip(),
+        }
+
+        if normalized_state in self._HIDDEN_UPDATE_STATES:
+            try:
+                self.update_indicator.pack_forget()
+            except Exception:
+                pass
+            dialog = getattr(self, "_update_dialog", None)
+            try:
+                if dialog is not None and dialog.winfo_exists():
+                    dialog._close()
+            except Exception:
+                pass
+            return
+
+        dot_color, text_color, label = self._UPDATE_INDICATOR_STYLES.get(
+            normalized_state,
+            self._UPDATE_INDICATOR_STYLES["error"],
+        )
+        if normalized_state == "downloading":
+            try:
+                percent = max(0, min(100, round(float(progress or 0))))
+            except (TypeError, ValueError):
+                percent = 0
+            label = f"{percent}%"
+        try:
+            self.update_dot.configure(fg_color=dot_color)
+            self.update_btn.configure(text=label, text_color=text_color)
+            if not self.update_indicator.winfo_manager():
+                self.update_indicator.pack(
+                    side="left",
+                    padx=(theme.SPACE_1, 0),
+                    before=self.window_controls_frame,
+                )
+        except Exception:
+            return
+
+        dialog = getattr(self, "_update_dialog", None)
+        try:
+            if dialog is not None and dialog.winfo_exists():
+                dialog.update_state(normalized_state, **self._update_details)
+        except Exception:
+            pass
+
+    def _show_update_dialog(self):
+        if self._update_state not in self._UPDATE_INDICATOR_STYLES:
+            return
+        dialog = getattr(self, "_update_dialog", None)
+        try:
+            if dialog is not None and dialog.winfo_exists():
+                dialog.lift()
+                dialog.focus_force()
+                return
+        except Exception:
+            pass
+        self._update_dialog = UpdateDialog(
+            self,
+            on_action=self._dispatch_update_action,
+            state=self._update_state,
+            **self._update_details,
+        )
+
+    def _dispatch_update_action(self, action):
+        callback = getattr(self, "_update_action_handler", None)
+        if callable(callback):
+            callback(action)
+
     def _on_maximize(self):
         if getattr(self, "_is_maximized", False):
             self._is_maximized = False
@@ -1180,6 +1579,12 @@ class MainWindow(ctk.CTk):
 
     def _on_site_change(self, site_name):
         self.form.set_site(site_name)
+        if site_name == "Trip.com 핫딜":
+            self.form.catalog_refresh_btn.configure(text="이벤트 갱신")
+            self.form.catalog_auto_refresh_checkbox.configure(text="Trip.com 이벤트 10분마다 갱신")
+        else:
+            self.form.catalog_refresh_btn.configure(text="현재 사이트 갱신")
+            self.form.catalog_auto_refresh_checkbox.configure(text="시작 시 사이트 정보 자동 갱신")
         self.form.save_config(site_name)
         self._keyescape_time_verified = False
         
@@ -1187,6 +1592,8 @@ class MainWindow(ctk.CTk):
         current_mode = self.form.engine_mode_btn.get()
         if current_mode == NAVER_MODE:
             self.last_naver_site = site_name
+        elif current_mode == TRIPCOM_MODE:
+            self.last_tripcom_site = site_name
         else:
             self.last_standard_site = site_name
             
@@ -1230,7 +1637,11 @@ class MainWindow(ctk.CTk):
         if hasattr(self, "form") and hasattr(self.form, "show_server_time_checkbox"):
             show_server_time = (self.form.show_server_time_checkbox.get() == 1)
             
-        is_supported_site = (current_mode == NAVER_MODE and site_name != "(네이버 예약을 등록하세요)") or (site_name == "키이스케이프")
+        is_supported_site = (
+            (current_mode == NAVER_MODE and site_name != "(네이버 예약을 등록하세요)")
+            or current_mode == TRIPCOM_MODE
+            or site_name == "키이스케이프"
+        )
         
         self._server_sync_generation += 1
         generation = self._server_sync_generation
@@ -1296,7 +1707,10 @@ class MainWindow(ctk.CTk):
                     site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
                     fallback_site = site_options[0] if site_options else "(네이버 예약을 등록하세요)"
                 else:
-                    site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
+                    site_options = self.default_site_names + [
+                        k for k, v in self.custom_sites.items()
+                        if v.get("style") != "naver" and v.get("engine_id") != "tripcom"
+                    ]
                     fallback_site = "제로월드"
 
                 if not site_options:
@@ -1332,7 +1746,10 @@ class MainWindow(ctk.CTk):
         if current_mode == NAVER_MODE:
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
         else:
-            site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
+            site_options = self.default_site_names + [
+                k for k, v in self.custom_sites.items()
+                if v.get("style") != "naver" and v.get("engine_id") != "tripcom"
+            ]
             
         self.site_dropdown.configure(values=site_options)
         
@@ -1356,6 +1773,10 @@ class MainWindow(ctk.CTk):
             SITES_CONFIG[site_name].update(projected)
             SITES_CONFIG[site_name]["engine_id"] = catalog.engine_id
             SITES_CONFIG[site_name]["engine_options"] = catalog.metadata.get("engine_options", {})
+            if catalog.metadata.get("server_clock_url"):
+                SITES_CONFIG[site_name]["server_clock_url"] = catalog.metadata["server_clock_url"]
+            if catalog.metadata.get("refresh_interval_seconds"):
+                SITES_CONFIG[site_name]["refresh_interval_seconds"] = catalog.metadata["refresh_interval_seconds"]
             target = {
                 "제로월드": ZEROWORLD_THEMES,
                 "지구별방탈출": JIGUBYEOL_THEMES,
@@ -1368,6 +1789,8 @@ class MainWindow(ctk.CTk):
             if site_name in self.catalog_configs:
                 self.catalog_configs[site_name].update(projected)
                 self.catalog_configs[site_name]["engine_options"] = catalog.metadata.get("engine_options", {})
+                if catalog.metadata.get("refresh_interval_seconds"):
+                    self.catalog_configs[site_name]["refresh_interval_seconds"] = catalog.metadata["refresh_interval_seconds"]
         elif site_name in self.custom_sites:
             self.custom_sites[site_name].update(projected)
             self.custom_sites[site_name]["engine_id"] = catalog.engine_id
@@ -1384,6 +1807,7 @@ class MainWindow(ctk.CTk):
             self.last_logged_mode = mode
 
         self._suppress_site_log = True
+        self.add_site_btn.configure(state="disabled" if mode == TRIPCOM_MODE else "normal")
 
         if mode == NAVER_MODE:
             site_options = [k for k, v in self.custom_sites.items() if v.get("style") == "naver"]
@@ -1399,8 +1823,18 @@ class MainWindow(ctk.CTk):
             self.site_var.set(target_site)
             self._on_site_change(target_site)
             self.site_dropdown.configure(values=site_options)
+        elif mode == TRIPCOM_MODE:
+            site_options = ["Trip.com 핫딜"]
+            target_site = "Trip.com 핫딜"
+            self.site_var.set(target_site)
+            self._on_site_change(target_site)
+            self.site_dropdown.configure(values=site_options)
         else:
-            site_options = self.default_site_names + [k for k, v in self.custom_sites.items() if v.get("style") != "naver"]
+            self.add_site_btn.configure(state="normal")
+            site_options = self.default_site_names + [
+                k for k, v in self.custom_sites.items()
+                if v.get("style") != "naver" and v.get("engine_id") != "tripcom"
+            ]
             if getattr(self, "last_standard_site", None) in site_options:
                 target_site = self.last_standard_site
             else:
@@ -1419,7 +1853,12 @@ class MainWindow(ctk.CTk):
         
         while self.is_sync_running and generation == self._server_sync_generation:
             try:
-                target_url = "https://www.keyescape.com/reservation.php" if site_name == "키이스케이프" else "https://booking.naver.com"
+                if site_name == "키이스케이프":
+                    target_url = "https://www.keyescape.com/reservation.php"
+                elif site_name == "Trip.com 핫딜":
+                    target_url = "https://kr.trip.com/"
+                else:
+                    target_url = "https://booking.naver.com"
                 req = urllib.request.Request(target_url, method="HEAD")
                 start = time.perf_counter()
                 with urllib.request.urlopen(req, timeout=3) as response:
@@ -1482,7 +1921,10 @@ class MainWindow(ctk.CTk):
         now = time.time() + self.naver_time_offset
         now_dt = datetime.fromtimestamp(now)
         current_site = self.site_var.get()
-        prefix = "키이스케이프" if current_site == "키이스케이프" else "네이버"
+        prefix = (
+            "키이스케이프" if current_site == "키이스케이프"
+            else ("Trip.com" if current_site == "Trip.com 핫딜" else "네이버")
+        )
 
         if hasattr(self, "server_time_title_label"):
             self.server_time_title_label.configure(text=f"{prefix} 서버 시간 · 동기화됨")
@@ -1501,6 +1943,13 @@ class MainWindow(ctk.CTk):
         self._ui_polling = False
         self.is_sync_running = False
         self._cancel_clock_timer()
+        trip_timer = getattr(self, "_tripcom_refresh_after_id", None)
+        if trip_timer is not None:
+            try:
+                self.after_cancel(trip_timer)
+            except Exception:
+                pass
+            self._tripcom_refresh_after_id = None
         guard = getattr(self, "scroll_repaint_guard", None)
         if guard is not None:
             guard.uninstall()
@@ -1524,22 +1973,36 @@ class MainWindow(ctk.CTk):
         else:
             self.pin_btn.configure(fg_color="transparent", text_color=theme.TEXT_MUTE)
 
-    # Every status shares one styling table so the badge can never end up with
-    # an unreadable colour pair, and so a new state cannot be introduced
-    # without also giving it a colour.
+    # Dot colour and text colour are defined together so new states cannot
+    # silently fall back to decoration-only feedback.  Running uses blue;
+    # yellow is reserved for a transition that needs attention, green for a
+    # confirmed success, and red for an actionable problem.
     STATUS_STYLES = {
-        "idle": (theme.TINT_NEUTRAL_BG, theme.TINT_NEUTRAL_FG),
-        "running": (theme.TINT_RUNNING_BG, theme.TINT_RUNNING_FG),
-        "stopping": (theme.TINT_NEUTRAL_BG, theme.TINT_NEUTRAL_FG),
-        "success": (theme.TINT_SUCCESS_BG, theme.TINT_SUCCESS_FG),
-        "error": (theme.TINT_ERROR_BG, theme.TINT_ERROR_FG),
-        "info": (theme.TINT_INFO_BG, theme.TINT_INFO_FG),
+        "idle": (theme.TEXT_MUTE, theme.TEXT_MUTE, theme.ELEVATED_COLOR),
+        "running": (theme.ACCENT_BLUE, theme.TEXT_BODY, theme.TINT_INFO_BG),
+        "warning": (theme.ACCENT_YELLOW, theme.TEXT_BODY, theme.TINT_RUNNING_BG),
+        "stopping": (theme.ACCENT_YELLOW, theme.TEXT_BODY, theme.TINT_RUNNING_BG),
+        "success": (theme.ACCENT_GREEN, theme.TEXT_BODY, theme.TINT_SUCCESS_BG),
+        "error": (theme.TINT_ERROR_FG, theme.TEXT_BODY, theme.TINT_ERROR_BG),
+        "info": (theme.TINT_INFO_FG, theme.TEXT_BODY, theme.TINT_INFO_BG),
     }
 
     def _set_status_badge(self, kind, text):
-        background, foreground = self.STATUS_STYLES.get(kind, self.STATUS_STYLES["idle"])
+        dot_color, foreground, halo_color = self.STATUS_STYLES.get(
+            kind,
+            self.STATUS_STYLES["idle"],
+        )
+        # Older engine/UI call sites used a decorative bullet as part of the
+        # label.  The dot is now a real element, so tolerate and remove it here.
+        clean_text = str(text).removeprefix("●").strip()
         try:
-            self.status_badge.configure(text=text, text_color=foreground, fg_color=background)
+            self.status_dot_shell.configure(fg_color=halo_color)
+            self.status_dot.configure(fg_color=dot_color)
+            self.status_badge.configure(
+                text=clean_text,
+                text_color=foreground,
+                fg_color="transparent",
+            )
         except Exception:
             pass
 
@@ -1556,7 +2019,7 @@ class MainWindow(ctk.CTk):
                 if error_msg:
                     self.log_panel.append_log(f"입력 오류: {error_msg}", "error")
                     self.current_status = "error"
-                    self._set_status_badge("error", "● 입력 확인 필요")
+                    self._set_status_badge("error", "입력 확인 필요")
                     return
                 if not messagebox.askyesno(
                     "예약 정보 확인",
@@ -1573,6 +2036,12 @@ class MainWindow(ctk.CTk):
             messagebox.showinfo("예약 시작", "사이트 정보 갱신이 끝난 뒤 예약을 시작해주세요.", parent=self)
             return
         selected_site = self.site_var.get()
+        payload = reservation_data.to_engine_payload()
+        # Register PII and API credentials before the first line belonging to
+        # this run can be persisted. Each run also gets a non-personal ID so
+        # concurrent/multiple executions can be correlated safely.
+        logging_setup.replace_run_secrets(payload)
+        logging_setup.begin_run()
         self.form.save_config(selected_site)
         self.log_panel.clear_log()
         self.attempt_count = 0
@@ -1593,7 +2062,7 @@ class MainWindow(ctk.CTk):
             hover_color=theme.ACCENT_RED_HOVER
         )
 
-        self._set_status_badge("running", "● 동작 중")
+        self._set_status_badge("running", "예약 감시 중")
 
         # Clear any stale engine events before starting a new run.
         while True:
@@ -1602,7 +2071,6 @@ class MainWindow(ctk.CTk):
             except queue.Empty:
                 break
 
-        payload = reservation_data.to_engine_payload()
         # Re-read the visible checkbox at the last possible moment. The
         # ReservationRequest was created before the confirmation dialog, so it
         # must not be allowed to carry a stale developer-mode flag into an actual
@@ -1651,7 +2119,7 @@ class MainWindow(ctk.CTk):
             self.current_status = "stopping"
             self.active_engine.stop_reservation()
             self.cta_btn.configure(text="중지 중...", state="disabled")
-            self._set_status_badge("stopping", "● 중지 중")
+            self._set_status_badge("stopping", "중지하는 중")
         else:
             self.log_panel.append_log("실행 중인 예약 작업이 없습니다.", "warning")
 
@@ -1673,21 +2141,23 @@ class MainWindow(ctk.CTk):
         if self._catalog_refresh_running:
             self.form.catalog_refresh_btn.configure(state="disabled")
         self.site_dropdown.configure(state="normal")
-        self.add_site_btn.configure(state="normal")
+        self.add_site_btn.configure(
+            state="disabled" if self.form.engine_mode_btn.get() == TRIPCOM_MODE else "normal"
+        )
         self._update_delete_button_state(self.site_var.get())
         self.booking_started_at = None
 
         if self.current_status == "error":
-            self._set_status_badge("error", "● 시작 실패")
+            self._set_status_badge("error", "시작 실패")
         elif getattr(self, "has_recent_error", False):
             # The run ended, and at least one error was logged along the way.
             # Surfacing that here is honest without pretending the whole run
             # failed while it was still going.
-            self._set_status_badge("error", "● 종료 · 오류 있음")
+            self._set_status_badge("error", "종료 · 오류 있음")
             self.current_status = "idle"
         else:
             self.current_status = "idle"
-            self._set_status_badge("idle", "● 대기 중")
+            self._set_status_badge("idle", "준비됨")
 
     def _on_engine_log(self, message, log_type):
         self.engine_event_queue.put(("log", message, log_type))
@@ -1714,12 +2184,15 @@ class MainWindow(ctk.CTk):
         if self.booking_started_at:
             elapsed = int(time.monotonic() - self.booking_started_at)
             text = (
-                f"● 동작 중 · {self.attempt_count:,}회 · "
+                f"예약 감시 중 · {self.attempt_count:,}회 · "
                 f"{elapsed // 60:02d}:{elapsed % 60:02d}"
             )
             if getattr(self, "has_recent_error", False):
                 text += " · 오류 있음"
-            self._set_status_badge("running", text)
+            self._set_status_badge(
+                "warning" if getattr(self, "has_recent_error", False) else "running",
+                text,
+            )
         self._status_timer_id = self.after(500, self._update_booking_status)
 
     def _drain_engine_events(self):
@@ -1752,7 +2225,9 @@ class MainWindow(ctk.CTk):
                 self._apply_server_sync_result(*event[1:])
 
         if logs:
-            self.log_panel.append_logs_batch(logs)
+            # BaseEngine persists these before enqueueing them, retaining the
+            # engine class and keeping file I/O off the Tk main thread.
+            self.log_panel.append_logs_batch(logs, persist=False)
             errors = [message for message, log_type in logs if log_type == "error"]
             if errors:
                 # Record the error, but do not declare the whole run failed:
@@ -1763,7 +2238,7 @@ class MainWindow(ctk.CTk):
                 self.last_error_message = errors[-1]
                 if not self._engine_is_active() and self.current_status != "stopping":
                     self.current_status = "error"
-                    self._set_status_badge("error", "● 오류 발생")
+                    self._set_status_badge("error", "오류 발생")
         if success:
             self.current_status = "idle"
             self._trigger_success_notification()
@@ -1786,18 +2261,33 @@ class MainWindow(ctk.CTk):
         self.engine_event_queue.put(("success",))
 
     def _start_catalog_auto_refresh(self):
+        self._tripcom_refresh_after_id = None
         if not self.form.catalog_auto_refresh_var.get():
             return
         if self.current_status in {"running", "stopping"}:
-            self.after(5000, self._start_catalog_auto_refresh)
+            self._tripcom_refresh_after_id = self.after(5000, self._start_catalog_auto_refresh)
             return
         stale_sites = [
             name
             for name, config in self.catalog_configs.items()
+            if config.get("engine_id") != "cgv"
             if self.catalog_service.is_stale(config.get("catalog_key", ""))
         ]
+        if "Trip.com 핫딜" in self.catalog_configs and "Trip.com 핫딜" not in stale_sites:
+            stale_sites.append("Trip.com 핫딜")
         if stale_sites:
             self._start_catalog_refresh(stale_sites, manual=False)
+        interval = int(
+            self.catalog_configs.get("Trip.com 핫딜", {}).get(
+                "refresh_interval_seconds", 600
+            )
+        )
+        interval = max(60, min(interval, 3600))
+        if self._tripcom_refresh_failures:
+            interval = min(1800, interval * (2 ** min(self._tripcom_refresh_failures, 3)))
+        self._tripcom_refresh_after_id = self.after(
+            interval * 1000, self._start_catalog_auto_refresh
+        )
 
     def _refresh_current_catalog(self):
         site_name = self.site_var.get()
@@ -1806,6 +2296,9 @@ class MainWindow(ctk.CTk):
             return
         if site_name not in self.catalog_configs:
             messagebox.showwarning("사이트 정보 갱신", "갱신할 수 있는 사이트가 아닙니다.", parent=self)
+            return
+        if self.catalog_configs.get(site_name, {}).get("engine_id") == "cgv":
+            self.form._open_cgv_selector()
             return
         self._start_catalog_refresh([site_name], manual=True)
 
@@ -1823,7 +2316,11 @@ class MainWindow(ctk.CTk):
                 config = self.catalog_configs.get(site_name)
                 if not config:
                     continue
-                result = self.catalog_service.refresh(config, target_date, force=manual)
+                result = self.catalog_service.refresh(
+                    config,
+                    target_date,
+                    force=manual or config.get("engine_id") == "tripcom",
+                )
                 self.engine_event_queue.put(("catalog_result", site_name, result, manual))
             self.engine_event_queue.put(("catalog_done", manual))
 
@@ -1839,6 +2336,11 @@ class MainWindow(ctk.CTk):
         return max(today, selected).isoformat()
 
     def _handle_catalog_result(self, site_name, result, manual):
+        if site_name == "Trip.com 핫딜":
+            if result.status in {"changed", "unchanged"}:
+                self._tripcom_refresh_failures = 0
+            elif result.status in {"deferred", "error"}:
+                self._tripcom_refresh_failures += 1
         catalog = self.catalog_service.catalogs.get(result.site_key)
         selection = None
         if site_name == self.site_var.get():
@@ -1889,9 +2391,11 @@ class MainWindow(ctk.CTk):
 
         added = sum(change.kind == "added" for change in result.applied_changes)
         renamed = sum(change.kind == "renamed" for change in result.applied_changes)
+        updated = sum(change.kind == "metadata_updated" for change in result.applied_changes)
         if result.changed:
             self.log_panel.append_log(
-                f"[{site_name}] 카탈로그 갱신 · 신규 {added} · 이름 변경 {renamed} · 확인 필요 {pending_count}",
+                f"[{site_name}] 카탈로그 갱신 · 신규 {added} · 정보 변경 {updated} · "
+                f"이름 변경 {renamed} · 확인 필요 {pending_count}",
                 "success" if not pending_count else "warning",
             )
         elif manual:
@@ -1903,7 +2407,8 @@ class MainWindow(ctk.CTk):
             else:
                 messagebox.showinfo(
                     "사이트 정보 갱신",
-                    f"{site_name} 갱신 완료\n\n신규: {added}개\n이름 변경: {renamed}개\n확인 필요: 0개",
+                    f"{site_name} 갱신 완료\n\n신규: {added}개\n정보 변경: {updated}개\n"
+                    f"이름 변경: {renamed}개\n확인 필요: 0개",
                     parent=self,
                 )
 
@@ -1948,6 +2453,8 @@ class MainWindow(ctk.CTk):
             )
             if theme_name:
                 self.form.theme_var.set(theme_name)
+                if self.form.engine_mode_btn.get() == TRIPCOM_MODE:
+                    self.form._apply_tripcom_event_selection()
 
     def _show_catalog_pending(self, site_name=None):
         site_name = site_name or self.site_var.get()
@@ -1995,7 +2502,7 @@ class MainWindow(ctk.CTk):
         self._engine_completion_handled = True
         self.has_recent_error = False
         self._reset_cta_state()
-        self._set_status_badge("success", "● 예약 성공")
+        self._set_status_badge("success", "예약 성공")
         try:
             # SND_ASYNC matters: without it PlaySound blocks the Tk main thread
             # until the sound finishes, freezing the UI at the exact moment the
