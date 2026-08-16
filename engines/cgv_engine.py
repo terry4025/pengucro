@@ -1147,15 +1147,50 @@ class CgvEngine(BaseEngine):
     @staticmethod
     def _click_visible_by_text(page, labels: tuple[str, ...]) -> bool:
         for label in labels:
-            locator = page.get_by_text(label, exact=True)
-            for index in range(locator.count()):
-                candidate = locator.nth(index)
+            for btn_loc in (
+                page.locator("button, a, div[role='button']").filter(has_text=label),
+                page.locator(f"button:has-text('{label}'), a:has-text('{label}')"),
+                page.get_by_text(label, exact=True),
+                page.get_by_text(label, exact=False),
+            ):
                 try:
-                    if candidate.is_visible() and candidate.is_enabled():
-                        candidate.click(timeout=2500)
-                        return True
+                    for index in range(btn_loc.count()):
+                        candidate = btn_loc.nth(index)
+                        if candidate.is_visible():
+                            try:
+                                candidate.click(timeout=2500)
+                                return True
+                            except Exception:
+                                candidate.click(force=True, timeout=1500)
+                                return True
                 except Exception:
                     continue
+
+            # Fallback to JavaScript DOM evaluation
+            try:
+                clicked = page.evaluate(
+                    r"""
+                    label => {
+                      const clean = s => (s || '').replace(/\s+/g, '');
+                      const targetClean = clean(label);
+                      const elements = [...document.querySelectorAll('button, a, div[role="button"], span, div')];
+                      for (const el of elements) {
+                        if (clean(el.textContent) === targetClean || (el.textContent || '').trim() === label) {
+                          const clickable = el.closest('button, a, div[role="button"]') || el;
+                          clickable.scrollIntoView({block: 'center', inline: 'center'});
+                          clickable.click();
+                          return true;
+                        }
+                      }
+                      return false;
+                    }
+                    """,
+                    label,
+                )
+                if clicked:
+                    return True
+            except Exception:
+                pass
         return False
 
     def _select_visitors(self, page, people: int) -> bool:
@@ -1276,6 +1311,7 @@ class CgvEngine(BaseEngine):
                         self.log(f"CGV 좌석 {seat} 선택 버튼을 누르지 못했습니다.", "warning")
                         return False
                 self.log(f"선택 좌석 확보 가능: {', '.join(group.seats)}", "success")
+                page.wait_for_timeout(300)
                 if not self._click_visible_by_text(page, ("선택완료", "선택 완료")):
                     self.log("좌석 임시선점 진행 버튼을 찾지 못했습니다.", "error")
                     return False
