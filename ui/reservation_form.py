@@ -1170,23 +1170,22 @@ class ReservationForm(ctk.CTkFrame):
         self._on_date_change()
 
     def _open_cgv_selector(self):
-        from tkinter import messagebox
-
         try:
-            people = int(self.people_entry.get().strip() or "1")
+            people = int(self.people_entry.get().strip() or "2")
         except ValueError:
-            messagebox.showwarning(
-                "CGV 예매 대상", "좌석을 고르기 전에 인원 수를 숫자로 입력해주세요.", parent=self
-            )
-            return
+            people = 2
         reservation_date = self.date_entry.get().strip()
         try:
             datetime.strptime(reservation_date, "%Y-%m-%d")
         except ValueError:
-            messagebox.showwarning(
-                "CGV 예매 대상", "먼저 달력에서 목표 날짜를 선택해주세요.", parent=self
-            )
-            return
+            reservation_date = (datetime.now().date() + timedelta(days=1)).isoformat()
+        if self.cgv_selection.get("date"):
+            reservation_date = str(self.cgv_selection["date"])
+        if self.cgv_selection.get("people"):
+            try:
+                people = int(self.cgv_selection["people"])
+            except (TypeError, ValueError):
+                pass
         from ui.cgv_booking_dialog import CgvBookingDialog
 
         return CgvBookingDialog(
@@ -1201,12 +1200,22 @@ class ReservationForm(ctk.CTkFrame):
         self.cgv_selection = dict(selection or {})
         date_value = str(self.cgv_selection.get("date", ""))
         time_value = str(self.cgv_selection.get("show_time", ""))
+        people_value = str(self.cgv_selection.get("people", "2"))
+        site_name = str(self.cgv_selection.get("site_name", ""))
+        movie_name = str(self.cgv_selection.get("movie", ""))
         if date_value:
             self.date_entry.delete(0, "end")
             self.date_entry.insert(0, date_value)
         if time_value:
             self.time_entry.delete(0, "end")
             self.time_entry.insert(0, time_value)
+        if people_value:
+            self.people_entry.delete(0, "end")
+            self.people_entry.insert(0, people_value)
+        if site_name:
+            self.branch_var.set(site_name)
+        if movie_name:
+            self.theme_var.set(movie_name)
         self._render_cgv_selection_summary()
         self.auto_save()
 
@@ -1214,25 +1223,36 @@ class ReservationForm(ctk.CTkFrame):
         selection = self.cgv_selection
         if not selection.get("site_no"):
             self.cgv_selection_summary.configure(
-                text="지점·영화·회차·좌석을 선택해주세요.",
+                text="IMAX 지점·영화·회차·좌석을 선택해주세요.",
                 text_color=theme.TEXT_MUTE,
             )
             self.cgv_selector_button.configure(text="선택")
             return
         if not selection.get("movie"):
             self.cgv_selection_summary.configure(
-                text=f"{selection.get('site_name', 'CGV')} · 회차와 좌석을 다시 선택해주세요.",
+                text=f"{selection.get('site_name', 'CGV')} · 영화·회차와 좌석을 다시 선택해주세요.",
                 text_color=theme.ACCENT_YELLOW,
             )
             self.cgv_selector_button.configure(text="계속")
             return
+        site_name = selection.get("site_name") or "CGV"
+        movie = selection.get("movie", "")
+        auditorium = selection.get("auditorium", "")
+        format_name = selection.get("format", "")
+        date_str = selection.get("date", "")
+        people_str = f"{selection.get('people', 2)}명"
+        preferred_times = selection.get("preferred_times") or (
+            [selection.get("show_time")] if selection.get("show_time") else []
+        )
+        times_preview = " → ".join(preferred_times) if preferred_times else "시간 미선택"
         seats = str(selection.get("seats", ""))
-        seat_preview = seats if len(seats) <= 32 else f"{seats[:29]}..."
+        seat_preview = seats if len(seats) <= 28 else f"{seats[:25]}..."
+        summary_lines = [
+            f"{site_name}  ·  {movie} ({format_name or auditorium})",
+            f"{date_str}  ·  {people_str}  ·  시간: {times_preview}  ·  좌석: {seat_preview}",
+        ]
         self.cgv_selection_summary.configure(
-            text=(
-                f"{selection.get('site_name', 'CGV')} · {selection.get('movie', '')}\n"
-                f"{selection.get('auditorium', '')} · {selection.get('show_time', '')} · {seat_preview}"
-            ),
+            text="\n".join(summary_lines),
             text_color=theme.TEXT_BODY,
         )
         self.cgv_selector_button.configure(text="변경")
@@ -2215,12 +2235,19 @@ class ReservationForm(ctk.CTkFrame):
             },
         }
         if is_cgv:
+            preferred_times = list(
+                self.cgv_selection.get("preferred_times")
+                or ([self.cgv_selection.get("show_time")] if self.cgv_selection.get("show_time") else [])
+            )
             raw_values["engine_metadata"]["cgv"] = {
                 "site_name": self.cgv_selection.get("site_name", branch_name),
                 "movie": theme_pk,
                 "auditorium": str(self.cgv_selection.get("auditorium", "")).strip(),
                 "format": str(self.cgv_selection.get("format", "")).strip(),
                 "seats": str(self.cgv_selection.get("seats", "")).strip(),
+                "show_time": str(self.cgv_selection.get("show_time", "")).strip(),
+                "preferred_times": preferred_times,
+                "is_preopen": bool(self.cgv_selection.get("is_preopen", False)),
                 "reference_date": str(self.cgv_selection.get("reference_date", "")),
                 "reference_only": bool(self.cgv_selection.get("reference_only", False)),
                 "booking_mode": self.cgv_booking_mode_var.get(),

@@ -137,3 +137,130 @@ def test_cgv_thread_policy_caps_slider_at_measured_safe_limit():
     assert slider.value == 4
     assert form.cgv_threads == 4
     assert "자동 감속" in title.config["text"]
+
+
+def test_cgv_selection_summary_renders_preferred_times_and_seats():
+    summary_label = Widget()
+    button = Widget()
+    form = SimpleNamespace(
+        cgv_selection={
+            "site_no": "0013",
+            "site_name": "CGV 용산아이파크몰",
+            "movie": "오디세이",
+            "auditorium": "IMAX관",
+            "format": "IMAX LASER 2D",
+            "date": "2026-08-26",
+            "people": 2,
+            "show_time": "14:00",
+            "preferred_times": ["14:00", "17:30", "21:00"],
+            "seats": "H22,H23 | G22,G23",
+        },
+        cgv_selection_summary=summary_label,
+        cgv_selector_button=button,
+    )
+
+    ReservationForm._render_cgv_selection_summary(form)
+
+    text = summary_label.config["text"]
+    assert "CGV 용산아이파크몰" in text
+    assert "오디세이" in text
+    assert "14:00 → 17:30 → 21:00" in text
+    assert "H22,H23" in text
+    assert button.config["text"] == "변경"
+
+
+def test_cgv_set_selection_synchronizes_form_fields():
+    class MockEntry:
+        def __init__(self, value=""):
+            self.value = value
+
+        def delete(self, _start, _end):
+            self.value = ""
+
+        def insert(self, _pos, text):
+            self.value = str(text)
+
+        def get(self):
+            return self.value
+
+    class MockVar:
+        def __init__(self, value=""):
+            self.value = value
+
+        def set(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    date_entry = MockEntry()
+    time_entry = MockEntry()
+    people_entry = MockEntry()
+    branch_var = MockVar()
+    theme_var = MockVar()
+    summary_label = Widget()
+    button = Widget()
+
+    form = SimpleNamespace(
+        cgv_selection={},
+        date_entry=date_entry,
+        time_entry=time_entry,
+        people_entry=people_entry,
+        branch_var=branch_var,
+        theme_var=theme_var,
+        cgv_selection_summary=summary_label,
+        cgv_selector_button=button,
+        auto_save=lambda: None,
+        _render_cgv_selection_summary=lambda: ReservationForm._render_cgv_selection_summary(form),
+    )
+
+    ReservationForm._set_cgv_selection(
+        form,
+        {
+            "site_no": "0013",
+            "site_name": "CGV 용산아이파크몰",
+            "movie": "오디세이",
+            "auditorium": "IMAX관",
+            "date": "2026-08-26",
+            "people": 2,
+            "show_time": "14:00",
+            "preferred_times": ["14:00", "17:30"],
+            "seats": "H22,H23",
+        },
+    )
+
+    assert date_entry.get() == "2026-08-26"
+    assert time_entry.get() == "14:00"
+    assert people_entry.get() == "2"
+    assert branch_var.get() == "CGV 용산아이파크몰"
+    assert theme_var.get() == "오디세이"
+
+
+def test_cgv_dialog_people_change_revalidates_seat_priority_groups():
+    from ui.cgv_booking_dialog import CgvBookingDialog
+
+    dialog = SimpleNamespace(
+        people=2,
+        people_label=Widget(),
+        priority_groups=[("H22", "H23"), ("G22", "G23")],
+        current_seats={"H22", "H23"},
+        seat_help=Widget(),
+        seats=(),
+        auto_seat_modes={},
+        auto_seat_menu=Widget(),
+        auto_seat_var=Widget(),
+        _auto_seat_options=lambda: {},
+        _render_seats=lambda: None,
+        _render_priorities=lambda: None,
+        _update_confirm_state=lambda: None,
+    )
+
+    # Change people from 2 to 3
+    CgvBookingDialog._set_people(dialog, 3)
+
+    assert dialog.people == 3
+    # 2-seat groups are now invalid for 3 people, so they are purged
+    assert dialog.priority_groups == []
+    assert dialog.current_seats == set()
+    assert "3석씩 선택" in dialog.seat_help.config["text"]
+

@@ -300,3 +300,79 @@ def test_direct_hold_result_never_reloads_browser_page():
     assert held is False
     assert fallback is True
     assert not hasattr(page, "reload")
+
+
+def test_cgv_engine_selects_first_matching_preferred_time():
+    from engines.cgv_client import select_schedule
+
+    payload = {
+        "data": {
+            "items": [
+                {
+                    "siteNo": "0013",
+                    "scnYmd": "20260826",
+                    "scnsNo": "01",
+                    "scnSseq": "1",
+                    "scnsrtTm": "1400",
+                    "movNm": "오디세이",
+                    "expoScnsNm": "IMAX관",
+                    "movkndDsplEnm": "IMAX LASER 2D",
+                },
+                {
+                    "siteNo": "0013",
+                    "scnYmd": "20260826",
+                    "scnsNo": "01",
+                    "scnSseq": "2",
+                    "scnsrtTm": "1730",
+                    "movNm": "오디세이",
+                    "expoScnsNm": "IMAX관",
+                    "movkndDsplEnm": "IMAX LASER 2D",
+                },
+            ]
+        }
+    }
+
+    # User prioritizes 17:30 over 14:00
+    chosen = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX관",
+        preferred_times=["17:30", "14:00"],
+    )
+    assert chosen is not None
+    assert chosen["scnSseq"] == "2"
+    assert chosen["scnsrtTm"] == "1730"
+    assert chosen["scnYmd"] == "20260826"
+
+
+def test_historical_identifiers_never_leak_into_target_booking():
+    from engines.cgv_client import select_schedule
+
+    # Historical screening had scnYmd 20260824, scnsNo 099, scnSseq 7
+    # Live schedule returned for 20260826 has scnYmd 20260826, scnsNo 002, scnSseq 1
+    live_schedule_payload = {
+        "data": [
+            {
+                "siteNo": "0013",
+                "scnYmd": "20260826",
+                "scnsNo": "002",
+                "scnSseq": "1",
+                "scnsrtTm": "1400",
+                "movNm": "오디세이",
+                "expoScnsNm": "IMAX관",
+                "movkndDsplEnm": "IMAX LASER 2D",
+            }
+        ]
+    }
+
+    chosen = select_schedule(
+        live_schedule_payload,
+        movie="오디세이",
+        auditorium="IMAX관",
+        preferred_times=["14:00"],
+    )
+    assert chosen is not None
+    assert chosen["scnYmd"] == "20260826"
+    assert chosen["scnsNo"] == "002"
+    assert chosen["scnSseq"] == "1"
+

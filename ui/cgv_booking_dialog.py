@@ -4,6 +4,7 @@ import re
 import threading
 import webbrowser
 from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 
 import customtkinter as ctk
@@ -38,8 +39,15 @@ def _format_name(item: Mapping[str, Any]) -> str:
     return str(item.get("movkndDsplEnm") or item.get("movkndDsplNm") or "").strip()
 
 
+def _format_time_display(raw_time: str) -> str:
+    norm = normalize_time(raw_time)
+    if len(norm) == 4:
+        return f"{norm[:2]}:{norm[2:]}"
+    return raw_time
+
+
 class CgvBookingDialog(ctk.CTkToplevel):
-    """CGV-specific, data-driven theater/screening/seat selector."""
+    """CGV-specific, data-driven theater/screening/seat selector with IMAX filtering and pre-open candidate support."""
 
     def __init__(
         self,
@@ -55,6 +63,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.reservation_date = reservation_date
         self.people = max(1, min(int(people), 8))
         self.initial = dict(initial or {})
+        self._request_generation = 0
         self._task_progress: tuple[str, str] | None = None
         self.client = CgvBrowserClient(log=self._browser_status)
         self.regions = ()
@@ -64,6 +73,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.selected_region = ""
         self.selected_site = None
         self.selected_schedule: dict[str, Any] | None = None
+        self.preferred_times: list[str] = list(
+            self.initial.get("preferred_times")
+            or ([self.initial.get("show_time")] if self.initial.get("show_time") else [])
+        )
         self.reference_date = reservation_date
         self.reference_only = False
         self.current_seats: set[str] = set()
@@ -76,28 +89,29 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._task_result = None
         self._task_done = None
 
-        self.title("CGV 예매 대상 선택")
-        self.geometry("1040x700")
-        self.minsize(920, 620)
+        self.title("CGV IMAX 예매 대상 선택")
+        self.geometry("1060x720")
+        self.minsize(940, 640)
         self.configure(fg_color=theme.CANVAS_COLOR)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
 
         self._build_header()
+        self._build_toolbar()
         self._build_content()
         self._build_footer()
         self._start_task(
-            "CGV의 실제 지역·지점 정보를 불러오고 있습니다...",
-            self.client.fetch_catalog,
+            "CGV IMAX 지점 목록을 불러오고 있습니다...",
+            lambda: self.client.fetch_catalog(imax_only=True),
             self._catalog_loaded,
         )
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=theme.SPACE_5, pady=(theme.SPACE_4, theme.SPACE_3))
+        header.pack(fill="x", padx=theme.SPACE_5, pady=(theme.SPACE_4, theme.SPACE_2))
         ctk.CTkLabel(
             header,
-            text="CGV 예매 대상",
+            text="CGV IMAX 예매 대상",
             font=theme.FONT_DISPLAY,
             text_color=theme.TEXT_PRIMARY,
         ).pack(anchor="w")
@@ -110,6 +124,142 @@ class CgvBookingDialog(ctk.CTkToplevel):
             justify="left",
         )
         self.status_label.pack(fill="x", pady=(theme.SPACE_1, 0))
+
+    def _build_toolbar(self) -> None:
+        toolbar = ctk.CTkFrame(
+            self,
+            fg_color=theme.SURFACE_COLOR,
+            border_width=1,
+            border_color=theme.HAIRLINE_COLOR,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        toolbar.pack(fill="x", padx=theme.SPACE_5, pady=(0, theme.SPACE_3))
+
+        # Left: Target Date controls
+        date_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        date_group.pack(side="left", padx=theme.SPACE_3, pady=theme.SPACE_2)
+        ctk.CTkLabel(
+            date_group,
+            text="목표 날짜",
+            font=theme.FONT_HEADING,
+            text_color=theme.TEXT_PRIMARY,
+        ).pack(side="left", padx=(0, theme.SPACE_2))
+
+        self.date_prev_btn = ctk.CTkButton(
+            date_group,
+            text="◀",
+            width=28,
+            height=theme.H_CONTROL,
+            command=self._prev_date,
+            fg_color=theme.ELEVATED_COLOR,
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_BODY,
+            corner_radius=theme.ROUNDED_SM,
+        )
+        self.date_prev_btn.pack(side="left", padx=(0, 2))
+
+        self.date_entry = ctk.CTkEntry(
+            date_group,
+            width=105,
+            height=theme.H_CONTROL,
+            fg_color=theme.ELEVATED_COLOR,
+            border_color=theme.CONTROL_BORDER,
+            text_color=theme.TEXT_PRIMARY,
+            font=theme.FONT_BODY,
+            justify="center",
+        )
+        self.date_entry.insert(0, self.reservation_date)
+        self.date_entry.pack(side="left", padx=2)
+        self.date_entry.bind("<Return>", lambda _e: self._date_entry_committed())
+        self.date_entry.bind("<FocusOut>", lambda _e: self._date_entry_committed())
+
+        self.date_next_btn = ctk.CTkButton(
+            date_group,
+            text="▶",
+            width=28,
+            height=theme.H_CONTROL,
+            command=self._next_date,
+            fg_color=theme.ELEVATED_COLOR,
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_BODY,
+            corner_radius=theme.ROUNDED_SM,
+        )
+        self.date_next_btn.pack(side="left", padx=(2, theme.SPACE_2))
+
+        self.date_picker_btn = ctk.CTkButton(
+            date_group,
+            text="달력",
+            width=48,
+            height=theme.H_CONTROL,
+            command=self._open_calendar_picker,
+            fg_color=theme.ELEVATED_COLOR,
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TINT_INFO_FG,
+            corner_radius=theme.ROUNDED_SM,
+        )
+        self.date_picker_btn.pack(side="left", padx=(0, theme.SPACE_4))
+
+        # Middle: People controls
+        people_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        people_group.pack(side="left", padx=theme.SPACE_3, pady=theme.SPACE_2)
+        ctk.CTkLabel(
+            people_group,
+            text="관람 인원",
+            font=theme.FONT_HEADING,
+            text_color=theme.TEXT_PRIMARY,
+        ).pack(side="left", padx=(0, theme.SPACE_2))
+
+        self.people_minus_btn = ctk.CTkButton(
+            people_group,
+            text="−",
+            width=28,
+            height=theme.H_CONTROL,
+            command=self._decrement_people,
+            fg_color=theme.ELEVATED_COLOR,
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_BODY,
+            corner_radius=theme.ROUNDED_SM,
+            font=theme.FONT_BODY,
+        )
+        self.people_minus_btn.pack(side="left", padx=(0, 2))
+
+        self.people_label = ctk.CTkLabel(
+            people_group,
+            text=f"{self.people}명",
+            width=42,
+            height=theme.H_CONTROL,
+            fg_color=theme.ELEVATED_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            font=theme.FONT_BODY_SM,
+            corner_radius=theme.ROUNDED_SM,
+        )
+        self.people_label.pack(side="left", padx=2)
+
+        self.people_plus_btn = ctk.CTkButton(
+            people_group,
+            text="+",
+            width=28,
+            height=theme.H_CONTROL,
+            command=self._increment_people,
+            fg_color=theme.ELEVATED_COLOR,
+            hover_color=theme.CARD_COLOR,
+            text_color=theme.TEXT_BODY,
+            corner_radius=theme.ROUNDED_SM,
+            font=theme.FONT_BODY,
+        )
+        self.people_plus_btn.pack(side="left", padx=(2, theme.SPACE_3))
+
+        # Right: Schedule status badge
+        self.target_type_badge = ctk.CTkLabel(
+            toolbar,
+            text="",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+            fg_color="transparent",
+            corner_radius=theme.ROUNDED_SM,
+            height=theme.H_BADGE,
+        )
+        self.target_type_badge.pack(side="right", padx=theme.SPACE_3, pady=theme.SPACE_2)
 
     def _panel(self, master, title: str):
         panel = ctk.CTkFrame(
@@ -133,17 +283,17 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.content = content
         content.pack(fill="both", expand=True, padx=theme.SPACE_5)
         content.columnconfigure(0, weight=2, minsize=180)
-        content.columnconfigure(1, weight=3, minsize=250)
+        content.columnconfigure(1, weight=3, minsize=260)
         content.columnconfigure(2, weight=8, minsize=500)
         content.rowconfigure(0, weight=1)
 
-        site_panel = self._panel(content, "지역과 지점")
+        site_panel = self._panel(content, "IMAX 지점")
         site_panel.grid(row=0, column=0, sticky="nsew", padx=(0, theme.SPACE_2))
         search_wrap = ctk.CTkFrame(site_panel, fg_color="transparent")
         search_wrap.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
         self.site_search = ctk.CTkEntry(
             search_wrap,
-            placeholder_text="지점 검색",
+            placeholder_text="IMAX 지점 검색",
             fg_color=theme.ELEVATED_COLOR,
             border_color=theme.HAIRLINE_COLOR,
             text_color=theme.TEXT_PRIMARY,
@@ -173,18 +323,9 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
         self.site_list.pack(fill="both", expand=True, padx=theme.SPACE_2, pady=(0, theme.SPACE_2))
 
-        schedule_panel = self._panel(content, "영화와 회차")
+        schedule_panel = self._panel(content, "영화와 회차 / 시간 우선순위")
         schedule_panel.grid(row=0, column=1, sticky="nsew", padx=theme.SPACE_1)
-        self.date_badge = ctk.CTkLabel(
-            schedule_panel,
-            text=f"목표 날짜  {self.reservation_date}",
-            font=theme.FONT_BODY_SM,
-            text_color=theme.TINT_INFO_FG,
-            fg_color=theme.TINT_INFO_BG,
-            corner_radius=theme.ROUNDED_SM,
-            height=theme.H_BADGE,
-        )
-        self.date_badge.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+
         self.movie_var = ctk.StringVar(value="영화를 먼저 불러오세요")
         self.movie_menu = ctk.CTkOptionMenu(
             schedule_panel,
@@ -202,6 +343,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             anchor="w",
         )
         self.movie_menu.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+
         self.auditorium_var = ctk.StringVar(value="상영관을 먼저 불러오세요")
         self.auditorium_menu = ctk.CTkOptionMenu(
             schedule_panel,
@@ -219,6 +361,30 @@ class CgvBookingDialog(ctk.CTkToplevel):
             anchor="w",
         )
         self.auditorium_menu.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+
+        time_toolbar = ctk.CTkFrame(schedule_panel, fg_color="transparent")
+        time_toolbar.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        ctk.CTkLabel(
+            time_toolbar,
+            text="희망 시간 선택 (클릭 순서대로 우선순위)",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_MUTE,
+        ).pack(side="left")
+        ctk.CTkButton(
+            time_toolbar,
+            text="시간 초기화",
+            command=self._clear_preferred_times,
+            width=68,
+            height=theme.H_GHOST,
+            fg_color="transparent",
+            hover_color=theme.CARD_COLOR,
+            border_width=1,
+            border_color=theme.CONTROL_BORDER,
+            text_color=theme.TEXT_BODY,
+            corner_radius=theme.ROUNDED_SM,
+            font=theme.FONT_CAPTION,
+        ).pack(side="right")
+
         self.schedule_list = SafeScrollableFrame(
             schedule_panel, fg_color="transparent", corner_radius=0
         )
@@ -322,8 +488,11 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
         self.auto_seat_menu.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
         self.seat_list = SafeScrollableFrame(
-            seat_panel, fg_color=theme.CANVAS_COLOR, corner_radius=theme.ROUNDED_MD,
-            border_width=1, border_color=theme.HAIRLINE_COLOR,
+            seat_panel,
+            fg_color=theme.CANVAS_COLOR,
+            corner_radius=theme.ROUNDED_MD,
+            border_width=1,
+            border_color=theme.HAIRLINE_COLOR,
         )
         self.seat_list.pack(fill="both", expand=True, padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
         self._render_seat_placeholder("회차를 선택한 뒤 실제 좌석도를 불러오세요.")
@@ -395,6 +564,113 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
         self.confirm_button.pack(side="right", fill="x", expand=True, padx=(theme.SPACE_3, 0))
 
+    def _prev_date(self) -> None:
+        try:
+            current = datetime.strptime(self.reservation_date, "%Y-%m-%d").date()
+            today = datetime.now().date()
+            if current > today:
+                self._change_date((current - timedelta(days=1)).isoformat())
+        except ValueError:
+            pass
+
+    def _next_date(self) -> None:
+        try:
+            current = datetime.strptime(self.reservation_date, "%Y-%m-%d").date()
+            self._change_date((current + timedelta(days=1)).isoformat())
+        except ValueError:
+            pass
+
+    def _open_calendar_picker(self) -> None:
+        from ui.reservation_form import CalendarDialog
+
+        CalendarDialog(self, self.reservation_date, self._change_date)
+
+    def _date_entry_committed(self) -> None:
+        raw = self.date_entry.get().strip()
+        try:
+            parsed = datetime.strptime(raw, "%Y-%m-%d").date()
+            self._change_date(parsed.isoformat())
+        except ValueError:
+            self.date_entry.delete(0, "end")
+            self.date_entry.insert(0, self.reservation_date)
+
+    def _change_date(self, new_date: str) -> None:
+        if new_date == self.reservation_date:
+            return
+        self.reservation_date = new_date
+        self.date_entry.delete(0, "end")
+        self.date_entry.insert(0, new_date)
+        self._request_generation += 1
+        generation = self._request_generation
+
+        self.schedules = ()
+        self.selected_schedule = None
+        self.preferred_times.clear()
+        self.seats = ()
+        self.current_seats.clear()
+        self.seat_recommendations = {}
+        self.auto_seat_var.set("명당 자동 선택")
+        self.auto_seat_menu.configure(values=["명당 자동 선택"], state="disabled")
+        self.movie_var.set("시간표를 불러오는 중...")
+        self.movie_menu.configure(values=["시간표를 불러오는 중..."])
+        self.auditorium_var.set("상영관을 먼저 불러오세요")
+        self.auditorium_menu.configure(values=["상영관을 먼저 불러오세요"])
+        self.target_type_badge.configure(text="")
+        self._render_schedules()
+        self._render_seat_placeholder("회차를 선택한 뒤 실제 좌석도를 불러오세요.")
+        self.load_seats_button.configure(state="disabled")
+        self._update_seat_guide()
+        self._update_confirm_state()
+
+        if self.selected_site:
+            self._start_task(
+                f"{self.selected_site.label}의 {new_date} 시간표 및 사전선택 후보를 조회하고 있습니다...",
+                lambda: self.client.fetch_schedule_with_reference(
+                    self.selected_site.site_no, new_date
+                ),
+                lambda result: self._schedule_loaded(result, generation=generation),
+            )
+
+    def _decrement_people(self) -> None:
+        if self.people > 1:
+            self._set_people(self.people - 1)
+
+    def _increment_people(self) -> None:
+        if self.people < 8:
+            self._set_people(self.people + 1)
+
+    def _set_people(self, new_people: int) -> None:
+        if new_people == self.people:
+            return
+        self.people = max(1, min(new_people, 8))
+        self.people_label.configure(text=f"{self.people}명")
+
+        # Invalidate incompatible stored seat priority groups
+        self.priority_groups = [
+            group for group in self.priority_groups
+            if len(group) == self.people and is_contiguous_seat_group(group, self.people)
+        ]
+        self.current_seats.clear()
+
+        self.seat_help.configure(
+            text=(
+                f"{self.people}석씩 선택해 우선순위를 추가하세요. "
+                + (
+                    "같은 열에서 붙어 있는 좌석만 한 묶음으로 저장됩니다. "
+                    if self.people > 1 else ""
+                )
+                + "매진·판매 불가 좌석도 취소표 감시 대상으로 선택할 수 있습니다."
+            )
+        )
+        if self.seats:
+            options = self._auto_seat_options()
+            self.auto_seat_modes = dict(options)
+            self.auto_seat_menu.configure(values=list(options), state="normal")
+            self.auto_seat_var.set(next(iter(options)))
+            self._render_seats()
+        self._render_priorities()
+        self._update_confirm_state()
+
     def _start_task(self, status: str, func, done) -> None:
         if self._task_done is not None:
             return
@@ -445,7 +721,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.region_menu.configure(values=region_names)
         self.region_menu.set("전체")
         self.status_label.configure(
-            text=f"CGV 실제 지점 {len(self.sites)}개를 불러왔습니다.",
+            text=f"CGV IMAX 지점 {len(self.sites)}개를 불러왔습니다.",
             text_color=theme.TINT_SUCCESS_FG,
         )
         self._render_sites()
@@ -454,6 +730,9 @@ class CgvBookingDialog(ctk.CTkToplevel):
             site = next((item for item in self.sites if item.site_no == initial_no), None)
             if site:
                 self._select_site(site)
+        elif self.sites:
+            # Default to first IMAX site if none selected
+            self._select_site(self.sites[0])
 
     def _region_changed(self, value: str) -> None:
         self.selected_region = ""
@@ -474,8 +753,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         ]
         if not filtered:
             ctk.CTkLabel(
-                self.site_list, text="검색 결과가 없습니다.",
-                font=theme.FONT_LABEL, text_color=theme.TEXT_MUTE,
+                self.site_list,
+                text="검색 결과가 없습니다.",
+                font=theme.FONT_LABEL,
+                text_color=theme.TEXT_MUTE,
             ).pack(pady=theme.SPACE_4)
             return
         for site in filtered:
@@ -507,44 +788,70 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_seat_guide()
         self.load_seats_button.configure(state="disabled")
         self._update_confirm_state()
+        self._request_generation += 1
+        generation = self._request_generation
         self._start_task(
-            f"{site.label}의 실제 시간표를 조회하고 있습니다...",
-            lambda: self.client.fetch_schedule_with_reference(site.site_no, self.reservation_date),
-            self._schedule_loaded,
+            f"{site.label}의 시간표 및 사전선택 후보를 조회하고 있습니다...",
+            lambda: self.client.fetch_schedule_with_reference(
+                site.site_no, self.reservation_date
+            ),
+            lambda result: self._schedule_loaded(result, generation=generation),
         )
 
-    def _schedule_loaded(self, result) -> None:
+    def _schedule_loaded(self, result, *, generation: int | None = None) -> None:
+        if generation is not None and generation != self._request_generation:
+            return
         schedules, reference_date, reference_only = result
         self.schedules = tuple(schedules)
         self.reference_date = reference_date
         self.reference_only = bool(reference_only)
+
+        # Separate real vs preopen templates
+        real_count = sum(not item.get("_pengucroPreopen") for item in self.schedules)
+        template_count = sum(bool(item.get("_pengucroPreopen")) for item in self.schedules)
+
         movies = sorted({_movie_name(item) for item in self.schedules if _movie_name(item)})
         self.movie_menu.configure(values=movies or ["표시할 영화가 없습니다"])
         initial_movie = str(self.initial.get("movie", ""))
-        self.movie_var.set(initial_movie if initial_movie in movies else (movies[0] if movies else ""))
+        self.movie_var.set(
+            initial_movie if initial_movie in movies else (movies[0] if movies else "")
+        )
         self._movie_changed(self.movie_var.get())
+
         if self.reference_only:
             self.status_label.configure(
                 text=(
-                    f"목표 날짜는 아직 미오픈입니다. {reference_date}의 최근 시간표를 대기 기준으로 표시합니다."
+                    f"목표 날짜는 아직 미오픈입니다. 최근 공개 일정({reference_date}) 기준으로 후보를 구성했습니다."
                 ),
                 text_color=theme.ACCENT_YELLOW,
             )
-            self.date_badge.configure(
-                text=f"목표 {self.reservation_date} · 좌석 기준 {reference_date}",
+            self.target_type_badge.configure(
+                text=f"미오픈 · 최근 공개 일정 기준 ({reference_date})",
                 text_color=theme.ACCENT_YELLOW,
                 fg_color=theme.TINT_RUNNING_BG,
             )
-        else:
-            self.status_label.configure(
-                text=f"{self.selected_site.label} · 실제 회차 {len(self.schedules)}개",
-                text_color=theme.TINT_SUCCESS_FG,
-            )
-            self.date_badge.configure(
-                text=f"목표 날짜  {self.reservation_date}",
-                text_color=theme.TINT_INFO_FG,
-                fg_color=theme.TINT_INFO_BG,
-            )
+        elif real_count > 0:
+            open_count = sum(int(item.get("frSeatCnt", 0) or 0) > 0 for item in self.schedules if not item.get("_pengucroPreopen"))
+            if open_count > 0:
+                self.status_label.configure(
+                    text=f"{self.selected_site.label} · 실제 회차 {real_count}개",
+                    text_color=theme.TINT_SUCCESS_FG,
+                )
+                self.target_type_badge.configure(
+                    text=f"실제 회차 오픈 ({self.reservation_date})",
+                    text_color=theme.TINT_SUCCESS_FG,
+                    fg_color=theme.TINT_INFO_BG,
+                )
+            else:
+                self.status_label.configure(
+                    text=f"{self.selected_site.label} · 회차 선공개(예매 대기) {real_count}개",
+                    text_color=theme.TINT_INFO_FG,
+                )
+                self.target_type_badge.configure(
+                    text=f"선공개 회차 · 예매 대기 ({self.reservation_date})",
+                    text_color=theme.TINT_INFO_FG,
+                    fg_color=theme.TINT_INFO_BG,
+                )
         self._render_schedules()
 
     @staticmethod
@@ -573,6 +880,13 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.load_seats_button.configure(state="disabled")
         self._render_schedules()
 
+    def _clear_preferred_times(self) -> None:
+        self.preferred_times.clear()
+        self.selected_schedule = None
+        self.load_seats_button.configure(state="disabled")
+        self._render_schedules()
+        self._update_confirm_state()
+
     def _render_schedules(self) -> None:
         for child in self.schedule_list.winfo_children():
             child.destroy()
@@ -592,79 +906,122 @@ class CgvBookingDialog(ctk.CTkToplevel):
                 justify="left",
             ).pack(pady=theme.SPACE_4)
             return
+
         for item in sorted(items, key=lambda value: normalize_time(value.get("scnsrtTm"))):
             raw_time = normalize_time(item.get("scnsrtTm"))
-            time_text = f"{raw_time[:2]}:{raw_time[2:4]}" if len(raw_time) == 4 else raw_time
-            auditorium = _auditorium_name(item)
+            time_text = _format_time_display(raw_time)
+            auditorium_text = _auditorium_name(item)
             format_text = _format_name(item)
+            is_preopen = bool(item.get("_pengucroPreopen"))
             try:
                 remaining = int(item.get("frSeatCnt", 0) or 0)
             except (TypeError, ValueError):
                 remaining = 0
-            selected = self.selected_schedule is item
-            seat_reference_date = str(item.get("_pengucroSeatReferenceDate", ""))
-            if self.reference_only:
-                status = f"{self.reference_date} 기준 · 미오픈 대기 가능"
-            elif seat_reference_date:
-                status = f"회차 선공개 · 좌석 기준 {seat_reference_date} · 오픈 감시 가능"
+
+            observed_dates = item.get("_pengucroObservedDates", ())
+            observed_count = len(observed_dates) if isinstance(observed_dates, (tuple, list)) else 0
+
+            if is_preopen:
+                dates_info = f"최근 {observed_count}일 관측" if observed_count > 0 else "최근 일정 기준"
+                status_label = f"미오픈 ({dates_info}) · 사전선택 대기"
+                status_color = theme.ACCENT_YELLOW
             elif remaining > 0:
-                status = f"잔여 {remaining}"
+                status_label = f"실제 회차 · 잔여 {remaining}석"
+                status_color = theme.TINT_SUCCESS_FG
             else:
-                status = "미오픈·매진 · 오픈/취소표 감시 가능"
+                seat_reference_date = str(item.get("_pengucroSeatReferenceDate", ""))
+                ref_info = f" · 좌석 기준 {seat_reference_date}" if seat_reference_date else ""
+                status_label = f"선공개 회차{ref_info} · 예매 대기 가능"
+                status_color = theme.TINT_INFO_FG
+
+            is_selected = time_text in self.preferred_times
+            priority_badge = ""
+            if is_selected:
+                priority_index = self.preferred_times.index(time_text) + 1
+                priority_badge = f"[{priority_index}순위] "
+
+            btn_text = (
+                f"{priority_badge}{time_text}  {auditorium_text}\n"
+                f"{format_text} · {status_label}"
+            )
             ctk.CTkButton(
                 self.schedule_list,
-                text=f"{time_text}  {auditorium}\n{format_text} · {status}",
-                command=lambda value=item: self._select_schedule(value),
+                text=btn_text,
+                command=lambda value=item: self._toggle_schedule_time(value),
                 anchor="w",
-                fg_color=theme.TINT_INFO_BG if selected else theme.ELEVATED_COLOR,
+                fg_color=theme.TINT_INFO_BG if is_selected else theme.ELEVATED_COLOR,
                 hover_color=theme.CARD_COLOR,
-                text_color=theme.TINT_INFO_FG if selected else theme.TEXT_BODY,
+                text_color=theme.TINT_INFO_FG if is_selected else theme.TEXT_BODY,
                 height=48,
                 corner_radius=theme.ROUNDED_MD,
+                border_width=1 if is_selected else 0,
+                border_color=theme.ACCENT_BLUE if is_selected else "transparent",
             ).pack(fill="x", pady=theme.SPACE_1)
 
-    def _select_schedule(self, item: dict[str, Any]) -> None:
-        self.selected_schedule = item
-        self.seats = ()
-        self.seat_recommendations = {}
-        self.current_seats.clear()
-        self._render_schedules()
-        if self.reference_only:
-            placeholder = (
-                f"{self.reference_date}의 최근 좌석도를 기준으로 우선순위를 정하면 "
-                f"{self.reservation_date} 회차가 열리는 즉시 감시합니다."
-            )
+    def _toggle_schedule_time(self, item: dict[str, Any]) -> None:
+        raw_time = normalize_time(item.get("scnsrtTm"))
+        time_text = _format_time_display(raw_time)
+
+        if time_text in self.preferred_times:
+            self.preferred_times.remove(time_text)
+            if not self.preferred_times:
+                self.selected_schedule = None
         else:
-            placeholder = "실제 좌석도를 불러오면 판매 상태와 관계없이 우선순위를 정할 수 있습니다."
-        self._render_seat_placeholder(placeholder)
-        self.load_seats_button.configure(state="normal")
+            self.preferred_times.append(time_text)
+            self.selected_schedule = item
+
+        self._render_schedules()
+
+        if self.preferred_times:
+            times_display = " → ".join(self.preferred_times)
+            self.status_label.configure(
+                text=f"선택한 시간 우선순위: {times_display}",
+                text_color=theme.TINT_SUCCESS_FG,
+            )
+            self.load_seats_button.configure(state="normal")
+            if not self.seats:
+                if self.reference_only or (self.selected_schedule and self.selected_schedule.get("_pengucroPreopen")):
+                    placeholder = (
+                        f"시간 우선순위({times_display}) 선택 완료.\n"
+                        "상영관의 최근 좌석도를 불러와 좌석 우선순위를 지정하세요."
+                    )
+                else:
+                    placeholder = f"시간 우선순위({times_display}) 선택 완료. 좌석도를 불러오세요."
+                self._render_seat_placeholder(placeholder)
+        else:
+            self.load_seats_button.configure(state="disabled")
+            self._render_seat_placeholder("회차 또는 희망 시간을 선택한 뒤 실제 좌석도를 불러오세요.")
+
         self._update_seat_guide()
         self._update_confirm_state()
 
-    def _seat_reference_schedule(self) -> dict[str, Any]:
-        selected = self.selected_schedule or {}
+    @classmethod
+    def _seat_reference_schedule(cls, self) -> dict[str, Any]:
+        selected = getattr(self, "selected_schedule", None) or {}
         embedded_reference = selected.get("_pengucroSeatReference")
         if isinstance(embedded_reference, Mapping) and embedded_reference:
             return dict(embedded_reference)
         try:
-            if int(selected.get("frSeatCnt", 0) or 0) > 0:
+            if int(selected.get("frSeatCnt", 0) or 0) > 0 and not selected.get("_pengucroPreopen"):
                 return selected
         except (TypeError, ValueError):
             pass
         screen_no = str(selected.get("scnsNo", ""))
+        schedules = getattr(self, "schedules", ())
         return next(
             (
-                item for item in self.schedules
+                item for item in schedules
                 if str(item.get("scnsNo", "")) == screen_no
                 and int(item.get("frSeatCnt", 0) or 0) > 0
+                and not item.get("_pengucroPreopen")
             ),
             selected,
         )
 
     def _load_seats(self) -> None:
-        if not self.selected_schedule:
+        if not self.selected_schedule and not self.preferred_times:
             return
-        reference = self._seat_reference_schedule()
+        reference = self._seat_reference_schedule(self)
         self._start_task(
             "실제 CGV 좌석도를 여는 중입니다. 로그인 안내가 뜨면 열린 Chrome에서 로그인해주세요.",
             lambda: self.client.fetch_seat_map(reference, self.people),
@@ -751,8 +1108,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
         row_count = len({seat.row for seat in self.seats})
         screen_width = max(1024, self.winfo_screenwidth())
         screen_height = max(720, self.winfo_screenheight())
-        desired_width = min(screen_width - 32, max(1040, 500 + min(map_width, 1120)))
-        desired_height = min(screen_height - 56, max(700, 330 + row_count * 25))
+        desired_width = min(screen_width - 32, max(1060, 500 + min(map_width, 1120)))
+        desired_height = min(screen_height - 56, max(720, 330 + row_count * 25))
         x = max(8, (screen_width - desired_width) // 2)
         y = max(8, (screen_height - desired_height) // 2)
         self.geometry(f"{desired_width}x{desired_height}+{x}+{y}")
@@ -1006,7 +1363,12 @@ class CgvBookingDialog(ctk.CTkToplevel):
     def _add_priority_group(self) -> None:
         if not is_contiguous_seat_group(self.current_seats, self.people):
             return
-        group = tuple(sorted(self.current_seats, key=lambda value: (re.sub(r"\d", "", value), int(re.sub(r"\D", "", value) or 0))))
+        group = tuple(
+            sorted(
+                self.current_seats,
+                key=lambda value: (re.sub(r"\d", "", value), int(re.sub(r"\D", "", value) or 0)),
+            )
+        )
         if group not in self.priority_groups:
             self.priority_groups.append(group)
         self.current_seats.clear()
@@ -1039,15 +1401,30 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_confirm_state()
 
     def _update_confirm_state(self) -> None:
-        ready = bool(self.selected_site and self.selected_schedule and self.priority_groups)
+        ready = bool(
+            self.selected_site
+            and (self.selected_schedule or self.preferred_times)
+            and self.priority_groups
+        )
         if hasattr(self, "confirm_button"):
             self.confirm_button.configure(state="normal" if ready else "disabled")
 
     def _confirm(self) -> None:
-        if not self.selected_site or not self.selected_schedule or not self.priority_groups:
+        if not self.selected_site or not self.priority_groups:
             return
-        raw_time = normalize_time(self.selected_schedule.get("scnsrtTm"))
-        show_time = f"{raw_time[:2]}:{raw_time[2:4]}" if len(raw_time) == 4 else raw_time
+        movie = self.movie_var.get()
+        auditorium_opt = self.auditorium_var.get()
+        auditorium = auditorium_opt.split(" · ")[0] if " · " in auditorium_opt else auditorium_opt
+        format_name = auditorium_opt.split(" · ")[1] if " · " in auditorium_opt else ""
+
+        preferred_times = list(self.preferred_times)
+        show_time = preferred_times[0] if preferred_times else ""
+
+        is_preopen = bool(
+            self.reference_only
+            or (self.selected_schedule and self.selected_schedule.get("_pengucroPreopen"))
+        )
+
         region_name = next(
             (region.name for region in self.regions if region.code == self.selected_site.region_code),
             "",
@@ -1057,13 +1434,16 @@ class CgvBookingDialog(ctk.CTkToplevel):
             "site_name": self.selected_site.label,
             "region": region_name,
             "date": self.reservation_date,
+            "people": self.people,
+            "movie": movie,
+            "auditorium": auditorium,
+            "format": format_name,
+            "show_time": show_time,
+            "preferred_times": preferred_times,
+            "is_preopen": is_preopen,
             "reference_date": self.reference_date,
             "reference_only": self.reference_only,
-            "movie": _movie_name(self.selected_schedule),
-            "auditorium": _auditorium_name(self.selected_schedule),
-            "format": _format_name(self.selected_schedule),
-            "show_time": show_time,
-            "scns_no": str(self.selected_schedule.get("scnsNo", "")),
+            "scns_no": "" if is_preopen else str((self.selected_schedule or {}).get("scnsNo", "")),
             "seats": " | ".join(",".join(group) for group in self.priority_groups),
             "seat_groups": [list(group) for group in self.priority_groups],
         }

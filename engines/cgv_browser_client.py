@@ -16,6 +16,7 @@ from engines.cgv_client import (
     CgvRegion,
     CgvSeat,
     CgvSite,
+    normalize_time,
     parse_api_seats,
     parse_site_catalog,
     schedule_items,
@@ -58,6 +59,22 @@ def _booking_payload(schedule: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _movie_name(item: Mapping[str, Any]) -> str:
+    return str(item.get("expoProdNm") or item.get("movNm") or item.get("prodNm") or "").strip()
+
+
+def _auditorium_name(item: Mapping[str, Any]) -> str:
+    return str(item.get("expoScnsNm") or item.get("scnsNm") or "").strip()
+
+
+def _format_name(item: Mapping[str, Any]) -> str:
+    return str(item.get("movkndDsplEnm") or item.get("movkndDsplNm") or "").strip()
+
+
+def _is_imax_text(text: str) -> bool:
+    return "IMAX" in str(text or "").upper()
+
+
 def _schedule_identity(schedule: Mapping[str, Any]) -> tuple[str, str, str]:
     def compact(*keys: str) -> str:
         value = next((schedule.get(key) for key in keys if schedule.get(key)), "")
@@ -91,6 +108,99 @@ def _seat_reference_for(
         return None
     ranked.sort(key=lambda item: item[0], reverse=True)
     return ranked[0][1] if ranked[0][0] >= 8 else None
+
+
+def _aggregate_historical_candidates(
+    history_by_date: Mapping[str, tuple[dict[str, Any], ...]],
+    target_date: str,
+    exact_schedules: tuple[dict[str, Any], ...],
+    site_no: str,
+) -> tuple[dict[str, Any], ...]:
+    """Aggregate unique candidate movies and times across recent published dates.
+
+    Movies already published on the target date are excluded here so real
+    target-date schedules always have absolute priority.
+    """
+    all_history_items = [
+        item for items in history_by_date.values() for item in items
+    ]
+    if not all_history_items:
+        return ()
+
+    target_digits = re.sub(r"\D", "", target_date)
+    exact_movies = {
+        re.sub(r"\s+", "", _movie_name(item)).casefold()
+        for item in exact_schedules
+        if _movie_name(item)
+    }
+
+    # Group by (canonical_movie_name, auditorium_name, format_name)
+    groups: dict[tuple[str, str, str], dict[str, list[str]]] = {}
+    display_names: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+
+    for item in all_history_items:
+        movie = _movie_name(item)
+        if not movie:
+            continue
+        canon_movie = re.sub(r"\s+", "", movie).casefold()
+        if canon_movie in exact_movies:
+            # Already published on target date! Real schedule has priority.
+            continue
+        auditorium = _auditorium_name(item)
+        format_name = _format_name(item)
+        group_key = (canon_movie, auditorium, format_name)
+        if group_key not in display_names:
+            display_names[group_key] = (movie, auditorium, format_name)
+        raw_time = normalize_time(item.get("scnsrtTm"))
+        if not raw_time or len(raw_time) < 4:
+            continue
+        date_str = str(item.get("scnYmd") or "")
+        groups.setdefault(group_key, {}).setdefault(raw_time, []).append(date_str)
+
+    candidates: list[dict[str, Any]] = []
+    for group_key, times_dict in groups.items():
+        movie, auditorium, format_name = display_names[group_key]
+        sample_target = {
+            "expoProdNm": movie,
+            "expoScnsNm": auditorium,
+            "movkndDsplEnm": format_name,
+        }
+        seat_ref = _seat_reference_for(sample_target, tuple(all_history_items))
+        ref_date = ""
+        if seat_ref:
+            raw_ymd = str(seat_ref.get("scnYmd", ""))
+            if len(raw_ymd) == 8:
+                ref_date = f"{raw_ymd[:4]}-{raw_ymd[4:6]}-{raw_ymd[6:]}"
+
+        for time_digits, dates in sorted(times_dict.items(), key=lambda pair: pair[0]):
+            unique_dates = tuple(dict.fromkeys(d for d in dates if d))
+            candidates.append(
+                {
+                    "siteNo": str(site_no),
+                    "scnYmd": target_digits,
+                    "scnsrtTm": time_digits,
+                    "expoProdNm": movie,
+                    "movNm": movie,
+                    "expoScnsNm": auditorium,
+                    "scnsNm": auditorium,
+                    "movkndDsplEnm": format_name,
+                    "movkndDsplNm": format_name,
+                    "frSeatCnt": 0,
+                    "_pengucroPreopen": True,
+                    "_pengucroObservedDates": unique_dates,
+                    "_pengucroSeatReference": dict(seat_ref) if seat_ref else None,
+                    "_pengucroSeatReferenceDate": ref_date,
+                }
+            )
+
+    def sort_key(item: dict[str, Any]):
+        aud = _auditorium_name(item)
+        fmt = _format_name(item)
+        is_imax = 0 if _is_imax_text(f"{aud} {fmt}") else 1
+        return (is_imax, _movie_name(item), normalize_time(item.get("scnsrtTm")))
+
+    candidates.sort(key=sort_key)
+    return tuple(candidates)
 
 
 class CgvBrowserClient:
@@ -297,7 +407,7 @@ class CgvBrowserClient:
             raise CgvError(str(data.get("statusMessage") or "CGV가 조회 요청을 처리하지 못했습니다."))
         return data
 
-    def fetch_catalog(self) -> CgvCatalogSnapshot:
+    def fetch_catalog(self, *, imax_only: bool = True) -> CgvCatalogSnapshot:
         def operation(page):
             query = urllib.parse.urlencode(
                 {"coCd": CGV_COMPANY_CODE, "custNo": "", "lntd": "", "lttd": "", "srchKwrd": ""}
@@ -305,7 +415,9 @@ class CgvBrowserClient:
             payload = self._fetch_json(
                 page, f"/api/v1/content/site/searchAllRegionAndSite?{query}"
             )
-            regions, sites = parse_site_catalog(payload)
+            regions, sites = parse_site_catalog(payload, imax_only=imax_only)
+            if not sites and imax_only:
+                regions, sites = parse_site_catalog(payload, imax_only=False)
             if not regions or not sites:
                 raise CgvError("CGV 지역·지점 목록이 비어 있습니다.")
             return CgvCatalogSnapshot(regions, sites)
@@ -325,7 +437,7 @@ class CgvBrowserClient:
         site_no: str,
         screening_date: str,
         *,
-        max_reference_days: int = 62,
+        max_reference_days: int = 14,
     ) -> tuple[tuple[dict[str, Any], ...], str, bool]:
         date_digits = _screening_date(screening_date)
         target = datetime.strptime(date_digits, "%Y%m%d").date()
@@ -333,33 +445,53 @@ class CgvBrowserClient:
 
         def operation(page):
             exact = self._fetch_schedule_on_page(page, site_no, date_digits)
-            reference_items: tuple[dict[str, Any], ...] = ()
-            reference_date = ""
-            for offset in range(1, max(1, int(max_reference_days)) + 1):
+            history_by_date: dict[str, tuple[dict[str, Any], ...]] = {}
+            all_history_items: list[dict[str, Any]] = []
+
+            # Sample bounded recent published dates
+            # Check up to max_reference_days backwards, not older than 7 days before today
+            max_days = max(1, min(int(max_reference_days), 14))
+            for offset in range(1, max_days + 1):
                 candidate = target - timedelta(days=offset)
-                if candidate < today:
+                if candidate < today - timedelta(days=7):
                     break
                 items = self._fetch_schedule_on_page(
                     page, site_no, candidate.strftime("%Y%m%d")
                 )
                 if items:
-                    reference_items = items
-                    reference_date = candidate.isoformat()
+                    history_by_date[candidate.isoformat()] = items
+                    all_history_items.extend(items)
+                if len(history_by_date) >= 7:
                     break
+
+            latest_ref_date = next(iter(history_by_date.keys()), "")
+
+            decorated_exact: list[dict[str, Any]] = []
             if exact:
-                decorated: list[dict[str, Any]] = []
                 for schedule in exact:
                     copied = dict(schedule)
-                    reference = _seat_reference_for(copied, reference_items)
+                    reference = _seat_reference_for(copied, tuple(all_history_items))
                     if reference is not None:
                         copied["_pengucroSeatReference"] = dict(reference)
-                        copied["_pengucroSeatReferenceDate"] = reference_date
-                    decorated.append(copied)
-                return tuple(decorated), target.isoformat(), False
-            if reference_items:
-                return reference_items, reference_date, True
+                        raw_ymd = str(reference.get("scnYmd", ""))
+                        if len(raw_ymd) == 8:
+                            copied["_pengucroSeatReferenceDate"] = f"{raw_ymd[:4]}-{raw_ymd[4:6]}-{raw_ymd[6:]}"
+                        else:
+                            copied["_pengucroSeatReferenceDate"] = latest_ref_date
+                    decorated_exact.append(copied)
+
+            templates = _aggregate_historical_candidates(
+                history_by_date, screening_date, tuple(exact or ()), str(site_no)
+            )
+            combined = tuple(decorated_exact) + tuple(templates)
+
+            if exact:
+                return combined, target.isoformat(), False
+            if combined:
+                return combined, (latest_ref_date or target.isoformat()), True
+
             raise CgvError(
-                "선택한 날짜의 시간표가 아직 열리지 않았고, 오늘 이후 공개된 최근 시간표에서도 대기 기준 회차를 찾지 못했습니다."
+                "선택한 날짜의 시간표가 아직 열리지 않았고, 최근 공개 일정에서도 사전선택 후보를 찾지 못했습니다."
             )
 
         return self._with_page(operation)

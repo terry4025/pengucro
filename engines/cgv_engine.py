@@ -1224,6 +1224,7 @@ class CgvEngine(BaseEngine):
         movie = str(cgv.get("movie") or reservation_data.get("themePK", "")).strip()
         auditorium = str(cgv.get("auditorium", "")).strip()
         show_time = str(reservation_data.get("reservationTime", ""))
+        preferred_times = list(cgv.get("preferred_times") or ([show_time] if show_time else []))
         screening_date = str(reservation_data.get("reservationDate", ""))
         site_name = str(cgv.get("site_name") or reservation_data.get("branchLabel", "CGV"))
         people = max(1, int(reservation_data.get("people", 1)))
@@ -1274,11 +1275,17 @@ class CgvEngine(BaseEngine):
                             movie=movie,
                             show_time=show_time,
                             auditorium=auditorium,
+                            preferred_times=preferred_times,
                         )
                         if schedule:
+                            sched_time = normalize_time(schedule.get("scnsrtTm"))
+                            time_label = (
+                                f"{sched_time[:2]}:{sched_time[2:]}"
+                                if len(sched_time) == 4
+                                else (show_time[:5] if show_time else "")
+                            )
                             self.log(
-                                f"CGV 회차 감지 · {movie} · {normalize_time(show_time)[:2]}:"
-                                f"{normalize_time(show_time)[2:]} · {elapsed:.0f}ms",
+                                f"CGV 회차 감지 · {movie} · {time_label} · {elapsed:.0f}ms",
                                 "success",
                             )
                             break

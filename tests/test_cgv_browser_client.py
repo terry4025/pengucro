@@ -154,6 +154,7 @@ def test_unopened_target_uses_nearest_published_schedule_as_waiting_template():
         "expoScnsNm": "IMAX관",
         "movkndDsplEnm": "IMAX LASER 2D",
         "scnsrtTm": "2130",
+        "scnYmd": reference.strftime("%Y%m%d"),
     }
     client = _ScheduleClient({reference.strftime("%Y%m%d"): (reference_schedule,)})
 
@@ -161,9 +162,101 @@ def test_unopened_target_uses_nearest_published_schedule_as_waiting_template():
         "0013", target.isoformat()
     )
 
-    assert schedules == (reference_schedule,)
+    assert len(schedules) == 1
+    assert schedules[0]["expoProdNm"] == "오디세이"
+    assert schedules[0]["scnsrtTm"] == "2130"
+    assert schedules[0]["_pengucroPreopen"] is True
+    assert schedules[0]["_pengucroSeatReference"] == reference_schedule
     assert reference_date == reference.isoformat()
     assert reference_only is True
+
+
+def test_multi_day_candidate_discovery_aggregates_across_dates_without_dropping_movies():
+    target = datetime.now().date() + timedelta(days=5)
+    day_minus_1 = target - timedelta(days=1)
+    day_minus_2 = target - timedelta(days=2)
+    day_minus_3 = target - timedelta(days=3)
+
+    sched_movie_a = {
+        "expoProdNm": "영화 A",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnsrtTm": "1900",
+        "scnYmd": day_minus_1.strftime("%Y%m%d"),
+    }
+    sched_odyssey_1 = {
+        "expoProdNm": "오디세이",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnsrtTm": "1400",
+        "scnYmd": day_minus_2.strftime("%Y%m%d"),
+    }
+    sched_odyssey_2 = {
+        "expoProdNm": "오디세이",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnsrtTm": "1730",
+        "scnYmd": day_minus_3.strftime("%Y%m%d"),
+    }
+
+    client = _ScheduleClient(
+        {
+            day_minus_1.strftime("%Y%m%d"): (sched_movie_a,),
+            day_minus_2.strftime("%Y%m%d"): (sched_odyssey_1,),
+            day_minus_3.strftime("%Y%m%d"): (sched_odyssey_2,),
+        }
+    )
+
+    schedules, reference_date, reference_only = client.fetch_schedule_with_reference(
+        "0013", target.isoformat()
+    )
+
+    assert reference_only is True
+    movie_names = {s["expoProdNm"] for s in schedules}
+    assert "영화 A" in movie_names
+    assert "오디세이" in movie_names
+
+    odyssey_times = {s["scnsrtTm"] for s in schedules if s["expoProdNm"] == "오디세이"}
+    assert odyssey_times == {"1400", "1730"}
+
+
+def test_real_target_date_schedule_takes_priority_over_historical_templates():
+    target = datetime.now().date() + timedelta(days=4)
+    reference = target - timedelta(days=1)
+
+    target_real_odyssey = {
+        "expoProdNm": "오디세이",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnYmd": target.strftime("%Y%m%d"),
+        "scnsrtTm": "2000",
+        "frSeatCnt": 50,
+    }
+    historical_odyssey = {
+        "expoProdNm": "오디세이",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnYmd": reference.strftime("%Y%m%d"),
+        "scnsrtTm": "1400",
+        "frSeatCnt": 100,
+    }
+
+    client = _ScheduleClient(
+        {
+            target.strftime("%Y%m%d"): (target_real_odyssey,),
+            reference.strftime("%Y%m%d"): (historical_odyssey,),
+        }
+    )
+
+    schedules, reference_date, reference_only = client.fetch_schedule_with_reference(
+        "0013", target.isoformat()
+    )
+
+    assert reference_only is False
+    assert len(schedules) == 1
+    assert schedules[0]["expoProdNm"] == "오디세이"
+    assert schedules[0]["scnsrtTm"] == "2000"
+    assert not schedules[0].get("_pengucroPreopen")
 
 
 def test_prepublished_target_attaches_recent_real_seat_layout_reference():
@@ -221,3 +314,4 @@ def test_booking_dialog_uses_recent_layout_when_target_date_button_is_not_open()
             schedules=(unavailable,),
         )
     ) == reference
+

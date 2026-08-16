@@ -1,13 +1,18 @@
 from engines.cgv_client import (
+    CGV_IMAX_SITE_NOS,
+    CgvRegion,
     CgvSeat,
     CgvSeatGroup,
+    CgvSite,
     build_seat_guide,
     build_seat_hold_payload,
     build_seat_price_payload,
     can_extend_contiguous_seat_group,
     can_extend_physical_seat_group,
     choose_recommended_seat_group,
+    filter_imax_catalog,
     is_contiguous_seat_group,
+    is_imax_site,
     parse_api_seats,
     parse_seat_groups,
     parse_dom_seats,
@@ -304,3 +309,76 @@ def test_auto_best_seat_can_find_next_priority_and_yongsan_preference_mode():
     assert first is not None and first[0].startswith("H")
     assert second is not None and second != first
     assert immersive is not None and immersive[0][0] in {"F", "G"}
+
+
+def test_filter_imax_catalog_keeps_only_imax_sites_and_recomputes_region_counts():
+    regions = (
+        CgvRegion("01", "서울", 30),
+        CgvRegion("02", "경기", 60),
+        CgvRegion("03", "제주", 2),
+    )
+    sites = (
+        CgvSite("0013", "용산아이파크몰", "01"),
+        CgvSite("0001", "강남", "01"),
+        CgvSite("0074", "왕십리", "01"),
+        CgvSite("0181", "판교", "02"),
+        CgvSite("9999", "일반영화관", "03"),
+    )
+
+    filtered_regions, filtered_sites = filter_imax_catalog(regions, sites)
+
+    assert [site.site_no for site in filtered_sites] == ["0013", "0074", "0181"]
+    assert len(filtered_regions) == 2
+    assert filtered_regions[0].name == "서울"
+    assert filtered_regions[0].count == 2
+    assert filtered_regions[1].name == "경기"
+    assert filtered_regions[1].count == 1
+
+
+def test_is_imax_site_detects_by_site_no_and_metadata():
+    assert is_imax_site(CgvSite("0013", "용산아이파크몰", "01")) is True
+    assert is_imax_site(CgvSite("0001", "강남", "01")) is False
+    assert is_imax_site({"siteNo": "0074", "siteNm": "왕십리"}) is True
+    assert is_imax_site({"siteNo": "9999", "siteNm": "테스트", "hallNm": "IMAX 3D"}) is True
+
+
+def test_select_schedule_prioritizes_preferred_times_in_order():
+    payload = {
+        "data": [
+            {"movNm": "오디세이", "expoScnsNm": "IMAX관", "scnsrtTm": "1000", "scnsNo": "1", "scnSseq": "1"},
+            {"movNm": "오디세이", "expoScnsNm": "IMAX관", "scnsrtTm": "1400", "scnsNo": "2", "scnSseq": "2"},
+            {"movNm": "오디세이", "expoScnsNm": "IMAX관", "scnsrtTm": "1800", "scnsNo": "3", "scnSseq": "3"},
+            {"movNm": "오디세이", "expoScnsNm": "IMAX관", "scnsrtTm": "2130", "scnsNo": "4", "scnSseq": "4"},
+        ]
+    }
+
+    # 1st preference is 18:00
+    chosen = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX",
+        preferred_times=["18:00", "14:00"],
+    )
+    assert chosen is not None
+    assert chosen["scnsrtTm"] == "1800"
+
+    # 1st preference is 12:00 (not available), 2nd is 21:30 (available)
+    chosen2 = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX",
+        preferred_times=["12:00", "21:30"],
+    )
+    assert chosen2 is not None
+    assert chosen2["scnsrtTm"] == "2130"
+
+    # Backward compatibility with single show_time
+    chosen3 = select_schedule(
+        payload,
+        movie="오디세이",
+        show_time="10:00",
+        auditorium="IMAX",
+    )
+    assert chosen3 is not None
+    assert chosen3["scnsrtTm"] == "1000"
+

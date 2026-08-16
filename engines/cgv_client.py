@@ -534,7 +534,91 @@ def parse_site_list(payload: Mapping[str, Any]) -> dict[str, str]:
     return dict(sorted(sites.items(), key=lambda pair: pair[0]))
 
 
-def parse_site_catalog(payload: Mapping[str, Any]) -> tuple[tuple[CgvRegion, ...], tuple[CgvSite, ...]]:
+# CGV theaters that operate an official IMAX auditorium in South Korea.
+# Used to focus the booking selector on IMAX-capable sites and eliminate
+# non-IMAX theaters from the selector UI without individual schedule requests.
+CGV_IMAX_SITE_NOS: frozenset[str] = frozenset({
+    "0013",  # 서울 용산아이파크몰 (IMAX GT Laser)
+    "0074",  # 서울 왕십리 (IMAX Laser)
+    "0199",  # 서울 천호 (IMAX Laser)
+    "0059",  # 서울 영등포 (IMAX Laser)
+    "0040",  # 서울 압구정 (IMAX Laser)
+    "0030",  # 경기 일산 (IMAX Laser)
+    "0181",  # 경기 판교 (IMAX Laser)
+    "0286",  # 경기 광교 (IMAX Laser)
+    "0289",  # 경기 동탄 (IMAX Laser)
+    "0105",  # 경기 평택 (IMAX Laser)
+    "0340",  # 경기 평택고덕 (IMAX Laser)
+    "0041",  # 경기 소풍 (IMAX Laser)
+    "0063",  # 경기 의정부 (IMAX)
+    "0039",  # 경기 안산 (IMAX)
+    "0012",  # 경기 수원 (IMAX)
+    "0002",  # 인천 인천 (IMAX Laser)
+    "0044",  # 부산 서면 (IMAX Laser)
+    "0259",  # 부산 센텀시티 (IMAX)
+    "0142",  # 울산 울산삼산 (IMAX Laser)
+    "0087",  # 경남 창원더시티 (IMAX)
+    "0007",  # 대구 대구 (IMAX)
+    "0072",  # 대구 대구스타디움 (IMAX)
+    "0174",  # 대구 대구이시아 (IMAX)
+    "0008",  # 대전 대전 (IMAX)
+    "0099",  # 대전 대전터미널 (IMAX Laser)
+    "0146",  # 충남 천안펜타포트 (IMAX Laser)
+    "0144",  # 충북 청주서문 (IMAX)
+    "0090",  # 광주 광주터미널 (IMAX Laser)
+    "0143",  # 전북 전주효자 (IMAX Laser)
+    "0156",  # 전남 순천신대 (IMAX)
+    "0060",  # 강원 춘천 (IMAX)
+    "0084",  # 강원 원주 (IMAX)
+    "0139",  # 강원 강릉 (IMAX)
+    "0120",  # 제주 제주 (IMAX)
+})
+
+
+def is_imax_site(item: Mapping[str, Any] | CgvSite) -> bool:
+    """Return whether a CGV site operates an IMAX auditorium."""
+    if isinstance(item, CgvSite):
+        site_no = str(item.site_no).strip()
+    else:
+        site_no = str(item.get("siteNo", "")).strip()
+    if site_no in CGV_IMAX_SITE_NOS:
+        return True
+    if isinstance(item, Mapping):
+        text = " ".join(str(v) for v in item.values()).upper()
+        if "IMAX" in text:
+            return True
+    return False
+
+
+def filter_imax_catalog(
+    regions: Iterable[CgvRegion],
+    sites: Iterable[CgvSite],
+    *,
+    imax_site_nos: frozenset[str] | None = None,
+) -> tuple[tuple[CgvRegion, ...], tuple[CgvSite, ...]]:
+    """Filter sites to IMAX theaters and recompute regional counts accordingly."""
+    allowed = imax_site_nos if imax_site_nos is not None else CGV_IMAX_SITE_NOS
+    filtered_sites = tuple(
+        site for site in sites
+        if site.site_no in allowed or is_imax_site(site)
+    )
+    counts_by_region: dict[str, int] = {}
+    for site in filtered_sites:
+        counts_by_region[site.region_code] = counts_by_region.get(site.region_code, 0) + 1
+
+    filtered_regions = tuple(
+        CgvRegion(code=region.code, name=region.name, count=counts_by_region[region.code])
+        for region in regions
+        if region.code in counts_by_region and counts_by_region[region.code] > 0
+    )
+    return filtered_regions, filtered_sites
+
+
+def parse_site_catalog(
+    payload: Mapping[str, Any],
+    *,
+    imax_only: bool = False,
+) -> tuple[tuple[CgvRegion, ...], tuple[CgvSite, ...]]:
     """Parse CGV's current region/site BFF response without static site data."""
 
     data = payload.get("data", payload)
@@ -563,6 +647,8 @@ def parse_site_catalog(payload: Mapping[str, Any]) -> tuple[tuple[CgvRegion, ...
         region_code = str(item.get("regnGrpCd", "")).strip()
         if site_no and name:
             sites.append(CgvSite(site_no, name, region_code))
+    if imax_only:
+        return filter_imax_catalog(regions, sites)
     return tuple(regions), tuple(sites)
 
 
@@ -750,13 +836,17 @@ def select_schedule(
     payload: Mapping[str, Any],
     *,
     movie: str,
-    show_time: str,
+    show_time: str = "",
     auditorium: str = "",
+    preferred_times: Iterable[str] = (),
 ) -> dict[str, Any] | None:
     movie_key = re.sub(r"\s+", "", movie).casefold()
     auditorium_key = re.sub(r"\s+", "", auditorium).casefold()
-    target_time = normalize_time(show_time)
-    matches: list[dict[str, Any]] = []
+    raw_preferred = [normalize_time(t) for t in preferred_times if normalize_time(t)]
+    if not raw_preferred and show_time:
+        raw_preferred = [normalize_time(show_time)]
+
+    candidates: list[dict[str, Any]] = []
     for item in schedule_items(payload):
         movie_text = " ".join(
             str(item.get(key, ""))
@@ -775,14 +865,23 @@ def select_schedule(
         )
         if movie_key and movie_key not in re.sub(r"\s+", "", movie_text).casefold():
             continue
-        if target_time and normalize_time(item.get("scnsrtTm")) != target_time:
-            continue
         if auditorium_key and auditorium_key not in re.sub(r"\s+", "", screen_text).casefold():
             continue
         if str(item.get("cntlYn", "N")).upper() == "Y":
             continue
-        matches.append(item)
-    return matches[0] if matches else None
+        candidates.append(item)
+
+    if not candidates:
+        return None
+
+    if raw_preferred:
+        for pref in raw_preferred:
+            for item in candidates:
+                if normalize_time(item.get("scnsrtTm")) == pref:
+                    return item
+        return None
+
+    return candidates[0]
 
 
 class CgvClient:
