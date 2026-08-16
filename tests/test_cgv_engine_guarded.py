@@ -1,0 +1,144 @@
+from engines.cgv_engine import CgvEngine as BaseCgvEngine
+from engines.cgv_engine_guarded import CgvEngine
+from engines.registry import EngineRegistry
+
+
+class _Page:
+    context = None
+
+    def is_closed(self):
+        return False
+
+
+def _make_engine(logs):
+    engine = CgvEngine(lambda message, level="info": logs.append((message, level)))
+    engine._browser_auth_data = lambda _page: {}
+    engine._seat_url = lambda _schedule, _cust_no="": "https://cgv.example/seat"
+    engine._direct_hold_config = lambda *_args, **_kwargs: {}
+    engine._start_fast_seat_monitor = lambda *_args, **_kwargs: True
+    engine._stop_fast_seat_monitor = lambda _page: None
+    return engine
+
+
+def test_registry_uses_guarded_cgv_engine():
+    engine = EngineRegistry.create(
+        site_name="CGV",
+        mode="",
+        payload={},
+        custom_sites={},
+        log_callback=lambda *_args: None,
+        success_callback=None,
+    )
+
+    assert type(engine) is CgvEngine
+    assert engine.FAST_SEAT_LAUNCH_INTERVAL_MS == 180
+
+
+def test_rate_limit_falls_back_immediately_without_exponential_backoff(monkeypatch):
+    logs = []
+    reads = []
+    engine = _make_engine(logs)
+
+    def blocked_snapshot(_page):
+        reads.append(1)
+        return {
+            "running": False,
+            "attempts": 4,
+            "completed": 4,
+            "inflight": 0,
+            "consecutiveErrors": 0,
+            "lastStatus": 429,
+            "blocked": True,
+            "unauthorized": False,
+            "lastError": "HTTP 429",
+            "terminalError": "",
+            "conflicts": 0,
+            "hit": None,
+        }
+
+    monkeypatch.setattr(
+        BaseCgvEngine,
+        "_read_fast_seat_monitor",
+        staticmethod(blocked_snapshot),
+    )
+
+    held, fallback = engine._watch_and_hold_api(
+        _Page(),
+        {"siteNo": "0013", "scnYmd": "20260826"},
+        (),
+        2,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (False, True)
+    assert len(reads) == 1
+    messages = [message for message, _level in logs]
+    assert any("연결 제한 감지" in message for message in messages)
+    assert any("즉시 전환" in message for message in messages)
+    assert not any("3.0초 후 재시도" in message for message in messages)
+    assert not any("6.0초 후 재시도" in message for message in messages)
+
+
+def test_consecutive_fetch_errors_fall_back_instead_of_restarting_monitor(monkeypatch):
+    logs = []
+    engine = _make_engine(logs)
+
+    monkeypatch.setattr(
+        BaseCgvEngine,
+        "_read_fast_seat_monitor",
+        staticmethod(
+            lambda _page: {
+                "running": False,
+                "attempts": 5,
+                "completed": 5,
+                "inflight": 0,
+                "consecutiveErrors": engine.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS,
+                "lastStatus": 0,
+                "blocked": False,
+                "unauthorized": False,
+                "lastError": "TypeError: Failed to fetch",
+                "terminalError": "",
+                "conflicts": 0,
+                "hit": None,
+            }
+        ),
+    )
+
+    held, fallback = engine._watch_and_hold_api(
+        _Page(),
+        {"siteNo": "0013", "scnYmd": "20260826"},
+        (),
+        2,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (False, True)
+    messages = [message for message, _level in logs]
+    assert any("연속 조회 실패" in message for message in messages)
+    assert any("즉시 전환" in message for message in messages)
+
+
+def test_missing_monitor_state_uses_safe_fallback(monkeypatch):
+    logs = []
+    engine = _make_engine(logs)
+
+    monkeypatch.setattr(
+        BaseCgvEngine,
+        "_read_fast_seat_monitor",
+        staticmethod(lambda _page: {}),
+    )
+
+    held, fallback = engine._watch_and_hold_api(
+        _Page(),
+        {"siteNo": "0013", "scnYmd": "20260826"},
+        (),
+        2,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (False, True)
+    messages = [message for message, _level in logs]
+    assert any("감시 상태를 읽지 못해" in message for message in messages)
