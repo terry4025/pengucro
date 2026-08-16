@@ -871,7 +871,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         if error:
             self._handle_task_error(error)
         elif done:
-            done(result)
+            try:
+                done(result)
+            except Exception as exc:
+                self._handle_task_error(str(exc))
 
     def _catalog_loaded(self, snapshot) -> None:
         self.regions = snapshot.regions
@@ -992,6 +995,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
         chosen_movie = initial_movie if is_initial_mov else (movies[0] if movies else "")
         if hasattr(self, "movie_var") and hasattr(self.movie_var, "set"):
             self.movie_var.set(chosen_movie)
+        if hasattr(self, "movie_menu") and hasattr(self.movie_menu, "set"):
+            self.movie_menu.set(chosen_movie or "표시할 영화가 없습니다")
         if hasattr(self, "_movie_changed"):
             self._movie_changed(chosen_movie, user_initiated=not is_initial_mov)
 
@@ -1099,6 +1104,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
 
         self.auditorium_menu.configure(values=options or ["표시할 상영관이 없습니다"])
         self.auditorium_var.set(chosen)
+        if hasattr(self, "auditorium_menu") and hasattr(self.auditorium_menu, "set"):
+            self.auditorium_menu.set(chosen or "표시할 상영관이 없습니다")
         self._auditorium_changed(chosen, user_initiated=not is_initial_aud)
 
     def _auditorium_changed(self, _value: str = "", *, user_initiated: bool = True) -> None:
@@ -1197,7 +1204,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
                 height=48,
                 corner_radius=theme.ROUNDED_MD,
                 border_width=1 if is_selected else 0,
-                border_color=theme.ACCENT_BLUE if is_selected else "transparent",
+                border_color=theme.ACCENT_BLUE if is_selected else theme.CONTROL_BORDER,
             ).pack(fill="x", pady=theme.SPACE_1)
 
     def _toggle_schedule_time(self, item: dict[str, Any]) -> None:
