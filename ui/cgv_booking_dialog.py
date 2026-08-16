@@ -111,8 +111,24 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
 
         self.title("CGV IMAX 예매 대상 선택")
-        self.geometry("1060x720")
-        self.minsize(940, 640)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        dialog_width = min(1060, max(920, screen_width - 40))
+        dialog_height = min(680, max(540, screen_height - 80))
+        self.minsize(900, 520)
+        try:
+            parent_top = parent.winfo_toplevel()
+            parent_x = parent_top.winfo_x()
+            parent_y = parent_top.winfo_y()
+            parent_w = parent_top.winfo_width()
+            parent_h = parent_top.winfo_height()
+            pos_x = max(0, parent_x + (parent_w - dialog_width) // 2)
+            pos_y = max(0, parent_y + (parent_h - dialog_height) // 2)
+            self.geometry(f"{dialog_width}x{dialog_height}+{pos_x}+{pos_y}")
+        except Exception:
+            pos_x = max(0, (screen_width - dialog_width) // 2)
+            pos_y = max(0, (screen_height - dialog_height) // 2)
+            self.geometry(f"{dialog_width}x{dialog_height}+{pos_x}+{pos_y}")
         self.configure(fg_color=theme.CANVAS_COLOR)
         self.protocol("WM_DELETE_WINDOW", self._close_dialog)
         self.transient(parent.winfo_toplevel())
@@ -120,8 +136,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
 
         self._build_header()
         self._build_toolbar()
-        self._build_content()
         self._build_footer()
+        self._build_content()
         self._start_task(
             "CGV IMAX 지점 목록을 불러오고 있습니다...",
             lambda cancel_event: self.client.fetch_catalog(imax_only=True, cancel_event=cancel_event),
@@ -134,7 +150,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=theme.SPACE_5, pady=(theme.SPACE_4, theme.SPACE_2))
+        header.pack(side="top", fill="x", padx=theme.SPACE_4, pady=(theme.SPACE_3, theme.SPACE_1))
         ctk.CTkLabel(
             header,
             text="CGV IMAX 예매 대상",
@@ -159,7 +175,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             border_color=theme.HAIRLINE_COLOR,
             corner_radius=theme.ROUNDED_MD,
         )
-        toolbar.pack(fill="x", padx=theme.SPACE_5, pady=(0, theme.SPACE_3))
+        toolbar.pack(side="top", fill="x", padx=theme.SPACE_4, pady=(0, theme.SPACE_2))
 
         # Left: Target Date controls
         date_group = ctk.CTkFrame(toolbar, fg_color="transparent")
@@ -301,13 +317,13 @@ class CgvBookingDialog(ctk.CTkToplevel):
             font=theme.FONT_HEADING,
             text_color=theme.TEXT_PRIMARY,
             anchor="w",
-        ).pack(fill="x", padx=theme.SPACE_3, pady=(theme.SPACE_3, theme.SPACE_2))
+        ).pack(fill="x", padx=theme.SPACE_3, pady=(theme.SPACE_2, theme.SPACE_1))
         return panel
 
     def _build_content(self) -> None:
         content = ctk.CTkFrame(self, fg_color="transparent")
         self.content = content
-        content.pack(fill="both", expand=True, padx=theme.SPACE_5)
+        content.pack(side="top", fill="both", expand=True, padx=theme.SPACE_4, pady=(0, theme.SPACE_1))
         content.columnconfigure(0, weight=2, minsize=180)
         content.columnconfigure(1, weight=3, minsize=260)
         content.columnconfigure(2, weight=8, minsize=500)
@@ -434,7 +450,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             wraplength=420,
             anchor="w",
         )
-        self.seat_help.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        self.seat_help.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_1))
         guide = ctk.CTkFrame(
             seat_panel,
             fg_color=theme.TINT_RUNNING_BG,
@@ -442,9 +458,9 @@ class CgvBookingDialog(ctk.CTkToplevel):
             border_color="#6B5A18",
             corner_radius=theme.ROUNDED_MD,
         )
-        guide.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        guide.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_1))
         guide_text = ctk.CTkFrame(guide, fg_color="transparent")
-        guide_text.pack(side="left", fill="x", expand=True, padx=theme.SPACE_3, pady=theme.SPACE_2)
+        guide_text.pack(side="left", fill="x", expand=True, padx=theme.SPACE_3, pady=theme.SPACE_1)
         self.guide_title_label = ctk.CTkLabel(
             guide_text,
             text="명당 가이드",
@@ -492,7 +508,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             height=theme.H_BUTTON,
             corner_radius=theme.ROUNDED_MD,
         )
-        self.load_seats_button.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        self.load_seats_button.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_1))
         self.auto_seat_var = ctk.StringVar(value="명당 자동 선택")
         self.auto_seat_modes = {"명당 자동 선택": ""}
         self.auto_seat_menu = ctk.CTkOptionMenu(
@@ -512,7 +528,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             anchor="w",
             font=theme.FONT_KR_LABEL,
         )
-        self.auto_seat_menu.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        self.auto_seat_menu.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_1))
         self.seat_list = SafeScrollableFrame(
             seat_panel,
             fg_color=theme.CANVAS_COLOR,
@@ -520,11 +536,11 @@ class CgvBookingDialog(ctk.CTkToplevel):
             border_width=1,
             border_color=theme.HAIRLINE_COLOR,
         )
-        self.seat_list.pack(fill="both", expand=True, padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        self.seat_list.pack(fill="both", expand=True, padx=theme.SPACE_3, pady=(0, theme.SPACE_1))
         self._render_seat_placeholder("회차를 선택한 뒤 실제 좌석도를 불러오세요.")
 
         actions = ctk.CTkFrame(seat_panel, fg_color="transparent")
-        actions.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
+        actions.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_1))
         self.add_priority_button = ctk.CTkButton(
             actions,
             text="우선순위 추가",
@@ -558,12 +574,12 @@ class CgvBookingDialog(ctk.CTkToplevel):
             justify="left",
             anchor="w",
         )
-        self.priority_label.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_3))
+        self.priority_label.pack(fill="x", padx=theme.SPACE_3, pady=(0, theme.SPACE_2))
         self._render_priorities()
 
     def _build_footer(self) -> None:
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.pack(fill="x", padx=theme.SPACE_5, pady=theme.SPACE_4)
+        footer.pack(side="bottom", fill="x", padx=theme.SPACE_4, pady=(theme.SPACE_2, theme.SPACE_3))
         ctk.CTkButton(
             footer,
             text="취소",
