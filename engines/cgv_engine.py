@@ -1178,21 +1178,29 @@ class CgvEngine(BaseEngine):
             except Exception:
                 return False
 
-        if has_session():
-            self.log("CGV 전용 Chrome의 가장 최근 회원 로그인 세션을 사용합니다.", "info")
-            return True
+        # Navigate to login page to verify if session is genuinely active or login is needed
         page.goto(
             f"{CGV_HOME_URL}/mem/login?nmbrAtktFlag=Y",
             wait_until="domcontentloaded",
             timeout=30000,
         )
+        page.wait_for_timeout(800)
+
+        # If already actively logged in, CGV immediately redirects away from /mem/login
+        if "/mem/login" not in page.url and has_session():
+            self.log("CGV 회원 로그인이 확인되었습니다.", "success")
+            return True
+
         self.log(
-            "회원 예매를 위해 열린 CGV Chrome에서 로그인해주세요. 로그인 완료 후 자동으로 계속합니다.",
+            "회원 예매를 위해 열린 CGV Chrome에서 로그인해주세요. 로그인 완료 후 자동으로 예약을 시작합니다.",
             "warning",
         )
         while not self.stop_event.is_set():
-            if has_session():
-                self.log("CGV 회원 로그인을 확인했습니다.", "success")
+            if page.is_closed():
+                return False
+            # When user completes login, CGV redirects away from /mem/login
+            if "/mem/login" not in page.url and has_session():
+                self.log("CGV 회원 로그인을 확인했습니다. 예약을 시작합니다.", "success")
                 return True
             page.wait_for_timeout(500)
         return False
