@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import re
 import threading
 import time
@@ -11,7 +12,7 @@ from typing import Any, Callable, Mapping
 import customtkinter as ctk
 
 import ui.theme as theme
-from engines.cgv_browser_client import CgvBrowserClient
+from engines.cgv_browser_client import CgvBrowserClient, CgvRequestCancelled
 from engines.cgv_client import (
     CgvSeat,
     build_seat_guide,
@@ -79,12 +80,11 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._request_generation = 0
         self._next_task_id = 0
         self._active_task_id: int | None = None
-        self._active_task_start_time: float = 0.0
         self._active_task_done: Callable | None = None
-        self._task_results: dict[int, tuple[Any, str | None]] = {}
-        self._pending_task: tuple[str, Callable, Callable] | None = None
-        self._task_timeout_seconds = 14.0
-        self._task_progress: tuple[str, str] | None = None
+        self._active_cancel_event: threading.Event | None = None
+        self._pending_task: tuple[str, Callable[[threading.Event | None], Any], Callable[[Any], None]] | None = None
+        self._ui_event_queue: queue.Queue = queue.Queue()
+        self._task_thread_local = threading.local()
         self.client = CgvBrowserClient(log=self._browser_status)
         self.regions = ()
         self.sites = ()
@@ -124,9 +124,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._build_footer()
         self._start_task(
             "CGV IMAX 지점 목록을 불러오고 있습니다...",
-            lambda: self.client.fetch_catalog(imax_only=True),
+            lambda cancel_event: self.client.fetch_catalog(imax_only=True, cancel_event=cancel_event),
             self._catalog_loaded,
         )
+        self.after(50, self._poll_task)
 
     def _is_alive(self) -> bool:
         return _is_dialog_alive(self)
@@ -605,20 +606,16 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._closing = True
         self._request_generation += 1
         self._pending_task = None
-        self._active_task_id = None
-        self._active_task_done = None
-        self._task_results.clear()
-        self._emit_or_log("[CGV] 선택창 종료 · 실행 중 결과 무시", "info")
-        if hasattr(self, "grab_release"):
-            try:
-                self.grab_release()
-            except Exception:
-                pass
-        if hasattr(self, "destroy"):
-            try:
-                self.destroy()
-            except Exception:
-                pass
+        if getattr(self, "_active_cancel_event", None) is not None:
+            self._active_cancel_event.set()
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def _prev_date(self) -> None:
         try:
@@ -651,7 +648,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             self.date_entry.insert(0, self.reservation_date)
 
     def _change_date(self, new_date: str) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
         if new_date == self.reservation_date:
             return
@@ -683,12 +680,14 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_confirm_state()
 
         if self.selected_site:
+            site_no = self.selected_site.site_no
+            req_date = str(new_date)
             self._start_task(
                 f"{self.selected_site.label}의 {new_date} 시간표 및 사전선택 후보를 조회하고 있습니다...",
-                lambda: self.client.fetch_schedule_with_reference(
-                    self.selected_site.site_no, new_date
+                lambda cancel_event, s=site_no, d=req_date: self.client.fetch_schedule_with_reference(
+                    s, d, cancel_event=cancel_event
                 ),
-                lambda result: self._schedule_loaded(result, generation=generation),
+                lambda result, g=generation: self._schedule_loaded(result, generation=g),
             )
 
     def _decrement_people(self) -> None:
@@ -731,58 +730,66 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._render_priorities()
         self._update_confirm_state()
 
-    def _start_task(self, status: str, func, done) -> None:
-        if not _is_dialog_alive(self):
+    def _launch_task(
+        self,
+        status: str,
+        func: Callable[[threading.Event | None], Any],
+        done: Callable[[Any], None],
+    ) -> None:
+        self._next_task_id += 1
+        task_id = self._next_task_id
+        cancel_event = threading.Event()
+
+        self._active_task_id = task_id
+        self._active_task_done = done
+        self._active_cancel_event = cancel_event
+
+        if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
+            self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
+
+        def worker(tid: int, ce: threading.Event, f: Callable[[threading.Event | None], Any]) -> None:
+            self._task_thread_local.task_id = tid
+            try:
+                result = f(ce)
+            except CgvRequestCancelled:
+                self._ui_event_queue.put(("cancelled", tid, None, None))
+            except Exception as exc:
+                self._ui_event_queue.put(("result", tid, None, str(exc)))
+            else:
+                self._ui_event_queue.put(("result", tid, result, None))
+
+        threading.Thread(
+            target=worker,
+            args=(task_id, cancel_event, func),
+            name=f"CgvDataDialog-{task_id}",
+            daemon=True,
+        ).start()
+
+    def _start_task(
+        self,
+        status: str,
+        func: Callable[[threading.Event | None], Any],
+        done: Callable[[Any], None],
+    ) -> None:
+        if getattr(self, "_closing", False):
             return
 
-        if self._active_task_id is not None:
+        if getattr(self, "_active_task_id", None) is not None:
             self._pending_task = (status, func, done)
+            if getattr(self, "_active_cancel_event", None) is not None:
+                self._active_cancel_event.set()
             if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
                 self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
             return
 
-        self._next_task_id += 1
-        task_id = self._next_task_id
-
-        if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
-            self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
-        self._active_task_id = task_id
-        self._active_task_start_time = time.monotonic()
-        self._active_task_done = done
-
-        def worker(tid: int, f: Callable) -> None:
-            try:
-                res = f()
-                err = None
-            except Exception as exc:
-                res = None
-                err = str(exc)
-            if _is_dialog_alive(self):
-                self._task_results[tid] = (res, err)
-
-        threading.Thread(
-            target=worker,
-            args=(task_id, func),
-            name=f"CgvDataDialog-{task_id}",
-            daemon=True,
-        ).start()
-        if hasattr(self, "after"):
-            self.after(60, self._poll_task)
+        self._launch_task(status, func, done)
 
     def _browser_status(self, message: str, level: str = "info") -> None:
-        if not _is_dialog_alive(self):
-            return
-        self._task_progress = (message, level)
-
-    def _emit_or_log(self, message: str, level: str = "info") -> None:
-        try:
-            if hasattr(self, "client") and hasattr(self.client, "_emit"):
-                self.client._emit(message, level)
-        except Exception:
-            pass
+        task_id = getattr(self._task_thread_local, "task_id", None)
+        self._ui_event_queue.put(("progress", task_id, message, level))
 
     def _handle_task_error(self, error_message: str) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
         if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
             self.status_label.configure(text=error_message, text_color=theme.TINT_ERROR_FG)
@@ -802,75 +809,69 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_confirm_state()
 
     def _poll_task(self) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
 
-        if self._task_progress is not None:
-            message, level = self._task_progress
-            self._task_progress = None
-            color = {
-                "success": theme.TINT_SUCCESS_FG,
-                "warning": theme.ACCENT_YELLOW,
-                "error": theme.TINT_ERROR_FG,
-            }.get(level, theme.TINT_INFO_FG)
-            if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
-                self.status_label.configure(text=message, text_color=color)
+        while True:
+            try:
+                event = self._ui_event_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        if self._active_task_id is None:
-            if self._pending_task is not None:
-                next_status, next_func, next_done = self._pending_task
-                self._pending_task = None
-                self._start_task(next_status, next_func, next_done)
+            kind, task_id, payload, extra = event
+
+            if task_id is not None and task_id != getattr(self, "_active_task_id", None):
+                # Discard events from obsolete or cancelled workers
+                continue
+
+            if kind == "progress":
+                message = payload
+                level = extra
+                color = {
+                    "success": theme.TINT_SUCCESS_FG,
+                    "warning": theme.ACCENT_YELLOW,
+                    "error": theme.TINT_ERROR_FG,
+                }.get(level, theme.TINT_INFO_FG)
+                if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
+                    self.status_label.configure(text=message, text_color=color)
+
+            elif kind == "cancelled":
+                self._finish_active_task(cancelled=True)
+
+            elif kind == "result":
+                result = payload
+                error = extra
+                self._finish_active_task(result=result, error=error)
+
+        if hasattr(self, "after") and not getattr(self, "_closing", False):
+            self.after(50, self._poll_task)
+
+    def _finish_active_task(
+        self,
+        *,
+        result: Any = None,
+        error: str | None = None,
+        cancelled: bool = False,
+    ) -> None:
+        done = self._active_task_done
+
+        self._active_task_id = None
+        self._active_task_done = None
+        self._active_cancel_event = None
+
+        if self._pending_task is not None:
+            next_status, next_func, next_done = self._pending_task
+            self._pending_task = None
+            self._launch_task(next_status, next_func, next_done)
             return
 
-        elapsed = time.monotonic() - self._active_task_start_time
-        if elapsed > self._task_timeout_seconds:
-            self._emit_or_log("[CGV] 시간표 조회 제한시간 초과 · 최신 요청으로 전환", "warning")
-            abandoned_id = self._active_task_id
-            self._active_task_id = None
-            self._active_task_done = None
-            self._task_results.pop(abandoned_id, None)
-
-            if self._pending_task is not None:
-                next_status, next_func, next_done = self._pending_task
-                self._pending_task = None
-                self._start_task(next_status, next_func, next_done)
-                return
-            else:
-                self._handle_task_error("조회 시간이 초과되었습니다. 다시 시도해주세요.")
-                return
-
-        if self._active_task_id in self._task_results:
-            result, error = self._task_results.pop(self._active_task_id)
-            done = self._active_task_done
-            self._active_task_id = None
-            self._active_task_done = None
-
-            # Discard any obsolete results
-            for old_id in list(self._task_results.keys()):
-                self._task_results.pop(old_id, None)
-                self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
-
-            if self._pending_task is not None:
-                next_status, next_func, next_done = self._pending_task
-                self._pending_task = None
-                self._start_task(next_status, next_func, next_done)
-                return
-
-            if error:
-                self._handle_task_error(error)
-            elif done:
-                done(result)
+        if cancelled:
             return
 
-        # Discard any older results
-        for old_id in list(self._task_results.keys()):
-            if old_id != self._active_task_id:
-                self._task_results.pop(old_id, None)
-                self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
-
-        if hasattr(self, "after"):
-            self.after(60, self._poll_task)
+        if error:
+            self._handle_task_error(error)
+        elif done:
+            done(result)
 
     def _catalog_loaded(self, snapshot) -> None:
         self.regions = snapshot.regions
@@ -932,7 +933,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             ).pack(fill="x", pady=1)
 
     def _select_site(self, site, *, user_initiated: bool = True) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
         if user_initiated:
             self._is_restoring_initial = False
@@ -959,19 +960,20 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_confirm_state()
         self._request_generation += 1
         generation = self._request_generation
+        site_no = site.site_no
+        req_date = str(self.reservation_date)
         self._start_task(
             f"{site.label}의 시간표 및 사전선택 후보를 조회하고 있습니다...",
-            lambda: self.client.fetch_schedule_with_reference(
-                site.site_no, self.reservation_date
+            lambda cancel_event, s=site_no, d=req_date: self.client.fetch_schedule_with_reference(
+                s, d, cancel_event=cancel_event
             ),
-            lambda result: self._schedule_loaded(result, generation=generation),
+            lambda result, g=generation: self._schedule_loaded(result, generation=g),
         )
 
     def _schedule_loaded(self, result, *, generation: int | None = None) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
-        if generation is not None and generation != self._request_generation:
-            self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
+        if generation is not None and generation != getattr(self, "_request_generation", None):
             return
         schedules, reference_date, reference_only = result
         self.schedules = tuple(schedules)
@@ -983,12 +985,15 @@ class CgvBookingDialog(ctk.CTkToplevel):
         template_count = sum(bool(item.get("_pengucroPreopen")) for item in self.schedules)
 
         movies = sorted({_movie_name(item) for item in self.schedules if _movie_name(item)})
-        self.movie_menu.configure(values=movies or ["표시할 영화가 없습니다"])
-        initial_movie = str(self.initial.get("movie", ""))
-        is_initial_mov = self._is_restoring_initial and initial_movie in movies
+        if hasattr(self, "movie_menu") and hasattr(self.movie_menu, "configure"):
+            self.movie_menu.configure(values=movies or ["표시할 영화가 없습니다"])
+        initial_movie = str(getattr(self, "initial", {}).get("movie", ""))
+        is_initial_mov = getattr(self, "_is_restoring_initial", False) and initial_movie in movies
         chosen_movie = initial_movie if is_initial_mov else (movies[0] if movies else "")
-        self.movie_var.set(chosen_movie)
-        self._movie_changed(chosen_movie, user_initiated=not is_initial_mov)
+        if hasattr(self, "movie_var") and hasattr(self.movie_var, "set"):
+            self.movie_var.set(chosen_movie)
+        if hasattr(self, "_movie_changed"):
+            self._movie_changed(chosen_movie, user_initiated=not is_initial_mov)
 
         if self.reference_only:
             self.status_label.configure(
@@ -1256,24 +1261,26 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
 
     def _load_seats(self) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
         if not self.selected_schedule and not self.preferred_times:
             return
         reference = self._seat_reference_schedule(self)
+        people = int(self.people)
         self._request_generation += 1
         generation = self._request_generation
         self._start_task(
             "실제 CGV 좌석도를 여는 중입니다. 로그인 안내가 뜨면 열린 Chrome에서 로그인해주세요.",
-            lambda: self.client.fetch_seat_map(reference, self.people),
-            lambda seats: self._seats_loaded(seats, generation=generation),
+            lambda cancel_event, r=reference, p=people: self.client.fetch_seat_map(
+                r, p, cancel_event=cancel_event
+            ),
+            lambda seats, g=generation: self._seats_loaded(seats, generation=g),
         )
 
     def _seats_loaded(self, seats, *, generation: int | None = None) -> None:
-        if not _is_dialog_alive(self):
+        if getattr(self, "_closing", False):
             return
-        if generation is not None and generation != self._request_generation:
-            self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
+        if generation is not None and generation != getattr(self, "_request_generation", None):
             return
         self.seats = tuple(seats)
         schedule = self.selected_schedule or {}

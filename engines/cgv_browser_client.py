@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -21,6 +22,16 @@ from engines.cgv_client import (
     parse_site_catalog,
     schedule_items,
 )
+
+
+class CgvRequestCancelled(Exception):
+    """Raised when a background CGV browser client request has been cancelled."""
+    pass
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise CgvRequestCancelled("CGV 조회 요청이 취소되었습니다.")
 
 
 class CgvLoginRequired(CgvError):
@@ -504,16 +515,21 @@ class CgvBrowserClient:
             raise CgvError(str(data.get("statusMessage") or "CGV가 조회 요청을 처리하지 못했습니다."))
         return data
 
-    def fetch_catalog(self, *, imax_only: bool = True) -> CgvCatalogSnapshot:
+    def fetch_catalog(
+        self, *, imax_only: bool = True, cancel_event: threading.Event | None = None
+    ) -> CgvCatalogSnapshot:
+        _check_cancel(cancel_event)
         self._emit("[CGV] 지점 목록 조회 시작", "info")
 
         def operation(page):
+            _check_cancel(cancel_event)
             query = urllib.parse.urlencode(
                 {"coCd": CGV_COMPANY_CODE, "custNo": "", "lntd": "", "lttd": "", "srchKwrd": ""}
             )
             payload = self._fetch_json(
                 page, f"/api/v1/content/site/searchAllRegionAndSite?{query}"
             )
+            _check_cancel(cancel_event)
             regions, sites = parse_site_catalog(payload, imax_only=imax_only)
             if imax_only and not sites:
                 raise CgvError("CGV IMAX 지점 정보를 확인하지 못했습니다.")
@@ -522,16 +538,27 @@ class CgvBrowserClient:
             return CgvCatalogSnapshot(regions, sites)
 
         snapshot = self._with_page(operation)
+        _check_cancel(cancel_event)
         self._emit(f"[CGV] 지점 목록 조회 완료 · {len(snapshot.sites)}개 지점", "success")
         return snapshot
 
-    def fetch_schedule(self, site_no: str, screening_date: str) -> tuple[dict[str, Any], ...]:
+    def fetch_schedule(
+        self,
+        site_no: str,
+        screening_date: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        _check_cancel(cancel_event)
         date_digits = _screening_date(screening_date)
 
         def operation(page):
+            _check_cancel(cancel_event)
             return self._fetch_schedule_on_page(page, site_no, date_digits)
 
-        return self._with_page(operation)
+        result = self._with_page(operation)
+        _check_cancel(cancel_event)
+        return result
 
     def fetch_schedule_with_reference(
         self,
@@ -539,14 +566,18 @@ class CgvBrowserClient:
         screening_date: str,
         *,
         max_reference_days: int = 14,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[tuple[dict[str, Any], ...], str, bool]:
+        _check_cancel(cancel_event)
         date_digits = _screening_date(screening_date)
         target = datetime.strptime(date_digits, "%Y%m%d").date()
         today = datetime.now().date()
         self._emit(f"[CGV] 시간표 조회 시작 · site={site_no} · date={screening_date}", "info")
 
         def operation(page):
+            _check_cancel(cancel_event)
             exact = self._fetch_schedule_on_page(page, site_no, date_digits)
+            _check_cancel(cancel_event)
             history_by_date: dict[str, tuple[dict[str, Any], ...]] = {}
             all_history_items: list[dict[str, Any]] = []
 
@@ -554,12 +585,14 @@ class CgvBrowserClient:
             # Check up to max_reference_days backwards, not older than 7 days before today
             max_days = max(1, min(int(max_reference_days), 14))
             for offset in range(1, max_days + 1):
+                _check_cancel(cancel_event)
                 candidate = target - timedelta(days=offset)
                 if candidate < today - timedelta(days=7):
                     break
                 items = self._fetch_schedule_on_page(
                     page, site_no, candidate.strftime("%Y%m%d")
                 )
+                _check_cancel(cancel_event)
                 if items:
                     history_by_date[candidate.isoformat()] = items
                     all_history_items.extend(items)
@@ -571,6 +604,7 @@ class CgvBrowserClient:
             decorated_exact: list[dict[str, Any]] = []
             if exact:
                 for schedule in exact:
+                    _check_cancel(cancel_event)
                     copied = dict(schedule)
                     reference = _seat_reference_for(copied, tuple(all_history_items))
                     if reference is not None:
@@ -582,10 +616,13 @@ class CgvBrowserClient:
                             copied["_pengucroSeatReferenceDate"] = latest_ref_date
                     decorated_exact.append(copied)
 
+            _check_cancel(cancel_event)
             templates = _aggregate_historical_candidates(
                 history_by_date, screening_date, tuple(exact or ()), str(site_no)
             )
             combined = tuple(decorated_exact) + tuple(templates)
+
+            _check_cancel(cancel_event)
 
             if exact:
                 return combined, target.isoformat(), False
@@ -597,11 +634,12 @@ class CgvBrowserClient:
             )
 
         combined, ref_date, is_ref = self._with_page(operation)
+        _check_cancel(cancel_event)
         self._emit(f"[CGV] 시간표 조회 완료 · {len(combined)}개", "success")
         return combined, ref_date, is_ref
 
     def _fetch_schedule_on_page(
-        self, page, site_no: str, date_digits: str
+        self, page, site_no: str, date_digits: str, *, timeout_ms: int = 5000
     ) -> tuple[dict[str, Any], ...]:
         query = urllib.parse.urlencode(
             {
@@ -614,15 +652,23 @@ class CgvBrowserClient:
                 "custNo": "",
             }
         )
-        payload = self._fetch_json(page, f"/api/v1/booking/searchMovScnInfo?{query}")
+        payload = self._fetch_json(
+            page, f"/api/v1/booking/searchMovScnInfo?{query}", timeout_ms=timeout_ms
+        )
         return tuple(schedule_items(payload))
 
     def fetch_seat_map(
-        self, schedule: Mapping[str, Any], people: int
+        self,
+        schedule: Mapping[str, Any],
+        people: int,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[CgvSeat, ...]:
+        _check_cancel(cancel_event)
         payload = _booking_payload(schedule)
 
         def operation(page):
+            _check_cancel(cancel_event)
             def open_visitor_page() -> str:
                 cinema_query = urllib.parse.urlencode(
                     {

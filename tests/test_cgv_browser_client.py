@@ -492,4 +492,43 @@ def test_with_page_fails_on_second_recovery_without_infinite_loop():
         assert any("자동 복구 실패" in msg for msg, lvl in events)
 
 
+def test_fetch_schedule_with_reference_raises_cgv_request_cancelled_when_event_set():
+    import threading
+    import pytest
+    from engines.cgv_browser_client import CgvBrowserClient, CgvRequestCancelled
+
+    client = CgvBrowserClient()
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(CgvRequestCancelled):
+        client.fetch_schedule_with_reference("0013", "2026-08-26", cancel_event=cancel_event)
+
+
+def test_fetch_catalog_raises_cgv_request_cancelled_when_event_set():
+    import threading
+    import pytest
+    from engines.cgv_browser_client import CgvBrowserClient, CgvRequestCancelled
+
+    client = CgvBrowserClient()
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(CgvRequestCancelled):
+        client.fetch_catalog(imax_only=True, cancel_event=cancel_event)
+
+
+def test_fetch_seat_map_raises_cgv_request_cancelled_when_event_set():
+    import threading
+    import pytest
+    from engines.cgv_browser_client import CgvBrowserClient, CgvRequestCancelled
+
+    client = CgvBrowserClient()
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(CgvRequestCancelled):
+        client.fetch_seat_map({"siteNo": "0013"}, 2, cancel_event=cancel_event)
+
+
 

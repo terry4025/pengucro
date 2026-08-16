@@ -313,6 +313,9 @@ def test_cgv_calendar_button_resolves_date_picker_dialog(monkeypatch):
 
 
 def test_cgv_dialog_active_task_with_rapid_date_changes_queues_and_runs_newest_only():
+    import queue
+    import threading
+    import time
     from ui.cgv_booking_dialog import CgvBookingDialog
 
     loaded_results = []
@@ -322,30 +325,30 @@ def test_cgv_dialog_active_task_with_rapid_date_changes_queues_and_runs_newest_o
         _closing=False,
         _next_task_id=0,
         _active_task_id=None,
-        _active_task_start_time=0.0,
         _active_task_done=None,
-        _task_results={},
+        _active_cancel_event=None,
         _pending_task=None,
-        _task_timeout_seconds=14.0,
-        _task_progress=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
         _request_generation=1,
         status_label=status_label,
         winfo_exists=lambda: True,
         after=lambda ms, cb: None,
-        _emit_or_log=lambda msg, lvl="info": None,
         _handle_task_error=lambda msg: None,
     )
+    dialog._launch_task = lambda status, func, done: CgvBookingDialog._launch_task(dialog, status, func, done)
     dialog._start_task = lambda status, func, done: CgvBookingDialog._start_task(dialog, status, func, done)
     dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
 
     # Task A starts
-    dialog._start_task("조회 A", lambda: (time.sleep(0.01), "result_A")[1], lambda res: loaded_results.append(("A", res)))
+    dialog._start_task("조회 A", lambda ce: (time.sleep(0.02), "result_A")[1], lambda res: loaded_results.append(("A", res)))
 
     # User rapidly changes to B then C
     # Request B is submitted while A is active
     dialog._start_task(
         "조회 B",
-        lambda: "result_B",
+        lambda ce: "result_B",
         lambda res: loaded_results.append(("B", res)),
     )
     assert dialog._pending_task is not None
@@ -355,16 +358,13 @@ def test_cgv_dialog_active_task_with_rapid_date_changes_queues_and_runs_newest_o
     dialog._request_generation = 3
     dialog._start_task(
         "조회 C",
-        lambda: "result_C",
+        lambda ce: (time.sleep(0.02), "result_C")[1],
         lambda res: loaded_results.append(("C", res)),
     )
     assert dialog._pending_task[0] == "조회 C"
 
     # Wait for Task A to finish
-    for _ in range(20):
-        if dialog._active_task_id in dialog._task_results:
-            break
-        time.sleep(0.01)
+    time.sleep(0.04)
     dialog._poll_task()
 
     # When A finishes and pending task C exists, pending task C starts immediately
@@ -372,10 +372,7 @@ def test_cgv_dialog_active_task_with_rapid_date_changes_queues_and_runs_newest_o
     assert dialog._pending_task is None
 
     # Wait for Task C to finish
-    for _ in range(20):
-        if dialog._active_task_id in dialog._task_results:
-            break
-        time.sleep(0.01)
+    time.sleep(0.04)
     dialog._poll_task()
 
     assert ("C", "result_C") in loaded_results
@@ -384,6 +381,8 @@ def test_cgv_dialog_active_task_with_rapid_date_changes_queues_and_runs_newest_o
 
 
 def test_cgv_dialog_site_change_while_active_task_runs_newest_site():
+    import queue
+    import threading
     import time
     from ui.cgv_booking_dialog import CgvBookingDialog
 
@@ -392,39 +391,36 @@ def test_cgv_dialog_site_change_while_active_task_runs_newest_site():
         _closing=False,
         _next_task_id=0,
         _active_task_id=None,
-        _active_task_start_time=0.0,
         _active_task_done=None,
-        _task_results={},
+        _active_cancel_event=None,
         _pending_task=None,
-        _task_timeout_seconds=14.0,
-        _task_progress=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
         _request_generation=1,
         status_label=Widget(),
         winfo_exists=lambda: True,
         after=lambda ms, cb: None,
-        _emit_or_log=lambda msg, lvl="info": None,
         _handle_task_error=lambda msg: None,
     )
+    dialog._launch_task = lambda status, func, done: CgvBookingDialog._launch_task(dialog, status, func, done)
     dialog._start_task = lambda status, func, done: CgvBookingDialog._start_task(dialog, status, func, done)
     dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
 
     # Site 1 is currently loading
-    dialog._start_task("지점 1 조회", lambda: (time.sleep(0.01), "snapshot_1")[1], lambda res: loaded_sites.append(("site_1", res)))
+    dialog._start_task("지점 1 조회", lambda ce: (time.sleep(0.02), "snapshot_1")[1], lambda res: loaded_sites.append(("site_1", res)))
 
     # User clicks Site 2 while Site 1 is loading
     dialog._request_generation = 2
     dialog._start_task(
         "지점 2 조회",
-        lambda: "snapshot_2",
+        lambda ce: (time.sleep(0.02), "snapshot_2")[1],
         lambda res: loaded_sites.append(("site_2", res)),
     )
     assert dialog._pending_task is not None
 
     # Wait for Site 1 to finish
-    for _ in range(20):
-        if dialog._active_task_id in dialog._task_results:
-            break
-        time.sleep(0.01)
+    time.sleep(0.04)
     dialog._poll_task()
 
     # Site 2 task is now active
@@ -432,10 +428,7 @@ def test_cgv_dialog_site_change_while_active_task_runs_newest_site():
     assert dialog._pending_task is None
 
     # Wait for Site 2 to finish
-    for _ in range(20):
-        if dialog._active_task_id in dialog._task_results:
-            break
-        time.sleep(0.01)
+    time.sleep(0.04)
     dialog._poll_task()
 
     assert ("site_2", "snapshot_2") in loaded_sites
@@ -950,53 +943,152 @@ def test_cgv_booking_dialog_ui_construction_smoke_test():
         root.destroy()
 
 
-def test_cgv_dialog_newest_request_wins_on_rapid_site_clicks():
+def test_cgv_dialog_worker_performs_zero_tk_calls():
+    import queue
+    import threading
     import time
     from types import SimpleNamespace
     from ui.cgv_booking_dialog import CgvBookingDialog
-    from engines.cgv_client import CgvSite
+
+    main_thread = threading.current_thread()
+
+    def assert_main_thread():
+        if threading.current_thread() != main_thread:
+            raise AssertionError("Tk method called from background worker thread!")
+
+    status_updates = []
+    dialog = SimpleNamespace(
+        _closing=False,
+        _next_task_id=0,
+        _active_task_id=None,
+        _active_task_done=None,
+        _active_cancel_event=None,
+        _pending_task=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
+        _request_generation=0,
+        winfo_exists=lambda: (assert_main_thread(), True)[1],
+        after=lambda ms, cb: (assert_main_thread(), None)[1],
+        status_label=SimpleNamespace(configure=lambda **kw: (assert_main_thread(), status_updates.append(kw))[1]),
+        _handle_task_error=lambda msg: None,
+    )
+
+    dialog._launch_task = lambda s, f, d: CgvBookingDialog._launch_task(dialog, s, f, d)
+    dialog._start_task = lambda s, f, d: CgvBookingDialog._start_task(dialog, s, f, d)
+    dialog._browser_status = lambda msg, lvl="info": CgvBookingDialog._browser_status(dialog, msg, lvl)
+    dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
+
+    results = []
+    def background_job(cancel_event):
+        dialog._browser_status("작업 진행 중", "info")
+        return "SUCCESS_RESULT"
+
+    dialog._start_task("작업 시작", background_job, lambda res: results.append(res))
+
+    # Drain queue via main thread
+    time.sleep(0.05)
+    dialog._poll_task()
+
+    assert results == ["SUCCESS_RESULT"]
+    assert any("작업 진행 중" in str(kw.get("text", "")) for kw in status_updates)
+
+
+def test_cgv_dialog_long_valid_task_not_abandoned_by_time():
+    import queue
+    import threading
+    import time
+    from types import SimpleNamespace
+    from ui.cgv_booking_dialog import CgvBookingDialog
+
+    dialog = SimpleNamespace(
+        _closing=False,
+        _next_task_id=0,
+        _active_task_id=None,
+        _active_task_done=None,
+        _active_cancel_event=None,
+        _pending_task=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
+        _request_generation=0,
+        status_label=SimpleNamespace(configure=lambda **kw: None),
+        _handle_task_error=lambda msg: None,
+    )
+
+    dialog._launch_task = lambda s, f, d: CgvBookingDialog._launch_task(dialog, s, f, d)
+    dialog._start_task = lambda s, f, d: CgvBookingDialog._start_task(dialog, s, f, d)
+    dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
+
+    results = []
+    # Simulate a task that takes time
+    def slow_job(cancel_event):
+        time.sleep(0.06)
+        return "SLOW_SUCCESS"
+
+    dialog._start_task("느린 작업", slow_job, lambda res: results.append(res))
+
+    # Poll multiple times while task is still running
+    dialog._poll_task()
+    dialog._poll_task()
+    assert dialog._active_task_id == 1
+    assert results == []
+
+    # Wait for completion
+    time.sleep(0.08)
+    dialog._poll_task()
+    assert results == ["SLOW_SUCCESS"]
+    assert dialog._active_task_id is None
+
+
+def test_cgv_dialog_newest_request_wins_on_rapid_site_clicks():
+    import queue
+    import threading
+    import time
+    from types import SimpleNamespace
+    from ui.cgv_booking_dialog import CgvBookingDialog
 
     executed_tasks = []
     dialog = SimpleNamespace(
         _closing=False,
         _next_task_id=0,
         _active_task_id=None,
-        _active_task_start_time=0.0,
         _active_task_done=None,
-        _task_results={},
+        _active_cancel_event=None,
         _pending_task=None,
-        _task_timeout_seconds=14.0,
-        _task_progress=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
         _request_generation=0,
-        winfo_exists=lambda: True,
-        after=lambda ms, cb: None,
         status_label=SimpleNamespace(configure=lambda **kw: None),
-        _emit_or_log=lambda msg, lvl="info": None,
         _handle_task_error=lambda msg: None,
     )
 
-    # Attach dialog methods
+    dialog._launch_task = lambda s, f, d: CgvBookingDialog._launch_task(dialog, s, f, d)
     dialog._start_task = lambda s, f, d: CgvBookingDialog._start_task(dialog, s, f, d)
     dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
 
     # Task A starts
-    dialog._start_task("Task A", lambda: (time.sleep(0.01), "A")[1], lambda res: executed_tasks.append(res))
+    dialog._start_task("Task A", lambda ce: (time.sleep(0.02), "A")[1], lambda res: executed_tasks.append(res))
     assert dialog._active_task_id == 1
     assert dialog._pending_task is None
+    assert dialog._active_cancel_event is not None
+    assert not dialog._active_cancel_event.is_set()
 
-    # Task B requested while A is active -> becomes pending
-    dialog._start_task("Task B", lambda: "B", lambda res: executed_tasks.append(res))
+    # Task B requested while A is active -> becomes pending, A's cancel event set
+    dialog._start_task("Task B", lambda ce: "B", lambda res: executed_tasks.append(res))
     assert dialog._active_task_id == 1
     assert dialog._pending_task is not None
     assert dialog._pending_task[0] == "Task B"
+    assert dialog._active_cancel_event.is_set()
 
     # Task C requested while A is active -> overwrites B as newest pending
-    dialog._start_task("Task C", lambda: "C", lambda res: executed_tasks.append(res))
+    dialog._start_task("Task C", lambda ce: (time.sleep(0.02), "C")[1], lambda res: executed_tasks.append(res))
     assert dialog._active_task_id == 1
-    assert dialog._pending_task[0] == "Task C"  # Task C is pending, Task B is discarded
+    assert dialog._pending_task[0] == "Task C"
 
-    # Wait for thread A to finish and insert into _task_results
-    time.sleep(0.05)
+    # Wait for thread A to finish
+    time.sleep(0.04)
     dialog._poll_task()
 
     # When Task A finishes, Task C starts immediately
@@ -1004,107 +1096,122 @@ def test_cgv_dialog_newest_request_wins_on_rapid_site_clicks():
     assert dialog._pending_task is None
 
     # Wait for Task C to finish
-    time.sleep(0.05)
+    time.sleep(0.04)
     dialog._poll_task()
 
-    # Only C should be executed/delivered to callback (Task B discarded, Task A skipped callback because pending won)
+    # Only C should be delivered to callback (Task B discarded, Task A skipped callback because pending won)
     assert executed_tasks == ["C"]
 
 
-def test_cgv_dialog_task_timeout_starts_newest_pending_task():
-    import time
+def test_cgv_dialog_stale_progress_ignored():
+    import queue
+    import threading
     from types import SimpleNamespace
     from ui.cgv_booking_dialog import CgvBookingDialog
 
-    executed_tasks = []
+    status_texts = []
     dialog = SimpleNamespace(
         _closing=False,
-        _next_task_id=0,
-        _active_task_id=None,
-        _active_task_start_time=0.0,
+        _next_task_id=2,
+        _active_task_id=2,  # Active task is ID 2
         _active_task_done=None,
-        _task_results={},
+        _active_cancel_event=None,
         _pending_task=None,
-        _task_timeout_seconds=0.05,  # Short timeout for testing
-        _task_progress=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
         _request_generation=0,
-        winfo_exists=lambda: True,
-        after=lambda ms, cb: None,
-        status_label=SimpleNamespace(configure=lambda **kw: None),
-        _emit_or_log=lambda msg, lvl="info": None,
+        status_label=SimpleNamespace(configure=lambda **kw: status_texts.append(kw.get("text"))),
         _handle_task_error=lambda msg: None,
     )
 
-    dialog._start_task = lambda s, f, d: CgvBookingDialog._start_task(dialog, s, f, d)
     dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
 
-    # Task 1 hangs (simulated)
-    dialog._start_task("Stalled Task", lambda: (time.sleep(1.0), "STALLED")[1], lambda res: executed_tasks.append(res))
-    assert dialog._active_task_id == 1
+    # Obsolete progress from Task 1
+    dialog._ui_event_queue.put(("progress", 1, "[CGV] 시간표 조회 완료 · 38개", "success"))
+    # Valid progress from Task 2
+    dialog._ui_event_queue.put(("progress", 2, "Task 2 진행 중", "info"))
 
-    # Task 2 requested
-    dialog._start_task("Task 2", lambda: "FAST_2", lambda res: executed_tasks.append(res))
-    assert dialog._pending_task[0] == "Task 2"
-
-    # Wait until Task 1 exceeds task_timeout_seconds
-    time.sleep(0.08)
     dialog._poll_task()
 
-    # Stalled Task 1 should be abandoned and Task 2 started!
-    assert dialog._active_task_id == 2
-    assert dialog._pending_task is None
-
-    for _ in range(20):
-        if dialog._active_task_id in dialog._task_results:
-            break
-        time.sleep(0.01)
-    dialog._poll_task()
-    assert executed_tasks == ["FAST_2"]
+    assert "[CGV] 시간표 조회 완료 · 38개" not in status_texts
+    assert "Task 2 진행 중" in status_texts
 
 
-def test_cgv_dialog_schedule_failure_resets_dependent_options_cleanly():
+def test_cgv_dialog_valid_38_schedules_reaches_schedule_loaded():
     from types import SimpleNamespace
     from ui.cgv_booking_dialog import CgvBookingDialog
+    from engines.cgv_client import CgvSite
 
-    status_events = []
     dialog = SimpleNamespace(
         _closing=False,
-        winfo_exists=lambda: True,
-        status_label=SimpleNamespace(configure=lambda **kw: status_events.append(kw)),
-        schedules=({"dummy": 1},),
-        selected_schedule={"dummy": 1},
+        _request_generation=1,
+        selected_site=CgvSite("0013", "용산아이파크몰", "01"),
+        selected_schedule=None,
+        schedules=(),
+        preferred_times=[],
+        priority_groups=[],
+        current_seats=set(),
+        seats=(),
+        seat_recommendations={},
+        reservation_date="2026-08-26",
+        reference_date="2026-08-26",
+        reference_only=False,
+        _is_restoring_initial=False,
         movie_var=SimpleNamespace(set=lambda val: None),
         movie_menu=SimpleNamespace(configure=lambda **kw: None),
         auditorium_var=SimpleNamespace(set=lambda val: None),
         auditorium_menu=SimpleNamespace(configure=lambda **kw: None),
+        target_type_badge=SimpleNamespace(configure=lambda **kw: None),
+        status_label=SimpleNamespace(configure=lambda **kw: None),
+        auto_seat_var=SimpleNamespace(set=lambda val: None),
+        auto_seat_menu=SimpleNamespace(configure=lambda **kw: None),
+        load_seats_button=SimpleNamespace(configure=lambda **kw: None),
+        confirm_button=SimpleNamespace(configure=lambda **kw: None, config={}),
+        schedule_list=SimpleNamespace(winfo_children=lambda: []),
         _render_schedules=lambda: None,
         _render_seat_placeholder=lambda msg: None,
         _update_seat_guide=lambda: None,
         _update_confirm_state=lambda: None,
+        _movie_changed=lambda movie, **kw: None,
     )
 
-    CgvBookingDialog._handle_task_error(dialog, "시간표를 불러오지 못했습니다.")
+    # 38 mock schedules
+    schedules = tuple(
+        {
+            "expoProdNm": f"Movie-{i}",
+            "expoScnsNm": "IMAX관",
+            "movkndDsplEnm": "IMAX LASER 2D",
+            "scnsrtTm": f"{10 + (i % 12):02d}00",
+            "frSeatCnt": 50,
+        }
+        for i in range(38)
+    )
 
-    assert dialog.schedules == ()
-    assert dialog.selected_schedule is None
-    assert any("시간표를 불러오지 못했습니다" in str(kw.get("text", "")) for kw in status_events)
+    CgvBookingDialog._schedule_loaded(dialog, (schedules, "2026-08-26", False), generation=1)
+
+    assert len(dialog.schedules) == 38
+    assert dialog.reference_only is False
 
 
 def test_cgv_dialog_close_cancels_pending_tasks_and_ignores_late_results():
+    import queue
+    import threading
     from types import SimpleNamespace
     from ui.cgv_booking_dialog import CgvBookingDialog
 
+    cancel_event = threading.Event()
     destroyed = False
     grab_released = False
 
     dialog = SimpleNamespace(
         _closing=False,
         _request_generation=5,
-        _pending_task=(1, "task", lambda: None, lambda: None),
+        _pending_task=("Pending", lambda ce: None, lambda res: None),
         _active_task_id=10,
         _active_task_done=lambda: None,
-        _task_results={10: ("res", None)},
-        _emit_or_log=lambda msg, lvl="info": None,
+        _active_cancel_event=cancel_event,
+        _ui_event_queue=queue.Queue(),
         grab_release=lambda: None,
         destroy=lambda: None,
     )
@@ -1114,9 +1221,40 @@ def test_cgv_dialog_close_cancels_pending_tasks_and_ignores_late_results():
     assert dialog._closing is True
     assert dialog._request_generation == 6
     assert dialog._pending_task is None
+    assert cancel_event.is_set()
+
+
+def test_cgv_dialog_intentional_cancellation_not_displayed_as_error():
+    import queue
+    import threading
+    from types import SimpleNamespace
+    from ui.cgv_booking_dialog import CgvBookingDialog
+
+    errors = []
+    dialog = SimpleNamespace(
+        _closing=False,
+        _next_task_id=1,
+        _active_task_id=1,
+        _active_task_done=lambda res: None,
+        _active_cancel_event=threading.Event(),
+        _pending_task=None,
+        _ui_event_queue=queue.Queue(),
+        _task_thread_local=threading.local(),
+        _request_generation=0,
+        status_label=SimpleNamespace(configure=lambda **kw: None),
+        _handle_task_error=lambda msg: errors.append(msg),
+    )
+
+    dialog._finish_active_task = lambda **kw: CgvBookingDialog._finish_active_task(dialog, **kw)
+    dialog._poll_task = lambda: CgvBookingDialog._poll_task(dialog)
+
+    # Cancelled event arrives
+    dialog._ui_event_queue.put(("cancelled", 1, None, None))
+    dialog._poll_task()
+
+    # Cancelled task must NOT invoke _handle_task_error
+    assert errors == []
     assert dialog._active_task_id is None
-    assert dialog._active_task_done is None
-    assert dialog._task_results == {}
 
 
 
