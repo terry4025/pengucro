@@ -1248,68 +1248,81 @@ class CgvEngine(BaseEngine):
         return False
 
     def _select_visitors(self, page, people: int) -> bool:
-        """Select the normal visitor count and open CGV's seat modal.
+        """Select the normal visitor count and open CGV's seat modal with robust retry for Next.js hydration."""
+        start_time = time.monotonic()
+        target_num = max(1, people)
 
-        The current one-page booking UI exposes numbered buttons (1..8), not
-        +/- controls.  The seat map is a modal on the same
-        ``/cnm/selectVisitorCnt`` route, so URL changes are not a readiness
-        signal.
-        """
-        page.wait_for_timeout(500)
-        result = page.evaluate(
-            r"""
-            people => {
-              const clean = value => (value || '').replace(/\s+/g, '');
-              const nodes = [...document.querySelectorAll('body *')];
-              const label = nodes.find(node => clean(node.textContent) === '일반');
-              if (!label) return {ok:false, reason:'adult-label'};
-              let box = label;
-              for (let i=0; i<7 && box; i++, box=box.parentElement) {
-                const target = [...box.querySelectorAll('button')].find(button =>
-                  !button.disabled && clean(button.textContent) === String(people)
-                );
-                if (target) {
-                  target.click();
-                  return {ok:true};
-                }
-              }
-              return {ok:false, reason:'number-button'};
-            }
-            """,
-            max(1, people),
-        )
-        if not isinstance(result, dict) or not result.get("ok"):
-            self.log("CGV 관람 인원 선택 버튼을 찾지 못했습니다.", "error")
-            return False
-        opened = page.evaluate(
-            r"""
-            () => {
-              const clean = value => (value || '').replace(/\s+/g, '');
-              const hint = [...document.querySelectorAll('p,div')].find(node =>
-                clean(node.textContent) === '좌석을선택해주세요'
-              );
-              let box = hint;
-              for (let i=0; i<6 && box; i++, box=box.parentElement) {
-                const button = [...box.querySelectorAll('button')].find(node =>
-                  !node.disabled && clean(node.textContent) === '선택'
-                );
-                if (button) { button.click(); return true; }
-              }
-              return false;
-            }
-            """
-        )
-        if not opened:
-            self.log("CGV 좌석 모달의 선택 버튼을 찾지 못했습니다.", "error")
-            return False
+        while not self.stop_event.is_set() and time.monotonic() - start_time < 12.0:
+            # 1. Check if seat map modal is already open
+            try:
+                if page.locator("button[data-seatlocno]").first.is_visible():
+                    return True
+            except Exception:
+                pass
+
+            # 2. Select visitor count for '일반'
+            try:
+                page.evaluate(
+                    r"""
+                    people => {
+                      const clean = value => (value || '').replace(/\s+/g, '');
+                      const nodes = [...document.querySelectorAll('*')];
+                      const label = nodes.find(node => node.children.length === 0 && clean(node.textContent) === '일반');
+                      if (!label) return false;
+                      let box = label;
+                      for (let i = 0; i < 7 && box; i++, box = box.parentElement) {
+                        const target = [...box.querySelectorAll('button')].find(button =>
+                          !button.disabled && clean(button.textContent) === String(people)
+                        );
+                        if (target) {
+                          target.click();
+                          return true;
+                        }
+                      }
+                      return false;
+                    }
+                    """,
+                    target_num,
+                )
+            except Exception:
+                pass
+
+            # 3. Click '선택' button to open seat modal
+            try:
+                page.evaluate(
+                    r"""
+                    () => {
+                      const clean = value => (value || '').replace(/\s+/g, '');
+                      const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                      const target = buttons.find(b => !b.disabled && clean(b.textContent) === '선택');
+                      if (target) {
+                        target.click();
+                        return true;
+                      }
+                      return false;
+                    }
+                    """
+                )
+            except Exception:
+                pass
+
+            # 4. Check if seat map modal is now open
+            try:
+                if page.locator("button[data-seatlocno]").first.is_visible():
+                    return True
+            except Exception:
+                pass
+
+            page.wait_for_timeout(350)
+
         try:
-            page.locator("button[data-seatlocno]").first.wait_for(
-                state="visible", timeout=15000
-            )
+            if page.locator("button[data-seatlocno]").first.is_visible():
+                return True
         except Exception:
-            self.log("CGV 좌석 정보가 제한 시간 안에 열리지 않았습니다.", "warning")
-            return False
-        return True
+            pass
+
+        self.log("CGV 관람 인원 선택 및 좌석 모달 열기에 실패했습니다.", "error")
+        return False
 
     @staticmethod
     def _available_seat_elements(page) -> list[dict[str, Any]]:
