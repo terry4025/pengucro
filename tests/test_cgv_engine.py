@@ -165,10 +165,119 @@ def test_fast_monitor_uses_staggered_persistent_requests_with_safe_inflight_cap(
     assert argument["concurrency"] == 4
     assert argument["groups"] == [["H22", "H23"]]
     assert argument["directHold"] is None
+    assert argument["requestHeaders"] == {}
+    assert argument["initialPayload"] is None
+    assert "headers.set('Authorization', `Bearer ${token}`)" in script
+    assert "headers.set('Accept-Language', 'ko-KR')" in script
+    assert "queuedPayload" in script
     assert "buildPricePayload" in script
     assert "buildHoldPayload" in script
     assert "state.conflicts += 1" in script
     assert "resume()" in script
+
+
+def test_initial_modal_seat_response_is_reused_with_only_safe_auth_headers():
+    payload = _seat_payload("H22", "H23")
+    url = (
+        "https://cgv.co.kr/api/v1/booking/searchIfSeatData?"
+        "siteNo=0013&scnYmd=20260818&scnsNo=018&scnSseq=2"
+    )
+
+    class Request:
+        def all_headers(self):
+            return {
+                "Authorization": "Bearer captured-token",
+                "Accept-Language": "ko-KR",
+                "Cookie": "must-not-be-copied",
+                "User-Agent": "must-not-be-overridden",
+            }
+
+    class Response:
+        status = 200
+        request = Request()
+
+        def __init__(self):
+            self.url = url
+
+        def json(self):
+            return payload
+
+    class Page:
+        def __init__(self):
+            self.handler = None
+            self.removed = None
+
+        def on(self, event, handler):
+            assert event == "response"
+            self.handler = handler
+
+        def remove_listener(self, event, handler):
+            self.removed = (event, handler)
+
+    engine = CgvEngine(lambda *_args: None)
+    page = Page()
+    handler = engine._begin_initial_seat_response_capture(page)
+    page.handler(Response())
+    engine._end_initial_seat_response_capture(page, handler)
+    captured = engine._consume_initial_seat_response(
+        {"siteNo": "0013", "scnYmd": "20260818", "scnsNo": "018", "scnSseq": "2"}
+    )
+
+    assert captured["data"] == payload
+    assert captured["url"] == url
+    assert captured["requestHeaders"] == {
+        "authorization": "Bearer captured-token",
+        "accept-language": "ko-KR",
+    }
+    assert page.removed == ("response", handler)
+
+
+def test_watch_seeds_monitor_from_initial_response_before_duplicate_get():
+    payload = _seat_payload("H22")
+    url = (
+        "https://cgv.co.kr/api/v1/booking/searchIfSeatData?"
+        "siteNo=0013&scnYmd=20260818&scnsNo=018&scnSseq=2"
+    )
+    starts = []
+    engine = CgvEngine(lambda *_args: None)
+    engine._initial_seat_response = {
+        "url": url,
+        "status": 200,
+        "data": payload,
+        "requestHeaders": {"authorization": "Bearer captured-token"},
+    }
+    engine._browser_auth_data = lambda _page: {"custNo": "member"}
+
+    def start(_page, seat_url, _groups, _concurrency, **kwargs):
+        starts.append((seat_url, kwargs))
+        return True
+
+    engine._start_fast_seat_monitor = start
+    engine._read_fast_seat_monitor = lambda _page: {
+        "running": False,
+        "completed": 1,
+        "lastStatus": 0,
+        "terminalError": "test-stop",
+        "hit": None,
+    }
+    engine._stop_fast_seat_monitor = lambda _page: None
+
+    held, fallback = engine._watch_and_hold_api(
+        object(),
+        {"siteNo": "0013", "scnYmd": "20260818", "scnsNo": "018", "scnSseq": "2"},
+        (CgvSeatGroup(("H22",)),),
+        1,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (False, True)
+    assert starts[0][0] == url
+    assert starts[0][1]["initial_payload"] == payload
+    assert starts[0][1]["request_headers"] == {
+        "authorization": "Bearer captured-token"
+    }
+    assert engine._initial_seat_response is None
 
 
 def test_direct_hold_config_prebuilds_schedule_and_sanitizes_customer_data():
@@ -201,17 +310,8 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     payload = _seat_payload("H22", "H23")
     starts = []
 
-    class PaymentWaiter:
-        @property
-        def last(self):
-            return self
-
-        def wait_for(self, **_kwargs):
-            actions.append("payment")
-
     class Page:
-        def get_by_text(self, *_args, **_kwargs):
-            return PaymentWaiter()
+        pass
 
     engine = CgvEngine(lambda *_args: None)
     engine.scan_concurrency = 3
@@ -241,7 +341,7 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     engine._post_json = lambda *_args: (_ for _ in ()).throw(AssertionError("Python POST must not run"))
     engine._select_api_seats_in_ui = lambda *_args: actions.append("ui") or True
     engine._install_cached_hold_responses = lambda *_args: actions.append("cache")
-    engine._click_visible_by_text = lambda *_args: actions.append("click") or True
+    engine._submit_seat_selection = lambda *_args: actions.append("submit") or True
     engine._restore_fetch = lambda *_args: None
 
     held, fallback = engine._watch_and_hold_api(
@@ -256,7 +356,7 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     assert held is True
     assert fallback is False
     assert starts[0]["auth"]["custNo"] == "member"
-    assert actions == ["monitor-with-direct-hold", "ui", "cache", "click", "payment"]
+    assert actions == ["monitor-with-direct-hold", "ui", "cache", "submit"]
 
 
 def test_direct_hold_result_never_reloads_browser_page():
@@ -284,7 +384,7 @@ def test_direct_hold_result_never_reloads_browser_page():
     engine._stop_fast_seat_monitor = lambda _page: None
     engine._select_api_seats_in_ui = lambda *_args: True
     engine._install_cached_hold_responses = lambda *_args: None
-    engine._click_visible_by_text = lambda *_args: False
+    engine._submit_seat_selection = lambda *_args: False
     engine._cancel_api_hold = lambda *_args: None
     engine._restore_fetch = lambda *_args: None
 
@@ -497,7 +597,7 @@ def test_developer_mode_retains_direct_hold():
     engine._stop_fast_seat_monitor = lambda _page: None
     engine._select_api_seats_in_ui = lambda *_args: True
     engine._install_cached_hold_responses = lambda *_args: None
-    engine._click_visible_by_text = lambda *_args: False
+    engine._submit_seat_selection = lambda *_args: False
     engine._cancel_api_hold = lambda *_args: None
     engine._restore_fetch = lambda *_args: None
 
@@ -1221,6 +1321,46 @@ def test_select_api_seats_in_ui_retries_if_dom_updates_asynchronously():
     assert attempts[0] == 3
 
 
+def test_select_api_seats_waits_for_real_selection_and_enabled_submit():
+    engine = CgvEngine(lambda *_args: None)
+    clicks = []
+    waits = []
+    states = iter(
+        (
+            {"selectedIds": [], "submitPresent": True, "submitReady": False, "ready": False},
+            {
+                "selectedIds": ["loc-1"],
+                "submitPresent": True,
+                "submitReady": False,
+                "ready": False,
+            },
+            {
+                "selectedIds": ["loc-1", "loc-2"],
+                "submitPresent": True,
+                "submitReady": True,
+                "ready": True,
+            },
+        )
+    )
+    engine._sync_seat_payload_to_ui = lambda *_args: True
+    engine._ensure_seat_selected_by_id = (
+        lambda _page, seat_id: clicks.append(seat_id) or True
+    )
+    engine._api_seat_selection_snapshot = lambda *_args: next(states)
+
+    class Page:
+        def wait_for_timeout(self, milliseconds):
+            waits.append(milliseconds)
+
+    selected = [
+        {"seatLocNo": "loc-1"},
+        {"seatLocNo": "loc-2"},
+    ]
+    assert engine._select_api_seats_in_ui(Page(), {}, selected) is True
+    assert clicks[:2] == ["loc-1", "loc-2"]
+    assert waits == [engine.API_UI_SYNC_INTERVAL_MS] * 2
+
+
 def test_choose_available_group_normalizes_group_seat_names_case_and_spacing():
     elements = [
         {"id": "loc-a1", "label": "A1", "unavailable": False},
@@ -1275,6 +1415,3 @@ def test_select_and_hold_seats_survives_wait_for_timeout_exception():
     groups = (CgvSeatGroup(("D01",)),)
     held = engine._select_and_hold_seats(Page(), groups, 1, False)
     assert held is True
-
-
-

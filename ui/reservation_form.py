@@ -1478,7 +1478,7 @@ class ReservationForm(ctk.CTkFrame):
             self.threads_title_label.configure(
                 text=(
                     f"회차 조회 동시 연결 (최대 {CGV_MAX_WORKERS} · "
-                    "좌석은 안전 단일 감시 · 자동 감속)"
+                    "좌석은 단일 감시 · 최초 응답 재사용 · 제한 시 브라우저 전환)"
                 ),
                 text_color=theme.TEXT_MUTE,
             )

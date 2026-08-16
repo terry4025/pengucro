@@ -271,8 +271,16 @@ class CgvEngine(BaseCgvEngine):
                     r"""
                     () => {
                       const clean = s => (s || '').replace(/\s+/g, '');
+                      const visible = node => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                               rect.width > 0 && rect.height > 0;
+                      };
                       const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                      const target = buttons.find(b => clean(b.textContent) === '선택완료' && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
+                      const target = buttons.find(b => clean(b.textContent) === '선택완료' &&
+                        visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
                       if (!target) return false;
                       if (typeof target.scrollIntoView === 'function') target.scrollIntoView({block: 'center'});
                       target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));

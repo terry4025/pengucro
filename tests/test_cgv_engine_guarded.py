@@ -83,10 +83,46 @@ def test_rate_limit_falls_back_immediately_without_exponential_backoff(monkeypat
     assert starts == [(1, 350)]
     assert engine._last_fast_monitor_exit_reason == "rate-limited"
     messages = [message for message, _level in logs]
-    assert any("연결 제한 감지" in message for message in messages)
+    assert any("요청 제한(HTTP 429) 감지" in message for message in messages)
     assert any("이미 열린 브라우저 좌석 화면" in message for message in messages)
     assert not any("3.0초 후 재시도" in message for message in messages)
     assert not any("6.0초 후 재시도" in message for message in messages)
+
+
+def test_http_403_is_reported_as_access_denied_not_rate_limit(monkeypatch):
+    logs = []
+    engine = _make_engine(logs)
+
+    monkeypatch.setattr(
+        BaseCgvEngine,
+        "_read_fast_seat_monitor",
+        staticmethod(
+            lambda _page: {
+                "running": False,
+                "completed": 1,
+                "lastStatus": 403,
+                "blocked": True,
+                "failureKind": "forbidden",
+                "terminalError": "",
+                "hit": None,
+            }
+        ),
+    )
+
+    held, fallback = engine._watch_and_hold_api(
+        _Page(),
+        {"siteNo": "0013", "scnYmd": "20260826"},
+        (),
+        2,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (False, True)
+    assert engine._last_fast_monitor_exit_reason == "access-forbidden"
+    messages = [message for message, _level in logs]
+    assert any("접근 거부(HTTP 403)" in message for message in messages)
+    assert not any("요청 제한(HTTP 429)" in message for message in messages)
 
 
 def test_consecutive_fetch_errors_fall_back_instead_of_restarting_monitor(monkeypatch):

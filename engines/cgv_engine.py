@@ -65,6 +65,9 @@ class CgvEngine(BaseEngine):
     RATE_LIMIT_BROWSER_MAX_RELOAD_INTERVAL = 15.0
     VISITOR_SELECTION_TIMEOUT = 12.0
     VISITOR_RETRY_INTERVAL_MS = 350
+    API_UI_SYNC_ATTEMPTS = 40
+    API_UI_SYNC_INTERVAL_MS = 25
+    CAPTURED_REQUEST_HEADERS = ("authorization", "accept-language")
 
     def __init__(self, log_callback, success_callback=None, **kwargs) -> None:
         super().__init__(log_callback, success_callback, **kwargs)
@@ -75,6 +78,8 @@ class CgvEngine(BaseEngine):
         self._context = None
         self._chrome = None
         self._last_fast_monitor_exit_reason = ""
+        self._initial_seat_response: dict[str, Any] | None = None
+        self._last_fast_retry_after_seconds = 0.0
 
     def start_reservation(
         self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False
@@ -87,8 +92,9 @@ class CgvEngine(BaseEngine):
         self.log(
             f"CGV 회차 API 조회를 최대 {self.scan_concurrency}개 동시 연결로 시작합니다. "
             f"회차 감지 후 좌석 API는 최대 {seat_concurrency}개 연결, "
-            f"{self.FAST_SEAT_LAUNCH_INTERVAL_MS}ms 간격으로 감시하며 "
-            "제한 신호가 감지되면 자동으로 감속합니다.",
+            f"{self.FAST_SEAT_LAUNCH_INTERVAL_MS}ms 간격으로 감시합니다. "
+            "좌석 모달의 최초 응답을 우선 재사용하고 제한 신호가 감지되면 "
+            "공식 브라우저 좌석 경로로 즉시 전환합니다.",
             "info",
         )
         super().start_reservation(reservation_data, 1, is_async=False)
@@ -173,6 +179,21 @@ class CgvEngine(BaseEngine):
         async ({url, concurrency, hedgeDelayMs}) => {
           const started = performance.now();
           const controllers = Array.from({length: concurrency}, () => new AbortController());
+          const requestHeaders = () => {
+            const headers = new Headers({
+              'Accept': 'application/json, text/plain, */*',
+              'Accept-Language': 'ko-KR'
+            });
+            const item = String(document.cookie || '').split('; ')
+              .find(value => value.startsWith('accessToken='));
+            if (item) {
+              const raw = item.slice('accessToken='.length);
+              let token = raw;
+              try { token = decodeURIComponent(raw); } catch (_) {}
+              if (token) headers.set('Authorization', `Bearer ${token}`);
+            }
+            return headers;
+          };
           return await new Promise((resolve) => {
             let failed = 0;
             const statuses = [];
@@ -182,7 +203,7 @@ class CgvEngine(BaseEngine):
               if (settled) return;
               fetch(url, {
                 method: 'GET', cache: 'no-store', credentials: 'include',
-                headers: {'Accept': 'application/json, text/plain, */*'},
+                headers: requestHeaders(),
                 signal: controller.signal
               }).then(async (response) => {
                 statuses.push(response.status);
@@ -233,15 +254,123 @@ class CgvEngine(BaseEngine):
         )
         return f"{CGV_BFF_BOOKING_URL}/searchIfSeatData?{query}"
 
+    def _begin_initial_seat_response_capture(self, page):
+        """Capture the seat response already requested by CGV's own modal.
+
+        Reusing this response avoids issuing a duplicate seat GET immediately
+        after the official UI has finished loading the same data.  The request
+        also provides the authorization headers added by CGV's current fetch
+        wrapper, which a plain ``window.fetch`` call does not add by itself.
+        """
+
+        self._initial_seat_response = None
+
+        def on_response(response) -> None:
+            try:
+                url = str(getattr(response, "url", "") or "")
+                if "searchIfSeatData" not in url:
+                    return
+                status = int(getattr(response, "status", 0) or 0)
+                request = getattr(response, "request", None)
+                raw_headers: dict[str, Any] = {}
+                if request is not None:
+                    all_headers = getattr(request, "all_headers", None)
+                    if callable(all_headers):
+                        raw_headers = all_headers() or {}
+                    else:
+                        raw_headers = getattr(request, "headers", {}) or {}
+                lowered = {
+                    str(key).lower(): str(value)
+                    for key, value in raw_headers.items()
+                }
+                request_headers = {
+                    key: lowered[key]
+                    for key in self.CAPTURED_REQUEST_HEADERS
+                    if lowered.get(key)
+                }
+                payload = response.json() if 200 <= status < 300 else None
+                self._initial_seat_response = {
+                    "url": url,
+                    "status": status,
+                    "data": payload if isinstance(payload, dict) else None,
+                    "requestHeaders": request_headers,
+                }
+            except Exception:
+                # The normal DOM path remains available when CDP cannot read a
+                # response body (for example, if the page was replaced).
+                return
+
+        try:
+            page.on("response", on_response)
+            return on_response
+        except Exception:
+            return None
+
+    @staticmethod
+    def _end_initial_seat_response_capture(page, handler) -> None:
+        if handler is None:
+            return
+        for method_name in ("remove_listener", "off"):
+            method = getattr(page, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method("response", handler)
+                return
+            except Exception:
+                continue
+
+    def _consume_initial_seat_response(
+        self, schedule: dict[str, Any]
+    ) -> dict[str, Any]:
+        captured = self._initial_seat_response
+        self._initial_seat_response = None
+        if not isinstance(captured, dict):
+            return {}
+        if int(captured.get("status", 0) or 0) < 200 or int(
+            captured.get("status", 0) or 0
+        ) >= 300:
+            return {}
+        if not isinstance(captured.get("data"), dict):
+            return {}
+
+        try:
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(str(captured.get("url", ""))).query
+            )
+        except Exception:
+            query = {}
+        for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq"):
+            expected = str(schedule.get(key, "") or "")
+            observed = str((query.get(key) or [""])[0] or "")
+            if expected and observed and expected != observed:
+                return {}
+        return captured
+
     @staticmethod
     def _post_json(page, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         result = page.evaluate(
             """
             async ({url, payload}) => {
               try {
+                const cookie = name => {
+                  const prefix = `${name}=`;
+                  const item = String(document.cookie || '').split('; ')
+                    .find(value => value.startsWith(prefix));
+                  if (!item) return '';
+                  const raw = item.slice(prefix.length);
+                  try { return decodeURIComponent(raw); } catch (_) { return raw; }
+                };
+                const headers = new Headers({
+                  'Accept': 'application/json',
+                  'Accept-Language': 'ko-KR',
+                  'Content-Type': 'application/json',
+                });
+                const token = cookie('accessToken');
+                if (token) headers.set('Authorization', `Bearer ${token}`);
                 const response = await fetch(url, {
                   method: 'POST', credentials: 'include', cache: 'no-store',
-                  headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+                  headers,
                   body: JSON.stringify(payload)
                 });
                 const text = await response.text();
@@ -360,14 +489,81 @@ class CgvEngine(BaseEngine):
         except Exception:
             return False
 
+    @staticmethod
+    def _api_seat_selection_snapshot(page, seat_ids: list[str]) -> dict[str, Any]:
+        try:
+            result = page.evaluate(
+                r"""
+                seatIds => {
+                  const clean = value => String(value || '').replace(/\s+/g, '');
+                  const visible = node => {
+                    if (!node) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                           rect.width > 0 && rect.height > 0;
+                  };
+                  const selected = node => {
+                    const classes = String(node.className || '').toLowerCase();
+                    const tokens = new Set(classes.split(/[\s_\-]+/));
+                    return node.title === '선택됨' ||
+                           node.getAttribute('aria-pressed') === 'true' ||
+                           node.getAttribute('aria-selected') === 'true' ||
+                           tokens.has('selected') || tokens.has('active') || tokens.has('on');
+                  };
+                  const selectedIds = seatIds.filter(seatId =>
+                    Array.from(document.querySelectorAll('button[data-seatlocno]'))
+                      .filter(node => node.getAttribute('data-seatlocno') === seatId)
+                      .some(selected)
+                  );
+                  const submit = Array.from(
+                    document.querySelectorAll('button, a, div[role="button"]')
+                  ).find(node => clean(node.textContent) === '선택완료' && visible(node));
+                  const submitReady = Boolean(
+                    submit && !submit.disabled && submit.getAttribute('aria-disabled') !== 'true'
+                  );
+                  return {
+                    selectedIds,
+                    submitPresent: Boolean(submit),
+                    submitReady,
+                    ready: selectedIds.length === seatIds.length && submitReady,
+                  };
+                }
+                """,
+                seat_ids,
+            )
+            return dict(result) if isinstance(result, dict) else {}
+        except Exception:
+            return {}
+
+    def _wait_for_seat_selection_ready(self, page, seat_ids: list[str]) -> bool:
+        observed_snapshot = False
+        for _ in range(self.API_UI_SYNC_ATTEMPTS):
+            snapshot = self._api_seat_selection_snapshot(page, seat_ids)
+            if not snapshot:
+                break
+            observed_snapshot = True
+            if snapshot.get("ready"):
+                return True
+            try:
+                page.wait_for_timeout(self.API_UI_SYNC_INTERVAL_MS)
+            except Exception:
+                time.sleep(self.API_UI_SYNC_INTERVAL_MS / 1000.0)
+        return not observed_snapshot
+
     def _select_api_seats_in_ui(self, page, payload, selected) -> bool:
         self._sync_seat_payload_to_ui(page, payload)
+        seat_ids: list[str] = []
         for seat in selected:
             seat_id = getattr(seat, "seat_id", None) or (
                 seat.get("seat_id") or seat.get("seatLocNo") or seat.get("id")
                 if isinstance(seat, dict)
                 else str(seat)
             )
+            seat_id = str(seat_id or "")
+            if not seat_id:
+                return False
+            seat_ids.append(seat_id)
             success = False
             for _ in range(5):
                 if self._ensure_seat_selected_by_id(page, seat_id):
@@ -379,7 +575,31 @@ class CgvEngine(BaseEngine):
                     time.sleep(0.05)
             if not success:
                 return False
-        return True
+
+        # A DOM click only queues React's state update.  Wait until every seat
+        # is visibly selected and the actual selection-complete button is
+        # enabled; clicking it earlier (especially with force=True) is ignored.
+        observed_snapshot = False
+        for _ in range(self.API_UI_SYNC_ATTEMPTS):
+            snapshot = self._api_seat_selection_snapshot(page, seat_ids)
+            if not snapshot:
+                break
+            observed_snapshot = True
+            if snapshot.get("ready"):
+                return True
+            selected_ids = {
+                str(value) for value in snapshot.get("selectedIds", []) if value
+            }
+            for seat_id in seat_ids:
+                if seat_id not in selected_ids:
+                    self._ensure_seat_selected_by_id(page, seat_id)
+            try:
+                page.wait_for_timeout(self.API_UI_SYNC_INTERVAL_MS)
+            except Exception:
+                time.sleep(self.API_UI_SYNC_INTERVAL_MS / 1000.0)
+        # Older test/mocked pages cannot expose a DOM snapshot.  The submit
+        # helper still performs its own enabled-state check in that case.
+        return not observed_snapshot
 
     @staticmethod
     def _ensure_seat_selected_by_id(page, seat_id: str) -> bool:
@@ -400,6 +620,7 @@ class CgvEngine(BaseEngine):
                   const tokens = new Set(classes.split(/[\s_\-]+/));
                   const isSelected = btn.getAttribute('aria-pressed') === 'true' ||
                                      btn.getAttribute('aria-selected') === 'true' ||
+                                     btn.title === '선택됨' ||
                                      tokens.has('selected') || tokens.has('active') || tokens.has('on') ||
                                      (btn.classList && (btn.classList.contains('selected') || btn.classList.contains('active') || btn.classList.contains('on')));
                   if (isSelected) {
@@ -568,6 +789,8 @@ class CgvEngine(BaseEngine):
         *,
         launch_interval_ms: int | None = None,
         direct_hold: dict[str, Any] | None = None,
+        request_headers: dict[str, str] | None = None,
+        initial_payload: dict[str, Any] | None = None,
     ) -> bool:
         """Start a same-origin browser monitor with staggered persistent GETs."""
 
@@ -578,7 +801,8 @@ class CgvEngine(BaseEngine):
         try:
             result = page.evaluate(
                 r"""
-                ({url, groups, concurrency, intervalMs, maxConsecutiveErrors, directHold}) => {
+                ({url, groups, concurrency, intervalMs, maxConsecutiveErrors,
+                  directHold, requestHeaders, initialPayload}) => {
                   const previous = window.__pengucroFastSeatMonitor;
                   if (previous && typeof previous.stop === 'function') previous.stop();
 
@@ -592,16 +816,63 @@ class CgvEngine(BaseEngine):
                     lastElapsedMs: 0,
                     blocked: false,
                     unauthorized: false,
+                    failureKind: '',
+                    retryAfterMs: 0,
                     lastError: '',
                     terminalError: '',
                     conflicts: 0,
                     hit: null,
+                    initialPayloadUsed: false,
                     timer: null,
                     controllers: new Set(),
                   };
                   const normalize = value => String(value || '')
                     .toUpperCase().replace(/[\s_-]+/g, '');
                   const normalizedGroups = groups.map(group => group.map(normalize));
+                  const cookieValue = name => {
+                    const prefix = `${name}=`;
+                    const item = String(document.cookie || '').split('; ')
+                      .find(value => value.startsWith(prefix));
+                    if (!item) return '';
+                    const raw = item.slice(prefix.length);
+                    try { return decodeURIComponent(raw); } catch (_) { return raw; }
+                  };
+                  const buildHeaders = extra => {
+                    const headers = new Headers(requestHeaders || {});
+                    const token = cookieValue('accessToken');
+                    if (!headers.has('Authorization') && token) {
+                      headers.set('Authorization', `Bearer ${token}`);
+                    }
+                    headers.set('Accept-Language', 'ko-KR');
+                    for (const [name, value] of Object.entries(extra || {})) {
+                      headers.set(name, value);
+                    }
+                    return headers;
+                  };
+                  const retryAfterMs = response => {
+                    const value = response && response.headers
+                      ? response.headers.get('Retry-After') : '';
+                    if (!value) return 0;
+                    const seconds = Number(value);
+                    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+                    const date = Date.parse(value);
+                    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+                  };
+                  const markHttpFailure = (response, stage = 'seat') => {
+                    state.lastStatus = response.status;
+                    state.retryAfterMs = retryAfterMs(response);
+                    if (response.status === 401) {
+                      state.unauthorized = true;
+                      state.failureKind = 'unauthorized';
+                    } else if (response.status === 403) {
+                      state.blocked = true;
+                      state.failureKind = 'forbidden';
+                    } else if (response.status === 429) {
+                      state.blocked = true;
+                      state.failureKind = 'rate-limited';
+                    }
+                    state.lastError = `${stage} HTTP ${response.status}`;
+                  };
                   const availableSeats = payload => {
                     const data = payload && payload.data ? payload.data : payload;
                     let items = data && data.items ? data.items : [];
@@ -655,13 +926,21 @@ class CgvEngine(BaseEngine):
                       method: 'POST',
                       credentials: 'include',
                       cache: 'no-store',
-                      headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+                      headers: buildHeaders({
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
+                      }),
                       body: JSON.stringify(body),
                       signal,
                     });
                     let data = null;
                     try { data = await response.json(); } catch (_) {}
-                    return {ok: response.ok, status: response.status, data};
+                    return {
+                      ok: response.ok,
+                      status: response.status,
+                      data,
+                      retryAfterMs: retryAfterMs(response),
+                    };
                   };
                   const buildPricePayload = selected => {
                     const schedule = directHold.schedule;
@@ -683,7 +962,9 @@ class CgvEngine(BaseEngine):
                         seatSalfrmCd: String(seat.seatSalfrmCd || ''),
                         prodBnduCd: '01',
                       })),
-                      zoneGroupYn: 'N',
+                      zoneGroupYn: selected.some(
+                        seat => String(seat.szoneSalpolCd || '') === '02'
+                      ) ? 'Y' : 'N',
                     };
                   };
                   const buildHoldPayload = selected => {
@@ -715,6 +996,8 @@ class CgvEngine(BaseEngine):
                       })),
                     };
                   };
+                  let queuedPayload = initialPayload && typeof initialPayload === 'object'
+                    ? initialPayload : null;
                   let launch;
                   const resume = () => {
                     if (state.hit || state.blocked || state.unauthorized || state.terminalError) return;
@@ -730,29 +1013,45 @@ class CgvEngine(BaseEngine):
                     state.attempts += 1;
                     const started = performance.now();
                     try {
-                      const response = await fetch(url, {
-                        method: 'GET',
-                        cache: 'no-store',
-                        credentials: 'include',
-                        headers: {'Accept': 'application/json, text/plain, */*'},
-                        signal: controller.signal,
-                      });
-                      state.lastStatus = response.status;
-                      state.lastElapsedMs = performance.now() - started;
-                      if (response.status === 403 || response.status === 429) {
-                        state.blocked = true;
-                        state.lastError = `HTTP ${response.status}`;
-                        state.stop();
-                        return;
+                      let payload = null;
+                      if (queuedPayload) {
+                        payload = queuedPayload;
+                        queuedPayload = null;
+                        state.initialPayloadUsed = true;
+                        state.lastStatus = 200;
+                        state.lastElapsedMs = 0;
+                      } else {
+                        const response = await fetch(url, {
+                          method: 'GET',
+                          cache: 'no-store',
+                          credentials: 'include',
+                          headers: buildHeaders({
+                            'Accept': 'application/json, text/plain, */*',
+                          }),
+                          signal: controller.signal,
+                        });
+                        state.lastStatus = response.status;
+                        state.lastElapsedMs = performance.now() - started;
+                        if ([401, 403, 429].includes(response.status)) {
+                          markHttpFailure(response);
+                          state.stop();
+                          return;
+                        }
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        payload = await response.json();
                       }
-                      if (response.status === 401) {
-                        state.unauthorized = true;
-                        state.lastError = 'HTTP 401';
-                        state.stop();
-                        return;
+                      const apiStatus = Number(payload && payload.statusCode != null
+                        ? payload.statusCode : 0);
+                      if (apiStatus !== 0) {
+                        if (apiStatus === -1001 || apiStatus === -1002) {
+                          state.unauthorized = true;
+                          state.failureKind = 'unauthorized';
+                          state.lastError = `seat API ${apiStatus}`;
+                          state.stop();
+                          return;
+                        }
+                        throw new Error(`seat API ${apiStatus}`);
                       }
-                      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                      const payload = await response.json();
                       state.consecutiveErrors = 0;
                       const group = findGroup(payload);
                       if (group) {
@@ -777,14 +1076,18 @@ class CgvEngine(BaseEngine):
                             transactionController.signal,
                           );
                           state.lastStatus = price.status;
-                          if (price.status === 401 || price.status === 403) {
+                          if (price.status === 401) {
                             state.unauthorized = true;
+                            state.failureKind = 'unauthorized';
                             state.lastError = `price HTTP ${price.status}`;
                             return;
                           }
-                          if (price.status === 429) {
+                          if (price.status === 403 || price.status === 429) {
                             state.blocked = true;
-                            state.lastError = 'price HTTP 429';
+                            state.failureKind = price.status === 403
+                              ? 'forbidden' : 'rate-limited';
+                            state.retryAfterMs = Number(price.retryAfterMs || 0);
+                            state.lastError = `price HTTP ${price.status}`;
                             return;
                           }
                           if (!price.data || typeof price.data !== 'object') {
@@ -804,14 +1107,18 @@ class CgvEngine(BaseEngine):
                             transactionController.signal,
                           );
                           state.lastStatus = hold.status;
-                          if (hold.status === 401 || hold.status === 403) {
+                          if (hold.status === 401) {
                             state.unauthorized = true;
+                            state.failureKind = 'unauthorized';
                             state.lastError = `hold HTTP ${hold.status}`;
                             return;
                           }
-                          if (hold.status === 429) {
+                          if (hold.status === 403 || hold.status === 429) {
                             state.blocked = true;
-                            state.lastError = 'hold HTTP 429';
+                            state.failureKind = hold.status === 403
+                              ? 'forbidden' : 'rate-limited';
+                            state.retryAfterMs = Number(hold.retryAfterMs || 0);
+                            state.lastError = `hold HTTP ${hold.status}`;
                             return;
                           }
                           if (!hold.data || typeof hold.data !== 'object') {
@@ -869,6 +1176,8 @@ class CgvEngine(BaseEngine):
                     "intervalMs": interval,
                     "maxConsecutiveErrors": self.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS,
                     "directHold": direct_hold,
+                    "requestHeaders": dict(request_headers or {}),
+                    "initialPayload": initial_payload,
                 },
             )
             return bool(result)
@@ -893,9 +1202,12 @@ class CgvEngine(BaseEngine):
                     lastElapsedMs: state.lastElapsedMs,
                     blocked: state.blocked,
                     unauthorized: state.unauthorized,
+                    failureKind: state.failureKind,
+                    retryAfterMs: state.retryAfterMs,
                     lastError: state.lastError,
                     terminalError: state.terminalError,
                     conflicts: state.conflicts,
+                    initialPayloadUsed: state.initialPayloadUsed,
                     hit: state.hit,
                   };
                 }
@@ -930,8 +1242,23 @@ class CgvEngine(BaseEngine):
         cgv: dict[str, Any],
     ) -> tuple[bool, bool]:
         self._last_fast_monitor_exit_reason = ""
+        self._last_fast_retry_after_seconds = 0.0
         auth = self._browser_auth_data(page)
-        seat_url = self._seat_url(schedule, auth.get("custNo", ""))
+        initial_response = self._consume_initial_seat_response(schedule)
+        seat_url = str(initial_response.get("url", "") or "") or self._seat_url(
+            schedule, auth.get("custNo", "")
+        )
+        request_headers = initial_response.get("requestHeaders", {})
+        if not isinstance(request_headers, dict):
+            request_headers = {}
+        initial_payload = initial_response.get("data")
+        if not isinstance(initial_payload, dict):
+            initial_payload = None
+        if initial_payload is not None:
+            self.log(
+                "CGV 최초 좌석 응답 재사용 · 중복 조회 없이 즉시 선점 여부를 확인합니다.",
+                "info",
+            )
         direct_hold = self._direct_hold_config(schedule, people, auth, cgv)
         preferred_concurrency = max(
             1,
@@ -948,7 +1275,12 @@ class CgvEngine(BaseEngine):
                 concurrency,
                 launch_interval_ms=launch_interval_ms,
                 direct_hold=direct_hold,
+                request_headers=request_headers,
+                initial_payload=initial_payload,
             )
+            # A captured response is a one-shot seed.  Never replay stale seat
+            # availability if the base policy restarts a monitor after errors.
+            initial_payload = None
             if not started:
                 self._last_fast_monitor_exit_reason = "monitor-start-failed"
                 self.log("CGV 고속 좌석 감시기를 시작하지 못해 안전 경로로 전환합니다.", "warning")
@@ -979,6 +1311,10 @@ class CgvEngine(BaseEngine):
             hit = snapshot.get("hit") if isinstance(snapshot, dict) else None
             if not isinstance(hit, dict):
                 status = int(snapshot.get("lastStatus", 0) or 0)
+                self._last_fast_retry_after_seconds = max(
+                    0.0,
+                    float(snapshot.get("retryAfterMs", 0) or 0) / 1000.0,
+                )
                 if snapshot.get("unauthorized") or status == 401:
                     self._last_fast_monitor_exit_reason = "unauthorized"
                     self.log("CGV 로그인 인증이 만료되어 브라우저 확인 경로로 전환합니다.", "warning")
@@ -1045,15 +1381,9 @@ class CgvEngine(BaseEngine):
                 return False, True
 
             self._install_cached_hold_responses(page, price_response, hold_response)
-            if self._click_visible_by_text(page, ("선택완료", "선택 완료")):
-                try:
-                    page.get_by_text("결제하기", exact=True).last.wait_for(
-                        state="visible", timeout=15000
-                    )
-                    self._restore_fetch(page)
-                    return True, False
-                except Exception:
-                    pass
+            if self._submit_seat_selection(page):
+                self._restore_fetch(page)
+                return True, False
             self._restore_fetch(page)
             self._cancel_api_hold(page, hold_payload, hold_response)
             self._last_fast_monitor_exit_reason = "checkout-transition-failed"
@@ -1498,6 +1828,7 @@ class CgvEngine(BaseEngine):
                   const tokens = new Set(classes.split(/[\s_\-]+/));
                   const isSelected = node.getAttribute('aria-pressed') === 'true' ||
                                      node.getAttribute('aria-selected') === 'true' ||
+                                     node.title === '선택됨' ||
                                      tokens.has('selected') || tokens.has('active') || tokens.has('on') ||
                                      (node.classList && (node.classList.contains('selected') || node.classList.contains('active') || node.classList.contains('on')));
                   const isUnavailable = !isSelected && (
@@ -1556,8 +1887,16 @@ class CgvEngine(BaseEngine):
                     r"""
                     () => {
                       const clean = s => (s || '').replace(/\s+/g, '');
+                      const visible = node => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                               rect.width > 0 && rect.height > 0;
+                      };
                       const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                      const target = buttons.find(b => clean(b.textContent) === '선택완료' && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
+                      const target = buttons.find(b => clean(b.textContent) === '선택완료' &&
+                        visible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true');
                       if (target) {
                         if (typeof target.scrollIntoView === 'function') target.scrollIntoView({block: 'center'});
                         target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
@@ -1765,8 +2104,11 @@ class CgvEngine(BaseEngine):
             )
             return page, True
 
-        if fallback_reason == "rate-limited":
-            cooldown = self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL
+        if fallback_reason in {"rate-limited", "access-forbidden"}:
+            cooldown = max(
+                self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL,
+                self._last_fast_retry_after_seconds,
+            )
             self.log(
                 f"CGV 좌석 API 제한 해제를 {cooldown:.0f}초 기다린 뒤 "
                 "브라우저 좌석 화면을 복구합니다.",
@@ -1791,7 +2133,7 @@ class CgvEngine(BaseEngine):
         fallback_reason: str = "",
     ) -> bool:
         last_reload = time.monotonic()
-        rate_limited = fallback_reason == "rate-limited"
+        rate_limited = fallback_reason in {"rate-limited", "access-forbidden"}
         reload_interval = (
             self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL
             if rate_limited
@@ -1842,10 +2184,16 @@ class CgvEngine(BaseEngine):
                     continue
 
                 self.log(f"선택 좌석 확보 가능: {', '.join(group.seats)}", "success")
-                try:
-                    page.wait_for_timeout(400)
-                except Exception:
-                    self.stop_event.wait(0.4)
+                selected_ids = [str(ids[seat]) for seat in group.seats]
+                if not self._wait_for_seat_selection_ready(page, selected_ids):
+                    self.silent_tick("CGV 좌석 선택 화면 반영 지연 · 다시 시도")
+                    page, ok = self._reload_or_recover_seat_page(
+                        page, schedule=schedule, people=people
+                    )
+                    if not ok:
+                        return False
+                    last_reload = time.monotonic()
+                    continue
                 if not self._submit_seat_selection(page):
                     self.silent_tick("CGV 좌석 선점 경합 발생 또는 모달 전환 재시도")
                     page, ok = self._reload_or_recover_seat_page(
@@ -2143,7 +2491,14 @@ class CgvEngine(BaseEngine):
                 if not self._enter_visitor_page(page, schedule):
                     keep_open = True
                     return
-                if not self._select_visitors(page, people):
+                seat_capture_handler = self._begin_initial_seat_response_capture(page)
+                try:
+                    visitors_ready = self._select_visitors(page, people)
+                finally:
+                    self._end_initial_seat_response_capture(
+                        page, seat_capture_handler
+                    )
+                if not visitors_ready:
                     keep_open = True
                     return
                 developer_mode = parse_bool_flag(reservation_data.get("devMode", False))

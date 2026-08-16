@@ -158,7 +158,8 @@ def test_cgv_thread_policy_caps_slider_at_measured_safe_limit():
     assert slider.config["to"] == 4
     assert slider.value == 4
     assert form.cgv_threads == 4
-    assert "자동 감속" in title.config["text"]
+    assert "최초 응답 재사용" in title.config["text"]
+    assert "제한 시 브라우저 전환" in title.config["text"]
 
 
 def test_cgv_selection_summary_renders_preferred_times_and_seats():
@@ -1255,7 +1256,6 @@ def test_cgv_dialog_intentional_cancellation_not_displayed_as_error():
     # Cancelled task must NOT invoke _handle_task_error
     assert errors == []
     assert dialog._active_task_id is None
-
 
 
 

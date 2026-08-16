@@ -42,7 +42,10 @@ class CgvEngine(HardenedCgvEngine):
             }
 
         status = int(snapshot.get("lastStatus", 0) or 0)
-        blocked = bool(snapshot.get("blocked")) or status in {403, 429}
+        failure_kind = str(snapshot.get("failureKind", "") or "")
+        forbidden = status == 403 or failure_kind == "forbidden"
+        rate_limited = status == 429 or failure_kind == "rate-limited"
+        blocked = bool(snapshot.get("blocked")) or forbidden or rate_limited
         stopped_by_fetch_errors = (
             not snapshot.get("running", False)
             and not snapshot.get("hit")
@@ -50,7 +53,10 @@ class CgvEngine(HardenedCgvEngine):
             >= self.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS
         )
 
-        if blocked:
+        if forbidden:
+            self._fast_monitor_fallback_reason = "access-forbidden"
+            snapshot["terminalError"] = "access-forbidden"
+        elif rate_limited or blocked:
             self._fast_monitor_fallback_reason = "rate-limited"
             snapshot["terminalError"] = "rate-limited"
         elif stopped_by_fetch_errors:
@@ -70,9 +76,23 @@ class CgvEngine(HardenedCgvEngine):
             reason = self._fast_monitor_fallback_reason
             self._fast_monitor_fallback_reason = ""
             if reason == "rate-limited":
+                retry_after = max(
+                    0.0, float(getattr(self, "_last_fast_retry_after_seconds", 0.0))
+                )
+                retry_detail = (
+                    f" · 서버 대기 지시 {retry_after:.0f}초 반영"
+                    if retry_after > 0
+                    else ""
+                )
                 message = (
-                    "CGV 고속 좌석 API 연결 제한 감지 · API 재시도를 중단하고 "
-                    "이미 열린 브라우저 좌석 화면으로 전환합니다."
+                    "CGV 고속 좌석 API 요청 제한(HTTP 429) 감지"
+                    f"{retry_detail} · API 재시도를 중단하고 이미 열린 "
+                    "브라우저 좌석 화면으로 전환합니다."
+                )
+            elif reason == "access-forbidden":
+                message = (
+                    "CGV 고속 좌석 API 접근 거부(HTTP 403) 감지 · "
+                    "인증된 공식 브라우저 좌석 화면으로 전환합니다."
                 )
             elif reason == "fetch-errors":
                 message = (
