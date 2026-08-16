@@ -16,10 +16,12 @@ class CgvEngine(HardenedCgvEngine):
     path instead.  This preserves the direct-hold success path unchanged.
     """
 
-    # 120 ms sustained polling proved aggressive enough to enter CGV's
-    # connection-limit path during real runs.  180 ms keeps sub-second detection
-    # while materially reducing sustained request pressure.
-    FAST_SEAT_LAUNCH_INTERVAL_MS = 180
+    # The seat endpoint is a sustained identical-request stream, unlike the
+    # short schedule race.  Keep it to one in-flight request and a conservative
+    # cadence so a four-worker schedule setting cannot immediately rate-limit
+    # the seat modal's own request.
+    FAST_SEAT_MAX_INFLIGHT = 1
+    FAST_SEAT_LAUNCH_INTERVAL_MS = 350
 
     def __init__(self, log_callback, success_callback=None, **kwargs) -> None:
         super().__init__(log_callback, success_callback, **kwargs)
@@ -69,18 +71,18 @@ class CgvEngine(HardenedCgvEngine):
             self._fast_monitor_fallback_reason = ""
             if reason == "rate-limited":
                 message = (
-                    "CGV 고속 좌석 API 연결 제한 감지 · 백오프 재시도 없이 "
-                    "브라우저 좌석 감시로 즉시 전환합니다."
+                    "CGV 고속 좌석 API 연결 제한 감지 · API 재시도를 중단하고 "
+                    "이미 열린 브라우저 좌석 화면으로 전환합니다."
                 )
             elif reason == "fetch-errors":
                 message = (
                     "CGV 고속 좌석 API 연속 조회 실패 · 같은 API 재시도 대신 "
-                    "브라우저 좌석 감시로 즉시 전환합니다."
+                    "이미 열린 브라우저 좌석 화면으로 전환합니다."
                 )
             else:
                 message = (
                     "CGV 고속 좌석 감시 상태를 읽지 못해 "
-                    "브라우저 좌석 감시로 즉시 전환합니다."
+                    "이미 열린 브라우저 좌석 화면으로 전환합니다."
                 )
 
         super().log(message, level)

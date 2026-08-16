@@ -132,6 +132,7 @@ class CgvEngine(BaseCgvEngine):
         people: int,
         developer_mode: bool,
         schedule: dict[str, Any] | None = None,
+        fallback_reason: str = "",
     ) -> bool:
         target = self._current_page(page)
         if target is None:
@@ -142,6 +143,7 @@ class CgvEngine(BaseCgvEngine):
             people,
             developer_mode,
             schedule=schedule,
+            fallback_reason=fallback_reason,
         )
         # _reload_or_recover_seat_page() updates _active_page whenever the base
         # loop swaps to a recovered page.  The checkout override below will use

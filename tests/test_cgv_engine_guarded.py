@@ -31,13 +31,20 @@ def test_registry_uses_guarded_cgv_engine():
     )
 
     assert type(engine) is CgvEngine
-    assert engine.FAST_SEAT_LAUNCH_INTERVAL_MS == 180
+    assert engine.FAST_SEAT_LAUNCH_INTERVAL_MS == 350
+    assert engine.FAST_SEAT_MAX_INFLIGHT == 1
 
 
 def test_rate_limit_falls_back_immediately_without_exponential_backoff(monkeypatch):
     logs = []
     reads = []
+    starts = []
     engine = _make_engine(logs)
+    engine.scan_concurrency = 4
+    engine._start_fast_seat_monitor = (
+        lambda _page, _url, _groups, concurrency, **kwargs:
+        starts.append((concurrency, kwargs["launch_interval_ms"])) or True
+    )
 
     def blocked_snapshot(_page):
         reads.append(1)
@@ -73,9 +80,11 @@ def test_rate_limit_falls_back_immediately_without_exponential_backoff(monkeypat
 
     assert (held, fallback) == (False, True)
     assert len(reads) == 1
+    assert starts == [(1, 350)]
+    assert engine._last_fast_monitor_exit_reason == "rate-limited"
     messages = [message for message, _level in logs]
     assert any("연결 제한 감지" in message for message in messages)
-    assert any("즉시 전환" in message for message in messages)
+    assert any("이미 열린 브라우저 좌석 화면" in message for message in messages)
     assert not any("3.0초 후 재시도" in message for message in messages)
     assert not any("6.0초 후 재시도" in message for message in messages)
 
@@ -115,9 +124,10 @@ def test_consecutive_fetch_errors_fall_back_instead_of_restarting_monitor(monkey
     )
 
     assert (held, fallback) == (False, True)
+    assert engine._last_fast_monitor_exit_reason == "consecutive-fetch-errors"
     messages = [message for message, _level in logs]
     assert any("연속 조회 실패" in message for message in messages)
-    assert any("즉시 전환" in message for message in messages)
+    assert any("이미 열린 브라우저 좌석 화면" in message for message in messages)
 
 
 def test_missing_monitor_state_uses_safe_fallback(monkeypatch):
@@ -140,5 +150,30 @@ def test_missing_monitor_state_uses_safe_fallback(monkeypatch):
     )
 
     assert (held, fallback) == (False, True)
+    assert engine._last_fast_monitor_exit_reason == "monitor-state-lost"
     messages = [message for message, _level in logs]
     assert any("감시 상태를 읽지 못해" in message for message in messages)
+
+
+def test_browser_fallback_keeps_existing_seat_dom_without_reload():
+    logs = []
+    engine = CgvEngine(lambda message, level="info": logs.append((message, level)))
+    page = _Page()
+    engine._seat_modal_snapshot = lambda _page: {
+        "modalOpen": True,
+        "seatCount": 336,
+    }
+    engine._reload_or_recover_seat_page = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("a ready seat DOM must not be reloaded")
+    )
+
+    returned_page, ready = engine._prepare_browser_fallback_page(
+        page,
+        schedule={"siteNo": "0013"},
+        people=1,
+        fallback_reason="rate-limited",
+    )
+
+    assert returned_page is page
+    assert ready is True
+    assert any("좌석 화면을 유지" in message for message, _level in logs)

@@ -1476,7 +1476,10 @@ class ReservationForm(ctk.CTkFrame):
                 text=str(self.cgv_threads), text_color=theme.ACCENT_BLUE
             )
             self.threads_title_label.configure(
-                text=f"동시 고속 API 감시 (CGV 안전 상한 {CGV_MAX_WORKERS} · 자동 감속)",
+                text=(
+                    f"회차 조회 동시 연결 (최대 {CGV_MAX_WORKERS} · "
+                    "좌석은 안전 단일 감시 · 자동 감속)"
+                ),
                 text_color=theme.TEXT_MUTE,
             )
             return

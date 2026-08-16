@@ -806,6 +806,77 @@ def test_reload_or_recover_seat_page_edge_cases():
     engine.stop_event.clear()
 
 
+def test_select_visitors_distinguishes_open_modal_with_blank_seat_data(monkeypatch):
+    logs = []
+    engine = CgvEngine(lambda message, level="info": logs.append((message, level)))
+    engine._seat_modal_snapshot = lambda _page: {
+        "modalOpen": True,
+        "seatCount": 0,
+    }
+    clock = iter((0.0, 0.0, 13.0))
+    monkeypatch.setattr("engines.cgv_engine.time.monotonic", lambda: next(clock))
+
+    class Page:
+        def evaluate(self, *_args, **_kwargs):
+            raise AssertionError("an open modal must not click hidden visitor controls again")
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    assert engine._select_visitors(Page(), 2) is False
+    messages = [message for message, _level in logs]
+    assert any("좌석 모달은 열렸지만 좌석 데이터" in message for message in messages)
+    assert not any("관람 인원 선택 및 좌석 모달 열기" in message for message in messages)
+
+
+def test_rate_limited_browser_monitor_survives_one_blank_reload(monkeypatch):
+    engine = CgvEngine(lambda *_args: None)
+    page = object()
+    reloads = []
+    element_reads = []
+    clock = iter((0.0, 5.0, 5.0))
+    monkeypatch.setattr("engines.cgv_engine.time.monotonic", lambda: next(clock))
+    engine._is_block_page = lambda _page: False
+
+    def available(_page):
+        element_reads.append(1)
+        if len(element_reads) == 1:
+            return []
+        return [
+            {
+                "id": "loc-h22",
+                "label": "H22",
+                "available": True,
+                "selected": False,
+                "unavailable": False,
+            }
+        ]
+
+    engine._available_seat_elements = available
+    engine._reload_or_recover_seat_page = (
+        lambda current, **_kwargs: reloads.append(current) or (current, False)
+    )
+    engine._ensure_seat_selected_by_id = lambda *_args: True
+    engine._submit_seat_selection = lambda _page: True
+
+    class Page:
+        def wait_for_timeout(self, _ms):
+            pass
+
+    page = Page()
+    held = engine._select_and_hold_seats(
+        page,
+        (CgvSeatGroup(("H22",)),),
+        1,
+        False,
+        fallback_reason="rate-limited",
+    )
+
+    assert held is True
+    assert reloads == [page]
+    assert len(element_reads) == 2
+
+
 def test_submit_seat_selection_timeout_returns_false():
     class Page:
         def evaluate(self, script, *args):
@@ -1204,7 +1275,6 @@ def test_select_and_hold_seats_survives_wait_for_timeout_exception():
     groups = (CgvSeatGroup(("D01",)),)
     held = engine._select_and_hold_seats(Page(), groups, 1, False)
     assert held is True
-
 
 
 

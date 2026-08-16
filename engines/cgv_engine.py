@@ -55,10 +55,16 @@ class CgvEngine(BaseEngine):
     PREOPEN_IDLE_INTERVAL = 20.0
     SCHEDULE_HINT_INTERVAL = 2.0
     FAST_SEAT_LAUNCH_INTERVAL_MS = 120
+    FAST_SEAT_MAX_INFLIGHT = CGV_MAX_WORKERS
     FAST_MONITOR_READ_INTERVAL = 0.025
     FAST_MONITOR_MAX_CONSECUTIVE_ERRORS = 5
     HEDGE_DELAY_MS = 110
     MAX_BACKOFF = 15.0
+    BROWSER_SEAT_RELOAD_INTERVAL = 1.5
+    RATE_LIMIT_BROWSER_RELOAD_INTERVAL = 4.0
+    RATE_LIMIT_BROWSER_MAX_RELOAD_INTERVAL = 15.0
+    VISITOR_SELECTION_TIMEOUT = 12.0
+    VISITOR_RETRY_INTERVAL_MS = 350
 
     def __init__(self, log_callback, success_callback=None, **kwargs) -> None:
         super().__init__(log_callback, success_callback, **kwargs)
@@ -68,14 +74,20 @@ class CgvEngine(BaseEngine):
         self._browser = None
         self._context = None
         self._chrome = None
+        self._last_fast_monitor_exit_reason = ""
 
     def start_reservation(
         self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False
     ) -> None:
         self.scan_concurrency = max(1, min(int(num_threads), CGV_MAX_WORKERS))
+        seat_concurrency = max(
+            1,
+            min(self.scan_concurrency, int(self.FAST_SEAT_MAX_INFLIGHT)),
+        )
         self.log(
-            f"CGV 고속 API 감시를 최대 {self.scan_concurrency}개 동시 연결로 시작합니다. "
-            f"좌석 요청은 {self.FAST_SEAT_LAUNCH_INTERVAL_MS}ms 간격으로 교차 실행하며 "
+            f"CGV 회차 API 조회를 최대 {self.scan_concurrency}개 동시 연결로 시작합니다. "
+            f"회차 감지 후 좌석 API는 최대 {seat_concurrency}개 연결, "
+            f"{self.FAST_SEAT_LAUNCH_INTERVAL_MS}ms 간격으로 감시하며 "
             "제한 신호가 감지되면 자동으로 감속합니다.",
             "info",
         )
@@ -917,10 +929,14 @@ class CgvEngine(BaseEngine):
         developer_mode: bool,
         cgv: dict[str, Any],
     ) -> tuple[bool, bool]:
+        self._last_fast_monitor_exit_reason = ""
         auth = self._browser_auth_data(page)
         seat_url = self._seat_url(schedule, auth.get("custNo", ""))
         direct_hold = self._direct_hold_config(schedule, people, auth, cgv)
-        preferred_concurrency = self.scan_concurrency
+        preferred_concurrency = max(
+            1,
+            min(self.scan_concurrency, int(self.FAST_SEAT_MAX_INFLIGHT)),
+        )
         concurrency = preferred_concurrency
         launch_interval_ms = self.FAST_SEAT_LAUNCH_INTERVAL_MS
         backoff = self.MIN_POLL_INTERVAL
@@ -934,6 +950,7 @@ class CgvEngine(BaseEngine):
                 direct_hold=direct_hold,
             )
             if not started:
+                self._last_fast_monitor_exit_reason = "monitor-start-failed"
                 self.log("CGV 고속 좌석 감시기를 시작하지 못해 안전 경로로 전환합니다.", "warning")
                 return False, True
 
@@ -963,9 +980,13 @@ class CgvEngine(BaseEngine):
             if not isinstance(hit, dict):
                 status = int(snapshot.get("lastStatus", 0) or 0)
                 if snapshot.get("unauthorized") or status == 401:
+                    self._last_fast_monitor_exit_reason = "unauthorized"
                     self.log("CGV 로그인 인증이 만료되어 브라우저 확인 경로로 전환합니다.", "warning")
                     return False, True
                 if snapshot.get("terminalError"):
+                    self._last_fast_monitor_exit_reason = str(
+                        snapshot.get("terminalError") or "terminal-error"
+                    )
                     self.log("CGV 선점 API 응답 구조가 변경되어 브라우저 안전 경로로 전환합니다.", "warning")
                     return False, True
                 if snapshot.get("blocked") or status in {403, 429}:
@@ -997,6 +1018,7 @@ class CgvEngine(BaseEngine):
 
             transaction = hit.get("transaction")
             if not isinstance(transaction, dict):
+                self._last_fast_monitor_exit_reason = "missing-transaction"
                 self.log("CGV 브라우저 내부 선점 결과가 없어 안전 경로로 전환합니다.", "warning")
                 return False, True
             price_response = transaction.get("priceResponse")
@@ -1006,6 +1028,7 @@ class CgvEngine(BaseEngine):
                 isinstance(value, dict)
                 for value in (price_response, hold_response, hold_payload)
             ):
+                self._last_fast_monitor_exit_reason = "incomplete-transaction"
                 self.log("CGV 브라우저 내부 선점 응답이 불완전해 안전 경로로 전환합니다.", "warning")
                 return False, True
             transaction_ms = float(transaction.get("elapsedMs", 0.0) or 0.0)
@@ -1017,6 +1040,7 @@ class CgvEngine(BaseEngine):
             )
             if not self._select_api_seats_in_ui(page, seat_payload, selected):
                 self._cancel_api_hold(page, hold_payload, hold_response)
+                self._last_fast_monitor_exit_reason = "ui-sync-failed"
                 self.log("CGV 화면 동기화에 실패해 확보 좌석을 해제하고 안전 경로로 전환합니다.", "warning")
                 return False, True
 
@@ -1032,6 +1056,7 @@ class CgvEngine(BaseEngine):
                     pass
             self._restore_fetch(page)
             self._cancel_api_hold(page, hold_payload, hold_response)
+            self._last_fast_monitor_exit_reason = "checkout-transition-failed"
             self.log(
                 "CGV 결제 화면 연결이 확인되지 않아 임시선점을 취소하고 브라우저 안전 경로로 전환합니다.",
                 "warning",
@@ -1349,81 +1374,117 @@ class CgvEngine(BaseEngine):
                 pass
         return False
 
-    def _select_visitors(self, page, people: int) -> bool:
-        """Select the normal visitor count and open CGV's seat modal with robust retry for Next.js hydration."""
-        start_time = time.monotonic()
-        target_num = max(1, people)
-
-        while not self.stop_event.is_set() and time.monotonic() - start_time < 12.0:
-            # 1. Check if seat map modal is already open
-            try:
-                if page.locator("button[data-seatlocno]").first.is_visible():
-                    return True
-            except Exception:
-                pass
-
-            # 2. Select visitor count for '일반'
-            try:
-                page.evaluate(
-                    r"""
-                    people => {
-                      const clean = value => (value || '').replace(/\s+/g, '');
-                      const nodes = [...document.querySelectorAll('*')];
-                      const label = nodes.find(node => node.children.length === 0 && clean(node.textContent) === '일반');
-                      if (!label) return false;
-                      let box = label;
-                      for (let i = 0; i < 7 && box; i++, box = box.parentElement) {
-                        const target = [...box.querySelectorAll('button')].find(button =>
-                          !button.disabled && clean(button.textContent) === String(people)
-                        );
-                        if (target) {
-                          target.click();
-                          return true;
-                        }
-                      }
-                      return false;
-                    }
-                    """,
-                    target_num,
-                )
-            except Exception:
-                pass
-
-            # 3. Click '선택' button to open seat modal
-            try:
-                page.evaluate(
-                    r"""
-                    () => {
-                      const clean = value => (value || '').replace(/\s+/g, '');
-                      const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                      const target = buttons.find(b => !b.disabled && clean(b.textContent) === '선택');
-                      if (target) {
-                        target.click();
-                        return true;
-                      }
-                      return false;
-                    }
-                    """
-                )
-            except Exception:
-                pass
-
-            # 4. Check if seat map modal is now open
-            try:
-                if page.locator("button[data-seatlocno]").first.is_visible():
-                    return True
-            except Exception:
-                pass
-
-            page.wait_for_timeout(350)
+    @staticmethod
+    def _seat_modal_snapshot(page) -> dict[str, Any]:
+        """Return separate readiness signals for the modal shell and seat data."""
 
         try:
-            if page.locator("button[data-seatlocno]").first.is_visible():
-                return True
+            result = page.evaluate(
+                r"""
+                () => {
+                  const clean = value => (value || '').replace(/\s+/g, '');
+                  const visible = node => {
+                    if (!node) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                           rect.width > 0 && rect.height > 0;
+                  };
+                  const seatButtons = Array.from(
+                    document.querySelectorAll('button[data-seatlocno]')
+                  ).filter(visible);
+                  const controls = Array.from(
+                    document.querySelectorAll('button, a, div[role="button"]')
+                  ).filter(visible);
+                  const hasControl = label => controls.some(
+                    node => clean(node.textContent) === label
+                  );
+                  return {
+                    modalOpen: seatButtons.length > 0 ||
+                               hasControl('인원변경') || hasControl('선택완료'),
+                    seatCount: seatButtons.length,
+                  };
+                }
+                """
+            )
+            return dict(result) if isinstance(result, dict) else {}
         except Exception:
-            pass
+            return {}
 
-        self.log("CGV 관람 인원 선택 및 좌석 모달 열기에 실패했습니다.", "error")
+    def _select_visitors(self, page, people: int) -> bool:
+        """Select visitors, open the seat modal, and wait for actual seat data."""
+        start_time = time.monotonic()
+        target_num = max(1, people)
+        last_snapshot: dict[str, Any] = {}
+
+        while (
+            not self.stop_event.is_set()
+            and time.monotonic() - start_time < self.VISITOR_SELECTION_TIMEOUT
+        ):
+            last_snapshot = self._seat_modal_snapshot(page)
+            if int(last_snapshot.get("seatCount", 0) or 0) > 0:
+                return True
+
+            # Once the shell is open, repeatedly clicking the hidden visitor
+            # controls only triggers more seat requests.  Wait for the existing
+            # request to finish (or for the caller's rate-limit recovery).
+            if not last_snapshot.get("modalOpen"):
+                try:
+                    page.evaluate(
+                        r"""
+                        people => {
+                          const clean = value => (value || '').replace(/\s+/g, '');
+                          const nodes = [...document.querySelectorAll('*')];
+                          const label = nodes.find(node => node.children.length === 0 && clean(node.textContent) === '일반');
+                          if (!label) return false;
+                          let box = label;
+                          for (let i = 0; i < 7 && box; i++, box = box.parentElement) {
+                            const target = [...box.querySelectorAll('button')].find(button =>
+                              !button.disabled && clean(button.textContent) === String(people)
+                            );
+                            if (target) {
+                              target.click();
+                              return true;
+                            }
+                          }
+                          return false;
+                        }
+                        """,
+                        target_num,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    page.evaluate(
+                        r"""
+                        () => {
+                          const clean = value => (value || '').replace(/\s+/g, '');
+                          const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                          const target = buttons.find(b => !b.disabled && clean(b.textContent) === '선택');
+                          if (target) {
+                            target.click();
+                            return true;
+                          }
+                          return false;
+                        }
+                        """
+                    )
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(self.VISITOR_RETRY_INTERVAL_MS)
+
+        last_snapshot = self._seat_modal_snapshot(page) or last_snapshot
+        if int(last_snapshot.get("seatCount", 0) or 0) > 0:
+            return True
+        if last_snapshot.get("modalOpen"):
+            self.log(
+                "CGV 좌석 모달은 열렸지만 좌석 데이터가 제한 시간 안에 로드되지 않았습니다.",
+                "warning",
+            )
+        else:
+            self.log("CGV 관람 인원 선택 및 좌석 모달 열기에 실패했습니다.", "error")
         return False
 
     @staticmethod
@@ -1664,6 +1725,8 @@ class CgvEngine(BaseEngine):
             if hasattr(page, "is_closed") and page.is_closed():
                 raise RuntimeError("TargetClosedError: Target page has been closed")
             page.reload(wait_until="domcontentloaded", timeout=30000)
+            if self._is_block_page(page):
+                return page, False
             if not self._select_visitors(page, people):
                 return page, False
             return page, True
@@ -1684,6 +1747,40 @@ class CgvEngine(BaseEngine):
             self.log(f"CGV 좌석 페이지 새로고침 오류: {format_exception(exc)}", "warning")
             return page, False
 
+    def _prepare_browser_fallback_page(
+        self,
+        page,
+        *,
+        schedule: dict[str, Any] | None = None,
+        people: int = 1,
+        fallback_reason: str = "",
+    ) -> tuple[Any, bool]:
+        """Keep a usable seat DOM instead of blindly reloading after fast-path failure."""
+
+        seat_state = self._seat_modal_snapshot(page)
+        if int(seat_state.get("seatCount", 0) or 0) > 0:
+            self.log(
+                "CGV 고속 감시 종료 · 이미 열린 좌석 화면을 유지하고 선택을 계속합니다.",
+                "info",
+            )
+            return page, True
+
+        if fallback_reason == "rate-limited":
+            cooldown = self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL
+            self.log(
+                f"CGV 좌석 API 제한 해제를 {cooldown:.0f}초 기다린 뒤 "
+                "브라우저 좌석 화면을 복구합니다.",
+                "warning",
+            )
+            if self.stop_event.wait(cooldown):
+                return page, False
+
+        return self._reload_or_recover_seat_page(
+            page,
+            schedule=schedule,
+            people=people,
+        )
+
     def _select_and_hold_seats(
         self,
         page,
@@ -1691,12 +1788,40 @@ class CgvEngine(BaseEngine):
         people: int,
         developer_mode: bool,
         schedule: dict[str, Any] | None = None,
+        fallback_reason: str = "",
     ) -> bool:
         last_reload = time.monotonic()
+        rate_limited = fallback_reason == "rate-limited"
+        reload_interval = (
+            self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL
+            if rate_limited
+            else self.BROWSER_SEAT_RELOAD_INTERVAL
+        )
         while not self.stop_event.is_set():
             if self._is_block_page(page):
-                self.log("CGV 접근 제한이 감지되어 좌석 조회를 중지했습니다.", "error")
-                return False
+                if not rate_limited:
+                    self.log("CGV 접근 제한이 감지되어 좌석 조회를 중지했습니다.", "error")
+                    return False
+                self.silent_tick(
+                    f"CGV 접근 제한 해제 대기 · {reload_interval:.1f}초 후 좌석 화면 복구"
+                )
+                if self.stop_event.wait(reload_interval):
+                    return False
+                page, ok = self._reload_or_recover_seat_page(
+                    page, schedule=schedule, people=people
+                )
+                if ok:
+                    reload_interval = self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL
+                else:
+                    reload_interval = min(
+                        self.RATE_LIMIT_BROWSER_MAX_RELOAD_INTERVAL,
+                        max(
+                            self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL,
+                            reload_interval * 2,
+                        ),
+                    )
+                last_reload = time.monotonic()
+                continue
             elements = self._available_seat_elements(page)
             chosen = self.choose_available_group(elements, groups)
             if chosen:
@@ -1736,13 +1861,26 @@ class CgvEngine(BaseEngine):
 
             self.silent_tick("선택한 CGV 좌석 묶음이 아직 비어 있지 않습니다")
             now = time.monotonic()
-            if now - last_reload >= 1.5:
+            if now - last_reload >= reload_interval:
                 page, ok = self._reload_or_recover_seat_page(
                     page, schedule=schedule, people=people
                 )
                 if not ok:
-                    return False
-                last_reload = now
+                    if not rate_limited or self.stop_event.is_set():
+                        return False
+                    reload_interval = min(
+                        self.RATE_LIMIT_BROWSER_MAX_RELOAD_INTERVAL,
+                        max(
+                            self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL,
+                            reload_interval * 2,
+                        ),
+                    )
+                    self.silent_tick(
+                        f"CGV 좌석 데이터 복구 대기 · {reload_interval:.1f}초 후 재시도"
+                    )
+                elif rate_limited:
+                    reload_interval = self.RATE_LIMIT_BROWSER_RELOAD_INTERVAL
+                last_reload = time.monotonic()
             else:
                 try:
                     page.wait_for_timeout(300)
@@ -2019,12 +2157,21 @@ class CgvEngine(BaseEngine):
                 )
                 if use_browser_fallback and not self.stop_event.is_set():
                     self._restore_fetch(page)
-                    page, ok = self._reload_or_recover_seat_page(
-                        page, schedule=schedule, people=people
+                    fallback_reason = self._last_fast_monitor_exit_reason
+                    page, ok = self._prepare_browser_fallback_page(
+                        page,
+                        schedule=schedule,
+                        people=people,
+                        fallback_reason=fallback_reason,
                     )
                     if ok:
                         held = self._select_and_hold_seats(
-                            page, groups, people, developer_mode, schedule=schedule
+                            page,
+                            groups,
+                            people,
+                            developer_mode,
+                            schedule=schedule,
+                            fallback_reason=fallback_reason,
                         )
                 keep_open = True
                 if held:
