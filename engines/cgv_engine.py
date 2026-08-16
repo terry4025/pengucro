@@ -69,6 +69,11 @@ class CgvEngine(BaseEngine):
     API_UI_SYNC_ATTEMPTS = 40
     API_UI_SYNC_INTERVAL_MS = 25
     CAPTURED_REQUEST_HEADERS = ("authorization", "accept-language")
+    CGV_PAYMENT_PAGE_TIMEOUT_SECONDS = 15.0
+    NPAY_PAGE_TIMEOUT_SECONDS = 20.0
+    NPAY_CONTROL_TIMEOUT_SECONDS = 15.0
+    NPAY_COMPLETION_TIMEOUT_SECONDS = 60.0
+    PAYMENT_POLL_INTERVAL_MS = 100
 
     def __init__(self, log_callback, success_callback=None, **kwargs) -> None:
         super().__init__(log_callback, success_callback, **kwargs)
@@ -1469,217 +1474,601 @@ class CgvEngine(BaseEngine):
             return False, True
         return False, False
 
-    def _proceed_naver_pay_checkout(self, page, developer_mode: bool = False) -> bool:
-        """Automate CGV checkout using Naver Pay (N pay).
-
-        1. Select 'N pay' payment method.
-        2. Check mandatory terms agreement.
-        3. Click CGV '결제하기' to launch Naver Pay popup.
-        4. In the Naver Pay popup:
-           - In developer mode: keep popup open and skip clicking '동의하고 결제하기'.
-           - In normal mode: click '동의하고 결제하기' to finalize payment.
-        """
+    @staticmethod
+    def _safe_page_url(page) -> str:
         try:
-            self.log("[CGV] 결제 페이지 진입 · 네이버페이 자동 결제 진행 중...", "info")
-            page.wait_for_timeout(1000)
+            return str(page.url or "")
+        except Exception:
+            return ""
 
-            # 1. Click N pay button
-            npay_candidates = [
-                page.locator("button, div[role='button'], a, div, label, span").filter(has_text="N pay"),
-                page.locator("button, div[role='button'], a, div, label, span").filter(has_text="npay"),
-                page.locator("img[alt*='npay'], img[alt*='N pay'], img[alt*='네이버페이']"),
-                page.locator("button:has-text('N pay'), button:has-text('npay')"),
-            ]
-            clicked_npay = False
-            for loc in npay_candidates:
-                try:
-                    for idx in range(loc.count()):
-                        cand = loc.nth(idx)
-                        if cand.is_visible():
-                            cand.click(force=True, timeout=2000)
-                            clicked_npay = True
-                            break
-                    if clicked_npay:
-                        break
-                except Exception:
-                    continue
+    @staticmethod
+    def _is_naver_payment_url(url: str) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").casefold()
+            path = parsed.path.casefold()
+        except Exception:
+            return False
+        return (
+            host == "pay.naver.com"
+            or host.endswith(".pay.naver.com")
+            or (host == "financial.pstatic.net" and "/instantpay/" in path)
+        )
 
-            # JavaScript fallback for N pay selection
-            if not clicked_npay:
-                try:
-                    clicked_npay = page.evaluate(
-                        r"""
-                        () => {
-                          const clean = s => (s || '').replace(/\s+/g, '').toLowerCase();
-                          const elements = Array.from(document.querySelectorAll('button, div[role="button"], a, label, span, div, p'));
-                          const target = elements.find(el => clean(el.textContent).includes('npay') || clean(el.textContent).includes('네이버페이'));
-                          if (target) {
-                            (target.closest('button, label, div[role="button"], a') || target).click();
-                            return true;
-                          }
-                          return false;
-                        }
-                        """
-                    )
-                except Exception:
-                    clicked_npay = False
-
-            if clicked_npay:
-                self.log("[CGV] 결제수단 N pay 선택 완료", "info")
-            else:
-                self.log("CGV 결제수단에서 N pay 버튼을 찾지 못했습니다. 수동으로 선택해주세요.", "warning")
-
-            page.wait_for_timeout(500)
-
-            # 2. Check terms agreement (약관 전체 동의)
-            terms_candidates = [
-                page.locator("label:has-text('전체 동의'), label:has-text('약관 전체 동의'), label:has-text('모두 동의')").first,
-                page.locator("label:has-text('동의')").last,
-                page.locator("input[type='checkbox']").last,
-            ]
-            for loc in terms_candidates:
-                try:
-                    if loc.count() > 0 and loc.is_visible():
-                        loc.click(timeout=2000)
-                        break
-                except Exception:
-                    continue
-
+    def _wait_for_checkout_condition(
+        self,
+        page,
+        condition,
+        timeout_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline and not self.stop_event.is_set():
             try:
-                page.evaluate(
-                    r"""
-                    () => {
-                      const clean = s => (s || '').replace(/\s+/g, '');
-                      const labels = Array.from(document.querySelectorAll('label, span, div, p'));
-                      const target = labels.find(el => clean(el.textContent).includes('전체동의') || clean(el.textContent).includes('약관전체동의') || clean(el.textContent).includes('모두동의'));
-                      if (target) {
-                        (target.closest('label') || target).click();
-                        return true;
-                      }
-                      return false;
-                    }
-                    """
-                )
+                if condition():
+                    return True
             except Exception:
                 pass
-
-            page.wait_for_timeout(500)
-
-            # 3. Click CGV '결제하기' button and capture Naver Pay popup
-            pay_btn = page.get_by_text("결제하기", exact=True).last
-            if not pay_btn.is_visible():
-                pay_btn = page.locator("button:has-text('결제하기'), a:has-text('결제하기')").last
-
-            self.log("[CGV] 네이버페이 결제창 호출 중...", "info")
-            naver_pay_page = None
             try:
-                with page.context.expect_page(timeout=15000) as popup_info:
-                    if pay_btn.is_visible():
-                        pay_btn.click(force=True, timeout=5000)
-                    else:
-                        page.evaluate(
-                            r"""
-                            () => {
-                              const clean = s => (s || '').replace(/\s+/g, '');
-                              const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-                              const target = buttons.reverse().find(b => clean(b.textContent) === '결제하기' && !b.disabled);
-                              if (target) target.click();
-                            }
-                            """
-                        )
-                naver_pay_page = popup_info.value
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
             except Exception:
-                for p in page.context.pages:
-                    if p != page and not p.is_closed() and any(
-                        domain in p.url for domain in ("naver.com", "pstatic.net", "instantPay")
-                    ):
-                        naver_pay_page = p
-                        break
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        try:
+            return bool(condition())
+        except Exception:
+            return False
 
-            if naver_pay_page is None:
-                self.log("네이버페이 결제창을 감지하지 못했습니다. 브라우저에서 직접 결제를 진행해주세요.", "warning")
+    def _cgv_payment_methods_ready(self, page) -> bool:
+        url = self._safe_page_url(page)
+        if "/mpy/main" in urllib.parse.urlparse(url).path:
+            return True
+        try:
+            return bool(
+                page.evaluate(
+                    r"""() => {
+                      const text = document.body ? document.body.innerText || '' : '';
+                      return text.includes('결제수단') && text.includes('최종결제금액');
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _click_enabled_payment_button(page) -> tuple[bool, str]:
+        try:
+            result = page.evaluate(
+                r"""() => {
+                  const clean = value => (value || '').replace(/\s+/g, '');
+                  const visible = node => {
+                    if (!node) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                           rect.width > 0 && rect.height > 0;
+                  };
+                  const buttons = Array.from(document.querySelectorAll(
+                    'button, a, [role="button"]'
+                  )).filter(node => {
+                    const text = clean(node.innerText || node.textContent);
+                    return visible(node) && text.endsWith('결제하기') &&
+                           !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+                  });
+                  const target = buttons[buttons.length - 1];
+                  if (!target) return {clicked: false, text: ''};
+                  target.scrollIntoView({block: 'center'});
+                  target.click();
+                  return {clicked: true, text: clean(target.innerText || target.textContent)};
+                }"""
+            )
+        except Exception:
+            return False, ""
+        if not isinstance(result, dict):
+            return False, ""
+        return bool(result.get("clicked")), str(result.get("text") or "")
+
+    def _wait_and_click_payment_button(
+        self,
+        page,
+        timeout_seconds: float,
+    ) -> tuple[bool, str]:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            clicked, text = self._click_enabled_payment_button(page)
+            if clicked:
+                return True, text
+            try:
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        return False, ""
+
+    def _advance_to_cgv_payment_methods(self, page) -> bool:
+        if self._cgv_payment_methods_ready(page):
+            return True
+        clicked, _text = self._wait_and_click_payment_button(
+            page,
+            self.NPAY_CONTROL_TIMEOUT_SECONDS,
+        )
+        if not clicked:
+            self.log(
+                "CGV 좌석 확인 화면의 첫 번째 '결제하기' 버튼을 찾지 못했습니다.",
+                "warning",
+            )
+            return False
+        self.log("[CGV] 좌석 확인 완료 · 결제수단 화면으로 이동 중...", "info")
+        ready = self._wait_for_checkout_condition(
+            page,
+            lambda: self._cgv_payment_methods_ready(page),
+            self.CGV_PAYMENT_PAGE_TIMEOUT_SECONDS,
+        )
+        if not ready:
+            self.log(
+                "CGV 결제수단 화면(/mpy/main) 진입을 확인하지 못했습니다.",
+                "warning",
+            )
+        return ready
+
+    def _select_cgv_npay_method(self, page) -> bool:
+        clicked = False
+        selected = False
+        deadline = time.monotonic() + self.NPAY_CONTROL_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            try:
+                state = page.evaluate(
+                    r"""allowClick => {
+                      const clean = value => (value || '').replace(/\s+/g, '').toLowerCase();
+                      const visible = node => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                               rect.width > 0 && rect.height > 0;
+                      };
+                      const buttons = Array.from(document.querySelectorAll('button'));
+                      const target = buttons.find(button => {
+                        const imageText = Array.from(button.querySelectorAll('img'))
+                          .map(image => image.getAttribute('alt') || '').join(' ');
+                        const text = clean([
+                          button.innerText,
+                          button.getAttribute('aria-label'),
+                          imageText,
+                        ].join(' '));
+                        return visible(button) &&
+                          (text.includes('npay') || text.includes('네이버페이'));
+                      });
+                      if (!target) return {found: false, selected: false, clicked: false};
+                      const scope = target.closest('li') || target;
+                      const classes = `${target.className || ''} ${scope.className || ''}`.toLowerCase();
+                      const isSelected = clean(target.getAttribute('title')) === '선택됨' ||
+                        target.getAttribute('aria-pressed') === 'true' ||
+                        target.getAttribute('aria-checked') === 'true' ||
+                        scope.getAttribute('data-selected') === 'true' ||
+                        /(^|[\s_-])(active|selected|checked)([\s_-]|$)/.test(classes);
+                      if (!isSelected && allowClick && !target.disabled &&
+                          target.getAttribute('aria-disabled') !== 'true') {
+                        target.scrollIntoView({block: 'center'});
+                        target.click();
+                        return {found: true, selected: false, clicked: true};
+                      }
+                      return {found: true, selected: isSelected, clicked: false};
+                    }""",
+                    not clicked,
+                )
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                clicked = clicked or bool(state.get("clicked"))
+                selected = bool(state.get("selected"))
+                if selected:
+                    self.log("[CGV] 결제수단 N pay 선택 완료", "info")
+                    return True
+            try:
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        self.log(
+            "CGV 결제수단 N pay를 선택했지만 선택 상태를 확인하지 못했습니다."
+            if clicked
+            else "CGV 결제수단에서 N pay 버튼을 찾지 못했습니다.",
+            "warning",
+        )
+        return False
+
+    def _accept_cgv_payment_terms(self, page) -> bool:
+        clicked = False
+        deadline = time.monotonic() + self.NPAY_CONTROL_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            try:
+                state = page.evaluate(
+                    r"""allowClick => {
+                      const checkbox = document.querySelector('input#chkAll[type="checkbox"]');
+                      if (!checkbox) return {found: false, checked: false, clicked: false};
+                      if (checkbox.checked) return {found: true, checked: true, clicked: false};
+                      if (!allowClick || checkbox.disabled) {
+                        return {found: true, checked: false, clicked: false};
+                      }
+                      const label = document.querySelector('label[for="chkAll"]');
+                      (label || checkbox).click();
+                      return {found: true, checked: false, clicked: true};
+                    }""",
+                    not clicked,
+                )
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                clicked = clicked or bool(state.get("clicked"))
+                if state.get("checked"):
+                    self.log("[CGV] 필수 약관 전체 동의 완료", "info")
+                    return True
+            try:
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        self.log(
+            "CGV 필수 약관 전체 동의 상태를 확인하지 못했습니다.",
+            "warning",
+        )
+        return False
+
+    def _find_naver_payment_page(self, page):
+        try:
+            context = page.context
+        except Exception:
+            context = None
+        deadline = time.monotonic() + self.NPAY_PAGE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            pages = []
+            if context is not None:
+                try:
+                    pages.extend(list(context.pages))
+                except Exception:
+                    pass
+            if page not in pages:
+                pages.append(page)
+            for candidate in reversed(pages):
+                try:
+                    if candidate.is_closed():
+                        continue
+                except Exception:
+                    pass
+                if self._is_naver_payment_url(self._safe_page_url(candidate)):
+                    try:
+                        candidate.bring_to_front()
+                        candidate.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    return candidate
+            try:
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        return None
+
+    def _open_naver_payment_page(self, page):
+        self.log("[CGV] N pay 약관 확인 완료 · 네이버페이 페이지 호출 중...", "info")
+        clicked, _text = self._wait_and_click_payment_button(
+            page,
+            self.NPAY_CONTROL_TIMEOUT_SECONDS,
+        )
+        if not clicked:
+            self.log(
+                "CGV 결제수단 화면의 두 번째 '결제하기' 버튼이 비활성화됐거나 보이지 않습니다.",
+                "warning",
+            )
+            return None
+        naver_page = self._find_naver_payment_page(page)
+        if naver_page is None:
+            self.log(
+                "네이버페이 페이지 전환을 확인하지 못했습니다. 예매 성공으로 처리하지 않습니다.",
+                "warning",
+            )
+            return None
+        self.log("[CGV] 네이버페이 페이지 로드 완료", "info")
+        return naver_page
+
+    @staticmethod
+    def _naver_payment_button_state(page) -> dict[str, Any]:
+        try:
+            result = page.evaluate(
+                r"""() => {
+                  const clean = value => (value || '').replace(/\s+/g, '');
+                  const visible = node => {
+                    if (!node) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                           rect.width > 0 && rect.height > 0;
+                  };
+                  const pattern = /^(?:[\d,]+원)?(?:동의하고)?결제하기$/;
+                  const buttons = Array.from(document.querySelectorAll('button'))
+                    .filter(button => visible(button) && pattern.test(clean(button.innerText)));
+                  const button = buttons[buttons.length - 1];
+                  if (!button) return {found: false, enabled: false, text: ''};
+                  return {
+                    found: true,
+                    enabled: !button.disabled && button.getAttribute('aria-disabled') !== 'true',
+                    text: clean(button.innerText),
+                  };
+                }"""
+            )
+        except Exception:
+            return {"found": False, "enabled": False, "text": ""}
+        return result if isinstance(result, dict) else {
+            "found": False,
+            "enabled": False,
+            "text": "",
+        }
+
+    @staticmethod
+    def _select_first_naver_card(page) -> str:
+        try:
+            return str(
+                page.evaluate(
+                    r"""() => {
+                      const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+                      const visible = node => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                               rect.width > 0 && rect.height > 0;
+                      };
+                      const headings = Array.from(document.querySelectorAll('strong'))
+                        .filter(node => visible(node) && clean(node.innerText) === '카드');
+                      for (const heading of headings) {
+                        let sibling = heading.nextElementSibling;
+                        while (sibling) {
+                          if (sibling.matches('strong') && clean(sibling.innerText) === '계좌') break;
+                          const buttons = Array.from(sibling.querySelectorAll('button'))
+                            .filter(button => visible(button) &&
+                              !clean(button.innerText).includes('점검중'));
+                          if (buttons.length) {
+                            const target = buttons[0];
+                            const label = clean(target.innerText);
+                            target.click();
+                            return label || '저장 카드';
+                          }
+                          sibling = sibling.nextElementSibling;
+                        }
+                      }
+                      const dialog = Array.from(document.querySelectorAll('[role="dialog"], section, div'))
+                        .find(node => visible(node) &&
+                          clean(node.innerText).includes('결제수단 전체보기'));
+                      if (dialog && !headings.length) {
+                        const candidates = Array.from(dialog.querySelectorAll('li button'))
+                          .filter(button => {
+                            const text = clean(button.innerText);
+                            const classText = Array.from(button.querySelectorAll('[class]'))
+                              .map(node => node.className || '').join(' ').toLowerCase();
+                            const hasCardMark = !!button.querySelector('img[alt$=" 로고"]') ||
+                              /(^|[_-])card([_-]|$)/.test(classText);
+                            return visible(button) && !text.includes('추가하기') &&
+                              !text.includes('점검중') && hasCardMark;
+                          });
+                        if (candidates.length) {
+                          const target = candidates[0];
+                          const label = clean(target.innerText);
+                          target.click();
+                          return label || '저장 카드';
+                        }
+                      }
+                      const allButtons = Array.from(document.querySelectorAll('button'));
+                      const fullView = allButtons.find(button =>
+                        visible(button) && clean(button.innerText) === '결제수단 전체보기'
+                      );
+                      if (fullView) {
+                        fullView.click();
+                        return '__opened__';
+                      }
+                      return '';
+                    }"""
+                )
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def _prepare_naver_card(self, page) -> bool:
+        deadline = time.monotonic() + self.NPAY_CONTROL_TIMEOUT_SECONDS
+        opened_card_list = False
+        selected_card = ""
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            state = self._naver_payment_button_state(page)
+            if selected_card and state.get("found") and state.get("enabled"):
+                self.log(
+                    f"[CGV] 네이버페이 저장 카드 선택 완료: {selected_card}",
+                    "info",
+                )
                 return True
+            selection = self._select_first_naver_card(page)
+            if selection == "__opened__":
+                opened_card_list = True
+            elif selection:
+                selected_card = selection
+            elif (
+                not opened_card_list
+                and state.get("found")
+                and state.get("enabled")
+            ):
+                self.log(
+                    "[CGV] 네이버페이의 저장된 기본 카드 결제수단을 확인했습니다.",
+                    "info",
+                )
+                return True
+            try:
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        detail = (
+            "사용 가능한 저장 카드를 선택하지 못했습니다."
+            if opened_card_list
+            else "네이버페이 결제 UI 또는 활성 결제 버튼을 확인하지 못했습니다."
+        )
+        self.log(f"{detail} 브라우저에서 직접 결제수단을 확인해주세요.", "warning")
+        return False
 
-            naver_pay_page.wait_for_load_state("domcontentloaded", timeout=15000)
-            self.log("[CGV] 네이버페이 결제창 로드 완료", "info")
+    def _click_naver_final_payment(self, page) -> bool:
+        clicked, text = self._wait_and_click_payment_button(
+            page,
+            self.NPAY_CONTROL_TIMEOUT_SECONDS,
+        )
+        if not clicked:
+            self.log(
+                "네이버페이의 마지막 '결제하기' 버튼을 찾지 못했습니다.",
+                "warning",
+            )
+            return False
+        self.log(f"[CGV] 네이버페이 마지막 '{text or '결제하기'}' 클릭 완료", "info")
+        return True
 
+    def _wait_for_cgv_payment_confirmation(self, cgv_page, naver_page) -> bool:
+        auth_reported = False
+        deadline = time.monotonic() + self.NPAY_COMPLETION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            pages = []
+            for base_page in (cgv_page, naver_page):
+                try:
+                    context_pages = list(base_page.context.pages)
+                except Exception:
+                    context_pages = []
+                pages.extend(context_pages)
+                if base_page not in pages:
+                    pages.append(base_page)
+            unique_pages = []
+            for candidate in pages:
+                if candidate not in unique_pages:
+                    unique_pages.append(candidate)
+            for candidate in reversed(unique_pages):
+                try:
+                    if candidate.is_closed():
+                        continue
+                except Exception:
+                    pass
+                url = self._safe_page_url(candidate)
+                try:
+                    body = candidate.locator("body").inner_text(timeout=1000)
+                except Exception:
+                    body = ""
+                try:
+                    parsed = urllib.parse.urlparse(url)
+                    host = (parsed.hostname or "").casefold()
+                    path = parsed.path.casefold()
+                except Exception:
+                    host = ""
+                    path = ""
+                success_by_url = host.endswith("cgv.co.kr") and (
+                    "/mpy/purchase/" in path or "/complete" in path
+                )
+                if success_by_url:
+                    self.log("[CGV] 네이버페이 결제 및 CGV 예매 완료 확인", "success")
+                    return True
+                if any(
+                    phrase in body
+                    for phrase in (
+                        "결제에 실패했습니다",
+                        "결제가 취소되었습니다",
+                        "결제를 취소했습니다",
+                        "결제 처리에 실패",
+                    )
+                ):
+                    self.log(
+                        "네이버페이에서 결제 실패 또는 취소 응답을 확인했습니다.",
+                        "warning",
+                    )
+                    return False
+                if not auth_reported and any(
+                    phrase in body
+                    for phrase in ("결제 비밀번호", "비밀번호 입력", "본인인증", "생체인증")
+                ):
+                    auth_reported = True
+                    self.log(
+                        "[CGV] 네이버페이 본인인증이 필요합니다. 열린 Chrome에서 인증하면 완료 상태를 계속 확인합니다.",
+                        "warning",
+                    )
+            try:
+                naver_page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+        self.log(
+            "네이버페이 결제 요청 후 CGV 예매 완료 화면을 확인하지 못했습니다. "
+            "예매 성공으로 처리하지 않으며 열린 브라우저에서 상태를 확인해주세요.",
+            "warning",
+        )
+        return False
+
+    def _proceed_naver_pay_checkout(self, page, developer_mode: bool = False) -> bool:
+        """Run the two CGV checkout steps, then drive the official Naver Pay page."""
+        try:
+            self.log("[CGV] 좌석 선점 완료 · 네이버페이 결제 흐름을 시작합니다.", "info")
+            if not self._advance_to_cgv_payment_methods(page):
+                return False
+            if not self._select_cgv_npay_method(page):
+                return False
+            if not self._accept_cgv_payment_terms(page):
+                return False
+            naver_pay_page = self._open_naver_payment_page(page)
+            if naver_pay_page is None:
+                return False
             if developer_mode:
                 self.log(
-                    "[개발자 모드] CGV 결제수단(N pay) 선택 및 약관 동의 후 네이버페이 결제창을 정상적으로 열었습니다.",
+                    "[개발자 모드] 네이버페이 페이지까지 정상 진입했습니다.",
                     "success",
                 )
                 self.log(
-                    "[개발자 모드] 실제 결제 승인 방지를 위해 네이버페이의 최종 '동의하고 결제하기' 버튼 클릭은 건너뜁니다.",
+                    "[개발자 모드] 실제 결제 방지를 위해 카드 선택과 마지막 '결제하기'는 실행하지 않습니다.",
                     "warning",
                 )
                 return True
-
-            naver_pay_page.wait_for_timeout(1000)
-            agree_candidates = [
-                naver_pay_page.get_by_text("동의하고 결제하기", exact=True).first,
-                naver_pay_page.locator("button:has-text('동의하고 결제하기')").first,
-                naver_pay_page.locator("button:has-text('결제하기')").last,
-            ]
-            clicked_agree = False
-            for btn in agree_candidates:
-                try:
-                    if btn.count() > 0 and btn.is_visible():
-                        btn.click(timeout=5000)
-                        clicked_agree = True
-                        break
-                except Exception:
-                    continue
-
-            if not clicked_agree:
-                self.log("네이버페이 결제 버튼을 찾지 못했습니다. 팝업창에서 직접 결제를 완료해주세요.", "warning")
-                return True
-
-            # 8. Check if initial payment succeeded or failed (e.g. insufficient funds)
-            naver_pay_page.wait_for_timeout(2500)
-            if naver_pay_page.is_closed():
-                self.log("[CGV] 🎉 네이버페이 기본 카드로 결제를 완료했습니다!", "success")
-                return True
-
-            # If popup is still open, check for decline / insufficient balance and fallback to Money / Bank account
-            try:
-                body_text = naver_pay_page.locator("body").inner_text(timeout=2000)
-            except Exception:
-                body_text = ""
-
-            has_error = any(
-                keyword in body_text
-                for keyword in ("부족", "잔액", "거절", "실패", "다른 결제", "한도", "오류")
-            )
-            if not naver_pay_page.is_closed():
-                self.log("[CGV] 1순위 카드 결제 미완료/잔액 부족 감지 · 2순위 네이버페이 머니/통장 결제로 자동 전환", "warning")
-                money_candidates = [
-                    naver_pay_page.locator("div, button, a").filter(has_text="머니 통장").last,
-                    naver_pay_page.locator("div, button, a").filter(has_text="네이버페이 머니").last,
-                    naver_pay_page.locator("div, button, a").filter(has_text="머니").last,
-                ]
-                for m_btn in money_candidates:
-                    try:
-                        if m_btn.count() > 0 and m_btn.is_visible():
-                            m_btn.click(timeout=2000)
-                            self.log("[CGV] 2순위 네이버페이 머니/통장 선택 완료", "info")
-                            break
-                    except Exception:
-                        continue
-
-                naver_pay_page.wait_for_timeout(500)
-                for btn in agree_candidates:
-                    try:
-                        if btn.count() > 0 and btn.is_visible():
-                            btn.click(timeout=5000)
-                            self.log("[CGV] 🎉 네이버페이 머니/통장으로 최종 결제를 재시도했습니다!", "success")
-                            return True
-                    except Exception:
-                        continue
-
-            return True
+            if not self._prepare_naver_card(naver_pay_page):
+                return False
+            if not self._click_naver_final_payment(naver_pay_page):
+                return False
+            return self._wait_for_cgv_payment_confirmation(page, naver_pay_page)
         except Exception as exc:
-            self.log(f"CGV 네이버페이 결제 진행 중 오류: {format_exception(exc)}", "warning")
+            self.log(
+                f"CGV 네이버페이 결제 진행 중 오류: {format_exception(exc)}",
+                "warning",
+            )
+            return False
+
+    def _report_checkout_outcome(
+        self,
+        *,
+        checkout_completed: bool,
+        developer_mode: bool,
+        site_no: str,
+        movie: str,
+    ) -> bool:
+        if not checkout_completed:
+            self.log(
+                "CGV 좌석은 임시선점했지만 결제 완료를 확인하지 못했습니다. "
+                "예매 성공으로 처리하지 않으며 열린 Chrome에서 결제를 확인해주세요.",
+                "warning",
+            )
+            return False
+        if developer_mode:
+            message = (
+                "개발자 테스트 모드: 네이버페이 페이지까지 정상 진입했습니다 "
+                "(최종 결제 미실행)."
+            )
+        else:
+            message = "CGV 네이버페이 결제 및 예매 완료를 확인했습니다."
+        result = BookingResult(
+            True,
+            message,
+            details={"site_no": site_no, "movie": movie},
+        )
+        if self.notify_success(result):
+            self.log(result.message, "success")
             return True
+        return False
 
     @staticmethod
     def _query_payload(schedule: dict[str, Any]) -> dict[str, Any]:
@@ -2605,18 +2994,16 @@ class CgvEngine(BaseEngine):
                         )
                 keep_open = True
                 if held:
-                    self._proceed_naver_pay_checkout(page, developer_mode=developer_mode)
-                    if developer_mode:
-                        msg = "개발자 테스트 모드: 네이버페이 결제창까지 정상 진입했습니다 (최종 결제 미실행)."
-                    else:
-                        msg = "CGV 좌석 선점 및 네이버페이 결제 진행을 완료했습니다."
-                    result = BookingResult(
-                        True,
-                        msg,
-                        details={"site_no": site_no, "movie": movie},
+                    checkout_completed = self._proceed_naver_pay_checkout(
+                        page,
+                        developer_mode=developer_mode,
                     )
-                    if self.notify_success(result):
-                        self.log(result.message, "success")
+                    self._report_checkout_outcome(
+                        checkout_completed=checkout_completed,
+                        developer_mode=developer_mode,
+                        site_no=site_no,
+                        movie=movie,
+                    )
         except Exception as exc:
             if not self.stop_event.is_set():
                 self.log(f"CGV 예약 흐름 오류: {format_exception(exc)}", "error")

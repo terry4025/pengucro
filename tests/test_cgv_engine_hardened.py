@@ -51,6 +51,32 @@ def test_checkout_uses_recovered_active_page(monkeypatch):
     assert used == [(recovered, True)]
 
 
+def test_checkout_rejects_closed_page_instead_of_reporting_success(monkeypatch):
+    class Browser:
+        def is_connected(self):
+            return True
+
+    class Context:
+        browser = Browser()
+
+    class Page:
+        context = Context()
+
+        def is_closed(self):
+            return True
+
+    monkeypatch.setattr(
+        BaseCgvEngine,
+        "_proceed_naver_pay_checkout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("closed pages must not reach the base checkout")
+        ),
+    )
+    engine = CgvEngine(lambda *_args: None)
+
+    assert engine._proceed_naver_pay_checkout(Page()) is False
+
+
 def test_schedule_poll_syncs_browser_and_context_handles(monkeypatch):
     class Browser:
         def is_connected(self):

@@ -153,12 +153,12 @@ class CgvEngine(BaseCgvEngine):
 
     def _proceed_naver_pay_checkout(self, page, developer_mode: bool = False) -> bool:
         target = self._current_page(page)
-        if target is None:
+        if not self._page_usable(target):
             self.log(
                 "CGV 결제 단계에서 사용할 브라우저 페이지가 닫혀 수동 확인이 필요합니다.",
                 "warning",
             )
-            return True
+            return False
         return super()._proceed_naver_pay_checkout(
             target, developer_mode=developer_mode
         )
