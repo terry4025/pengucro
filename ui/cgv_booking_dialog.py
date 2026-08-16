@@ -900,16 +900,44 @@ class CgvBookingDialog(ctk.CTkToplevel):
                 if _movie_name(item) == movie and self._auditorium_option(item)
             }
         )
-        initial_auditorium = str(self.initial.get("auditorium", ""))
-        is_initial_aud = (
-            self._is_restoring_initial
-            and bool(initial_auditorium)
-            and any(option.startswith(initial_auditorium) for option in options)
-        )
-        chosen = next(
-            (option for option in options if initial_auditorium and option.startswith(initial_auditorium)),
-            options[0] if options else "",
-        )
+        initial_auditorium = str(self.initial.get("auditorium", "")).strip()
+        initial_format = str(self.initial.get("format", "")).strip()
+
+        chosen = ""
+        is_initial_aud = False
+
+        if self._is_restoring_initial and initial_auditorium:
+            # 1. Exact match for auditorium + format if format is stored
+            if initial_format:
+                exact_target = f"{initial_auditorium} · {initial_format}"
+                if exact_target in options:
+                    chosen = exact_target
+                    is_initial_aud = True
+                else:
+                    matching = next(
+                        (
+                            opt for opt in options
+                            if opt.startswith(initial_auditorium) and initial_format in opt
+                        ),
+                        "",
+                    )
+                    if matching:
+                        chosen = matching
+                        is_initial_aud = True
+
+            # 2. Legacy fallback: auditorium-only match if format is missing or not matched
+            if not chosen:
+                matching = next(
+                    (opt for opt in options if opt.startswith(initial_auditorium)),
+                    "",
+                )
+                if matching:
+                    chosen = matching
+                    is_initial_aud = True
+
+        if not chosen:
+            chosen = options[0] if options else ""
+
         self.auditorium_menu.configure(values=options or ["표시할 상영관이 없습니다"])
         self.auditorium_var.set(chosen)
         self._auditorium_changed(chosen, user_initiated=not is_initial_aud)
