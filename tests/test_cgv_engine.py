@@ -174,6 +174,11 @@ def test_fast_monitor_uses_staggered_persistent_requests_with_safe_inflight_cap(
     assert "buildHoldPayload" in script
     assert "state.conflicts += 1" in script
     assert "resume()" in script
+    assert "claiming: false" in script
+    assert "state.claiming = true" in script
+    assert "state.claiming || state.hit" in script
+    assert "if (!state.running && !state.timer) return" not in script
+    assert argument["transactionTimeoutMs"] == engine.FAST_HOLD_TRANSACTION_TIMEOUT_MS
 
 
 def test_initial_modal_seat_response_is_reused_with_only_safe_auth_headers():
@@ -357,6 +362,69 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     assert fallback is False
     assert starts[0]["auth"]["custNo"] == "member"
     assert actions == ["monitor-with-direct-hold", "ui", "cache", "submit"]
+
+
+def test_watch_waits_for_inflight_direct_hold_instead_of_restarting_monitor():
+    payload = _seat_payload("H22", "H23")
+    starts = []
+    stops = []
+    snapshots = iter(
+        (
+            {
+                "running": False,
+                "claiming": True,
+                "phase": "pricing",
+                "completed": 0,
+                "lastStatus": 200,
+                "hit": None,
+            },
+            {
+                "running": False,
+                "claiming": False,
+                "phase": "held",
+                "completed": 1,
+                "lastStatus": 200,
+                "hit": {
+                    "data": payload,
+                    "elapsedMs": 0,
+                    "transaction": {
+                        "priceResponse": {"statusCode": 0},
+                        "holdResponse": {
+                            "statusCode": 0,
+                            "data": {"resultCode": "0", "movAtktNo": "hold-race-1"},
+                        },
+                        "holdPayload": {"seatPrmpDataList": []},
+                        "elapsedMs": 75,
+                    },
+                },
+            },
+        )
+    )
+
+    engine = CgvEngine(lambda *_args: None)
+    engine._browser_auth_data = lambda _page: {"custNo": "member"}
+    engine._start_fast_seat_monitor = (
+        lambda *_args, **_kwargs: starts.append(1) or True
+    )
+    engine._read_fast_seat_monitor = lambda _page: next(snapshots)
+    engine._stop_fast_seat_monitor = lambda _page: stops.append(1)
+    engine._select_api_seats_in_ui = lambda *_args: True
+    engine._install_cached_hold_responses = lambda *_args: None
+    engine._submit_seat_selection = lambda *_args: True
+    engine._restore_fetch = lambda *_args: None
+
+    held, fallback = engine._watch_and_hold_api(
+        object(),
+        {"siteNo": "0013", "scnYmd": "20260818", "scnsNo": "018", "scnSseq": "2"},
+        (CgvSeatGroup(("H22", "H23")),),
+        2,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (True, False)
+    assert starts == [1]
+    assert stops == [1]
 
 
 def test_direct_hold_result_never_reloads_browser_page():

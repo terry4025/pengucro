@@ -58,6 +58,7 @@ class CgvEngine(BaseEngine):
     FAST_SEAT_MAX_INFLIGHT = CGV_MAX_WORKERS
     FAST_MONITOR_READ_INTERVAL = 0.025
     FAST_MONITOR_MAX_CONSECUTIVE_ERRORS = 5
+    FAST_HOLD_TRANSACTION_TIMEOUT_MS = 8000
     HEDGE_DELAY_MS = 110
     MAX_BACKOFF = 15.0
     BROWSER_SEAT_RELOAD_INTERVAL = 1.5
@@ -802,12 +803,14 @@ class CgvEngine(BaseEngine):
             result = page.evaluate(
                 r"""
                 ({url, groups, concurrency, intervalMs, maxConsecutiveErrors,
-                  directHold, requestHeaders, initialPayload}) => {
+                  transactionTimeoutMs, directHold, requestHeaders, initialPayload}) => {
                   const previous = window.__pengucroFastSeatMonitor;
                   if (previous && typeof previous.stop === 'function') previous.stop();
 
                   const state = {
                     running: true,
+                    claiming: false,
+                    phase: 'monitoring',
                     attempts: 0,
                     completed: 0,
                     inflight: 0,
@@ -819,12 +822,22 @@ class CgvEngine(BaseEngine):
                     failureKind: '',
                     retryAfterMs: 0,
                     lastError: '',
+                    lastApiStatus: 0,
+                    lastApiMessage: '',
                     terminalError: '',
                     conflicts: 0,
                     hit: null,
                     initialPayloadUsed: false,
                     timer: null,
                     controllers: new Set(),
+                  };
+                  const recordApiFailure = (stage, payload, fallbackStatus = -1) => {
+                    const status = Number(payload && payload.statusCode != null
+                      ? payload.statusCode : fallbackStatus);
+                    const message = String(payload && payload.statusMessage || '');
+                    state.lastApiStatus = status;
+                    state.lastApiMessage = message;
+                    state.lastError = `${stage} API ${status}${message ? `: ${message}` : ''}`;
                   };
                   const normalize = value => String(value || '')
                     .toUpperCase().replace(/[\s_-]+/g, '');
@@ -906,15 +919,17 @@ class CgvEngine(BaseEngine):
                     return null;
                   };
                   state.stop = () => {
-                    if (!state.running && !state.timer) return;
                     state.running = false;
+                    state.claiming = false;
+                    state.phase = 'stopped';
                     if (state.timer) clearInterval(state.timer);
                     state.timer = null;
                     for (const controller of state.controllers) controller.abort();
                     state.controllers.clear();
                   };
                   const pauseOtherRequests = keep => {
-                    state.running = false;
+                    state.claiming = true;
+                    state.phase = 'claiming';
                     if (state.timer) clearInterval(state.timer);
                     state.timer = null;
                     for (const controller of state.controllers) {
@@ -1001,12 +1016,17 @@ class CgvEngine(BaseEngine):
                   let launch;
                   const resume = () => {
                     if (state.hit || state.blocked || state.unauthorized || state.terminalError) return;
+                    state.claiming = false;
+                    state.phase = 'monitoring';
                     state.running = true;
+                    if (state.timer) clearInterval(state.timer);
                     state.timer = setInterval(launch, intervalMs);
                     setTimeout(launch, 0);
                   };
                   launch = async () => {
-                    if (!state.running || state.inflight >= concurrency) return;
+                    if (!state.running || state.claiming || state.hit ||
+                        state.blocked || state.unauthorized || state.terminalError ||
+                        state.inflight >= concurrency) return;
                     const controller = new AbortController();
                     state.controllers.add(controller);
                     state.inflight += 1;
@@ -1043,20 +1063,22 @@ class CgvEngine(BaseEngine):
                       const apiStatus = Number(payload && payload.statusCode != null
                         ? payload.statusCode : 0);
                       if (apiStatus !== 0) {
+                        recordApiFailure('seat', payload, apiStatus);
                         if (apiStatus === -1001 || apiStatus === -1002) {
                           state.unauthorized = true;
                           state.failureKind = 'unauthorized';
-                          state.lastError = `seat API ${apiStatus}`;
                           state.stop();
                           return;
                         }
-                        throw new Error(`seat API ${apiStatus}`);
+                        throw new Error(state.lastError);
                       }
                       state.consecutiveErrors = 0;
                       const group = findGroup(payload);
                       if (group) {
                         pauseOtherRequests(controller);
                         if (!directHold) {
+                          state.claiming = false;
+                          state.phase = 'matched';
                           state.hit = {
                             data: payload,
                             group: group.labels,
@@ -1068,7 +1090,12 @@ class CgvEngine(BaseEngine):
                         const transactionStarted = performance.now();
                         const transactionController = new AbortController();
                         state.controllers.add(transactionController);
+                        const transactionTimer = setTimeout(
+                          () => transactionController.abort(),
+                          transactionTimeoutMs,
+                        );
                         try {
+                          state.phase = 'pricing';
                           const pricePayload = buildPricePayload(group.seats);
                           const price = await postJson(
                             directHold.priceUrl,
@@ -1080,6 +1107,7 @@ class CgvEngine(BaseEngine):
                             state.unauthorized = true;
                             state.failureKind = 'unauthorized';
                             state.lastError = `price HTTP ${price.status}`;
+                            state.stop();
                             return;
                           }
                           if (price.status === 403 || price.status === 429) {
@@ -1088,18 +1116,23 @@ class CgvEngine(BaseEngine):
                               ? 'forbidden' : 'rate-limited';
                             state.retryAfterMs = Number(price.retryAfterMs || 0);
                             state.lastError = `price HTTP ${price.status}`;
+                            state.stop();
                             return;
                           }
                           if (!price.data || typeof price.data !== 'object') {
                             state.terminalError = 'price-response-shape';
+                            state.lastError = 'price response is not JSON';
+                            state.stop();
                             return;
                           }
                           if (!price.ok || Number(price.data.statusCode ?? -1) !== 0) {
+                            recordApiFailure('price', price.data);
                             state.conflicts += 1;
                             resume();
                             return;
                           }
 
+                          state.phase = 'holding';
                           const holdPayload = buildHoldPayload(group.seats);
                           const hold = await postJson(
                             directHold.holdUrl,
@@ -1111,6 +1144,7 @@ class CgvEngine(BaseEngine):
                             state.unauthorized = true;
                             state.failureKind = 'unauthorized';
                             state.lastError = `hold HTTP ${hold.status}`;
+                            state.stop();
                             return;
                           }
                           if (hold.status === 403 || hold.status === 429) {
@@ -1119,10 +1153,13 @@ class CgvEngine(BaseEngine):
                               ? 'forbidden' : 'rate-limited';
                             state.retryAfterMs = Number(hold.retryAfterMs || 0);
                             state.lastError = `hold HTTP ${hold.status}`;
+                            state.stop();
                             return;
                           }
                           if (!hold.data || typeof hold.data !== 'object') {
                             state.terminalError = 'hold-response-shape';
+                            state.lastError = 'hold response is not JSON';
+                            state.stop();
                             return;
                           }
                           const holdData = hold.data.data || {};
@@ -1131,10 +1168,13 @@ class CgvEngine(BaseEngine):
                             && String(holdData.resultCode ?? '0') === '0'
                             && Boolean(holdData.movAtktNo);
                           if (!held) {
+                            recordApiFailure('hold', hold.data);
                             state.conflicts += 1;
                             resume();
                             return;
                           }
+                          state.claiming = false;
+                          state.phase = 'held';
                           state.hit = {
                             data: payload,
                             group: group.labels,
@@ -1146,8 +1186,24 @@ class CgvEngine(BaseEngine):
                               elapsedMs: performance.now() - transactionStarted,
                             },
                           };
+                        } catch (error) {
+                          if (!(error && error.name === 'AbortError' && !state.running)) {
+                            state.consecutiveErrors += 1;
+                            state.lastError = error && error.name === 'AbortError'
+                              ? 'seat hold transaction timeout'
+                              : `seat hold transaction: ${String(error || 'failed')}`;
+                            if (state.consecutiveErrors >= maxConsecutiveErrors) {
+                              state.stop();
+                            } else {
+                              resume();
+                            }
+                          }
                         } finally {
+                          clearTimeout(transactionTimer);
                           state.controllers.delete(transactionController);
+                          if (state.hit || state.blocked || state.unauthorized || state.terminalError) {
+                            state.claiming = false;
+                          }
                         }
                       }
                     } catch (error) {
@@ -1164,8 +1220,8 @@ class CgvEngine(BaseEngine):
                   };
 
                   window.__pengucroFastSeatMonitor = state;
-                  launch();
                   state.timer = setInterval(launch, intervalMs);
+                  launch();
                   return true;
                 }
                 """,
@@ -1175,6 +1231,7 @@ class CgvEngine(BaseEngine):
                     "concurrency": max(1, min(int(concurrency), CGV_MAX_WORKERS)),
                     "intervalMs": interval,
                     "maxConsecutiveErrors": self.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS,
+                    "transactionTimeoutMs": self.FAST_HOLD_TRANSACTION_TIMEOUT_MS,
                     "directHold": direct_hold,
                     "requestHeaders": dict(request_headers or {}),
                     "initialPayload": initial_payload,
@@ -1194,6 +1251,8 @@ class CgvEngine(BaseEngine):
                   if (!state) return null;
                   return {
                     running: state.running,
+                    claiming: state.claiming,
+                    phase: state.phase,
                     attempts: state.attempts,
                     completed: state.completed,
                     inflight: state.inflight,
@@ -1205,6 +1264,8 @@ class CgvEngine(BaseEngine):
                     failureKind: state.failureKind,
                     retryAfterMs: state.retryAfterMs,
                     lastError: state.lastError,
+                    lastApiStatus: state.lastApiStatus,
+                    lastApiMessage: state.lastApiMessage,
                     terminalError: state.terminalError,
                     conflicts: state.conflicts,
                     initialPayloadUsed: state.initialPayloadUsed,
@@ -1300,7 +1361,17 @@ class CgvEngine(BaseEngine):
                             "선택한 CGV 좌석 묶음을 고속 API로 감시 중",
                         )
                         last_completed = completed
-                    if snapshot.get("hit") or not snapshot.get("running", False):
+                    terminal = (
+                        snapshot.get("hit")
+                        or snapshot.get("blocked")
+                        or snapshot.get("unauthorized")
+                        or snapshot.get("terminalError")
+                        or (
+                            not snapshot.get("running", False)
+                            and not snapshot.get("claiming", False)
+                        )
+                    )
+                    if terminal:
                         break
             finally:
                 self._stop_fast_seat_monitor(page)
@@ -1332,7 +1403,11 @@ class CgvEngine(BaseEngine):
                     self.silent_tick(f"CGV 좌석 API 연결 제한 · {backoff:.1f}초 후 재시도")
                 else:
                     backoff = min(self.MAX_BACKOFF, max(0.5, backoff * 1.5))
-                    self.silent_tick("CGV 고속 좌석 API 조회 오류")
+                    detail = str(snapshot.get("lastError", "") or "").strip()
+                    message = "CGV 고속 좌석 API 조회 오류"
+                    if detail:
+                        message += f" ({detail[:160]})"
+                    self.silent_tick(message)
                 self.stop_event.wait(backoff)
                 continue
 

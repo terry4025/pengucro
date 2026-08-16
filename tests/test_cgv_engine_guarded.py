@@ -166,6 +166,31 @@ def test_consecutive_fetch_errors_fall_back_instead_of_restarting_monitor(monkey
     assert any("이미 열린 브라우저 좌석 화면" in message for message in messages)
 
 
+def test_claim_in_progress_is_not_misclassified_as_stopped_fetch_errors(monkeypatch):
+    logs = []
+    engine = _make_engine(logs)
+    monkeypatch.setattr(
+        BaseCgvEngine,
+        "_read_fast_seat_monitor",
+        staticmethod(
+            lambda _page: {
+                "running": False,
+                "claiming": True,
+                "phase": "pricing",
+                "consecutiveErrors": engine.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS,
+                "terminalError": "",
+                "hit": None,
+            }
+        ),
+    )
+
+    snapshot = engine._read_fast_seat_monitor(_Page())
+
+    assert snapshot["claiming"] is True
+    assert snapshot.get("terminalError", "") == ""
+    assert engine._fast_monitor_fallback_reason == ""
+
+
 def test_missing_monitor_state_uses_safe_fallback(monkeypatch):
     logs = []
     engine = _make_engine(logs)

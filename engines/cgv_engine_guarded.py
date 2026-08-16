@@ -48,6 +48,7 @@ class CgvEngine(HardenedCgvEngine):
         blocked = bool(snapshot.get("blocked")) or forbidden or rate_limited
         stopped_by_fetch_errors = (
             not snapshot.get("running", False)
+            and not snapshot.get("claiming", False)
             and not snapshot.get("hit")
             and int(snapshot.get("consecutiveErrors", 0) or 0)
             >= self.FAST_MONITOR_MAX_CONSECUTIVE_ERRORS
