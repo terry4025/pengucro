@@ -956,20 +956,44 @@ class CgvEngine(BaseEngine):
 
             # 1. Click N pay button
             npay_candidates = [
-                page.locator("button, div[role='button'], a, div").filter(has_text="N pay").last,
-                page.locator("button, div[role='button'], a, div").filter(has_text="npay").last,
-                page.locator("img[alt*='npay'], img[alt*='N pay'], img[alt*='네이버페이']").first,
-                page.locator("button:has-text('N pay'), button:has-text('npay')").first,
+                page.locator("button, div[role='button'], a, div, label, span").filter(has_text="N pay"),
+                page.locator("button, div[role='button'], a, div, label, span").filter(has_text="npay"),
+                page.locator("img[alt*='npay'], img[alt*='N pay'], img[alt*='네이버페이']"),
+                page.locator("button:has-text('N pay'), button:has-text('npay')"),
             ]
             clicked_npay = False
             for loc in npay_candidates:
                 try:
-                    if loc.count() > 0 and loc.is_visible():
-                        loc.click(timeout=3000)
-                        clicked_npay = True
+                    for idx in range(loc.count()):
+                        cand = loc.nth(idx)
+                        if cand.is_visible():
+                            cand.click(force=True, timeout=2000)
+                            clicked_npay = True
+                            break
+                    if clicked_npay:
                         break
                 except Exception:
                     continue
+
+            # JavaScript fallback for N pay selection
+            if not clicked_npay:
+                try:
+                    clicked_npay = page.evaluate(
+                        r"""
+                        () => {
+                          const clean = s => (s || '').replace(/\s+/g, '').toLowerCase();
+                          const elements = Array.from(document.querySelectorAll('button, div[role="button"], a, label, span, div, p'));
+                          const target = elements.find(el => clean(el.textContent).includes('npay') || clean(el.textContent).includes('네이버페이'));
+                          if (target) {
+                            (target.closest('button, label, div[role="button"], a') || target).click();
+                            return true;
+                          }
+                          return false;
+                        }
+                        """
+                    )
+                except Exception:
+                    clicked_npay = False
 
             if clicked_npay:
                 self.log("[CGV] 결제수단 N pay 선택 완료", "info")
@@ -992,6 +1016,24 @@ class CgvEngine(BaseEngine):
                 except Exception:
                     continue
 
+            try:
+                page.evaluate(
+                    r"""
+                    () => {
+                      const clean = s => (s || '').replace(/\s+/g, '');
+                      const labels = Array.from(document.querySelectorAll('label, span, div, p'));
+                      const target = labels.find(el => clean(el.textContent).includes('전체동의') || clean(el.textContent).includes('약관전체동의') || clean(el.textContent).includes('모두동의'));
+                      if (target) {
+                        (target.closest('label') || target).click();
+                        return true;
+                      }
+                      return false;
+                    }
+                    """
+                )
+            except Exception:
+                pass
+
             page.wait_for_timeout(500)
 
             # 3. Click CGV '결제하기' button and capture Naver Pay popup
@@ -1003,7 +1045,19 @@ class CgvEngine(BaseEngine):
             naver_pay_page = None
             try:
                 with page.context.expect_page(timeout=15000) as popup_info:
-                    pay_btn.click(timeout=5000)
+                    if pay_btn.is_visible():
+                        pay_btn.click(force=True, timeout=5000)
+                    else:
+                        page.evaluate(
+                            r"""
+                            () => {
+                              const clean = s => (s || '').replace(/\s+/g, '');
+                              const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                              const target = buttons.reverse().find(b => clean(b.textContent) === '결제하기' && !b.disabled);
+                              if (target) target.click();
+                            }
+                            """
+                        )
                 naver_pay_page = popup_info.value
             except Exception:
                 for p in page.context.pages:
@@ -1290,6 +1344,94 @@ class CgvEngine(BaseEngine):
                 return group, {seat: available[seat] for seat in group.seats}
         return None
 
+    def _submit_seat_selection(self, page) -> bool:
+        """Click '선택완료' in the seat map modal and ensure the modal closes or transitions."""
+        for attempt in range(6):
+            # 1. Try JavaScript click on the exact active '선택완료' button inside modal
+            clicked = False
+            try:
+                clicked = page.evaluate(
+                    r"""
+                    () => {
+                      const clean = s => (s || '').replace(/\s+/g, '');
+                      const buttons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+                      const target = buttons.find(b => clean(b.textContent) === '선택완료' && !b.disabled);
+                      if (target) {
+                        target.scrollIntoView({block: 'center'});
+                        target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                        target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                        target.click();
+                        return true;
+                      }
+                      return false;
+                    }
+                    """
+                )
+            except Exception:
+                clicked = False
+
+            # 2. Try Playwright locator
+            if not clicked:
+                for loc in (
+                    page.locator("button:has-text('선택완료'), a:has-text('선택완료')"),
+                    page.get_by_text("선택완료", exact=True),
+                    page.get_by_text("선택 완료", exact=True),
+                ):
+                    try:
+                        for idx in range(loc.count()):
+                            btn = loc.nth(idx)
+                            if btn.is_visible():
+                                btn.click(force=True, timeout=1500)
+                                clicked = True
+                                break
+                        if clicked:
+                            break
+                    except Exception:
+                        continue
+
+            page.wait_for_timeout(800)
+
+            # Check if conflict alert dialog popped up
+            has_conflict = False
+            try:
+                has_conflict = page.evaluate(
+                    r"""
+                    () => {
+                      const text = (document.body.innerText || '');
+                      return text.includes('이미 선택된') || text.includes('다른 고객이') || text.includes('예매 중인 좌석');
+                    }
+                    """
+                )
+            except Exception:
+                has_conflict = False
+
+            if has_conflict:
+                self._click_visible_by_text(page, ("확인",))
+                return False
+
+            # Check if seat modal is closed (seat buttons are no longer present or payment elements appear)
+            modal_closed = False
+            try:
+                modal_closed = page.evaluate(
+                    r"""
+                    () => {
+                      const seatButtons = document.querySelectorAll('button[data-seatlocno]');
+                      const visibleSeats = Array.from(seatButtons).filter(b => b.offsetParent !== null);
+                      const hasPaySection = document.body.innerText.includes('결제수단') ||
+                                            document.body.innerText.includes('N pay') ||
+                                            document.body.innerText.includes('최종 결제금액');
+                      return visibleSeats.length === 0 || hasPaySection;
+                    }
+                    """
+                )
+            except Exception:
+                modal_closed = False
+
+            if modal_closed:
+                return True
+
+        return False
+
     def _select_and_hold_seats(
         self,
         page,
@@ -1311,27 +1453,17 @@ class CgvEngine(BaseEngine):
                         self.log(f"CGV 좌석 {seat} 선택 버튼을 누르지 못했습니다.", "warning")
                         return False
                 self.log(f"선택 좌석 확보 가능: {', '.join(group.seats)}", "success")
-                page.wait_for_timeout(300)
-                if not self._click_visible_by_text(page, ("선택완료", "선택 완료")):
-                    self.log("좌석 임시선점 진행 버튼을 찾지 못했습니다.", "error")
-                    return False
-                try:
-                    page.get_by_text("결제하기", exact=True).last.wait_for(
-                        state="visible", timeout=15000
-                    )
-                    return True
-                except Exception:
-                    # A seat can disappear between rendering and the atomic
-                    # seatTempPrmp call. Acknowledge CGV's normal conflict
-                    # dialog and continue the watch instead of reporting a
-                    # false success.
-                    self._click_visible_by_text(page, ("확인",))
-                    self.silent_tick("CGV 좌석 선점 경합 발생 · 다시 조회")
+                page.wait_for_timeout(400)
+                if not self._submit_seat_selection(page):
+                    self.silent_tick("CGV 좌석 선점 경합 발생 또는 모달 전환 재시도")
                     page.reload(wait_until="domcontentloaded", timeout=30000)
                     if not self._select_visitors(page, people):
                         return False
                     last_reload = time.monotonic()
                     continue
+
+                self.log("CGV 좌석 임시선점 완료 · 결제 페이지로 이동했습니다.", "success")
+                return True
 
             self.silent_tick("선택한 CGV 좌석 묶음이 아직 비어 있지 않습니다")
             now = time.monotonic()
