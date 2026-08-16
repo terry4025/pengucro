@@ -83,25 +83,34 @@ def _pid_alive(pid: int) -> bool:
         return False
     if pid == os.getpid():
         return True
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, int(pid))
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            # Access denied still proves that the process exists.
-            return int(kernel32.GetLastError()) == 5
-        except Exception:
-            return False
     try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
+        import psutil
+
+        return bool(psutil.pid_exists(int(pid)))
+    except Exception:
+        pass
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        synchronize = 0x00100000
+        query_limited = 0x1000
+        handle = kernel32.OpenProcess(synchronize | query_limited, False, int(pid))
+        if not handle:
+            return int(ctypes.get_last_error()) == 5
+        try:
+            return int(kernel32.WaitForSingleObject(handle, 0)) == 0x00000102
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
         return False
 
 

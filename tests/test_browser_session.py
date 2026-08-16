@@ -66,3 +66,14 @@ def test_chrome_launch_failure_includes_port_and_exception_type(tmp_path, monkey
     assert "포트 9444" in messages[-1][0]
     assert "TimeoutError" in messages[-1][0]
     assert messages[-1][1] == "warning"
+
+
+def test_pid_alive_returns_true_for_current_process():
+    assert browser_session._pid_alive(os.getpid()) is True
+    assert browser_session._pid_alive(0) is False
+    assert browser_session._pid_alive(-1) is False
+
+
+def test_pid_alive_handles_nonexistent_pid():
+    assert browser_session._pid_alive(4194300) is False
+
