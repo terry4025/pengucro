@@ -450,4 +450,18 @@ def test_preopen_idle_and_schedule_hint_intervals():
     assert _has_schedule_hint(movie_imax_hint, "오디세이", "IMAX관") is True
 
 
+def test_cgv_engine_detects_recoverable_browser_errors():
+    from engines.cgv_engine import CgvEngine
 
+    assert CgvEngine._is_recoverable_browser_error(
+        RuntimeError("TargetClosedError: Page.evaluate: Target page, context or browser has been closed")
+    ) is True
+    assert CgvEngine._is_recoverable_browser_error(
+        RuntimeError("Target page has been closed")
+    ) is True
+    assert CgvEngine._is_recoverable_browser_error(
+        RuntimeError("CDP disconnected")
+    ) is True
+    assert CgvEngine._is_recoverable_browser_error(
+        ValueError("Something else went wrong")
+    ) is False

@@ -130,6 +130,28 @@ class CgvEngine(BaseEngine):
         normalized = re.sub(r"\s+", "", text)
         return "비정상적으로CGV에접속" in normalized or "이용이제한" in normalized
 
+    @staticmethod
+    def _is_recoverable_browser_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(
+            err in msg
+            for err in (
+                "targetclosederror",
+                "target closed",
+                "page closed",
+                "browser closed",
+                "has been closed",
+                "cdp disconnected",
+                "connection closed",
+                "session closed",
+                "browser has been closed",
+                "context or browser has been closed",
+                "cannot navigate to invalid url",
+                "net::err_connection_refused",
+                "net::err_connection_reset",
+            )
+        )
+
     def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
         script = """
         async ({url, concurrency, hedgeDelayMs}) => {
@@ -1285,7 +1307,42 @@ class CgvEngine(BaseEngine):
                 schedule = None
                 error_backoff = 1.0
                 while not self.stop_event.is_set():
-                    result = self._race_schedule(page, schedule_url, concurrency)
+                    try:
+                        result = self._race_schedule(page, schedule_url, concurrency)
+                    except Exception as exc:
+                        if self.stop_event.is_set():
+                            break
+                        if self._is_recoverable_browser_error(exc) or (hasattr(page, "is_closed") and page.is_closed()):
+                            self.log(
+                                f"[CGV] 브라우저 연결 끊김 감지 ({exc.__class__.__name__}) · 자동 재연결 시도 중...",
+                                "warning",
+                            )
+                            try:
+                                if not browser.is_connected():
+                                    chrome = browser_session.start_isolated(log=self.log) or chrome
+                                    browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
+                                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                                page = next(
+                                    (item for item in context.pages if not item.is_closed() and "cgv.co.kr" in item.url),
+                                    None,
+                                )
+                                page = page or context.new_page()
+                                page.on("dialog", lambda dialog: dialog.accept())
+                                page.goto(
+                                    self._cinema_url(site_no, site_name),
+                                    wait_until="domcontentloaded",
+                                    timeout=30000,
+                                )
+                                self.log("[CGV] 브라우저 재연결 성공 · 미오픈 감시를 계속합니다.", "success")
+                                continue
+                            except Exception as rec_err:
+                                self.log(
+                                    f"[CGV] 브라우저 재연결 대기 중... ({format_exception(rec_err)})",
+                                    "warning",
+                                )
+                                self.stop_event.wait(3.0)
+                                continue
+                        raise
                     status = int(result.get("status", 0) or 0)
                     elapsed = float(result.get("elapsedMs", 0.0) or 0.0)
                     if result.get("ok"):
