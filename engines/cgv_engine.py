@@ -1037,16 +1037,62 @@ class CgvEngine(BaseEngine):
                 naver_pay_page.locator("button:has-text('동의하고 결제하기')").first,
                 naver_pay_page.locator("button:has-text('결제하기')").last,
             ]
+            clicked_agree = False
             for btn in agree_candidates:
                 try:
                     if btn.count() > 0 and btn.is_visible():
                         btn.click(timeout=5000)
-                        self.log("[CGV] 🎉 네이버페이 최종 '동의하고 결제하기'를 완료했습니다!", "success")
-                        return True
+                        clicked_agree = True
+                        break
                 except Exception:
                     continue
 
-            self.log("네이버페이 결제 버튼을 찾지 못했습니다. 팝업창에서 직접 결제를 완료해주세요.", "warning")
+            if not clicked_agree:
+                self.log("네이버페이 결제 버튼을 찾지 못했습니다. 팝업창에서 직접 결제를 완료해주세요.", "warning")
+                return True
+
+            # 8. Check if initial payment succeeded or failed (e.g. insufficient funds)
+            naver_pay_page.wait_for_timeout(2500)
+            if naver_pay_page.is_closed():
+                self.log("[CGV] 🎉 네이버페이 기본 카드로 결제를 완료했습니다!", "success")
+                return True
+
+            # If popup is still open, check for decline / insufficient balance and fallback to Money / Bank account
+            try:
+                body_text = naver_pay_page.locator("body").inner_text(timeout=2000)
+            except Exception:
+                body_text = ""
+
+            has_error = any(
+                keyword in body_text
+                for keyword in ("부족", "잔액", "거절", "실패", "다른 결제", "한도", "오류")
+            )
+            if not naver_pay_page.is_closed():
+                self.log("[CGV] 1순위 카드 결제 미완료/잔액 부족 감지 · 2순위 네이버페이 머니/통장 결제로 자동 전환", "warning")
+                money_candidates = [
+                    naver_pay_page.locator("div, button, a").filter(has_text="머니 통장").last,
+                    naver_pay_page.locator("div, button, a").filter(has_text="네이버페이 머니").last,
+                    naver_pay_page.locator("div, button, a").filter(has_text="머니").last,
+                ]
+                for m_btn in money_candidates:
+                    try:
+                        if m_btn.count() > 0 and m_btn.is_visible():
+                            m_btn.click(timeout=2000)
+                            self.log("[CGV] 2순위 네이버페이 머니/통장 선택 완료", "info")
+                            break
+                    except Exception:
+                        continue
+
+                naver_pay_page.wait_for_timeout(500)
+                for btn in agree_candidates:
+                    try:
+                        if btn.count() > 0 and btn.is_visible():
+                            btn.click(timeout=5000)
+                            self.log("[CGV] 🎉 네이버페이 머니/통장으로 최종 결제를 재시도했습니다!", "success")
+                            return True
+                    except Exception:
+                        continue
+
             return True
         except Exception as exc:
             self.log(f"CGV 네이버페이 결제 진행 중 오류: {format_exception(exc)}", "warning")
