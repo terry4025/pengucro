@@ -1196,6 +1196,19 @@ class ReservationForm(ctk.CTkFrame):
             on_select=self._set_cgv_selection,
         )
 
+    @staticmethod
+    def _set_entry_text_safely(entry, text: str) -> None:
+        try:
+            prev_state = entry.cget("state")
+        except Exception:
+            prev_state = getattr(entry, "config", {}).get("state", "normal")
+        if prev_state == "disabled":
+            entry.configure(state="normal")
+        entry.delete(0, "end")
+        entry.insert(0, str(text))
+        if prev_state == "disabled":
+            entry.configure(state="disabled")
+
     def _set_cgv_selection(self, selection):
         self.cgv_selection = dict(selection or {})
         date_value = str(self.cgv_selection.get("date", ""))
@@ -1204,14 +1217,11 @@ class ReservationForm(ctk.CTkFrame):
         site_name = str(self.cgv_selection.get("site_name", ""))
         movie_name = str(self.cgv_selection.get("movie", ""))
         if date_value:
-            self.date_entry.delete(0, "end")
-            self.date_entry.insert(0, date_value)
+            ReservationForm._set_entry_text_safely(self.date_entry, date_value)
         if time_value:
-            self.time_entry.delete(0, "end")
-            self.time_entry.insert(0, time_value)
+            ReservationForm._set_entry_text_safely(self.time_entry, time_value)
         if people_value:
-            self.people_entry.delete(0, "end")
-            self.people_entry.insert(0, people_value)
+            ReservationForm._set_entry_text_safely(self.people_entry, people_value)
         if site_name:
             self.branch_var.set(site_name)
         if movie_name:
@@ -1653,10 +1663,32 @@ class ReservationForm(ctk.CTkFrame):
             self.phone_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
             self.phone_label.configure(text_color=theme.TEXT_MUTE)
             if is_cgv:
+                self.branch_dropdown.configure(state="disabled")
+                self.branch_label.configure(text_color=theme.TEXT_DISABLED)
+                self.theme_dropdown.configure(state="disabled")
+                self.theme_label.configure(text_color=theme.TEXT_DISABLED)
+                self.date_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.date_label.configure(text_color=theme.TEXT_DISABLED)
+                self.date_picker_btn.configure(state="disabled")
+                self.time_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.time_label.configure(text_color=theme.TEXT_DISABLED)
+                self.time_picker_btn.configure(state="disabled")
+                self.people_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.people_label.configure(text_color=theme.TEXT_DISABLED)
                 self.name_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
                 self.name_label.configure(text_color=theme.TEXT_DISABLED)
                 self.phone_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
                 self.phone_label.configure(text_color=theme.TEXT_DISABLED)
+                self.custom_theme_checkbox.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.theme_pk_entry.configure(state="disabled", text_color=theme.TEXT_DISABLED)
+                self.cgv_selector_button.configure(state="normal")
+            else:
+                self.date_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+                self.date_label.configure(text_color=theme.TEXT_MUTE)
+                self.date_picker_btn.configure(state="normal")
+                self.time_label.configure(text_color=theme.TEXT_MUTE)
+                self.people_entry.configure(state="normal", text_color=theme.TEXT_PRIMARY)
+                self.people_label.configure(text_color=theme.TEXT_MUTE)
             
             self._toggle_custom_theme()
             self.engine_mode_frame.grid(row=6, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
@@ -2196,13 +2228,28 @@ class ReservationForm(ctk.CTkFrame):
         yescaptcha_enabled = (
             keyescape_active and bool(self.yescaptcha_enabled_var.get())
         )
+        res_date = (
+            str(self.cgv_selection.get("date", "")).strip()
+            if is_cgv and self.cgv_selection.get("date")
+            else self.date_entry.get().strip()
+        )
+        res_people = (
+            str(self.cgv_selection.get("people", "")).strip()
+            if is_cgv and self.cgv_selection.get("people")
+            else self.people_entry.get().strip()
+        )
+        res_time = (
+            str(self.cgv_selection.get("show_time", "")).strip()
+            if is_cgv and self.cgv_selection.get("show_time")
+            else self.time_entry.get().strip()
+        )
         raw_values = {
             "branch": branch_id,
             "branchLabel": self.branch_var.get(),
-            "reservationDate": self.date_entry.get().strip(),
+            "reservationDate": res_date,
             "name": self.name_entry.get().strip(),
             "phone": self.phone_entry.get().strip(),
-            "people": self.people_entry.get().strip(),
+            "people": res_people,
             "themePK": theme_pk,
             "themeLabel": (
                 theme_pk
@@ -2211,7 +2258,7 @@ class ReservationForm(ctk.CTkFrame):
                 if not self.custom_theme_checkbox.get()
                 else f"직접 입력 ({theme_pk})"
             ),
-            "reservationTime": self.time_entry.get().strip(),
+            "reservationTime": res_time,
             "paymentType": "1",
             "policy": "true",
             # Read the checkbox itself, not only its backing Tk variable. This
@@ -2330,14 +2377,17 @@ class ReservationForm(ctk.CTkFrame):
         elif keyescape_active:
             threads = int(self.threads_slider.get())
             threads = max(1, min(threads, 3))
-        elif self._site_uses_dpsnnn():
-            threads = max(
-                1, min(int(self.threads_slider.get()), DPSNNN_MAX_WORKERS)
-            )
         elif is_cgv:
-            threads = max(1, min(int(self.threads_slider.get()), CGV_MAX_WORKERS))
+            slider = getattr(self, "threads_slider", None)
+            threads = max(1, min(int(slider.get() if slider else CGV_MAX_WORKERS), CGV_MAX_WORKERS))
+        elif getattr(self, "_site_uses_dpsnnn", lambda: False)():
+            slider = getattr(self, "threads_slider", None)
+            threads = max(
+                1, min(int(slider.get() if slider else DPSNNN_MAX_WORKERS), DPSNNN_MAX_WORKERS)
+            )
         else:
-            threads = max(1, min(int(self.threads_slider.get()), 50))
+            slider = getattr(self, "threads_slider", None)
+            threads = max(1, min(int(slider.get() if slider else 50), 50))
         return request, None, threads, not (is_naver or is_tripcom)
 
     def _format_phone(self, event=None):

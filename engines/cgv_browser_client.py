@@ -75,6 +75,53 @@ def _is_imax_text(text: str) -> bool:
     return "IMAX" in str(text or "").upper()
 
 
+def _is_imax_schedule(item: Mapping[str, Any]) -> bool:
+    fields = (
+        item.get("expoScnsNm"),
+        item.get("scnsNm"),
+        item.get("movkndDsplEnm"),
+        item.get("movkndDsplNm"),
+        item.get("hallNm"),
+    )
+    return any(_is_imax_text(str(f or "")) for f in fields)
+
+
+def _is_equivalent_screening(
+    item: Mapping[str, Any], exact_schedules: Iterable[Mapping[str, Any]]
+) -> bool:
+    """Check if an equivalent real schedule already exists on the target date.
+
+    A normal 2D screening on the target date must NOT suppress an IMAX historical
+    candidate. Only when an actual matching IMAX screening for that movie exists
+    on the target date should the equivalent historical template be suppressed.
+    """
+    item_movie = re.sub(r"\s+", "", _movie_name(item)).casefold()
+    if not item_movie:
+        return False
+    item_is_imax = _is_imax_schedule(item)
+    item_auditorium = re.sub(r"\s+", "", _auditorium_name(item)).casefold()
+    item_format = re.sub(r"\s+", "", _format_name(item)).casefold()
+
+    for exact in exact_schedules:
+        exact_movie = re.sub(r"\s+", "", _movie_name(exact)).casefold()
+        if not exact_movie or exact_movie != item_movie:
+            continue
+        exact_is_imax = _is_imax_schedule(exact)
+        if item_is_imax and not exact_is_imax:
+            # Target date only has a non-IMAX screening for this movie; keep IMAX candidate!
+            continue
+        if not item_is_imax and exact_is_imax:
+            continue
+        exact_auditorium = re.sub(r"\s+", "", _auditorium_name(exact)).casefold()
+        exact_format = re.sub(r"\s+", "", _format_name(exact)).casefold()
+        if item_auditorium and exact_auditorium and item_auditorium != exact_auditorium:
+            continue
+        if item_format and exact_format and item_format != exact_format:
+            continue
+        return True
+    return False
+
+
 def _schedule_identity(schedule: Mapping[str, Any]) -> tuple[str, str, str]:
     def compact(*keys: str) -> str:
         value = next((schedule.get(key) for key in keys if schedule.get(key)), "")
@@ -128,27 +175,27 @@ def _aggregate_historical_candidates(
         return ()
 
     target_digits = re.sub(r"\D", "", target_date)
-    exact_movies = {
-        re.sub(r"\s+", "", _movie_name(item)).casefold()
-        for item in exact_schedules
-        if _movie_name(item)
-    }
 
     # Group by (canonical_movie_name, auditorium_name, format_name)
     groups: dict[tuple[str, str, str], dict[str, list[str]]] = {}
     display_names: dict[tuple[str, str, str], tuple[str, str, str]] = {}
 
     for item in all_history_items:
+        # Strictly IMAX records only for candidate discovery
+        if not _is_imax_schedule(item):
+            continue
         movie = _movie_name(item)
         if not movie:
             continue
-        canon_movie = re.sub(r"\s+", "", movie).casefold()
-        if canon_movie in exact_movies:
+        if _is_equivalent_screening(item, exact_schedules):
             # Already published on target date! Real schedule has priority.
             continue
         auditorium = _auditorium_name(item)
         format_name = _format_name(item)
-        group_key = (canon_movie, auditorium, format_name)
+        canon_movie = re.sub(r"\s+", "", movie).casefold()
+        canon_auditorium = re.sub(r"\s+", "", auditorium).casefold()
+        canon_format = re.sub(r"\s+", "", format_name).casefold()
+        group_key = (canon_movie, canon_auditorium, canon_format)
         if group_key not in display_names:
             display_names[group_key] = (movie, auditorium, format_name)
         raw_time = normalize_time(item.get("scnsrtTm"))
@@ -416,8 +463,8 @@ class CgvBrowserClient:
                 page, f"/api/v1/content/site/searchAllRegionAndSite?{query}"
             )
             regions, sites = parse_site_catalog(payload, imax_only=imax_only)
-            if not sites and imax_only:
-                regions, sites = parse_site_catalog(payload, imax_only=False)
+            if imax_only and not sites:
+                raise CgvError("CGV IMAX 지점 정보를 확인하지 못했습니다.")
             if not regions or not sites:
                 raise CgvError("CGV 지역·지점 목록이 비어 있습니다.")
             return CgvCatalogSnapshot(regions, sites)

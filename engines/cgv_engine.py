@@ -21,10 +21,31 @@ from engines.cgv_client import (
     normalize_time,
     parse_seat_groups,
     parse_api_seats,
+    schedule_items,
     select_schedule,
 )
 from pengucro.diagnostics import format_exception
 from pengucro.models import BookingResult, parse_bool_flag
+
+
+def _has_schedule_hint(payload: Any, movie: str, auditorium: str) -> bool:
+    items = schedule_items(payload) if isinstance(payload, dict) else []
+    canon_movie = re.sub(r"\s+", "", movie).casefold()
+    canon_auditorium = re.sub(r"\s+", "", auditorium).casefold()
+    for item in items:
+        item_movie = re.sub(
+            r"\s+", "", str(item.get("expoProdNm") or item.get("movNm") or "")
+        ).casefold()
+        if canon_movie and canon_movie in item_movie:
+            return True
+        item_scns = re.sub(
+            r"\s+", "", str(item.get("expoScnsNm") or item.get("scnsNm") or "")
+        ).casefold()
+        if canon_auditorium and canon_auditorium in item_scns:
+            return True
+        if "imax" in canon_auditorium and "imax" in item_scns:
+            return True
+    return False
 
 
 class CgvEngine(BaseEngine):
@@ -37,6 +58,8 @@ class CgvEngine(BaseEngine):
     """
 
     MIN_POLL_INTERVAL = 0.12
+    PREOPEN_IDLE_INTERVAL = 20.0
+    SCHEDULE_HINT_INTERVAL = 2.0
     FAST_SEAT_LAUNCH_INTERVAL_MS = 120
     FAST_MONITOR_READ_INTERVAL = 0.025
     FAST_MONITOR_MAX_CONSECUTIVE_ERRORS = 5
@@ -1263,15 +1286,18 @@ class CgvEngine(BaseEngine):
 
                 schedule_url = self._schedule_url(site_no, screening_date)
                 concurrency = self.scan_concurrency
-                backoff = self.MIN_POLL_INTERVAL
+                current_state = ""
                 schedule = None
+                error_backoff = 1.0
                 while not self.stop_event.is_set():
                     result = self._race_schedule(page, schedule_url, concurrency)
                     status = int(result.get("status", 0) or 0)
                     elapsed = float(result.get("elapsedMs", 0.0) or 0.0)
                     if result.get("ok"):
+                        error_backoff = 1.0
+                        payload_data = result.get("data", {})
                         schedule = select_schedule(
-                            result.get("data", {}),
+                            payload_data,
                             movie=movie,
                             show_time=show_time,
                             auditorium=auditorium,
@@ -1285,32 +1311,46 @@ class CgvEngine(BaseEngine):
                                 else (show_time[:5] if show_time else "")
                             )
                             self.log(
-                                f"CGV 회차 감지 · {movie} · {time_label} · {elapsed:.0f}ms",
+                                f"[CGV] 실제 IMAX 회차 감지 · {movie} · {time_label} · {elapsed:.0f}ms · 고속 선점 모드 전환",
                                 "success",
                             )
                             break
-                        self.silent_tick("선택한 CGV 회차가 아직 열리지 않았습니다")
+
+                        has_hint = _has_schedule_hint(payload_data, movie, auditorium)
+                        if has_hint:
+                            if current_state != "SCHEDULE_HINT":
+                                current_state = "SCHEDULE_HINT"
+                                self.log("[CGV] 목표 영화 선공개 감지 · 감시 간격 단축 (2초)", "warning")
+                            self.silent_tick("목표 영화/상영관 선공개 감지 · 오픈 대기 중")
+                            poll_interval = self.SCHEDULE_HINT_INTERVAL
+                        else:
+                            if current_state != "PREOPEN_IDLE":
+                                current_state = "PREOPEN_IDLE"
+                                self.log("[CGV] 미오픈 대기 · 20초 간격으로 시간표 확인", "info")
+                            self.silent_tick("선택한 CGV 회차가 아직 열리지 않았습니다 (미오픈 대기)")
+                            poll_interval = self.PREOPEN_IDLE_INTERVAL
+
                         if elapsed > 2500 and concurrency > 1:
                             concurrency -= 1
                             self.log(
                                 f"CGV 응답 지연이 커 동시 조회를 {concurrency}개로 자동 감속합니다.",
                                 "warning",
                             )
-                        backoff = self.MIN_POLL_INTERVAL
+                        self.stop_event.wait(poll_interval)
                     else:
                         if status in {403, 429} or any(
                             int(value or 0) in {403, 429} for value in result.get("statuses", [])
                         ):
                             if concurrency > 1:
                                 concurrency = 1
-                            backoff = min(self.MAX_BACKOFF, max(3.0, backoff * 2))
+                            error_backoff = min(self.MAX_BACKOFF, max(3.0, error_backoff * 2))
                             self.silent_tick(
-                                f"CGV 연결 제한({status or '응답 없음'}) · {backoff:.1f}초 후 재시도"
+                                f"CGV 연결 제한({status or '응답 없음'}) · {error_backoff:.1f}초 후 재시도"
                             )
                         else:
-                            backoff = min(self.MAX_BACKOFF, max(1.0, backoff * 1.5))
+                            error_backoff = min(self.MAX_BACKOFF, max(1.0, error_backoff * 1.5))
                             self.silent_tick("CGV 회차 조회 통신 오류")
-                    self.stop_event.wait(backoff)
+                        self.stop_event.wait(error_backoff)
 
                 if self.stop_event.is_set() or not schedule:
                     return

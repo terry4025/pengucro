@@ -376,3 +376,60 @@ def test_historical_identifiers_never_leak_into_target_booking():
     assert chosen["scnsNo"] == "002"
     assert chosen["scnSseq"] == "1"
 
+
+def test_preopen_idle_and_schedule_hint_intervals():
+    from engines.cgv_engine import CgvEngine, _has_schedule_hint
+
+    assert CgvEngine.PREOPEN_IDLE_INTERVAL == 20.0
+    assert CgvEngine.SCHEDULE_HINT_INTERVAL == 2.0
+    assert CgvEngine.MIN_POLL_INTERVAL == 0.12
+
+    # Unrelated movie on target date -> no hint (PREOPEN_IDLE)
+    unrelated_payload = {
+        "data": [
+            {
+                "siteNo": "0013",
+                "scnYmd": "20260826",
+                "scnsNo": "001",
+                "scnSseq": "1",
+                "scnsrtTm": "1200",
+                "movNm": "전혀 다른 영화",
+                "expoScnsNm": "2관",
+            }
+        ]
+    }
+    assert _has_schedule_hint(unrelated_payload, "오디세이", "IMAX관") is False
+
+    # Target movie exists on target date (even in 2D) -> hint (SCHEDULE_HINT)
+    movie_hint_payload = {
+        "data": [
+            {
+                "siteNo": "0013",
+                "scnYmd": "20260826",
+                "scnsNo": "001",
+                "scnSseq": "1",
+                "scnsrtTm": "1200",
+                "movNm": "오디세이",
+                "expoScnsNm": "2관",
+            }
+        ]
+    }
+    assert _has_schedule_hint(movie_hint_payload, "오디세이", "IMAX관") is True
+
+    # IMAX auditorium appears on target date -> hint
+    imax_hint_payload = {
+        "data": [
+            {
+                "siteNo": "0013",
+                "scnYmd": "20260826",
+                "scnsNo": "001",
+                "scnSseq": "1",
+                "scnsrtTm": "1200",
+                "movNm": "영화 B",
+                "expoScnsNm": "IMAX관",
+            }
+        ]
+    }
+    assert _has_schedule_hint(imax_hint_payload, "오디세이", "IMAX관") is True
+
+

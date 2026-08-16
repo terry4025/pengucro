@@ -86,8 +86,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
             group.seats
             for group in parse_seat_groups(str(self.initial.get("seats", "")), self.people)
         ]
+        self._task_progress = None
         self._task_result = None
         self._task_done = None
+        self._pending_task = None
 
         self.title("CGV IMAX 예매 대상 선택")
         self.geometry("1060x720")
@@ -581,9 +583,9 @@ class CgvBookingDialog(ctk.CTkToplevel):
             pass
 
     def _open_calendar_picker(self) -> None:
-        from ui.reservation_form import CalendarDialog
+        from ui.reservation_form import DatePickerDialog
 
-        CalendarDialog(self, self.reservation_date, self._change_date)
+        DatePickerDialog(self, self.reservation_date, self._change_date)
 
     def _date_entry_committed(self) -> None:
         raw = self.date_entry.get().strip()
@@ -673,6 +675,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
 
     def _start_task(self, status: str, func, done) -> None:
         if self._task_done is not None:
+            self._pending_task = (status, func, done)
+            self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
             return
         self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
         self._task_result = None
@@ -711,8 +715,13 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._task_done = None
         if error:
             self.status_label.configure(text=error, text_color=theme.TINT_ERROR_FG)
-            return
-        done(result)
+        else:
+            done(result)
+
+        if self._pending_task is not None:
+            next_status, next_func, next_done = self._pending_task
+            self._pending_task = None
+            self._start_task(next_status, next_func, next_done)
 
     def _catalog_loaded(self, snapshot) -> None:
         self.regions = snapshot.regions

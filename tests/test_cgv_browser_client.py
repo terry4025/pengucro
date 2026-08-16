@@ -315,3 +315,95 @@ def test_booking_dialog_uses_recent_layout_when_target_date_button_is_not_open()
         )
     ) == reference
 
+
+def test_target_odyssey_2d_does_not_suppress_historical_odyssey_imax():
+    target = datetime.now().date() + timedelta(days=4)
+    reference = target - timedelta(days=1)
+
+    target_2d_odyssey = {
+        "expoProdNm": "오디세이",
+        "expoScnsNm": "2관",
+        "movkndDsplEnm": "2D 일반",
+        "scnYmd": target.strftime("%Y%m%d"),
+        "scnsrtTm": "1900",
+        "frSeatCnt": 50,
+    }
+    historical_imax_odyssey = {
+        "expoProdNm": "오디세이",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnYmd": reference.strftime("%Y%m%d"),
+        "scnsrtTm": "1400",
+        "frSeatCnt": 100,
+    }
+
+    client = _ScheduleClient(
+        {
+            target.strftime("%Y%m%d"): (target_2d_odyssey,),
+            reference.strftime("%Y%m%d"): (historical_imax_odyssey,),
+        }
+    )
+
+    schedules, reference_date, reference_only = client.fetch_schedule_with_reference(
+        "0013", target.isoformat()
+    )
+
+    # Both target 2D and historical IMAX candidate should be available (IMAX candidate not suppressed!)
+    assert any(s["expoProdNm"] == "오디세이" and "IMAX" in s.get("expoScnsNm", "") for s in schedules)
+
+
+def test_historical_ordinary_2d_candidate_excluded_and_imax_included():
+    target = datetime.now().date() + timedelta(days=4)
+    reference = target - timedelta(days=1)
+
+    sched_2d = {
+        "expoProdNm": "일반영화",
+        "expoScnsNm": "1관",
+        "movkndDsplEnm": "2D 일반",
+        "scnYmd": reference.strftime("%Y%m%d"),
+        "scnsrtTm": "1500",
+    }
+    sched_imax = {
+        "expoProdNm": "아이맥스영화",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "scnYmd": reference.strftime("%Y%m%d"),
+        "scnsrtTm": "1730",
+    }
+
+    client = _ScheduleClient(
+        {
+            reference.strftime("%Y%m%d"): (sched_2d, sched_imax),
+        }
+    )
+
+    schedules, _, reference_only = client.fetch_schedule_with_reference(
+        "0013", target.isoformat()
+    )
+
+    movie_names = {s["expoProdNm"] for s in schedules}
+    assert "아이맥스영화" in movie_names
+    assert "일반영화" not in movie_names
+
+
+def test_empty_imax_site_catalog_raises_error_without_silent_fallback():
+    import pytest
+    from engines.cgv_client import CgvError
+    from engines.cgv_browser_client import CgvBrowserClient
+
+    client = CgvBrowserClient()
+    # Payload with regions and non-IMAX sites only (0 IMAX sites)
+    fake_payload = {
+        "statusCode": 0,
+        "data": {
+            "regionList": [{"regionCd": "01", "regionNm": "서울", "siteCnt": 1}],
+            "siteList": [{"siteNo": "9999", "siteNm": "일반영화관", "regionCd": "01"}],
+        },
+    }
+    client._with_page = lambda op: op(None)
+    client._fetch_json = lambda page, path: fake_payload
+
+    with pytest.raises(CgvError, match="CGV IMAX 지점 정보를 확인하지 못했습니다"):
+        client.fetch_catalog(imax_only=True)
+
+
