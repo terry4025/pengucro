@@ -86,6 +86,9 @@ class CgvBookingDialog(ctk.CTkToplevel):
             group.seats
             for group in parse_seat_groups(str(self.initial.get("seats", "")), self.people)
         ]
+        self._is_restoring_initial = bool(
+            self.initial.get("site_no") or self.initial.get("movie")
+        )
         self._task_progress = None
         self._task_result = None
         self._task_done = None
@@ -351,7 +354,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             schedule_panel,
             variable=self.auditorium_var,
             values=["상영관을 먼저 불러오세요"],
-            command=lambda _value: self._render_schedules(),
+            command=self._auditorium_changed,
             fg_color=theme.ELEVATED_COLOR,
             button_color=theme.ELEVATED_COLOR,
             button_hover_color=theme.CARD_COLOR,
@@ -599,6 +602,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
     def _change_date(self, new_date: str) -> None:
         if new_date == self.reservation_date:
             return
+        self._is_restoring_initial = False
         self.reservation_date = new_date
         self.date_entry.delete(0, "end")
         self.date_entry.insert(0, new_date)
@@ -608,6 +612,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.schedules = ()
         self.selected_schedule = None
         self.preferred_times.clear()
+        self.priority_groups.clear()
         self.seats = ()
         self.current_seats.clear()
         self.seat_recommendations = {}
@@ -738,10 +743,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         if initial_no:
             site = next((item for item in self.sites if item.site_no == initial_no), None)
             if site:
-                self._select_site(site)
+                self._select_site(site, user_initiated=False)
         elif self.sites:
             # Default to first IMAX site if none selected
-            self._select_site(self.sites[0])
+            self._select_site(self.sites[0], user_initiated=False)
 
     def _region_changed(self, value: str) -> None:
         self.selected_region = ""
@@ -773,7 +778,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             ctk.CTkButton(
                 self.site_list,
                 text=site.label,
-                command=lambda value=site: self._select_site(value),
+                command=lambda value=site: self._select_site(value, user_initiated=True),
                 anchor="w",
                 fg_color=theme.TINT_INFO_BG if selected else "transparent",
                 hover_color=theme.CARD_COLOR,
@@ -782,7 +787,11 @@ class CgvBookingDialog(ctk.CTkToplevel):
                 corner_radius=theme.ROUNDED_SM,
             ).pack(fill="x", pady=1)
 
-    def _select_site(self, site) -> None:
+    def _select_site(self, site, *, user_initiated: bool = True) -> None:
+        if user_initiated:
+            self._is_restoring_initial = False
+            self.preferred_times.clear()
+            self.priority_groups.clear()
         self.selected_site = site
         self.selected_schedule = None
         self.schedules = ()
@@ -822,10 +831,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         movies = sorted({_movie_name(item) for item in self.schedules if _movie_name(item)})
         self.movie_menu.configure(values=movies or ["표시할 영화가 없습니다"])
         initial_movie = str(self.initial.get("movie", ""))
-        self.movie_var.set(
-            initial_movie if initial_movie in movies else (movies[0] if movies else "")
-        )
-        self._movie_changed(self.movie_var.get())
+        is_initial_mov = self._is_restoring_initial and initial_movie in movies
+        chosen_movie = initial_movie if is_initial_mov else (movies[0] if movies else "")
+        self.movie_var.set(chosen_movie)
+        self._movie_changed(chosen_movie, user_initiated=not is_initial_mov)
 
         if self.reference_only:
             self.status_label.configure(
@@ -869,7 +878,20 @@ class CgvBookingDialog(ctk.CTkToplevel):
         format_text = _format_name(item)
         return f"{auditorium} · {format_text}" if format_text else auditorium
 
-    def _movie_changed(self, _value: str) -> None:
+    def _movie_changed(self, _value: str = "", *, user_initiated: bool = True) -> None:
+        if user_initiated:
+            self._is_restoring_initial = False
+            self.preferred_times.clear()
+            self.priority_groups.clear()
+            self.selected_schedule = None
+            self.seats = ()
+            self.current_seats.clear()
+            self.seat_recommendations = {}
+            self.auto_seat_var.set("명당 자동 선택")
+            self.auto_seat_menu.configure(values=["명당 자동 선택"], state="disabled")
+            self._render_seat_placeholder("회차를 선택한 뒤 실제 좌석도를 불러오세요.")
+            self._update_seat_guide()
+
         movie = self.movie_var.get()
         options = sorted(
             {
@@ -879,15 +901,39 @@ class CgvBookingDialog(ctk.CTkToplevel):
             }
         )
         initial_auditorium = str(self.initial.get("auditorium", ""))
+        is_initial_aud = (
+            self._is_restoring_initial
+            and bool(initial_auditorium)
+            and any(option.startswith(initial_auditorium) for option in options)
+        )
         chosen = next(
-            (option for option in options if option.startswith(initial_auditorium)),
+            (option for option in options if initial_auditorium and option.startswith(initial_auditorium)),
             options[0] if options else "",
         )
         self.auditorium_menu.configure(values=options or ["표시할 상영관이 없습니다"])
         self.auditorium_var.set(chosen)
+        self._auditorium_changed(chosen, user_initiated=not is_initial_aud)
+
+    def _auditorium_changed(self, _value: str = "", *, user_initiated: bool = True) -> None:
+        if user_initiated:
+            self._is_restoring_initial = False
+            self.preferred_times.clear()
+            self.priority_groups.clear()
+            self.selected_schedule = None
+            self.seats = ()
+            self.current_seats.clear()
+            self.seat_recommendations = {}
+            self.auto_seat_var.set("명당 자동 선택")
+            self.auto_seat_menu.configure(values=["명당 자동 선택"], state="disabled")
+            self._render_seat_placeholder("회차를 선택한 뒤 실제 좌석도를 불러오세요.")
+            self._update_seat_guide()
+
         self.selected_schedule = None
         self.load_seats_button.configure(state="disabled")
         self._render_schedules()
+        self._update_confirm_state()
+        if not user_initiated:
+            self._is_restoring_initial = False
 
     def _clear_preferred_times(self) -> None:
         self.preferred_times.clear()
@@ -1410,8 +1456,20 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_confirm_state()
 
     def _update_confirm_state(self) -> None:
+        movie = self.movie_var.get() if hasattr(self, "movie_var") else ""
+        auditorium = self.auditorium_var.get() if hasattr(self, "auditorium_var") else ""
+        has_valid_movie = bool(
+            movie
+            and movie not in ("영화를 먼저 불러오세요", "시간표를 불러오는 중...", "표시할 영화가 없습니다")
+        )
+        has_valid_auditorium = bool(
+            auditorium
+            and auditorium not in ("상영관을 먼저 불러오세요", "표시할 상영관이 없습니다")
+        )
         ready = bool(
             self.selected_site
+            and has_valid_movie
+            and has_valid_auditorium
             and (self.selected_schedule or self.preferred_times)
             and self.priority_groups
         )

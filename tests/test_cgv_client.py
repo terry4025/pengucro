@@ -382,3 +382,82 @@ def test_select_schedule_prioritizes_preferred_times_in_order():
     assert chosen3 is not None
     assert chosen3["scnsrtTm"] == "1000"
 
+
+def test_select_schedule_matches_explicit_formats_and_preferred_times():
+    payload = {
+        "data": [
+            {
+                "movNm": "오디세이",
+                "expoScnsNm": "IMAX관",
+                "movkndDsplEnm": "IMAX LASER 2D",
+                "scnsrtTm": "1400",
+                "scnsNo": "1",
+                "scnSseq": "1",
+            },
+            {
+                "movNm": "오디세이",
+                "expoScnsNm": "IMAX관",
+                "movkndDsplEnm": "IMAX 3D",
+                "scnsrtTm": "1400",
+                "scnsNo": "2",
+                "scnSseq": "2",
+            },
+            {
+                "movNm": "오디세이",
+                "expoScnsNm": "IMAX관",
+                "movkndDsplEnm": "IMAX 3D",
+                "scnsrtTm": "1730",
+                "scnsNo": "3",
+                "scnSseq": "3",
+            },
+        ]
+    }
+
+    # Test A: format = "IMAX LASER 2D" selects the 2D schedule at 14:00
+    chosen_2d = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX",
+        format_name="IMAX LASER 2D",
+        preferred_times=["14:00"],
+    )
+    assert chosen_2d is not None
+    assert chosen_2d["scnSseq"] == "1"
+    assert chosen_2d["movkndDsplEnm"] == "IMAX LASER 2D"
+
+    # Test B: format = "IMAX 3D" selects the 3D schedule at 14:00
+    chosen_3d = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX",
+        format_name="IMAX 3D",
+        preferred_times=["14:00"],
+    )
+    assert chosen_3d is not None
+    assert chosen_3d["scnSseq"] == "2"
+    assert chosen_3d["movkndDsplEnm"] == "IMAX 3D"
+
+    # Test C: format = "" (legacy) matches first matching by time
+    chosen_legacy = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX",
+        format_name="",
+        preferred_times=["14:00"],
+    )
+    assert chosen_legacy is not None
+
+    # Test D: preferred times with format filter: 17:30 (3D) -> 14:00 (2D) with format="IMAX LASER 2D"
+    chosen_pref = select_schedule(
+        payload,
+        movie="오디세이",
+        auditorium="IMAX",
+        format_name="IMAX LASER 2D",
+        preferred_times=["17:30", "14:00"],
+    )
+    # 17:30 only exists in 3D, so 14:00 2D should be selected
+    assert chosen_pref is not None
+    assert chosen_pref["scnsrtTm"] == "1400"
+    assert chosen_pref["scnSseq"] == "1"
+
+

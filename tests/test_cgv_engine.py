@@ -383,9 +383,10 @@ def test_preopen_idle_and_schedule_hint_intervals():
     assert CgvEngine.PREOPEN_IDLE_INTERVAL == 20.0
     assert CgvEngine.SCHEDULE_HINT_INTERVAL == 2.0
     assert CgvEngine.MIN_POLL_INTERVAL == 0.12
+    assert CgvEngine.HEDGE_DELAY_MS == 110
 
-    # Unrelated movie on target date -> no hint (PREOPEN_IDLE)
-    unrelated_payload = {
+    # Unrelated movie on target date in 2D -> no hint (PREOPEN_IDLE)
+    unrelated_2d = {
         "data": [
             {
                 "siteNo": "0013",
@@ -398,10 +399,26 @@ def test_preopen_idle_and_schedule_hint_intervals():
             }
         ]
     }
-    assert _has_schedule_hint(unrelated_payload, "오디세이", "IMAX관") is False
+    assert _has_schedule_hint(unrelated_2d, "오디세이", "IMAX관") is False
+
+    # Unrelated movie on target date in IMAX -> MUST NOT trigger hint (PREOPEN_IDLE)
+    unrelated_imax = {
+        "data": [
+            {
+                "siteNo": "0013",
+                "scnYmd": "20260826",
+                "scnsNo": "001",
+                "scnSseq": "1",
+                "scnsrtTm": "1200",
+                "movNm": "전혀 다른 영화",
+                "expoScnsNm": "IMAX관",
+            }
+        ]
+    }
+    assert _has_schedule_hint(unrelated_imax, "오디세이", "IMAX관") is False
 
     # Target movie exists on target date (even in 2D) -> hint (SCHEDULE_HINT)
-    movie_hint_payload = {
+    movie_2d_hint = {
         "data": [
             {
                 "siteNo": "0013",
@@ -414,10 +431,10 @@ def test_preopen_idle_and_schedule_hint_intervals():
             }
         ]
     }
-    assert _has_schedule_hint(movie_hint_payload, "오디세이", "IMAX관") is True
+    assert _has_schedule_hint(movie_2d_hint, "오디세이", "IMAX관") is True
 
-    # IMAX auditorium appears on target date -> hint
-    imax_hint_payload = {
+    # Target movie in IMAX -> hint (SCHEDULE_HINT)
+    movie_imax_hint = {
         "data": [
             {
                 "siteNo": "0013",
@@ -425,11 +442,12 @@ def test_preopen_idle_and_schedule_hint_intervals():
                 "scnsNo": "001",
                 "scnSseq": "1",
                 "scnsrtTm": "1200",
-                "movNm": "영화 B",
+                "movNm": "오디세이",
                 "expoScnsNm": "IMAX관",
             }
         ]
     }
-    assert _has_schedule_hint(imax_hint_payload, "오디세이", "IMAX관") is True
+    assert _has_schedule_hint(movie_imax_hint, "오디세이", "IMAX관") is True
+
 
 

@@ -839,9 +839,11 @@ def select_schedule(
     show_time: str = "",
     auditorium: str = "",
     preferred_times: Iterable[str] = (),
+    format_name: str = "",
 ) -> dict[str, Any] | None:
     movie_key = re.sub(r"\s+", "", movie).casefold()
     auditorium_key = re.sub(r"\s+", "", auditorium).casefold()
+    format_key = re.sub(r"\s+", "", format_name).casefold()
     raw_preferred = [normalize_time(t) for t in preferred_times if normalize_time(t)]
     if not raw_preferred and show_time:
         raw_preferred = [normalize_time(show_time)]
@@ -857,15 +859,24 @@ def select_schedule(
             for key in (
                 "expoScnsNm",
                 "scnsNm",
+            )
+        )
+        format_text = " ".join(
+            str(item.get(key, ""))
+            for key in (
                 "movkndDsplEnm",
                 "movkndDsplNm",
                 "sbtdivNm",
                 "videoAddexpCdNm",
+                "expoScnsNm",
+                "scnsNm",
             )
         )
         if movie_key and movie_key not in re.sub(r"\s+", "", movie_text).casefold():
             continue
-        if auditorium_key and auditorium_key not in re.sub(r"\s+", "", screen_text).casefold():
+        if auditorium_key and auditorium_key not in re.sub(r"\s+", "", screen_text).casefold() and auditorium_key not in re.sub(r"\s+", "", format_text).casefold():
+            continue
+        if format_key and format_key not in re.sub(r"\s+", "", format_text).casefold():
             continue
         if str(item.get("cntlYn", "N")).upper() == "Y":
             continue

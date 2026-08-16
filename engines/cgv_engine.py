@@ -28,22 +28,16 @@ from pengucro.diagnostics import format_exception
 from pengucro.models import BookingResult, parse_bool_flag
 
 
-def _has_schedule_hint(payload: Any, movie: str, auditorium: str) -> bool:
+def _has_schedule_hint(payload: Any, movie: str, auditorium: str = "") -> bool:
     items = schedule_items(payload) if isinstance(payload, dict) else []
     canon_movie = re.sub(r"\s+", "", movie).casefold()
-    canon_auditorium = re.sub(r"\s+", "", auditorium).casefold()
+    if not canon_movie:
+        return False
     for item in items:
         item_movie = re.sub(
             r"\s+", "", str(item.get("expoProdNm") or item.get("movNm") or "")
         ).casefold()
         if canon_movie and canon_movie in item_movie:
-            return True
-        item_scns = re.sub(
-            r"\s+", "", str(item.get("expoScnsNm") or item.get("scnsNm") or "")
-        ).casefold()
-        if canon_auditorium and canon_auditorium in item_scns:
-            return True
-        if "imax" in canon_auditorium and "imax" in item_scns:
             return True
     return False
 
@@ -1246,6 +1240,7 @@ class CgvEngine(BaseEngine):
         site_no = str(reservation_data.get("branch", "")).strip()
         movie = str(cgv.get("movie") or reservation_data.get("themePK", "")).strip()
         auditorium = str(cgv.get("auditorium", "")).strip()
+        format_name = str(cgv.get("format", "")).strip()
         show_time = str(reservation_data.get("reservationTime", ""))
         preferred_times = list(cgv.get("preferred_times") or ([show_time] if show_time else []))
         screening_date = str(reservation_data.get("reservationDate", ""))
@@ -1302,6 +1297,7 @@ class CgvEngine(BaseEngine):
                             show_time=show_time,
                             auditorium=auditorium,
                             preferred_times=preferred_times,
+                            format_name=format_name,
                         )
                         if schedule:
                             sched_time = normalize_time(schedule.get("scnsrtTm"))

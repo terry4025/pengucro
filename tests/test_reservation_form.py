@@ -11,6 +11,9 @@ class Value:
     def get(self):
         return self.value
 
+    def set(self, value):
+        self.value = value
+
 
 class Widget(Value):
     def __init__(self, value=0):
@@ -25,6 +28,12 @@ class Widget(Value):
 
     def set(self, value):
         self.value = value
+
+    def delete(self, *args, **kwargs):
+        pass
+
+    def insert(self, *args, **kwargs):
+        pass
 
     def grid(self, *args, **kwargs):
         pass
@@ -514,5 +523,203 @@ def test_cgv_selection_mirrors_authoritatively_into_reservation_data():
     assert request.people == 2
     assert request.reservation_time == "17:30:00"
     assert request.engine_metadata["cgv"]["preferred_times"] == ["17:30", "14:00"]
+
+
+def test_cgv_dialog_invalidation_rules_for_theater_date_movie_auditorium():
+    from ui.cgv_booking_dialog import CgvBookingDialog
+    from engines.cgv_client import CgvSite
+
+    dialog = SimpleNamespace(
+        selected_site=CgvSite("0013", "용산아이파크몰", "01"),
+        selected_schedule={"scnsrtTm": "1400"},
+        schedules=({"movNm": "오디세이", "expoScnsNm": "IMAX관"},),
+        preferred_times=["14:00", "17:30"],
+        priority_groups=[("H22", "H23")],
+        current_seats={"H22", "H23"},
+        seats=(),
+        seat_recommendations={"H22": None},
+        reservation_date="2026-08-26",
+        date_entry=Widget("2026-08-26"),
+        _request_generation=0,
+        _is_restoring_initial=False,
+        initial={},
+        movie_var=Value("오디세이"),
+        movie_menu=Widget(),
+        auditorium_var=Value("IMAX관 · IMAX LASER 2D"),
+        auditorium_menu=Widget(),
+        target_type_badge=Widget(),
+        status_label=Widget(),
+        auto_seat_var=Value("명당 자동 선택"),
+        auto_seat_menu=Widget(),
+        load_seats_button=Widget(),
+        confirm_button=Widget(),
+        site_search=Widget(""),
+        site_list=Widget(),
+        schedule_list=Widget(),
+        sites=(CgvSite("0013", "용산아이파크몰", "01"), CgvSite("0074", "왕십리", "01")),
+        selected_region="",
+        _start_task=lambda *args: None,
+        _render_sites=lambda: None,
+        _render_schedules=lambda: None,
+        _render_seat_placeholder=lambda _msg: None,
+        _update_seat_guide=lambda: None,
+        _update_confirm_state=lambda: CgvBookingDialog._update_confirm_state(dialog),
+    )
+
+    dialog._movie_changed = lambda val="", **kw: CgvBookingDialog._movie_changed(dialog, val, **kw)
+    dialog._auditorium_changed = lambda val="", **kw: CgvBookingDialog._auditorium_changed(dialog, val, **kw)
+    dialog._auditorium_option = CgvBookingDialog._auditorium_option
+    dialog._schedule_loaded = lambda res, **kw: CgvBookingDialog._schedule_loaded(dialog, res, **kw)
+    dialog._select_site = lambda site, **kw: CgvBookingDialog._select_site(dialog, site, **kw)
+
+    # 1. User changes Auditorium -> preferred_times, priority_groups, selected_schedule cleared
+    dialog._auditorium_changed("IMAX관 · IMAX 3D", user_initiated=True)
+    assert dialog.preferred_times == []
+    assert dialog.priority_groups == []
+    assert dialog.selected_schedule is None
+    assert dialog.confirm_button.config.get("state") == "disabled"
+
+    # Set state back
+    dialog.preferred_times = ["14:00"]
+    dialog.priority_groups = [("H22", "H23")]
+    dialog.selected_schedule = {"scnsrtTm": "1400"}
+    CgvBookingDialog._update_confirm_state(dialog)
+    assert dialog.confirm_button.config.get("state") == "normal"
+
+    # 2. User changes Movie -> preferred_times, priority_groups, selected_schedule cleared
+    dialog.movie_var.set("다른 영화")
+    dialog._movie_changed("다른 영화", user_initiated=True)
+    assert dialog.preferred_times == []
+    assert dialog.priority_groups == []
+    assert dialog.selected_schedule is None
+    assert dialog.confirm_button.config.get("state") == "disabled"
+
+    # Set state back
+    dialog.movie_var.set("오디세이")
+    dialog.auditorium_var.set("IMAX관 · IMAX LASER 2D")
+    dialog.preferred_times = ["14:00"]
+    dialog.priority_groups = [("H22", "H23")]
+    dialog.selected_schedule = {"scnsrtTm": "1400"}
+    CgvBookingDialog._update_confirm_state(dialog)
+    assert dialog.confirm_button.config.get("state") == "normal"
+
+    # 3. User changes Date -> preferred_times, priority_groups, selected_schedule cleared
+    CgvBookingDialog._change_date(dialog, "2026-08-27")
+    assert dialog.preferred_times == []
+    assert dialog.priority_groups == []
+    assert dialog.selected_schedule is None
+    assert dialog.confirm_button.config.get("state") == "disabled"
+
+    # Set state back
+    dialog.movie_var.set("오디세이")
+    dialog.auditorium_var.set("IMAX관 · IMAX LASER 2D")
+    dialog.preferred_times = ["14:00"]
+    dialog.priority_groups = [("H22", "H23")]
+    dialog.selected_schedule = {"scnsrtTm": "1400"}
+    CgvBookingDialog._update_confirm_state(dialog)
+    assert dialog.confirm_button.config.get("state") == "normal"
+
+    # 4. User changes Site -> preferred_times, priority_groups, selected_schedule cleared
+    new_site = CgvSite("0074", "왕십리", "01")
+    dialog._select_site(new_site, user_initiated=True)
+    assert dialog.preferred_times == []
+    assert dialog.priority_groups == []
+    assert dialog.selected_schedule is None
+    assert dialog.confirm_button.config.get("state") == "disabled"
+
+
+def test_cgv_dialog_initial_restoration_preserves_saved_selection_and_user_change_clears():
+    from ui.cgv_booking_dialog import CgvBookingDialog
+    from engines.cgv_client import CgvSite
+
+    initial_config = {
+        "site_no": "0013",
+        "movie": "오디세이",
+        "auditorium": "IMAX관",
+        "preferred_times": ["14:00", "17:30"],
+        "seats": "H22,H23",
+    }
+
+    dialog = SimpleNamespace(
+        initial=initial_config,
+        selected_site=None,
+        selected_schedule=None,
+        schedules=(),
+        preferred_times=list(initial_config["preferred_times"]),
+        priority_groups=[("H22", "H23")],
+        current_seats=set(),
+        seats=(),
+        seat_recommendations={},
+        reservation_date="2026-08-26",
+        _request_generation=0,
+        _is_restoring_initial=True,
+        movie_var=Value("영화를 먼저 불러오세요"),
+        movie_menu=Widget(),
+        auditorium_var=Value("상영관을 먼저 불러오세요"),
+        auditorium_menu=Widget(),
+        target_type_badge=Widget(),
+        status_label=Widget(),
+        auto_seat_var=Value("명당 자동 선택"),
+        auto_seat_menu=Widget(),
+        load_seats_button=Widget(),
+        confirm_button=Widget(),
+        site_search=Widget(""),
+        site_list=Widget(),
+        schedule_list=Widget(),
+        sites=(CgvSite("0013", "용산아이파크몰", "01"),),
+        selected_region="",
+        _start_task=lambda *args: None,
+        _render_sites=lambda: None,
+        _render_schedules=lambda: None,
+        _render_seat_placeholder=lambda _msg: None,
+        _update_seat_guide=lambda: None,
+        _update_confirm_state=lambda: CgvBookingDialog._update_confirm_state(dialog),
+    )
+
+    dialog._movie_changed = lambda val="", **kw: CgvBookingDialog._movie_changed(dialog, val, **kw)
+    dialog._auditorium_changed = lambda val="", **kw: CgvBookingDialog._auditorium_changed(dialog, val, **kw)
+    dialog._auditorium_option = CgvBookingDialog._auditorium_option
+    dialog._schedule_loaded = lambda res, **kw: CgvBookingDialog._schedule_loaded(dialog, res, **kw)
+    dialog._select_site = lambda site, **kw: CgvBookingDialog._select_site(dialog, site, **kw)
+
+    # Initial site selection (programmatic restore, user_initiated=False)
+    dialog._select_site(dialog.sites[0], user_initiated=False)
+    assert dialog.preferred_times == ["14:00", "17:30"]
+    assert dialog.priority_groups == [("H22", "H23")]
+
+    # Schedules loaded containing the initial movie and auditorium
+    schedules_data = (
+        {
+            "expoProdNm": "오디세이",
+            "expoScnsNm": "IMAX관",
+            "movkndDsplEnm": "IMAX LASER 2D",
+            "scnsrtTm": "1400",
+            "frSeatCnt": 50,
+        },
+        {
+            "expoProdNm": "오디세이",
+            "expoScnsNm": "IMAX관",
+            "movkndDsplEnm": "IMAX LASER 2D",
+            "scnsrtTm": "1730",
+            "frSeatCnt": 50,
+        },
+    )
+    dialog._schedule_loaded((schedules_data, "2026-08-26", False))
+
+    # Saved initial selection restored without losing times or seats
+    assert dialog.movie_var.get() == "오디세이"
+    assert "IMAX관" in dialog.auditorium_var.get()
+    assert dialog.preferred_times == ["14:00", "17:30"]
+    assert dialog.priority_groups == [("H22", "H23")]
+    assert dialog.confirm_button.config.get("state") == "normal"
+    assert dialog._is_restoring_initial is False
+
+    # Now user manually changes movie -> stale times and seats MUST be cleared
+    dialog.movie_var.set("새로운 영화")
+    dialog._movie_changed("새로운 영화", user_initiated=True)
+    assert dialog.preferred_times == []
+    assert dialog.priority_groups == []
+    assert dialog.confirm_button.config.get("state") == "disabled"
+
 
 
