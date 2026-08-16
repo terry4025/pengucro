@@ -730,15 +730,16 @@ class ReservationForm(ctk.CTkFrame):
         self.threads_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.threads_frame.grid(row=8, column=0, columnspan=2, padx=theme.CARD_PAD, pady=(theme.ROW_GAP, theme.SPACE_2), sticky="ew")
 
-        # Labels container (to pack title and value side-by-side)
+        # Top row: title label and value badge
         self.threads_label_frame = ctk.CTkFrame(self.threads_frame, fg_color="transparent")
-        self.threads_label_frame.pack(side="left")
+        self.threads_label_frame.pack(fill="x", pady=(0, theme.LABEL_GAP))
 
         self.threads_title_label = ctk.CTkLabel(
             self.threads_label_frame,
             text="동시 시도 수",
             font=theme.FONT_BODY_SM,
-            text_color=theme.TEXT_MUTE
+            text_color=theme.TEXT_MUTE,
+            anchor="w"
         )
         self.threads_title_label.pack(side="left")
 
@@ -771,13 +772,13 @@ class ReservationForm(ctk.CTkFrame):
             button_color=theme.ACCENT_WHITE,
             button_hover_color=theme.TEXT_BODY,
             command=self._on_threads_slider_move,
-            height=8,
-            corner_radius=4,
-            button_length=14,
-            button_corner_radius=7
+            height=12,
+            corner_radius=6,
+            button_length=16,
+            button_corner_radius=8
         )
         self.threads_slider.set(30)
-        self.threads_slider.pack(side="right", fill="x", expand=True, padx=(theme.SPACE_3, 0))
+        self.threads_slider.pack(fill="x", expand=True, pady=(2, 0))
 
         # -------------------------------------------------------------
         # Row 6: Booking Method
