@@ -170,7 +170,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             fg_color=theme.ELEVATED_COLOR,
             border_color=theme.CONTROL_BORDER,
             text_color=theme.TEXT_PRIMARY,
-            font=theme.FONT_BODY,
+            font=theme.FONT_BODY_MD,
             justify="center",
         )
         self.date_entry.insert(0, self.reservation_date)
@@ -224,7 +224,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             hover_color=theme.CARD_COLOR,
             text_color=theme.TEXT_BODY,
             corner_radius=theme.ROUNDED_SM,
-            font=theme.FONT_BODY,
+            font=theme.FONT_BODY_MD,
         )
         self.people_minus_btn.pack(side="left", padx=(0, 2))
 
@@ -250,7 +250,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
             hover_color=theme.CARD_COLOR,
             text_color=theme.TEXT_BODY,
             corner_radius=theme.ROUNDED_SM,
-            font=theme.FONT_BODY,
+            font=theme.FONT_BODY_MD,
         )
         self.people_plus_btn.pack(side="left", padx=(2, theme.SPACE_3))
 

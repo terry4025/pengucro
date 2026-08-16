@@ -888,5 +888,47 @@ def test_cgv_dialog_legacy_restoration_without_format_uses_auditorium_fallback()
     assert dialog.confirm_button.config.get("state") == "normal"
 
 
+def test_all_theme_references_in_cgv_dialog_and_ui_exist():
+    import glob
+    import pathlib
+    import re
+    import ui.theme as theme
+
+    theme_attrs = set(dir(theme))
+    for pyfile in glob.glob("ui/**/*.py", recursive=True):
+        content = pathlib.Path(pyfile).read_text(encoding="utf-8")
+        matches = set(re.findall(r"theme\.([A-Za-z0-9_]+)", content))
+        invalid = [m for m in matches if m not in theme_attrs]
+        assert not invalid, f"Found invalid theme tokens in {pyfile}: {invalid}"
+
+
+def test_cgv_booking_dialog_ui_construction_smoke_test():
+    import customtkinter as ctk
+    from ui.cgv_booking_dialog import CgvBookingDialog
+
+    root = ctk.CTk()
+    root.withdraw()
+    try:
+        dialog = CgvBookingDialog(
+            parent=root,
+            on_select=lambda data: None,
+            reservation_date="2026-08-26",
+            people=2,
+            initial={},
+        )
+        assert dialog.date_entry is not None
+        assert dialog.people_label is not None
+        assert dialog.movie_menu is not None
+        assert dialog.auditorium_menu is not None
+        assert dialog.schedule_list is not None
+        assert dialog.seat_list is not None
+        assert dialog.confirm_button is not None
+        dialog.destroy()
+    finally:
+        root.destroy()
+
+
+
+
 
 
