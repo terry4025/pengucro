@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import webbrowser
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -46,6 +47,17 @@ def _format_time_display(raw_time: str) -> str:
     return raw_time
 
 
+def _is_dialog_alive(dialog: Any) -> bool:
+    if getattr(dialog, "_closing", False):
+        return False
+    if hasattr(dialog, "winfo_exists"):
+        try:
+            return bool(dialog.winfo_exists())
+        except Exception:
+            return False
+    return True
+
+
 class CgvBookingDialog(ctk.CTkToplevel):
     """CGV-specific, data-driven theater/screening/seat selector with IMAX filtering and pre-open candidate support."""
 
@@ -63,7 +75,15 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.reservation_date = reservation_date
         self.people = max(1, min(int(people), 8))
         self.initial = dict(initial or {})
+        self._closing = False
         self._request_generation = 0
+        self._next_task_id = 0
+        self._active_task_id: int | None = None
+        self._active_task_start_time: float = 0.0
+        self._active_task_done: Callable | None = None
+        self._task_results: dict[int, tuple[Any, str | None]] = {}
+        self._pending_task: tuple[str, Callable, Callable] | None = None
+        self._task_timeout_seconds = 14.0
         self._task_progress: tuple[str, str] | None = None
         self.client = CgvBrowserClient(log=self._browser_status)
         self.regions = ()
@@ -89,15 +109,12 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._is_restoring_initial = bool(
             self.initial.get("site_no") or self.initial.get("movie")
         )
-        self._task_progress = None
-        self._task_result = None
-        self._task_done = None
-        self._pending_task = None
 
         self.title("CGV IMAX 예매 대상 선택")
         self.geometry("1060x720")
         self.minsize(940, 640)
         self.configure(fg_color=theme.CANVAS_COLOR)
+        self.protocol("WM_DELETE_WINDOW", self._close_dialog)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
 
@@ -110,6 +127,9 @@ class CgvBookingDialog(ctk.CTkToplevel):
             lambda: self.client.fetch_catalog(imax_only=True),
             self._catalog_loaded,
         )
+
+    def _is_alive(self) -> bool:
+        return _is_dialog_alive(self)
 
     def _build_header(self) -> None:
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -546,7 +566,7 @@ class CgvBookingDialog(ctk.CTkToplevel):
         ctk.CTkButton(
             footer,
             text="취소",
-            command=self.destroy,
+            command=self._close_dialog,
             width=100,
             fg_color="transparent",
             hover_color=theme.CARD_COLOR,
@@ -568,6 +588,37 @@ class CgvBookingDialog(ctk.CTkToplevel):
             corner_radius=theme.ROUNDED_MD,
         )
         self.confirm_button.pack(side="right", fill="x", expand=True, padx=(theme.SPACE_3, 0))
+
+    def _is_alive(self) -> bool:
+        if getattr(self, "_closing", False):
+            return False
+        if hasattr(self, "winfo_exists"):
+            try:
+                return bool(self.winfo_exists())
+            except Exception:
+                return False
+        return True
+
+    def _close_dialog(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        self._request_generation += 1
+        self._pending_task = None
+        self._active_task_id = None
+        self._active_task_done = None
+        self._task_results.clear()
+        self._emit_or_log("[CGV] 선택창 종료 · 실행 중 결과 무시", "info")
+        if hasattr(self, "grab_release"):
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+        if hasattr(self, "destroy"):
+            try:
+                self.destroy()
+            except Exception:
+                pass
 
     def _prev_date(self) -> None:
         try:
@@ -600,6 +651,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
             self.date_entry.insert(0, self.reservation_date)
 
     def _change_date(self, new_date: str) -> None:
+        if not _is_dialog_alive(self):
+            return
         if new_date == self.reservation_date:
             return
         self._is_restoring_initial = False
@@ -679,29 +732,79 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self._update_confirm_state()
 
     def _start_task(self, status: str, func, done) -> None:
-        if self._task_done is not None:
-            self._pending_task = (status, func, done)
-            self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
+        if not _is_dialog_alive(self):
             return
-        self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
-        self._task_result = None
-        self._task_done = done
 
-        def worker() -> None:
+        if self._active_task_id is not None:
+            self._pending_task = (status, func, done)
+            if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
+                self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
+            return
+
+        self._next_task_id += 1
+        task_id = self._next_task_id
+
+        if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
+            self.status_label.configure(text=status, text_color=theme.TINT_INFO_FG)
+        self._active_task_id = task_id
+        self._active_task_start_time = time.monotonic()
+        self._active_task_done = done
+
+        def worker(tid: int, f: Callable) -> None:
             try:
-                self._task_result = (func(), None)
+                res = f()
+                err = None
             except Exception as exc:
-                self._task_result = (None, str(exc))
+                res = None
+                err = str(exc)
+            if _is_dialog_alive(self):
+                self._task_results[tid] = (res, err)
 
-        threading.Thread(target=worker, name="CgvDataDialog", daemon=True).start()
-        self.after(80, self._poll_task)
+        threading.Thread(
+            target=worker,
+            args=(task_id, func),
+            name=f"CgvDataDialog-{task_id}",
+            daemon=True,
+        ).start()
+        if hasattr(self, "after"):
+            self.after(60, self._poll_task)
 
     def _browser_status(self, message: str, level: str = "info") -> None:
+        if not _is_dialog_alive(self):
+            return
         self._task_progress = (message, level)
 
-    def _poll_task(self) -> None:
-        if not self.winfo_exists():
+    def _emit_or_log(self, message: str, level: str = "info") -> None:
+        try:
+            if hasattr(self, "client") and hasattr(self.client, "_emit"):
+                self.client._emit(message, level)
+        except Exception:
+            pass
+
+    def _handle_task_error(self, error_message: str) -> None:
+        if not _is_dialog_alive(self):
             return
+        if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
+            self.status_label.configure(text=error_message, text_color=theme.TINT_ERROR_FG)
+        self.schedules = ()
+        self.selected_schedule = None
+        if hasattr(self, "movie_var") and hasattr(self.movie_var, "set"):
+            self.movie_var.set("시간표를 불러오지 못했습니다")
+        if hasattr(self, "movie_menu") and hasattr(self.movie_menu, "configure"):
+            self.movie_menu.configure(values=["시간표를 불러오지 못했습니다"])
+        if hasattr(self, "auditorium_var") and hasattr(self.auditorium_var, "set"):
+            self.auditorium_var.set("상영관을 먼저 불러오세요")
+        if hasattr(self, "auditorium_menu") and hasattr(self.auditorium_menu, "configure"):
+            self.auditorium_menu.configure(values=["상영관을 먼저 불러오세요"])
+        self._render_schedules()
+        self._render_seat_placeholder("시간표를 불러오지 못했습니다. 다시 시도해주세요.")
+        self._update_seat_guide()
+        self._update_confirm_state()
+
+    def _poll_task(self) -> None:
+        if not _is_dialog_alive(self):
+            return
+
         if self._task_progress is not None:
             message, level = self._task_progress
             self._task_progress = None
@@ -710,23 +813,64 @@ class CgvBookingDialog(ctk.CTkToplevel):
                 "warning": theme.ACCENT_YELLOW,
                 "error": theme.TINT_ERROR_FG,
             }.get(level, theme.TINT_INFO_FG)
-            self.status_label.configure(text=message, text_color=color)
-        if self._task_result is None:
-            self.after(80, self._poll_task)
-            return
-        result, error = self._task_result
-        done = self._task_done
-        self._task_result = None
-        self._task_done = None
-        if error:
-            self.status_label.configure(text=error, text_color=theme.TINT_ERROR_FG)
-        else:
-            done(result)
+            if hasattr(self, "status_label") and hasattr(self.status_label, "configure"):
+                self.status_label.configure(text=message, text_color=color)
 
-        if self._pending_task is not None:
-            next_status, next_func, next_done = self._pending_task
-            self._pending_task = None
-            self._start_task(next_status, next_func, next_done)
+        if self._active_task_id is None:
+            if self._pending_task is not None:
+                next_status, next_func, next_done = self._pending_task
+                self._pending_task = None
+                self._start_task(next_status, next_func, next_done)
+            return
+
+        elapsed = time.monotonic() - self._active_task_start_time
+        if elapsed > self._task_timeout_seconds:
+            self._emit_or_log("[CGV] 시간표 조회 제한시간 초과 · 최신 요청으로 전환", "warning")
+            abandoned_id = self._active_task_id
+            self._active_task_id = None
+            self._active_task_done = None
+            self._task_results.pop(abandoned_id, None)
+
+            if self._pending_task is not None:
+                next_status, next_func, next_done = self._pending_task
+                self._pending_task = None
+                self._start_task(next_status, next_func, next_done)
+                return
+            else:
+                self._handle_task_error("조회 시간이 초과되었습니다. 다시 시도해주세요.")
+                return
+
+        if self._active_task_id in self._task_results:
+            result, error = self._task_results.pop(self._active_task_id)
+            done = self._active_task_done
+            self._active_task_id = None
+            self._active_task_done = None
+
+            # Discard any obsolete results
+            for old_id in list(self._task_results.keys()):
+                self._task_results.pop(old_id, None)
+                self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
+
+            if self._pending_task is not None:
+                next_status, next_func, next_done = self._pending_task
+                self._pending_task = None
+                self._start_task(next_status, next_func, next_done)
+                return
+
+            if error:
+                self._handle_task_error(error)
+            elif done:
+                done(result)
+            return
+
+        # Discard any older results
+        for old_id in list(self._task_results.keys()):
+            if old_id != self._active_task_id:
+                self._task_results.pop(old_id, None)
+                self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
+
+        if hasattr(self, "after"):
+            self.after(60, self._poll_task)
 
     def _catalog_loaded(self, snapshot) -> None:
         self.regions = snapshot.regions
@@ -788,6 +932,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
             ).pack(fill="x", pady=1)
 
     def _select_site(self, site, *, user_initiated: bool = True) -> None:
+        if not _is_dialog_alive(self):
+            return
         if user_initiated:
             self._is_restoring_initial = False
             self.preferred_times.clear()
@@ -800,6 +946,11 @@ class CgvBookingDialog(ctk.CTkToplevel):
         self.current_seats.clear()
         self.auto_seat_var.set("명당 자동 선택")
         self.auto_seat_menu.configure(values=["명당 자동 선택"], state="disabled")
+        self.movie_var.set("시간표를 불러오는 중...")
+        self.movie_menu.configure(values=["시간표를 불러오는 중..."])
+        self.auditorium_var.set("상영관을 먼저 불러오세요")
+        self.auditorium_menu.configure(values=["상영관을 먼저 불러오세요"])
+        self.target_type_badge.configure(text="")
         self._render_sites()
         self._render_schedules()
         self._render_seat_placeholder("회차를 선택한 뒤 실제 좌석도를 불러오세요.")
@@ -817,7 +968,10 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
 
     def _schedule_loaded(self, result, *, generation: int | None = None) -> None:
+        if not _is_dialog_alive(self):
+            return
         if generation is not None and generation != self._request_generation:
+            self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
             return
         schedules, reference_date, reference_only = result
         self.schedules = tuple(schedules)
@@ -1102,16 +1256,25 @@ class CgvBookingDialog(ctk.CTkToplevel):
         )
 
     def _load_seats(self) -> None:
+        if not _is_dialog_alive(self):
+            return
         if not self.selected_schedule and not self.preferred_times:
             return
         reference = self._seat_reference_schedule(self)
+        self._request_generation += 1
+        generation = self._request_generation
         self._start_task(
             "실제 CGV 좌석도를 여는 중입니다. 로그인 안내가 뜨면 열린 Chrome에서 로그인해주세요.",
             lambda: self.client.fetch_seat_map(reference, self.people),
-            self._seats_loaded,
+            lambda seats: self._seats_loaded(seats, generation=generation),
         )
 
-    def _seats_loaded(self, seats) -> None:
+    def _seats_loaded(self, seats, *, generation: int | None = None) -> None:
+        if not _is_dialog_alive(self):
+            return
+        if generation is not None and generation != self._request_generation:
+            self._emit_or_log("[CGV] 이전 요청 결과 무시", "info")
+            return
         self.seats = tuple(seats)
         schedule = self.selected_schedule or {}
         self.seat_recommendations = recommend_cgv_seats(
@@ -1543,4 +1706,4 @@ class CgvBookingDialog(ctk.CTkToplevel):
             "seat_groups": [list(group) for group in self.priority_groups],
         }
         self.on_select(result)
-        self.destroy()
+        self._close_dialog()

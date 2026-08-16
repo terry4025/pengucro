@@ -407,3 +407,89 @@ def test_empty_imax_site_catalog_raises_error_without_silent_fallback():
         client.fetch_catalog(imax_only=True)
 
 
+def test_fetch_json_timeout_raises_cgv_error():
+    import pytest
+    from engines.cgv_client import CgvError
+
+    class _MockPage:
+        def evaluate(self, js, args):
+            # Simulate AbortError timeout
+            return {"status": 408, "timeout": True, "error": "TIMEOUT"}
+
+    page = _MockPage()
+    with pytest.raises(CgvError, match="CGV 데이터 조회 응답 시간이 초과되었습니다"):
+        CgvBrowserClient._fetch_json(page, "/api/v1/booking/searchMovScnInfo")
+
+
+def test_with_page_retries_once_on_recoverable_browser_disconnect():
+    import pytest
+    from unittest.mock import MagicMock, patch
+    from engines.cgv_client import CgvError
+
+    events = []
+    client = CgvBrowserClient(log=lambda msg, level: events.append((msg, level)))
+
+    attempts = 0
+    def mock_op(page):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("TargetClosedError: Target page, context or browser has been closed")
+        return "recovered_result"
+
+    # Mock playwright & browser_session
+    mock_chrome = MagicMock()
+    mock_browser = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_browser.contexts = [mock_context]
+    mock_context.new_page.return_value = mock_page
+
+    with patch("engines.browser_session.start_isolated", return_value=mock_chrome), \
+         patch("playwright.sync_api.sync_playwright") as mock_pw_ctx:
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp.return_value = mock_browser
+        mock_pw_ctx.return_value.__enter__.return_value = mock_pw
+
+        result = client._with_page(mock_op)
+        assert result == "recovered_result"
+        assert attempts == 2
+        assert any("1회 자동 복구" in msg for msg, lvl in events)
+        assert any("자동 복구 성공" in msg for msg, lvl in events)
+        assert mock_page.close.call_count == 2
+        assert mock_chrome.release.call_count == 2
+
+
+def test_with_page_fails_on_second_recovery_without_infinite_loop():
+    import pytest
+    from unittest.mock import MagicMock, patch
+
+    events = []
+    client = CgvBrowserClient(log=lambda msg, level: events.append((msg, level)))
+
+    attempts = 0
+    def mock_op(page):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("TargetClosedError: Target page has been closed")
+
+    mock_chrome = MagicMock()
+    mock_browser = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_browser.contexts = [mock_context]
+    mock_context.new_page.return_value = mock_page
+
+    with patch("engines.browser_session.start_isolated", return_value=mock_chrome), \
+         patch("playwright.sync_api.sync_playwright") as mock_pw_ctx:
+        mock_pw = MagicMock()
+        mock_pw.chromium.connect_over_cdp.return_value = mock_browser
+        mock_pw_ctx.return_value.__enter__.return_value = mock_pw
+
+        with pytest.raises(RuntimeError, match="TargetClosedError"):
+            client._with_page(mock_op)
+        assert attempts == 2  # exactly 2 attempts, no infinite loop
+        assert any("자동 복구 실패" in msg for msg, lvl in events)
+
+
+

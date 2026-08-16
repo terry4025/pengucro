@@ -393,53 +393,101 @@ class CgvBrowserClient:
             "CGV 로그인 대기 시간이 끝났습니다. 좌석 불러오기를 다시 눌러주세요."
         )
 
+    @staticmethod
+    def _is_recoverable_browser_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(
+            err in msg
+            for err in (
+                "targetclosederror",
+                "target closed",
+                "page closed",
+                "browser closed",
+                "cdp disconnected",
+                "connection closed",
+                "session closed",
+                "browser has been closed",
+            )
+        )
+
     def _with_page(self, operation):
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
             raise CgvError("CGV 데이터 조회에 필요한 브라우저 모듈을 찾지 못했습니다.") from exc
 
-        chrome = browser_session.start_isolated(log=self._emit)
-        if chrome is None:
-            raise CgvError("CGV 데이터 조회용 Chrome을 시작하지 못했습니다.")
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
-                page = context.new_page()
-                try:
-                    self._goto_with_retry(
-                        page, CGV_HOME_URL, wait_until="domcontentloaded", timeout=45000
-                    )
-                    return operation(page)
-                finally:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            chrome = browser_session.start_isolated(log=self._emit)
+            if chrome is None:
+                raise CgvError("CGV 데이터 조회용 Chrome을 시작하지 못했습니다.")
+            try:
+                with sync_playwright() as playwright:
+                    browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    page = context.new_page()
                     try:
-                        page.close()
-                    except Exception:
-                        pass
-        finally:
-            # Keep the persistent Chrome open.  If login is required the user can
-            # finish it there and press retry without losing the authenticated
-            # profile; the slot itself is released for the booking engine.
-            chrome.release()
+                        self._goto_with_retry(
+                            page, CGV_HOME_URL, wait_until="domcontentloaded", timeout=45000
+                        )
+                        result = operation(page)
+                        if attempt > 0:
+                            self._emit("[CGV] 브라우저 자동 복구 성공", "success")
+                        return result
+                    finally:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and self._is_recoverable_browser_error(exc):
+                    self._emit("[CGV] 브라우저 연결 끊김 · 1회 자동 복구", "warning")
+                    continue
+                if attempt > 0:
+                    self._emit("[CGV] 브라우저 자동 복구 실패", "error")
+                raise
+            finally:
+                # Keep the persistent Chrome open. If login is required the user can
+                # finish it there and press retry without losing the authenticated
+                # profile; the slot itself is released for the booking engine.
+                chrome.release()
+        if last_error:
+            raise last_error
 
     @staticmethod
-    def _fetch_json(page, path: str) -> dict[str, Any]:
+    def _fetch_json(page, path: str, timeout_ms: int = 10000) -> dict[str, Any]:
         result = page.evaluate(
             """
-            async path => {
-              const response = await fetch(path, {
-                method: 'GET', credentials: 'include', cache: 'no-store',
-                headers: {'Accept': 'application/json'}
-              });
-              const text = await response.text();
-              let data = null;
-              try { data = JSON.parse(text); } catch (_) {}
-              return {status: response.status, data, text: text.slice(0, 500)};
+            async ([path, timeoutMs]) => {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), timeoutMs || 10000);
+              try {
+                const response = await fetch(path, {
+                  method: 'GET',
+                  credentials: 'include',
+                  cache: 'no-store',
+                  headers: {'Accept': 'application/json'},
+                  signal: controller.signal
+                });
+                const text = await response.text();
+                let data = null;
+                try { data = JSON.parse(text); } catch (_) {}
+                return {status: response.status, data, text: text.slice(0, 500)};
+              } catch (err) {
+                if (err && err.name === 'AbortError') {
+                  return {status: 408, timeout: true, error: 'TIMEOUT'};
+                }
+                return {status: 0, error: String(err)};
+              } finally {
+                clearTimeout(timer);
+              }
             }
             """,
-            path,
+            [path, timeout_ms],
         )
+        if isinstance(result, dict) and (result.get("timeout") or result.get("status") == 408):
+            raise CgvError(f"CGV 데이터 조회 응답 시간이 초과되었습니다. (제한시간 {timeout_ms // 1000}초)")
         status = int(result.get("status", 0)) if isinstance(result, dict) else 0
         if status in {401, 403}:
             raise CgvAccessBlocked(
@@ -449,12 +497,16 @@ class CgvBrowserClient:
             raise CgvAccessBlocked("CGV 조회가 일시적으로 제한되었습니다. 잠시 뒤 다시 시도해주세요.")
         data = result.get("data") if isinstance(result, dict) else None
         if status < 200 or status >= 300 or not isinstance(data, dict):
-            raise CgvError(f"CGV 데이터 조회에 실패했습니다. (HTTP {status or '응답 없음'})")
+            error_msg = result.get("error") if isinstance(result, dict) else ""
+            detail = f" - {error_msg}" if error_msg else f" (HTTP {status or '응답 없음'})"
+            raise CgvError(f"CGV 데이터 조회에 실패했습니다.{detail}")
         if int(data.get("statusCode", 0) or 0) != 0:
             raise CgvError(str(data.get("statusMessage") or "CGV가 조회 요청을 처리하지 못했습니다."))
         return data
 
     def fetch_catalog(self, *, imax_only: bool = True) -> CgvCatalogSnapshot:
+        self._emit("[CGV] 지점 목록 조회 시작", "info")
+
         def operation(page):
             query = urllib.parse.urlencode(
                 {"coCd": CGV_COMPANY_CODE, "custNo": "", "lntd": "", "lttd": "", "srchKwrd": ""}
@@ -469,7 +521,9 @@ class CgvBrowserClient:
                 raise CgvError("CGV 지역·지점 목록이 비어 있습니다.")
             return CgvCatalogSnapshot(regions, sites)
 
-        return self._with_page(operation)
+        snapshot = self._with_page(operation)
+        self._emit(f"[CGV] 지점 목록 조회 완료 · {len(snapshot.sites)}개 지점", "success")
+        return snapshot
 
     def fetch_schedule(self, site_no: str, screening_date: str) -> tuple[dict[str, Any], ...]:
         date_digits = _screening_date(screening_date)
@@ -489,6 +543,7 @@ class CgvBrowserClient:
         date_digits = _screening_date(screening_date)
         target = datetime.strptime(date_digits, "%Y%m%d").date()
         today = datetime.now().date()
+        self._emit(f"[CGV] 시간표 조회 시작 · site={site_no} · date={screening_date}", "info")
 
         def operation(page):
             exact = self._fetch_schedule_on_page(page, site_no, date_digits)
@@ -541,7 +596,9 @@ class CgvBrowserClient:
                 "선택한 날짜의 시간표가 아직 열리지 않았고, 최근 공개 일정에서도 사전선택 후보를 찾지 못했습니다."
             )
 
-        return self._with_page(operation)
+        combined, ref_date, is_ref = self._with_page(operation)
+        self._emit(f"[CGV] 시간표 조회 완료 · {len(combined)}개", "success")
+        return combined, ref_date, is_ref
 
     def _fetch_schedule_on_page(
         self, page, site_no: str, date_digits: str
