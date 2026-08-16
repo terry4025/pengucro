@@ -992,7 +992,18 @@ class CgvBookingDialog(ctk.CTkToplevel):
             self.movie_menu.configure(values=movies or ["표시할 영화가 없습니다"])
         initial_movie = str(getattr(self, "initial", {}).get("movie", ""))
         is_initial_mov = getattr(self, "_is_restoring_initial", False) and initial_movie in movies
-        chosen_movie = initial_movie if is_initial_mov else (movies[0] if movies else "")
+        if is_initial_mov:
+            chosen_movie = initial_movie
+        else:
+            imax_movies = [
+                m for m in movies
+                if any(
+                    "IMAX" in _auditorium_name(item).upper() or "IMAX" in _format_name(item).upper()
+                    for item in self.schedules
+                    if _movie_name(item) == m
+                )
+            ]
+            chosen_movie = imax_movies[0] if imax_movies else (movies[0] if movies else "")
         if hasattr(self, "movie_var") and hasattr(self.movie_var, "set"):
             self.movie_var.set(chosen_movie)
         if hasattr(self, "movie_menu") and hasattr(self.movie_menu, "set"):
@@ -1016,24 +1027,19 @@ class CgvBookingDialog(ctk.CTkToplevel):
             open_count = sum(int(item.get("frSeatCnt", 0) or 0) > 0 for item in self.schedules if not item.get("_pengucroPreopen"))
             if open_count > 0:
                 self.status_label.configure(
-                    text=f"{self.selected_site.label} · 실제 회차 {real_count}개",
+                    text=f"{self.selected_site.label} · 실제 회차 {real_count}개 (예매 가능)",
                     text_color=theme.TINT_SUCCESS_FG,
-                )
-                self.target_type_badge.configure(
-                    text=f"실제 회차 오픈 ({self.reservation_date})",
-                    text_color=theme.TINT_SUCCESS_FG,
-                    fg_color=theme.TINT_INFO_BG,
                 )
             else:
                 self.status_label.configure(
-                    text=f"{self.selected_site.label} · 회차 선공개(예매 대기) {real_count}개",
-                    text_color=theme.TINT_INFO_FG,
+                    text=f"{self.selected_site.label} · 실제 회차 {real_count}개 (매진/취소표 감시)",
+                    text_color=theme.ACCENT_YELLOW,
                 )
-                self.target_type_badge.configure(
-                    text=f"선공개 회차 · 예매 대기 ({self.reservation_date})",
-                    text_color=theme.TINT_INFO_FG,
-                    fg_color=theme.TINT_INFO_BG,
-                )
+            self.target_type_badge.configure(
+                text=f"실제 회차 오픈 ({self.reservation_date})",
+                text_color=theme.TINT_SUCCESS_FG,
+                fg_color=theme.TINT_INFO_BG,
+            )
         self._render_schedules()
 
     @staticmethod
@@ -1100,7 +1106,8 @@ class CgvBookingDialog(ctk.CTkToplevel):
                     is_initial_aud = True
 
         if not chosen:
-            chosen = options[0] if options else ""
+            imax_opts = [opt for opt in options if "IMAX" in opt.upper()]
+            chosen = imax_opts[0] if imax_opts else (options[0] if options else "")
 
         self.auditorium_menu.configure(values=options or ["표시할 상영관이 없습니다"])
         self.auditorium_var.set(chosen)
@@ -1172,16 +1179,16 @@ class CgvBookingDialog(ctk.CTkToplevel):
 
             if is_preopen:
                 dates_info = f"최근 {observed_count}일 관측" if observed_count > 0 else "최근 일정 기준"
-                status_label = f"미오픈 ({dates_info}) · 사전선택 대기"
+                seat_ref_date = str(item.get("_pengucroSeatReferenceDate", ""))
+                ref_info = f" · 좌석도 {seat_ref_date} 기준" if seat_ref_date else ""
+                status_label = f"미오픈 ({dates_info}){ref_info} · 사전선택 대기"
                 status_color = theme.ACCENT_YELLOW
             elif remaining > 0:
                 status_label = f"실제 회차 · 잔여 {remaining}석"
                 status_color = theme.TINT_SUCCESS_FG
             else:
-                seat_reference_date = str(item.get("_pengucroSeatReferenceDate", ""))
-                ref_info = f" · 좌석 기준 {seat_reference_date}" if seat_reference_date else ""
-                status_label = f"선공개 회차{ref_info} · 예매 대기 가능"
-                status_color = theme.TINT_INFO_FG
+                status_label = "실제 회차 · 매진 (취소표 감시)"
+                status_color = theme.TEXT_MUTE
 
             is_selected = time_text in self.preferred_times
             priority_badge = ""
