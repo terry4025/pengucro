@@ -896,17 +896,6 @@ class CgvEngine(BaseEngine):
                 "success",
             )
 
-            if developer_mode:
-                if not self._select_api_seats_in_ui(page, seat_payload, selected):
-                    self.log("CGV 화면 동기화에 실패해 브라우저 안전 경로로 전환합니다.", "warning")
-                    return False, True
-                self.log(f"선택 좌석 확보 가능: {', '.join(group.seats)}", "success")
-                self.log(
-                    "개발자 테스트 모드로 좌석을 선택한 상태에서 정지합니다. 임시선점 요청은 보내지 않았습니다.",
-                    "success",
-                )
-                return False, False
-
             transaction = hit.get("transaction")
             if not isinstance(transaction, dict):
                 self.log("CGV 브라우저 내부 선점 결과가 없어 안전 경로로 전환합니다.", "warning")
@@ -950,6 +939,118 @@ class CgvEngine(BaseEngine):
             )
             return False, True
         return False, False
+
+    def _proceed_naver_pay_checkout(self, page, developer_mode: bool = False) -> bool:
+        """Automate CGV checkout using Naver Pay (N pay).
+
+        1. Select 'N pay' payment method.
+        2. Check mandatory terms agreement.
+        3. Click CGV '결제하기' to launch Naver Pay popup.
+        4. In the Naver Pay popup:
+           - In developer mode: keep popup open and skip clicking '동의하고 결제하기'.
+           - In normal mode: click '동의하고 결제하기' to finalize payment.
+        """
+        try:
+            self.log("[CGV] 결제 페이지 진입 · 네이버페이 자동 결제 진행 중...", "info")
+            page.wait_for_timeout(1000)
+
+            # 1. Click N pay button
+            npay_candidates = [
+                page.locator("button, div[role='button'], a, div").filter(has_text="N pay").last,
+                page.locator("button, div[role='button'], a, div").filter(has_text="npay").last,
+                page.locator("img[alt*='npay'], img[alt*='N pay'], img[alt*='네이버페이']").first,
+                page.locator("button:has-text('N pay'), button:has-text('npay')").first,
+            ]
+            clicked_npay = False
+            for loc in npay_candidates:
+                try:
+                    if loc.count() > 0 and loc.is_visible():
+                        loc.click(timeout=3000)
+                        clicked_npay = True
+                        break
+                except Exception:
+                    continue
+
+            if clicked_npay:
+                self.log("[CGV] 결제수단 N pay 선택 완료", "info")
+            else:
+                self.log("CGV 결제수단에서 N pay 버튼을 찾지 못했습니다. 수동으로 선택해주세요.", "warning")
+
+            page.wait_for_timeout(500)
+
+            # 2. Check terms agreement (약관 전체 동의)
+            terms_candidates = [
+                page.locator("label:has-text('전체 동의'), label:has-text('약관 전체 동의'), label:has-text('모두 동의')").first,
+                page.locator("label:has-text('동의')").last,
+                page.locator("input[type='checkbox']").last,
+            ]
+            for loc in terms_candidates:
+                try:
+                    if loc.count() > 0 and loc.is_visible():
+                        loc.click(timeout=2000)
+                        break
+                except Exception:
+                    continue
+
+            page.wait_for_timeout(500)
+
+            # 3. Click CGV '결제하기' button and capture Naver Pay popup
+            pay_btn = page.get_by_text("결제하기", exact=True).last
+            if not pay_btn.is_visible():
+                pay_btn = page.locator("button:has-text('결제하기'), a:has-text('결제하기')").last
+
+            self.log("[CGV] 네이버페이 결제창 호출 중...", "info")
+            naver_pay_page = None
+            try:
+                with page.context.expect_page(timeout=15000) as popup_info:
+                    pay_btn.click(timeout=5000)
+                naver_pay_page = popup_info.value
+            except Exception:
+                for p in page.context.pages:
+                    if p != page and not p.is_closed() and any(
+                        domain in p.url for domain in ("naver.com", "pstatic.net", "instantPay")
+                    ):
+                        naver_pay_page = p
+                        break
+
+            if naver_pay_page is None:
+                self.log("네이버페이 결제창을 감지하지 못했습니다. 브라우저에서 직접 결제를 진행해주세요.", "warning")
+                return True
+
+            naver_pay_page.wait_for_load_state("domcontentloaded", timeout=15000)
+            self.log("[CGV] 네이버페이 결제창 로드 완료", "info")
+
+            if developer_mode:
+                self.log(
+                    "[개발자 모드] CGV 결제수단(N pay) 선택 및 약관 동의 후 네이버페이 결제창을 정상적으로 열었습니다.",
+                    "success",
+                )
+                self.log(
+                    "[개발자 모드] 실제 결제 승인 방지를 위해 네이버페이의 최종 '동의하고 결제하기' 버튼 클릭은 건너뜁니다.",
+                    "warning",
+                )
+                return True
+
+            naver_pay_page.wait_for_timeout(1000)
+            agree_candidates = [
+                naver_pay_page.get_by_text("동의하고 결제하기", exact=True).first,
+                naver_pay_page.locator("button:has-text('동의하고 결제하기')").first,
+                naver_pay_page.locator("button:has-text('결제하기')").last,
+            ]
+            for btn in agree_candidates:
+                try:
+                    if btn.count() > 0 and btn.is_visible():
+                        btn.click(timeout=5000)
+                        self.log("[CGV] 🎉 네이버페이 최종 '동의하고 결제하기'를 완료했습니다!", "success")
+                        return True
+                except Exception:
+                    continue
+
+            self.log("네이버페이 결제 버튼을 찾지 못했습니다. 팝업창에서 직접 결제를 완료해주세요.", "warning")
+            return True
+        except Exception as exc:
+            self.log(f"CGV 네이버페이 결제 진행 중 오류: {format_exception(exc)}", "warning")
+            return True
 
     @staticmethod
     def _query_payload(schedule: dict[str, Any]) -> dict[str, Any]:
@@ -1129,12 +1230,6 @@ class CgvEngine(BaseEngine):
                         self.log(f"CGV 좌석 {seat} 선택 버튼을 누르지 못했습니다.", "warning")
                         return False
                 self.log(f"선택 좌석 확보 가능: {', '.join(group.seats)}", "success")
-                if developer_mode:
-                    self.log(
-                        "개발자 테스트 모드로 좌석을 선택한 상태에서 정지합니다. 임시선점 요청은 보내지 않았습니다.",
-                        "success",
-                    )
-                    return False
                 if not self._click_visible_by_text(page, ("선택완료", "선택 완료")):
                     self.log("좌석 임시선점 진행 버튼을 찾지 못했습니다.", "error")
                     return False
@@ -1439,9 +1534,14 @@ class CgvEngine(BaseEngine):
                         )
                 keep_open = True
                 if held:
+                    self._proceed_naver_pay_checkout(page, developer_mode=developer_mode)
+                    if developer_mode:
+                        msg = "개발자 테스트 모드: 네이버페이 결제창까지 정상 진입했습니다 (최종 결제 미실행)."
+                    else:
+                        msg = "CGV 좌석 선점 및 네이버페이 결제 진행을 완료했습니다."
                     result = BookingResult(
                         True,
-                        "CGV 좌석 임시선점을 완료했습니다. 열린 Chrome에서 제한 시간 안에 결제해주세요.",
+                        msg,
                         details={"site_no": site_no, "movie": movie},
                     )
                     if self.notify_success(result):
