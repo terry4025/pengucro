@@ -1539,7 +1539,7 @@ class ReservationForm(ctk.CTkFrame):
         """Only the browser-driven engines have a halfway point to stop at."""
         if self.engine_mode_btn.get() in {NAVER_MODE, TRIPCOM_MODE}:
             return True
-        if self.current_site == "키이스케이프":
+        if self.current_site in {"키이스케이프", "CGV"}:
             return True
         site = self.custom_sites.get(self.current_site) or {}
         engine_id = site.get("engine_id") or site.get("style")
