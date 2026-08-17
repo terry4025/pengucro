@@ -43,6 +43,7 @@ import requests
 from engines import browser_session
 from engines.base_engine import BaseEngine
 from engines.keyescape_coordination import SharedServerClock, SharedSlotLookup
+from engines.keyescape_schedule_cache import remember_slot_template
 from engines.server_clock import ServerClock
 from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
 from pengucro.diagnostics import write_redacted_debug_text
@@ -210,9 +211,9 @@ class KeyescapeEngine(BaseEngine):
     SLOT_HEDGE_DELAY_SECONDS = 0.025
     SLOT_HEDGE_MIN_SECONDS = 0.015
     SLOT_HEDGE_MAX_SECONDS = 0.060
-    SLOT_READ_LEAD_SECONDS = 0.040
+    SLOT_READ_LEAD_SECONDS = 0.450
     SLOT_READ_LEAD_MIN_SECONDS = 0.010
-    SLOT_READ_LEAD_MAX_SECONDS = 0.080
+    SLOT_READ_LEAD_MAX_SECONDS = 0.650
     SLOT_PREWARM_LEAD_SECONDS = 3.0
     FINAL_QUIET_LEAD_SECONDS = 2.0
     TIMING_HISTORY_FILE = "keyescape_timing.json"
@@ -580,45 +581,9 @@ class KeyescapeEngine(BaseEngine):
     def _remember_slot_template(
         self, target_date, zizum_num, theme_num, slots
     ) -> bool:
-        signature, mapping = self._slot_template_payload(slots)
-        if not signature:
-            return False
-        try:
-            source_day = datetime.strptime(target_date, "%Y-%m-%d").date()
-        except (TypeError, ValueError):
-            return False
-        key = f"{self.site_url.lower()}|{zizum_num}|{theme_num}"
-        cache = load_json(self.SLOT_TEMPLATE_FILE, {"version": 1, "entries": {}})
-        if not isinstance(cache, dict):
-            cache = {"version": 1, "entries": {}}
-        entries = cache.setdefault("entries", {})
-        if not isinstance(entries, dict):
-            entries = {}
-            cache["entries"] = entries
-        history = entries.get(key, [])
-        if not isinstance(history, list):
-            history = []
-        history = [
-            row for row in history
-            if isinstance(row, dict) and row.get("date") != source_day.isoformat()
-        ]
-        history.append({
-            "date": source_day.isoformat(),
-            "weekday": source_day.weekday(),
-            "group": self._schedule_group(source_day),
-            "gubun": self._slot_template_gubun(slots),
-            "signature": signature,
-            "slots": mapping,
-            "observed_at": datetime.now(KST).isoformat(timespec="seconds"),
-        })
-        entries[key] = sorted(
-            history, key=lambda row: str(row.get("date", ""))
-        )[-self.SLOT_TEMPLATE_LIMIT:]
-        try:
-            save_json(self.SLOT_TEMPLATE_FILE, cache)
-        except OSError:
-            return False
-        return True
+        return remember_slot_template(
+            self.site_url, target_date, str(zizum_num), str(theme_num), slots
+        )
 
     def _trusted_slot_from_cache(
         self, target_date, target_time, zizum_num, theme_num
@@ -757,6 +722,43 @@ class KeyescapeEngine(BaseEngine):
         )
         return hedge_delay, retry_delay, read_lead
 
+    @classmethod
+    def _cold_start_timing_parameters(cls, initial_rtt):
+        """Use a congestion-sized first lead before any opening sample exists."""
+        try:
+            measured_rtt = max(0.0, float(initial_rtt))
+        except (TypeError, ValueError):
+            measured_rtt = 0.0
+        hedge_delay = min(
+            cls.SLOT_HEDGE_MAX_SECONDS,
+            max(cls.SLOT_HEDGE_MIN_SECONDS, measured_rtt * 0.35),
+        )
+        retry_delay = min(
+            cls.SLOT_RETRY_MAX_SECONDS,
+            max(cls.SLOT_RETRY_MIN_SECONDS, measured_rtt),
+        )
+        read_lead = min(
+            cls.SLOT_READ_LEAD_MAX_SECONDS,
+            max(
+                cls.SLOT_READ_LEAD_MIN_SECONDS,
+                cls.SLOT_READ_LEAD_SECONDS,
+                measured_rtt / 2.0,
+            ),
+        )
+        return hedge_delay, retry_delay, read_lead
+
+    def _ensure_parallel_live_fallback(self, already_open: bool) -> bool:
+        """Give a one-page trusted run an independent live-query safety page."""
+        if not self._trusted_slot_id or already_open or self._page_count != 1:
+            return False
+        self._page_count = 2
+        self.log(
+            "[정보] 검증 시간표 빠른 제출 1페이지와 실제 시간표 확인 "
+            "1페이지를 병렬 안전 경로로 자동 준비합니다.",
+            "info",
+        )
+        return True
+
     @staticmethod
     def _timing_key(zizum_num, theme_num, target_time):
         return f"{zizum_num}:{theme_num}:{target_time}"
@@ -850,6 +852,20 @@ class KeyescapeEngine(BaseEngine):
             self._trace_timing(
                 f"슬롯 조회 재시도 응답 · RTT {state['last_rtt'] * 1000.0:.1f}ms"
             )
+            slot_id, bookable = self._match_slot(slots, target_time)
+            if (
+                slot_id
+                and slot_id != self.PLACEHOLDER_SLOT_ID
+                and not bookable
+            ):
+                state["closed_observations"] = int(
+                    state.get("closed_observations", 0) or 0
+                ) + 1
+                if int(state["closed_observations"]) < 2:
+                    self._trace_timing(
+                        "마감 상태 1회 감지 · 다음 독립 응답으로 확정 여부 확인"
+                    )
+                    return []
             return slots
 
         state["hedges_remaining"] = hedges_remaining - 1
@@ -885,24 +901,56 @@ class KeyescapeEngine(BaseEngine):
             if timer_active:
                 self._end_high_resolution_timer()
 
+        primary_result = None
         if primary.done():
             try:
                 slots, read_rtt = primary.result()
             except Exception:
                 slots = []
                 read_rtt = 0.0
-            slot_id, _bookable = self._match_slot(slots, target_time)
-            if slot_id and slot_id != self.PLACEHOLDER_SLOT_ID:
+            slot_id, bookable = self._match_slot(slots, target_time)
+            if (
+                slot_id
+                and slot_id != self.PLACEHOLDER_SLOT_ID
+                and bookable
+            ):
                 state["last_rtt"] = read_rtt
                 return slots
+            primary_result = (slots, read_rtt)
 
         secondary = asyncio.create_task(
             measured_read(self._get_slot_hedge_session(), "2차")
         )
-        pending = {primary, secondary}
+        pending = {secondary}
+        if primary_result is None:
+            pending.add(primary)
         fallback = []
+        closed_rows = []
         first_error = None
         observed_rtts = []
+
+        def observe(slots, read_rtt):
+            if read_rtt > 0:
+                observed_rtts.append(read_rtt)
+            slot_id, bookable = self._match_slot(slots, target_time)
+            if slot_id and slot_id != self.PLACEHOLDER_SLOT_ID:
+                if bookable:
+                    return "ready"
+                closed_rows.append(slots)
+                state["closed_observations"] = int(
+                    state.get("closed_observations", 0) or 0
+                ) + 1
+                if len(closed_rows) == 1:
+                    self._trace_timing(
+                        "1차 마감 상태 감지 · 2차 응답으로 확정 여부 확인"
+                    )
+                return "closed"
+            if slots and not fallback:
+                fallback.extend(slots)
+            return "pending"
+
+        if primary_result is not None:
+            observe(*primary_result)
         while pending:
             done, pending = await asyncio.wait(
                 pending, return_when=asyncio.FIRST_COMPLETED
@@ -910,22 +958,25 @@ class KeyescapeEngine(BaseEngine):
             for task in done:
                 try:
                     slots, read_rtt = task.result()
-                    observed_rtts.append(read_rtt)
                 except Exception as exc:
                     first_error = first_error or exc
                     continue
-                if slots and not fallback:
-                    fallback = slots
-                slot_id, _bookable = self._match_slot(slots, target_time)
-                if slot_id and slot_id != self.PLACEHOLDER_SLOT_ID:
+                if observe(slots, read_rtt) == "ready":
                     state["last_rtt"] = read_rtt
                     for remaining in pending:
                         self._track_slot_background_task(remaining)
                     return slots
         if observed_rtts:
             state["last_rtt"] = min(observed_rtts)
+        if (
+            closed_rows
+            and int(state.get("closed_observations", 0) or 0) >= 2
+        ):
+            return closed_rows[-1]
         if fallback:
             return fallback
+        if closed_rows:
+            return []
         if first_error is not None:
             raise first_error
         return []
@@ -1431,6 +1482,7 @@ class KeyescapeEngine(BaseEngine):
         already_open = (
             self.open_at is None or self.clock.seconds_until(self.open_at) <= 0
         )
+        self._ensure_parallel_live_fallback(already_open)
         verified_slot = bool(slot_id and already_open)
         timing_key, hedge_delay, retry_delay, read_lead, has_timing = (
             self._load_timing_profile(
@@ -1438,17 +1490,8 @@ class KeyescapeEngine(BaseEngine):
             )
         )
         if not has_timing and initial_slot_rtt > 0:
-            hedge_delay = min(
-                self.SLOT_HEDGE_MAX_SECONDS,
-                max(self.SLOT_HEDGE_MIN_SECONDS, initial_slot_rtt * 0.35),
-            )
-            retry_delay = min(
-                self.SLOT_RETRY_MAX_SECONDS,
-                max(self.SLOT_RETRY_MIN_SECONDS, initial_slot_rtt),
-            )
-            read_lead = min(
-                self.SLOT_READ_LEAD_MAX_SECONDS,
-                max(self.SLOT_READ_LEAD_MIN_SECONDS, initial_slot_rtt / 2.0),
+            hedge_delay, retry_delay, read_lead = (
+                self._cold_start_timing_parameters(initial_slot_rtt)
             )
         self._live_slot_state = {
             "slot_id": slot_id if verified_slot else "",
@@ -1465,6 +1508,7 @@ class KeyescapeEngine(BaseEngine):
             "retry_delay": retry_delay,
             "read_lead": read_lead,
             "last_rtt": 0.0,
+            "closed_observations": 0,
             "timing_key": timing_key,
             "timing_sample": None,
             "record_timing": self._remember_slot_timing,
@@ -2979,6 +3023,8 @@ class KeyescapeEngine(BaseEngine):
                 live_slot_id, live_slot_status = await self._resolve_live_slot(
                     target_date, target_time, zizum_num, theme_num, slot_id
                 )
+                if self._page_success_event.is_set():
+                    return
             if live_slot_status == "capacity":
                 await self._report_capacity_result()
                 return

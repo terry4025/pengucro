@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.22",
+        changes=(
+            "키이스케이프 공개 시간표의 검증 슬롯 사전 저장 추가",
+            "키이스케이프 검증 슬롯 제출과 실제 시간표 확인 병렬화",
+            "키이스케이프 오픈 경계 첫 조회 시점의 서버 지연 보정",
+            "키이스케이프 마감 응답의 이중 확인으로 오판 방지",
+        ),
+    ),
+    PatchNote(
         version="6.21",
         changes=(
             "CGV IMAX 전용 지점 선택과 미오픈 날짜의 영화·상영관·복수 희망시간 사전 설정 추가",

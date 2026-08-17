@@ -7,6 +7,9 @@ from datetime import date, datetime, timedelta
 from typing import Any
 import requests
 from bs4 import BeautifulSoup
+from engines.keyescape_schedule_cache import (
+    remember_slot_template as remember_keyescape_slot_template,
+)
 from engines.zeroworld_catalog import ZeroWorldTimeSlot, parse_time_slots, decode_body
 from pengucro.storage import load_json, save_json
 
@@ -112,8 +115,11 @@ def fetch_keyescape_slots(
             'date': date_str,
             'zizumNum': branch_id,
             'themeNum': theme_num,
-        })
+    })
     if exact.get("status") and exact.get("data"):
+        remember_keyescape_slot_template(
+            base_url, date_str, str(branch_id), str(theme_num), exact["data"]
+        )
         return rows_to_slots(exact["data"])
 
     # The target date is not published.  Read the same server-date/calendar
@@ -181,6 +187,13 @@ def fetch_keyescape_slots(
             'themeNum': theme_num,
         })
         if template.get("status") and template.get("data"):
+            remember_keyescape_slot_template(
+                base_url,
+                source_day.isoformat(),
+                str(branch_id),
+                str(theme_num),
+                template["data"],
+            )
             return rows_to_slots(
                 template["data"], estimated=True,
                 source_date=source_day.isoformat(), basis=basis,

@@ -9,6 +9,19 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v622_patch_notes_are_short_and_exact():
+    note = notes_for("6.22")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 공개 시간표의 검증 슬롯 사전 저장 추가",
+        "키이스케이프 검증 슬롯 제출과 실제 시간표 확인 병렬화",
+        "키이스케이프 오픈 경계 첫 조회 시점의 서버 지연 보정",
+        "키이스케이프 마감 응답의 이중 확인으로 오판 방지",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v621_patch_notes_are_short_and_exact():
     note = notes_for("6.21")
 

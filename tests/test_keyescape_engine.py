@@ -477,6 +477,22 @@ def test_timing_parameters_adapt_to_observed_slot_read_rtt():
     assert read_lead == pytest.approx(0.05)
 
 
+def test_cold_start_sends_primary_well_before_opening_congestion():
+    hedge, retry, read_lead = KeyescapeEngine._cold_start_timing_parameters(0.04)
+
+    assert hedge == pytest.approx(KeyescapeEngine.SLOT_HEDGE_MIN_SECONDS)
+    assert retry == pytest.approx(KeyescapeEngine.SLOT_RETRY_MIN_SECONDS)
+    assert read_lead == pytest.approx(0.45)
+
+
+def test_cold_start_lead_adapts_to_slow_preflight_but_stays_bounded():
+    _hedge, _retry, read_lead = KeyescapeEngine._cold_start_timing_parameters(1.2)
+    assert read_lead == pytest.approx(0.6)
+
+    _hedge, _retry, capped = KeyescapeEngine._cold_start_timing_parameters(2.0)
+    assert capped == pytest.approx(KeyescapeEngine.SLOT_READ_LEAD_MAX_SECONDS)
+
+
 def test_first_live_slot_read_uses_faster_valid_hedge():
     engine = make_engine()
     secondary_session = object()
@@ -525,6 +541,76 @@ def test_fast_primary_live_slot_read_does_not_send_hedge():
 
     assert engine._match_slot(slots, "09:50") == ("2301", True)
     assert calls == [engine._session]
+
+
+def test_first_closed_response_waits_for_second_open_response():
+    engine = make_engine()
+    secondary_session = object()
+    engine._slot_hedge_session = secondary_session
+    calls = []
+
+    async def fetch(session, date_str, branch, theme, end_day=0):
+        calls.append(session)
+        if session is engine._session:
+            return [{"num": "2301", "hh": "9", "mm": "50", "enable": "N"}]
+        return [{"num": "2301", "hh": "9", "mm": "50", "enable": "Y"}]
+
+    engine._fetch_slots_with_session = fetch
+    engine._live_slot_state = {
+        "hedges_remaining": 1,
+        "hedge_delay": 0.001,
+        "last_rtt": 0.0,
+        "closed_observations": 0,
+    }
+
+    slots = run(engine._fetch_live_slots("2026-08-15", "22", "65", "09:50"))
+
+    assert engine._match_slot(slots, "09:50") == ("2301", True)
+    assert calls == [engine._session, secondary_session]
+    assert engine._live_slot_state["closed_observations"] == 1
+
+
+def test_closed_slot_requires_two_independent_boundary_responses():
+    engine = make_engine()
+    secondary_session = object()
+    engine._slot_hedge_session = secondary_session
+
+    async def fetch(session, date_str, branch, theme, end_day=0):
+        return [{"num": "2301", "hh": "9", "mm": "50", "enable": "N"}]
+
+    engine._fetch_slots_with_session = fetch
+    engine._live_slot_state = {
+        "hedges_remaining": 1,
+        "hedge_delay": 0.001,
+        "last_rtt": 0.0,
+        "closed_observations": 0,
+    }
+
+    slots = run(engine._fetch_live_slots("2026-08-15", "22", "65", "09:50"))
+
+    assert engine._match_slot(slots, "09:50") == ("2301", False)
+    assert engine._live_slot_state["closed_observations"] == 2
+
+
+def test_single_retry_cannot_declare_capacity_without_second_observation():
+    engine = make_engine()
+
+    async def fetch(session, date_str, branch, theme, end_day=0):
+        return [{"num": "2301", "hh": "9", "mm": "50", "enable": "N"}]
+
+    engine._fetch_slots_with_session = fetch
+    engine._live_slot_state = {
+        "hedges_remaining": 0,
+        "last_rtt": 0.0,
+        "closed_observations": 0,
+    }
+
+    first = run(engine._fetch_live_slots("2026-08-15", "22", "65", "09:50"))
+    second = run(engine._fetch_live_slots("2026-08-15", "22", "65", "09:50"))
+
+    assert first == []
+    assert engine._match_slot(second, "09:50") == ("2301", False)
+    assert engine._live_slot_state["closed_observations"] == 2
 
 
 def test_quiet_wait_scopes_high_resolution_timer():
@@ -613,6 +699,16 @@ def test_only_first_standby_page_receives_trusted_fast_slot():
     assert first._trusted_slot_id == "2828"
     assert first._trusted_slot_sources == engine._trusted_slot_sources
     assert second._trusted_slot_id == ""
+
+
+def test_one_page_trusted_run_automatically_adds_live_fallback_page():
+    engine = make_engine()
+    engine._page_count = 1
+    engine._trusted_slot_id = "2828"
+
+    assert engine._ensure_parallel_live_fallback(already_open=False) is True
+    assert engine._page_count == 2
+    assert engine._ensure_parallel_live_fallback(already_open=False) is False
 
 
 def test_trusted_first_page_and_live_fallback_page_use_separate_slot_paths():

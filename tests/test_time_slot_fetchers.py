@@ -10,6 +10,7 @@ from engines.time_slot_fetchers import (
     fetch_doomescape_slots,
     fetch_naver_slots
 )
+from pengucro.storage import load_json
 
 class MockResponse:
     def __init__(self, status_code, content_or_text, is_json=False):
@@ -66,8 +67,9 @@ def test_fetch_zeroworld_slots(monkeypatch):
     assert slots[1].available is False
 
 
-def test_fetch_keyescape_slots(monkeypatch):
+def test_fetch_keyescape_slots(monkeypatch, tmp_path):
     import requests
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
     # 키이스케이프 JSON 응답 모킹
     mock_json = {
         "status": True,
@@ -79,7 +81,7 @@ def test_fetch_keyescape_slots(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda *args, **kwargs: MockResponse(200, mock_json, is_json=True))
     
     slots = fetch_keyescape_slots(
-        base_url="https://keyescape.com",
+        base_url="https://www.keyescape.com",
         branch_id="1",
         theme_id="99",
         date_str="2026-07-28",
@@ -95,9 +97,12 @@ def test_fetch_keyescape_slots(monkeypatch):
     assert slots[1].available is False
 
 
-def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(monkeypatch):
+def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(
+    monkeypatch, tmp_path
+):
     """A Saturday target must use the previous Saturday, not the nearer Friday."""
     import requests
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
 
     calls = []
 
@@ -123,8 +128,14 @@ def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(monk
             return MockResponse(200, {
                 "status": True,
                 "data": [
-                    {"num": "2219", "hh": "9", "mm": "50", "enable": "Y"},
-                    {"num": "2292", "hh": "10", "mm": "50", "enable": "N"},
+                    {
+                        "num": "2219", "hh": "9", "mm": "50",
+                        "enable": "Y", "gubun": "C",
+                    },
+                    {
+                        "num": "2292", "hh": "10", "mm": "50",
+                        "enable": "N", "gubun": "C",
+                    },
                 ],
             }, is_json=True)
         pytest.fail(f"unexpected date probe: {data}")
@@ -132,7 +143,7 @@ def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(monk
     monkeypatch.setattr(requests, "post", fake_post)
 
     slots = fetch_keyescape_slots(
-        base_url="https://keyescape.com",
+        base_url="https://www.keyescape.com",
         branch_id="22",
         theme_id="43",
         date_str="2026-08-15",
@@ -147,6 +158,18 @@ def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(monk
     assert all(slot.available is False for slot in slots)
     probed_dates = [call.get("date") for call in calls if call["t"] == "get_theme_time"]
     assert probed_dates == ["2026-08-15", "2026-08-08"]
+    cache = load_json("keyescape_slot_templates.json", {})
+    saved = cache["entries"]["https://www.keyescape.com|22|65"][-1]
+    assert saved["date"] == "2026-08-08"
+    assert saved["group"] == "weekday_5"
+    assert saved["gubun"] == "C"
+    assert saved["slots"] == {"09:50": "2219", "10:50": "2292"}
+    from engines.keyescape_engine import KeyescapeEngine
+
+    engine = KeyescapeEngine(lambda *_args: None)
+    assert engine._trusted_slot_from_cache(
+        "2026-08-15", "09:50", "22", "65"
+    ) == ("2219", ("2026-08-08",))
 
 
 def test_fetch_jigubyeol_slots(monkeypatch):
