@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.23",
+        changes=(
+            "키이스케이프 1페이지 모드의 단일 탭 HTTP 실시간 슬롯 검증 유지",
+            "키이스케이프 실시간 슬롯 변경 시 단일 탭 내 즉시 대상 슬롯 교체",
+        ),
+    ),
+    PatchNote(
         version="6.22",
         changes=(
             "키이스케이프 공개 시간표의 검증 슬롯 사전 저장 추가",

@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v623_patch_notes_are_short_and_exact():
+    note = notes_for("6.23")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 1페이지 모드의 단일 탭 HTTP 실시간 슬롯 검증 유지",
+        "키이스케이프 실시간 슬롯 변경 시 단일 탭 내 즉시 대상 슬롯 교체",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v622_patch_notes_are_short_and_exact():
     note = notes_for("6.22")
 
