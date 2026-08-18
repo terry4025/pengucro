@@ -14,7 +14,7 @@ from ui import cgv_booking_dialog as _cgv_booking_dialog  # noqa: E402
 
 _cgv_booking_dialog.CgvBrowserClient = _RuntimeCgvBrowserClient
 
-from ui.cgv_booking_dialog_movie_runtime import CgvBookingDialog as _RuntimeCgvBookingDialog  # noqa: E402
+from ui.cgv_booking_dialog_yongsan_preopen import CgvBookingDialog as _RuntimeCgvBookingDialog  # noqa: E402
 
 _cgv_booking_dialog.CgvBookingDialog = _RuntimeCgvBookingDialog
 
