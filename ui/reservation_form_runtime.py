@@ -16,7 +16,10 @@ class ReservationForm(BaseReservationForm):
     """
 
     def get_reservation_data(self):
-        request, message, threads, is_async = super().get_reservation_data()
+        # Keep compatibility with the repository's unbound SimpleNamespace
+        # state tests. zero-argument super() rejects those mock objects even
+        # though the base method itself only needs duck-typed form attributes.
+        request, message, threads, is_async = BaseReservationForm.get_reservation_data(self)
         if request is None:
             return request, message, threads, is_async
 
@@ -27,7 +30,7 @@ class ReservationForm(BaseReservationForm):
         if not uses_cgv:
             return request, message, threads, is_async
 
-        raw_groups = self.cgv_selection.get("seat_groups", ())
+        raw_groups = getattr(self, "cgv_selection", {}).get("seat_groups", ())
         structured: list[list[str]] = []
         if isinstance(raw_groups, (list, tuple)):
             for raw_group in raw_groups:
