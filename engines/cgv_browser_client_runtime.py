@@ -2,17 +2,22 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from engines import browser_session
 from engines.cgv_browser_client import CgvBrowserClient as BaseCgvBrowserClient
+from engines.cgv_chrome_session import start_cgv_chrome
 from engines.cgv_client import CGV_HOME_URL, CgvError
 
 
 class CgvBrowserClient(BaseCgvBrowserClient):
-    """CGV browser client that reuses one persistent CGV tab whenever possible.
+    """CGV browser client using one persistent slot-1 tab/profile.
 
-    Successful operations keep the selected CGV tab alive. If Playwright/CDP
-    reports a recoverable disconnect, that page is no longer a safe reuse
-    candidate, so it is closed before the one supported reconnect attempt.
+    Healthy CGV tabs remain open between selector reads. Recoverable disconnects
+    discard only the broken page and retry once on the same persistent slot-1
+    profile so CGV/Naver Pay login state is never silently switched to slot 2/3.
+
+    Schedule/reference behavior itself remains the base policy so partially-open
+    target dates can still show historical candidates for movies that have not
+    published yet. Exact target-day seat-map selection is handled by the dialog
+    runtime instead of deleting those useful candidates here.
     """
 
     @staticmethod
@@ -59,9 +64,12 @@ class CgvBrowserClient(BaseCgvBrowserClient):
         last_error: Exception | None = None
         broken_page = None
         for attempt in range(2):
-            chrome = browser_session.start_isolated(log=self._emit)
+            chrome = start_cgv_chrome(log=self._emit)
             if chrome is None:
-                raise CgvError("CGV 데이터 조회용 Chrome을 시작하지 못했습니다.")
+                raise CgvError(
+                    "CGV 데이터 조회용 Chrome 슬롯 1을 사용할 수 없습니다. "
+                    "슬롯 1을 사용 중인 다른 Pengucro 실행을 먼저 종료해주세요."
+                )
             page = None
             try:
                 with sync_playwright() as playwright:
@@ -77,24 +85,18 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                             timeout=45000,
                         )
                         self._emit(
-                            "[CGV] 재사용할 탭이 없어 CGV 탭 1개를 준비했습니다. 이후 조회에서 그대로 재사용합니다.",
+                            "[CGV] 슬롯 1에 재사용할 CGV 탭이 없어 탭 1개를 준비했습니다. 이후 그대로 재사용합니다.",
                             "info",
                         )
                     else:
                         self._emit(
-                            "[CGV] 이미 열려 있는 CGV 탭과 로그인 세션을 그대로 재사용합니다.",
+                            "[CGV] 슬롯 1의 기존 CGV 탭과 로그인 세션을 그대로 재사용합니다.",
                             "info",
                         )
 
                     result = operation(page)
                     if attempt > 0:
                         self._emit("[CGV] 브라우저 자동 복구 성공", "success")
-
-                    # A reconnect should normally produce a fresh Page object.
-                    # If a browser/mock context hands back the exact object that
-                    # was already classified as disconnected, do not leave that
-                    # object in the reusable-tab pool even if this operation
-                    # happened to complete. Healthy fresh pages remain open.
                     if broken_page is not None and page is broken_page:
                         self._discard_broken_page(page)
                     return result
@@ -102,20 +104,21 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                 last_error = exc
                 recoverable = self._is_recoverable_browser_error(exc)
                 if recoverable:
-                    # A disconnected target must not survive in the reusable-tab
-                    # pool. Remember its identity so a reconnect cannot silently
-                    # recycle the same object as a supposedly healthy tab.
                     broken_page = page
                     self._discard_broken_page(page)
                     if attempt == 0:
-                        self._emit("[CGV] 브라우저 연결 끊김 · 손상 탭 정리 후 1회 자동 복구", "warning")
+                        self._emit(
+                            "[CGV] 브라우저 연결 끊김 · 손상 탭 정리 후 슬롯 1에서 1회 자동 복구",
+                            "warning",
+                        )
                         continue
                 if attempt > 0 and recoverable:
                     self._emit("[CGV] 브라우저 자동 복구 실패", "error")
                 raise
             finally:
-                # Keep healthy tabs/profile alive across normal reads; only a
-                # recoverable failure (or recycled broken object) is closed.
+                # Chrome itself remains open. Release only the cross-process
+                # lease after this short selector read so the booking engine can
+                # immediately reacquire the exact same slot-1 profile.
                 chrome.release()
         if last_error:
             raise last_error
