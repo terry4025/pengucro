@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.32",
+        changes=(
+            "CGV 장시간 미오픈 감시 시 저부하 및 변동 감지 버스트 전환 지원",
+            "CGV 회차 조회 요청 6초 타임아웃 및 세션 만료 시 자동 복구 안정화",
+            "CGV 30분 주기 감시 헬스 체크 및 시간표 구성 변화 감지 정밀화",
+        ),
+    ),
+    PatchNote(
         version="6.31",
         changes=(
             "CGV 미오픈 회차 및 목표 영화 선공개 감시 주기 단축",
