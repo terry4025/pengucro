@@ -14,9 +14,9 @@ def test_runtime_preserves_guarded_fast_seat_policy():
     assert CgvEngine.FAST_SEAT_LAUNCH_INTERVAL_MS == 350
 
 
-def test_preopen_schedule_watch_no_longer_has_twenty_second_blind_window():
-    assert 0.5 <= CgvEngine.PREOPEN_IDLE_INTERVAL <= 2.0
-    assert 0.5 <= CgvEngine.SCHEDULE_HINT_INTERVAL <= 1.0
+def test_preopen_schedule_watch_uses_subsecond_bounded_cadence():
+    assert 0.5 <= CgvEngine.PREOPEN_IDLE_INTERVAL <= 0.75
+    assert 0.5 <= CgvEngine.SCHEDULE_HINT_INTERVAL <= 0.5
 
 
 def test_registry_uses_final_cgv_runtime():
@@ -29,6 +29,35 @@ def test_registry_uses_final_cgv_runtime():
         success_callback=None,
     )
     assert isinstance(engine, CgvEngine)
+
+
+def test_select_visitors_can_handoff_on_captured_initial_seat_response(monkeypatch):
+    logs = []
+    engine = _engine(logs)
+    engine._initial_seat_response = {
+        "status": 200,
+        "data": {"data": {"items": []}},
+    }
+    monkeypatch.setattr(
+        engine,
+        "_seat_modal_snapshot",
+        lambda _page: {"modalOpen": True, "seatCount": 0},
+    )
+
+    class Page:
+        wait_calls = 0
+
+        @staticmethod
+        def is_closed():
+            return False
+
+        def wait_for_timeout(self, _milliseconds):
+            self.wait_calls += 1
+
+    page = Page()
+    assert engine._select_visitors(page, 2) is True
+    assert page.wait_calls == 0
+    assert any("DOM 렌더 완료를 기다리지 않고" in message for message, _ in logs)
 
 
 def test_advance_clicks_intermediate_checkout_confirmation(monkeypatch):
@@ -104,5 +133,5 @@ def test_runtime_rewrites_base_preopen_log_cadence():
     engine.log("[CGV] 미오픈 대기 · 20초 간격으로 시간표 확인", "info")
     engine.log("[CGV] 목표 영화 선공개 감지 · 감시 간격 단축 (2초)", "warning")
 
-    assert any("2초 간격으로 목표 날짜 시간표 확인" in message for message, _ in logs)
-    assert any("감시 간격 1초로 단축" in message for message, _ in logs)
+    assert any("0.75초 간격으로 목표 날짜 시간표 확인" in message for message, _ in logs)
+    assert any("감시 간격 0.5초로 단축" in message for message, _ in logs)
