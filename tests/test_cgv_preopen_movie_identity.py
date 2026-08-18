@@ -4,6 +4,7 @@ import engines.cgv_engine as base_engine_module
 import engines.cgv_engine_priority_ladder as ladder_module
 from engines.cgv_engine_movie_identity_runtime import (
     CgvEngine,
+    _has_schedule_hint,
     select_schedule,
 )
 from engines.cgv_engine_priority_ladder_runtime import CgvEngine as PriorityLadderRuntimeCgvEngine
@@ -79,6 +80,20 @@ def test_preopen_long_movie_name_matches_real_open_movie_name():
     assert schedule_matches_movie(actual, "오디세이(IMAX LASER 2D)", "IMAX LASER 2D")
 
 
+def test_preopen_hint_is_movie_only_even_when_regular_2d_appears_first():
+    regular_2d = _schedule(
+        auditorium="2관",
+        format_name="2D",
+        mov_name="오디세이",
+        expo_name="",
+    )
+    payload = {"data": [regular_2d]}
+
+    assert _has_schedule_hint(payload, "오디세이", "IMAX관") is True
+    assert _has_schedule_hint(payload, "오디세이(IMAX LASER 2D)", "IMAX관") is True
+    assert _has_schedule_hint(payload, "전혀 다른 영화", "IMAX관") is False
+
+
 def test_canonical_fallback_never_crosses_into_regular_2d_screening():
     regular = _schedule(
         auditorium="15관",
@@ -109,6 +124,7 @@ def test_canonical_fallback_never_crosses_into_regular_2d_screening():
 
 def test_final_runtime_patches_both_initial_detector_and_time_ladder():
     assert base_engine_module.select_schedule is select_schedule
+    assert base_engine_module._has_schedule_hint is _has_schedule_hint
     assert ladder_module.select_schedule is select_schedule
 
 
