@@ -9,6 +9,19 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v625_patch_notes_are_short_and_exact():
+    note = notes_for("6.25")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 최종 서버시각 정밀도 보존 및 보정 로그 추가",
+        "키이스케이프 Chrome 예약 endpoint 연결 예열 강화",
+        "키이스케이프 예약 POST의 DNS·TLS·첫응답 지연 측정 추가",
+        "키이스케이프 1~3페이지에 동일 최적화 런타임 적용",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v624_patch_notes_are_short_and_exact():
     note = notes_for("6.24")
 
