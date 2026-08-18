@@ -9,20 +9,11 @@ from engines.cgv_client import is_contiguous_seat_group, normalize_seat_name
 from ui.cgv_booking_dialog import CgvBookingDialog as BaseCgvBookingDialog
 
 
+MAX_VISIBLE_PRIORITY_CHIPS = 6
+
+
 def parse_manual_seat_priorities(raw: str, people: int) -> list[tuple[str, ...]]:
-    """Parse user-entered CGV seat groups without requiring a live seat map.
-
-    Examples for two people:
-      C8,C9
-      C8 C9 | D8 D9
-      C8,C9; D8,D9
-
-    Each group must contain exactly ``people`` seats in one contiguous row.
-    Physical-seat existence is intentionally not required here because this
-    feature is specifically for unpublished dates whose seat map is not yet
-    available. The booking engine still resolves the labels against the real
-    seat map when the target screening opens.
-    """
+    """Parse user-entered CGV seat groups without requiring a live seat map."""
 
     count = max(1, min(int(people), 8))
     text = str(raw or "").strip()
@@ -59,18 +50,18 @@ def parse_manual_seat_priorities(raw: str, people: int) -> list[tuple[str, ...]]
 
 
 class CgvBookingDialog(BaseCgvBookingDialog):
-    """CGV selector with a seat-map-first layout and pre-open manual seats."""
+    """CGV selector with large seat map, visible priorities and manual seats."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._expand_dialog_for_seat_map()
         self._hide_visual_seat_guide()
         self._install_manual_seat_controls()
+        self._install_priority_summary()
         self._refresh_manual_seat_ui()
+        self._render_priority_summary()
 
     def _expand_dialog_for_seat_map(self) -> None:
-        """Use more of the available screen height for the seat viewport."""
-
         try:
             self.update_idletasks()
             geometry = str(self.geometry())
@@ -91,14 +82,6 @@ class CgvBookingDialog(BaseCgvBookingDialog):
             pass
 
     def _hide_visual_seat_guide(self) -> None:
-        """Hide the guide card while preserving its recommendation model.
-
-        ``BaseCgvBookingDialog._update_seat_guide`` continues to build
-        ``current_guide`` and update the hidden labels. Auto-seat selection can
-        therefore keep using the same recommendation data without spending
-        scarce vertical space on the explanatory card.
-        """
-
         title = getattr(self, "guide_title_label", None)
         guide_text = getattr(title, "master", None)
         guide = getattr(guide_text, "master", None)
@@ -115,8 +98,8 @@ class CgvBookingDialog(BaseCgvBookingDialog):
         self.add_priority_button.configure(text="선택한 좌석 우선순위 추가")
         self.seat_help.configure(
             text=(
-                f"{self.people}석씩 우선순위를 저장하세요. 미오픈 날짜는 아래 빠른 입력을 사용하고, "
-                "실제 좌석도가 열리면 같은 우선순위를 자동으로 검증합니다."
+                f"{self.people}석씩 우선순위를 저장하세요. 미오픈 날짜는 빠른 입력을 사용할 수 있고, "
+                "실제 회차가 열리면 선택한 순서대로 자동 확인합니다."
             )
         )
 
@@ -127,9 +110,6 @@ class CgvBookingDialog(BaseCgvBookingDialog):
             border_color=theme.CONTROL_BORDER,
             corner_radius=theme.ROUNDED_MD,
         )
-        # CustomTkinter wrappers do not always expose the same Tk packing parent
-        # as the logical widget. The load button is a known direct child and is
-        # already packed, so anchor the new controls after that stable sibling.
         self.manual_seat_frame.pack(
             fill="x",
             padx=theme.SPACE_3,
@@ -222,6 +202,103 @@ class CgvBookingDialog(BaseCgvBookingDialog):
         )
         self.remove_last_priority_button.pack(side="right")
 
+    def _install_priority_summary(self) -> None:
+        """Keep saved priorities visible without shrinking the seat viewport."""
+
+        seat_panel = self.auto_seat_menu.master
+        try:
+            self.priority_label.pack_forget()
+        except Exception:
+            pass
+
+        self.priority_summary_frame = ctk.CTkFrame(
+            seat_panel,
+            fg_color=theme.SURFACE_COLOR,
+            border_width=1,
+            border_color=theme.HAIRLINE_COLOR,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        # auto_seat_menu is a direct packed child of the same seat panel, so the
+        # summary is safely anchored above it and therefore above the seat map.
+        self.priority_summary_frame.pack(
+            fill="x",
+            padx=theme.SPACE_3,
+            pady=(0, theme.SPACE_1),
+            before=self.auto_seat_menu,
+        )
+
+        header = ctk.CTkFrame(self.priority_summary_frame, fg_color="transparent")
+        header.pack(fill="x", padx=theme.SPACE_2, pady=(theme.SPACE_1, 0))
+        ctk.CTkLabel(
+            header,
+            text="저장된 좌석 우선순위",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_MUTE,
+            anchor="w",
+        ).pack(side="left")
+        self.priority_overflow_label = ctk.CTkLabel(
+            header,
+            text="",
+            font=theme.FONT_CAPTION,
+            text_color=theme.TEXT_TERTIARY,
+            anchor="e",
+        )
+        self.priority_overflow_label.pack(side="right")
+
+        self.priority_chip_grid = ctk.CTkFrame(
+            self.priority_summary_frame,
+            fg_color="transparent",
+        )
+        self.priority_chip_grid.pack(
+            fill="x", padx=theme.SPACE_2, pady=(theme.SPACE_1, theme.SPACE_2)
+        )
+        for column in range(3):
+            self.priority_chip_grid.columnconfigure(column, weight=1, uniform="priority")
+
+    def _render_priority_summary(self) -> None:
+        grid = getattr(self, "priority_chip_grid", None)
+        if grid is None:
+            return
+        for child in grid.winfo_children():
+            child.destroy()
+
+        visible = list(self.priority_groups[:MAX_VISIBLE_PRIORITY_CHIPS])
+        if not visible:
+            ctk.CTkLabel(
+                grid,
+                text="아직 저장된 좌석 우선순위가 없습니다.",
+                font=theme.FONT_LABEL,
+                text_color=theme.TEXT_MUTE,
+                anchor="w",
+            ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=2, pady=1)
+        else:
+            for index, group in enumerate(visible):
+                ctk.CTkButton(
+                    grid,
+                    text=f"{index + 1}순위 · {','.join(group)}  ×",
+                    command=lambda idx=index: self._remove_priority_at(idx),
+                    height=theme.H_GHOST,
+                    fg_color=theme.ELEVATED_COLOR,
+                    hover_color=theme.CARD_COLOR,
+                    border_width=1,
+                    border_color=theme.CONTROL_BORDER,
+                    text_color=theme.TEXT_BODY,
+                    corner_radius=theme.ROUNDED_SM,
+                    font=theme.FONT_CAPTION,
+                    anchor="w",
+                ).grid(
+                    row=index // 3,
+                    column=index % 3,
+                    sticky="ew",
+                    padx=2,
+                    pady=2,
+                )
+
+        overflow = max(0, len(self.priority_groups) - MAX_VISIBLE_PRIORITY_CHIPS)
+        self.priority_overflow_label.configure(
+            text=f"+{overflow}개 더 있음" if overflow else f"총 {len(self.priority_groups)}개"
+        )
+
     def _refresh_manual_seat_ui(self) -> None:
         if not hasattr(self, "manual_seat_entry"):
             return
@@ -285,27 +362,33 @@ class CgvBookingDialog(BaseCgvBookingDialog):
             )
         self._render_priorities()
 
-    def _remove_last_priority(self) -> None:
-        if not self.priority_groups:
+    def _remove_priority_at(self, index: int) -> None:
+        if not (0 <= int(index) < len(self.priority_groups)):
             return
-        removed = self.priority_groups.pop()
+        removed = self.priority_groups.pop(int(index))
         self.status_label.configure(
-            text=f"마지막 우선순위 {', '.join(removed)}를 삭제했습니다.",
+            text=f"{int(index) + 1}순위 {', '.join(removed)}를 삭제했습니다.",
             text_color=theme.TEXT_MUTE,
         )
         if self.seats:
             self._render_seats()
         self._render_priorities()
 
+    def _remove_last_priority(self) -> None:
+        if not self.priority_groups:
+            return
+        self._remove_priority_at(len(self.priority_groups) - 1)
+
     def _render_priorities(self) -> None:
         BaseCgvBookingDialog._render_priorities(self)
         refresh = getattr(self, "_refresh_manual_seat_ui", None)
         if callable(refresh):
             refresh()
+        render_summary = getattr(self, "_render_priority_summary", None)
+        if callable(render_summary):
+            render_summary()
 
     def _set_people(self, new_people: int) -> None:
-        # Keep the method compatible with the repository's unbound
-        # SimpleNamespace state tests; zero-argument super() rejects those mocks.
         BaseCgvBookingDialog._set_people(self, new_people)
         refresh = getattr(self, "_refresh_manual_seat_ui", None)
         if callable(refresh):
