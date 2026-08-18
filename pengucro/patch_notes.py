@@ -17,6 +17,12 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.34",
+        changes=(
+            "CGV 좌석 선점 완료 후 네이버페이 결제 진입 시 상속 시그니처 오류 수정",
+        ),
+    ),
+    PatchNote(
         version="6.33",
         changes=(
             "CGV 좌석도 선택 시 상단에 우선순위 추가 버튼 고정 배치",

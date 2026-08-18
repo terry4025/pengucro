@@ -87,3 +87,28 @@ def test_cgv_engine_enter_naver_pay_password_missing_digit():
     res = engine._enter_naver_pay_password(page, "123456")
     assert res is False
     assert any("수동 입력" in msg for msg, lvl in logs if lvl == "warning")
+
+
+def test_cgv_hardened_and_registry_proceed_naver_pay_checkout_signature():
+    from engines.registry import EngineRegistry
+    from pengucro.models import STANDARD_MODE
+
+    logs = []
+    engine = EngineRegistry.create(
+        site_name="CGV",
+        mode=STANDARD_MODE,
+        payload={},
+        custom_sites={},
+        log_callback=lambda msg, lvl="info": logs.append((msg, lvl)),
+        success_callback=lambda: None,
+    )
+
+    class DummyPage:
+        def is_closed(self):
+            return True
+
+    # Calling with npay_password must pass through all subclasses without TypeError
+    page = DummyPage()
+    res = engine._proceed_naver_pay_checkout(page, developer_mode=True, npay_password="123456")
+    assert res is False
+    assert any("닫혀 수동 확인이 필요합니다" in msg for msg, lvl in logs)

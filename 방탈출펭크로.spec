@@ -76,7 +76,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로6.33_yescaptcha',
+    name='방탈출펭크로6.34_yescaptcha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

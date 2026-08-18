@@ -41,14 +41,14 @@ def test_checkout_uses_recovered_active_page(monkeypatch):
     engine = CgvEngine(lambda *_args: None)
     engine._active_page = recovered
 
-    def fake_checkout(_self, page, developer_mode=False):
-        used.append((page, developer_mode))
+    def fake_checkout(_self, page, developer_mode=False, npay_password=""):
+        used.append((page, developer_mode, npay_password))
         return True
 
     monkeypatch.setattr(BaseCgvEngine, "_proceed_naver_pay_checkout", fake_checkout)
 
-    assert engine._proceed_naver_pay_checkout(stale, developer_mode=True) is True
-    assert used == [(recovered, True)]
+    assert engine._proceed_naver_pay_checkout(stale, developer_mode=True, npay_password="pass") is True
+    assert used == [(recovered, True, "pass")]
 
 
 def test_checkout_rejects_closed_page_instead_of_reporting_success(monkeypatch):

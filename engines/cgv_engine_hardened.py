@@ -151,7 +151,12 @@ class CgvEngine(BaseCgvEngine):
         # original local variable.
         return held
 
-    def _proceed_naver_pay_checkout(self, page, developer_mode: bool = False) -> bool:
+    def _proceed_naver_pay_checkout(
+        self,
+        page,
+        developer_mode: bool = False,
+        npay_password: str = "",
+    ) -> bool:
         target = self._current_page(page)
         if not self._page_usable(target):
             self.log(
@@ -160,7 +165,9 @@ class CgvEngine(BaseCgvEngine):
             )
             return False
         return super()._proceed_naver_pay_checkout(
-            target, developer_mode=developer_mode
+            target,
+            developer_mode=developer_mode,
+            npay_password=npay_password,
         )
 
     def _reconnect_seat_session(
