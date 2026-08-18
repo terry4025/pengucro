@@ -53,9 +53,11 @@ def test_quiet_watch_uses_one_request_and_burst_caps_at_two():
     assert engine._effective_schedule_concurrency(4) == 1
 
     engine._schedule_burst_until = time.monotonic() + 10.0
+    engine._sync_schedule_poll_interval()
     assert engine._effective_schedule_concurrency(1) == 1
     assert engine._effective_schedule_concurrency(2) == 2
     assert engine._effective_schedule_concurrency(4) == 2
+    assert engine.PREOPEN_IDLE_INTERVAL == 0.5
 
 
 def test_schedule_fingerprint_ignores_remaining_seat_changes():
@@ -85,7 +87,9 @@ def test_schedule_identity_change_activates_short_burst():
     )
 
     assert engine._schedule_burst_until > time.monotonic()
+    engine._sync_schedule_poll_interval()
     assert engine._effective_schedule_concurrency(4) == 2
+    assert engine.PREOPEN_IDLE_INTERVAL == 0.5
 
 
 def test_401_soft_refresh_retries_once(monkeypatch):
