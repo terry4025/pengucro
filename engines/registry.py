@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from engines.doomescape_engine import DoomEscapeEngine
-from engines.cgv_engine_runtime import CgvEngine
+from engines.cgv_engine_watchdog import CgvEngine
 from engines.dpsnnn_engine import DpsnnnEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.keyescape_engine_runtime import KeyescapeEngine
