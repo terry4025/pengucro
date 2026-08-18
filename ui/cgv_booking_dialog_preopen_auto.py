@@ -34,7 +34,8 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
             return next(iter(options), "명당 자동 선택")
         return next(
             (label for label, value in options.items() if str(value) == mode),
-            self.auto_seat_preference_label or next(iter(options), "명당 자동 선택"),
+            getattr(self, "auto_seat_preference_label", "")
+            or next(iter(options), "명당 자동 선택"),
         )
 
     def _refresh_preopen_auto_controls(self) -> None:
@@ -66,45 +67,57 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
         options = dict(self._auto_seat_options())
         self.auto_seat_modes = options
         menu.configure(values=list(options), state="normal")
-        label = self._label_for_auto_mode(self.auto_seat_preference, options)
+        label = CgvBookingDialog._label_for_auto_mode(
+            self, getattr(self, "auto_seat_preference", ""), options
+        )
         variable.set(label)
-        if self.auto_seat_preference:
+        if getattr(self, "auto_seat_preference", ""):
             self.auto_seat_preference_label = label
 
     def _update_seat_guide(self) -> None:
-        super()._update_seat_guide()
-        self._refresh_preopen_auto_controls()
+        # Keep these wrapper methods callable as unbound functions with the
+        # repository's SimpleNamespace dialog fixtures.  zero-argument super()
+        # requires ``self`` to be an actual subclass instance and broke the
+        # historical tests once this final runtime layer was installed.
+        ControlsCgvBookingDialog._update_seat_guide(self)
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _select_site(self, site, *, user_initiated: bool = True) -> None:
         if user_initiated:
-            self._clear_auto_preference()
-        super()._select_site(site, user_initiated=user_initiated)
-        self._refresh_preopen_auto_controls()
+            CgvBookingDialog._clear_auto_preference(self)
+        ControlsCgvBookingDialog._select_site(
+            self, site, user_initiated=user_initiated
+        )
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _movie_changed(self, value: str = "", *, user_initiated: bool = True) -> None:
         if user_initiated:
-            self._clear_auto_preference()
-        super()._movie_changed(value, user_initiated=user_initiated)
-        self._refresh_preopen_auto_controls()
+            CgvBookingDialog._clear_auto_preference(self)
+        ControlsCgvBookingDialog._movie_changed(
+            self, value, user_initiated=user_initiated
+        )
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _auditorium_changed(self, value: str = "", *, user_initiated: bool = True) -> None:
         if user_initiated:
-            self._clear_auto_preference()
-        super()._auditorium_changed(value, user_initiated=user_initiated)
-        self._refresh_preopen_auto_controls()
+            CgvBookingDialog._clear_auto_preference(self)
+        ControlsCgvBookingDialog._auditorium_changed(
+            self, value, user_initiated=user_initiated
+        )
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _set_people(self, new_people: int) -> None:
-        super()._set_people(new_people)
-        self._refresh_preopen_auto_controls()
+        ControlsCgvBookingDialog._set_people(self, new_people)
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _clear_preferred_times(self) -> None:
-        super()._clear_preferred_times()
-        self._refresh_preopen_auto_controls()
+        ControlsCgvBookingDialog._clear_preferred_times(self)
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _auto_select_seats(self, label: str) -> None:
         mode = str(self.auto_seat_modes.get(label, "") or "").strip()
         if not mode:
-            self._clear_auto_preference()
+            CgvBookingDialog._clear_auto_preference(self)
             self._update_confirm_state()
             return
 
@@ -127,13 +140,13 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
         # With a real map present, keep the mature preview behavior while also
         # retaining the mode as a runtime fallback if manually saved groups are
         # unavailable on the target screening.
-        super()._auto_select_seats(label)
+        ControlsCgvBookingDialog._auto_select_seats(self, label)
         self._update_confirm_state()
 
     def _clear_priorities(self) -> None:
-        self._clear_auto_preference()
-        super()._clear_priorities()
-        self._refresh_preopen_auto_controls()
+        CgvBookingDialog._clear_auto_preference(self)
+        ControlsCgvBookingDialog._clear_priorities(self)
+        CgvBookingDialog._refresh_preopen_auto_controls(self)
 
     def _update_confirm_state(self) -> None:
         movie = self.movie_var.get() if hasattr(self, "movie_var") else ""
@@ -154,13 +167,17 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
             )
         )
         has_seat_strategy = bool(
-            getattr(self, "priority_groups", None) or self.auto_seat_preference
+            getattr(self, "priority_groups", None)
+            or getattr(self, "auto_seat_preference", "")
         )
         ready = bool(
-            self.selected_site
+            getattr(self, "selected_site", None)
             and has_valid_movie
             and has_valid_auditorium
-            and (self.selected_schedule or self.preferred_times)
+            and (
+                getattr(self, "selected_schedule", None)
+                or getattr(self, "preferred_times", None)
+            )
             and has_seat_strategy
         )
         if hasattr(self, "confirm_button"):
