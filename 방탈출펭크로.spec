@@ -37,7 +37,6 @@ a = Analysis(
         'ui.cgv_booking_dialog',
         'ui.cgv_booking_dialog_runtime',
         'ui.reservation_form',
-        'ui.reservation_form_runtime',
         'ui.update_dialog',
         'pengucro.logging_setup',
         # The updater is partly loaded on demand. Keep its controller, helper,
