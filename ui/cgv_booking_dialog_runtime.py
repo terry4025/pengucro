@@ -59,12 +59,31 @@ def parse_manual_seat_priorities(raw: str, people: int) -> list[tuple[str, ...]]
 
 
 class CgvBookingDialog(BaseCgvBookingDialog):
-    """CGV selector with pre-open manual seat entry and streamlined controls."""
+    """CGV selector with a seat-map-first layout and pre-open manual seats."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._hide_visual_seat_guide()
         self._install_manual_seat_controls()
         self._refresh_manual_seat_ui()
+
+    def _hide_visual_seat_guide(self) -> None:
+        """Hide the guide card while preserving its recommendation model.
+
+        ``BaseCgvBookingDialog._update_seat_guide`` continues to build
+        ``current_guide`` and update the hidden labels.  Auto-seat selection can
+        therefore keep using the same recommendation data without spending
+        scarce vertical space on the explanatory card.
+        """
+
+        title = getattr(self, "guide_title_label", None)
+        guide_text = getattr(title, "master", None)
+        guide = getattr(guide_text, "master", None)
+        if guide is not None:
+            try:
+                guide.pack_forget()
+            except Exception:
+                pass
 
     def _install_manual_seat_controls(self) -> None:
         seat_panel = self.load_seats_button.master
@@ -73,9 +92,8 @@ class CgvBookingDialog(BaseCgvBookingDialog):
         self.add_priority_button.configure(text="선택한 좌석 우선순위 추가")
         self.seat_help.configure(
             text=(
-                f"{self.people}석씩 우선순위를 저장하세요. 좌석도가 아직 열리지 않은 날짜도 "
-                "아래 빠른 입력으로 C8,C9처럼 미리 지정할 수 있습니다. "
-                "실제 좌석도가 열리면 같은 우선순위를 그대로 검증·사용합니다."
+                f"{self.people}석씩 우선순위를 저장하세요. 미오픈 날짜는 아래 빠른 입력을 사용하고, "
+                "실제 좌석도가 열리면 같은 우선순위를 자동으로 검증합니다."
             )
         )
 
