@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.40",
+        changes=(
+            "CGV 용산아이파크몰 IMAX 미오픈 상태에서 명당 좌석 번호 사전 프리셋 지정 지원",
+            "좌석도 미로딩 상태에서도 인원수별(1~8인) 중앙 명당 우선순위 칩 추가 지원",
+        ),
+    ),
+    PatchNote(
         version="6.39",
         changes=(
             "CGV 미오픈 저장 영화명과 실제 오픈 영화명 간 표준 식별 브릿지 적용",
