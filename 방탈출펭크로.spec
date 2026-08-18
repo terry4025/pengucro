@@ -26,6 +26,8 @@ a = Analysis(
         'engines.cgv_engine_pairwise_observer',
         'engines.cgv_engine_visitor_runtime',
         'engines.cgv_engine_visitor_dom_runtime',
+        'engines.cgv_engine_priority_ladder',
+        'engines.cgv_engine_priority_ladder_runtime',
         'engines.cgv_client',
         'engines.cgv_browser_client',
         'engines.cgv_browser_client_runtime',
@@ -36,14 +38,14 @@ a = Analysis(
         'playwright.sync_api',
         'win32crypt',
         # Modules added in the 5.32/5.4 reworks. They are imported normally, so
-        # PyInstaller finds them on its own; listed here so a future import
-        # being made lazy cannot silently drop them from the bundle.
+        # static analysis cannot see them.  Keep the final selector layer too.
         'ui.loading_overlay',
         'ui.repaint',
         'ui.scrollable',
         'ui.cgv_booking_dialog',
         'ui.cgv_booking_dialog_runtime',
         'ui.cgv_booking_dialog_controls',
+        'ui.cgv_booking_dialog_preopen_auto',
         'ui.reservation_form',
         'ui.reservation_form_runtime',
         'ui.update_dialog',

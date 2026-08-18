@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from engines.doomescape_engine import DoomEscapeEngine
-from engines.cgv_engine_visitor_dom_runtime import CgvEngine
+from engines.cgv_engine_priority_ladder_runtime import CgvEngine
 from engines.dpsnnn_engine import DpsnnnEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.keyescape_engine_runtime import KeyescapeEngine
@@ -63,7 +63,7 @@ class EngineRegistry:
             elif engine_id == "naver" or (not engine_id and style == "naver"):
                 engine = NaverEngine(**common)
             elif engine_id == "keyescape":
-                engine = KeyescapeEngine(site_url=site.get("base_url"), **common)
+                engine = KeyescapeEngine(site_url=site.get("base_url") or site.get("url", ""), **common)
             elif engine_id == "doomescape":
                 engine = DoomEscapeEngine(site_url=site.get("base_url") or site.get("url", ""), **common)
             elif engine_id == "dpsnnn":
