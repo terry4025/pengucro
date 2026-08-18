@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.38",
+        changes=(
+            "CGV 시간 우선순위와 좌석 우선순위 통합 사다리(Ladder) 감시 지원",
+            "CGV 미오픈 상태에서도 명당 자동 선택 전략(중앙/추천 등) 설정 지원",
+            "IMAX LASER 2D 및 일반 2D 레이저 상영관 분리 필터링 적용",
+        ),
+    ),
+    PatchNote(
         version="6.37",
         changes=(
             "CGV 관람인원 선택 화면에서 세션 만료 시 로그인 후 자동 복귀 지원",
