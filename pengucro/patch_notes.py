@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.33",
+        changes=(
+            "CGV 좌석도 선택 시 상단에 우선순위 추가 버튼 고정 배치",
+            "CGV 1~8인 연속 좌석 쌍(Pair) 단위 동기화 및 자동 클릭 개선",
+            "CGV 좌석 선택 영역에 전체 초기화 버튼 추가 및 상태 메시지 안내",
+        ),
+    ),
+    PatchNote(
         version="6.32",
         changes=(
             "CGV 장시간 미오픈 감시 시 저부하 및 변동 감지 버스트 전환 지원",
