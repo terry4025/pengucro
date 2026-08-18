@@ -8,14 +8,11 @@ from engines.cgv_client import CGV_HOME_URL, CgvError
 
 
 class CgvBrowserClient(BaseCgvBrowserClient):
-    """CGV browser client that reuses one persistent CGV tab whenever possible.
+    """CGV browser client using one persistent slot-1 tab/profile.
 
-    Successful operations keep the selected CGV tab alive. If Playwright/CDP
-    reports a recoverable disconnect, that page is no longer a safe reuse
-    candidate, so it is closed before the one supported reconnect attempt.
-
-    All CGV reads are pinned to Chrome slot 1 so the selector and the final
-    booking share the same persistent CGV/Naver Pay login profile.
+    Healthy CGV tabs remain open between selector reads. Recoverable disconnects
+    discard only the broken page and retry once on the same persistent slot-1
+    profile so CGV/Naver Pay login state is never silently switched to slot 2/3.
     """
 
     @staticmethod
@@ -95,12 +92,6 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                     result = operation(page)
                     if attempt > 0:
                         self._emit("[CGV] 브라우저 자동 복구 성공", "success")
-
-                    # A reconnect should normally produce a fresh Page object.
-                    # If a browser/mock context hands back the exact object that
-                    # was already classified as disconnected, do not leave that
-                    # object in the reusable-tab pool even if this operation
-                    # happened to complete. Healthy fresh pages remain open.
                     if broken_page is not None and page is broken_page:
                         self._discard_broken_page(page)
                     return result
@@ -111,15 +102,41 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                     broken_page = page
                     self._discard_broken_page(page)
                     if attempt == 0:
-                        self._emit("[CGV] 브라우저 연결 끊김 · 손상 탭 정리 후 슬롯 1에서 1회 자동 복구", "warning")
+                        self._emit(
+                            "[CGV] 브라우저 연결 끊김 · 손상 탭 정리 후 슬롯 1에서 1회 자동 복구",
+                            "warning",
+                        )
                         continue
                 if attempt > 0 and recoverable:
                     self._emit("[CGV] 브라우저 자동 복구 실패", "error")
                 raise
             finally:
-                # Keep the Chrome/profile alive. Release only the cross-process
-                # lease after this short catalog/seat read; final booking will
-                # reacquire the same slot-1 profile.
+                # Chrome itself remains open. Release only the cross-process
+                # lease after this short selector read so the booking engine can
+                # immediately reacquire the exact same slot-1 profile.
                 chrome.release()
         if last_error:
             raise last_error
+
+    def fetch_schedule_with_reference(self, *args, **kwargs):
+        """Never mix a previous-date template into an already-open target day.
+
+        The base helper intentionally gathers recent dates for pre-open seat-map
+        references. It also returned those historical template rows alongside
+        exact target-date rows, which allowed a 24th selection to accidentally
+        carry a 23rd schedule into the seat viewer. When the target date has real
+        schedules, expose only those exact rows; historical data remains embedded
+        only as ``_pengucroSeatReference`` metadata for layout assistance.
+        """
+
+        schedules, reference_date, reference_only = super().fetch_schedule_with_reference(
+            *args, **kwargs
+        )
+        if not reference_only:
+            exact = tuple(
+                item for item in schedules
+                if not bool(item.get("_pengucroPreopen"))
+            )
+            if exact:
+                return exact, reference_date, False
+        return schedules, reference_date, reference_only
