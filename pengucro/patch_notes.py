@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.36",
+        changes=(
+            "CGV 좌석 클릭 반영 속도 향상을 위한 DOM MutationObserver 도입",
+            "좌석 선택 완료 및 롤백 대기 시간을 이벤트 기반으로 즉시 단축",
+        ),
+    ),
+    PatchNote(
         version="6.35",
         changes=(
             "CGV 좌석 자동 선택 시 상영관별 좌우 파트너 방향 적응형 동기화 지원",
