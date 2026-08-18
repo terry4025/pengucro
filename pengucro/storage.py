@@ -77,9 +77,9 @@ def append_history(record: dict[str, Any]) -> Path:
 class SecretStore:
     """Stores secrets encrypted for the current Windows user with DPAPI.
 
-    PyInstaller builds historically depended on ``pywin32`` for DPAPI.  If that
+    PyInstaller builds historically depended on ``pywin32`` for DPAPI. If that
     optional module was omitted from a release, ``set()`` raised before the form
-    could save ordinary settings such as the selected people count.  Use the
+    could save ordinary settings such as the selected people count. Use the
     native Windows crypt32 API as a fallback and keep secret-write failures from
     aborting the independent config.json save path.
     """
@@ -101,21 +101,45 @@ class SecretStore:
                 ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
             ]
 
+        blob_ptr = ctypes.POINTER(DATA_BLOB)
         crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
-        kernel32.LocalFree.restype = wintypes.HLOCAL
 
-        buffer = ctypes.create_string_buffer(value, max(1, len(value)))
+        crypt32.CryptProtectData.argtypes = [
+            blob_ptr,
+            wintypes.LPCWSTR,
+            blob_ptr,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            blob_ptr,
+        ]
+        crypt32.CryptProtectData.restype = wintypes.BOOL
+        crypt32.CryptUnprotectData.argtypes = [
+            blob_ptr,
+            ctypes.POINTER(ctypes.c_void_p),
+            blob_ptr,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            blob_ptr,
+        ]
+        crypt32.CryptUnprotectData.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        raw_buffer = (ctypes.c_ubyte * max(1, len(value)))()
+        if value:
+            ctypes.memmove(raw_buffer, value, len(value))
         in_blob = DATA_BLOB(
             len(value),
-            ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
+            ctypes.cast(raw_buffer, ctypes.POINTER(ctypes.c_ubyte)),
         )
         out_blob = DATA_BLOB()
+        description_ptr = ctypes.c_void_p()
 
         if protect:
-            func = crypt32.CryptProtectData
-            ok = func(
+            ok = crypt32.CryptProtectData(
                 ctypes.byref(in_blob),
                 "Pengucro",
                 None,
@@ -125,11 +149,9 @@ class SecretStore:
                 ctypes.byref(out_blob),
             )
         else:
-            description = wintypes.LPWSTR()
-            func = crypt32.CryptUnprotectData
-            ok = func(
+            ok = crypt32.CryptUnprotectData(
                 ctypes.byref(in_blob),
-                ctypes.byref(description),
+                ctypes.byref(description_ptr),
                 None,
                 None,
                 None,
@@ -143,7 +165,9 @@ class SecretStore:
             return ctypes.string_at(out_blob.pbData, out_blob.cbData)
         finally:
             if out_blob.pbData:
-                kernel32.LocalFree(ctypes.cast(out_blob.pbData, wintypes.HLOCAL))
+                kernel32.LocalFree(ctypes.cast(out_blob.pbData, ctypes.c_void_p))
+            if description_ptr.value:
+                kernel32.LocalFree(description_ptr)
 
     @classmethod
     def _protect(cls, value: bytes) -> bytes:
@@ -164,8 +188,6 @@ class SecretStore:
         except ImportError:
             return cls._windows_dpapi(value, protect=False)
         except OSError as exc:
-            # Data created by pywin32 is ordinary DPAPI ciphertext; retrying via
-            # crypt32 also handles a partially broken pywin32 installation.
             try:
                 return cls._windows_dpapi(value, protect=False)
             except RuntimeError:
@@ -186,8 +208,8 @@ class SecretStore:
             save_json(self.filename, values)
             return True
         except (OSError, RuntimeError, ValueError):
-            # Personal-secret persistence must never prevent config.json from
-            # being saved.  Existing ciphertext is left intact on failure.
+            # A secret backend problem must not prevent ReservationForm from
+            # continuing to save config.json (people, site, threads, etc.).
             return False
 
     def get(self, key: str, default: str = "") -> str:
