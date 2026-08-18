@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from engines.cgv_browser_client_runtime import CgvBrowserClient
@@ -5,7 +7,7 @@ from engines.cgv_engine_runtime import CgvEngine
 from pengucro import __release_sequence__, __version__
 from pengucro.patch_notes import notes_for
 from pengucro.storage import SecretStore, load_json, save_json
-from ui.cgv_booking_dialog_runtime import parse_manual_seat_priorities
+from ui.cgv_booking_dialog_runtime import CgvBookingDialog, parse_manual_seat_priorities
 
 
 def test_manual_seat_priorities_work_without_live_seat_map():
@@ -94,6 +96,51 @@ def test_ui_module_exports_runtime_cgv_dialog_and_client():
     assert WiredDialog is RuntimeDialog
     assert WiredClient is CgvBrowserClient
     assert DialogClient is CgvBrowserClient
+
+
+def test_seat_guide_visual_is_hidden_without_destroying_guide_state():
+    class GuideFrame:
+        def __init__(self):
+            self.hidden = False
+
+        def pack_forget(self):
+            self.hidden = True
+
+    guide = GuideFrame()
+    guide_text = SimpleNamespace(master=guide)
+    title = SimpleNamespace(master=guide_text)
+    dialog = SimpleNamespace(
+        guide_title_label=title,
+        current_guide=object(),
+        auto_seat_modes={"명당 자동 선택": "recommended"},
+    )
+
+    CgvBookingDialog._hide_visual_seat_guide(dialog)
+
+    assert guide.hidden is True
+    assert dialog.current_guide is not None
+    assert "명당 자동 선택" in dialog.auto_seat_modes
+
+
+def test_dialog_expands_height_to_show_more_seat_map():
+    state = {"geometry": "1060x680+100+100", "minsize": None}
+
+    def geometry(value=None):
+        if value is None:
+            return state["geometry"]
+        state["geometry"] = value
+
+    dialog = SimpleNamespace(
+        update_idletasks=lambda: None,
+        geometry=geometry,
+        winfo_screenheight=lambda: 900,
+        minsize=lambda width, height: state.__setitem__("minsize", (width, height)),
+    )
+
+    CgvBookingDialog._expand_dialog_for_seat_map(dialog)
+
+    assert state["geometry"].startswith("1060x760+")
+    assert state["minsize"] == (900, 560)
 
 
 def test_v627_release_contract_is_complete():
