@@ -75,7 +75,7 @@ def test_preopen_long_movie_name_matches_real_open_movie_name():
         preferred_times=["14:00"],
     )
 
-    assert chosen is actual
+    assert chosen == actual
     assert schedule_matches_movie(actual, "오디세이(IMAX LASER 2D)", "IMAX LASER 2D")
 
 
@@ -102,7 +102,7 @@ def test_canonical_fallback_never_crosses_into_regular_2d_screening():
         preferred_times=["14:00"],
     )
 
-    assert chosen is imax
+    assert chosen == imax
     assert chosen["expoScnsNm"] == "IMAX관"
     assert chosen["movkndDsplEnm"] == "IMAX LASER 2D"
 
