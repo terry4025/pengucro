@@ -86,16 +86,17 @@ def test_secret_failure_does_not_abort_plain_config_persistence(monkeypatch, tmp
     assert load_json("config.json", {})["people"] == "2"
 
 
-def test_ui_module_exports_runtime_cgv_dialog_and_client():
+def test_ui_scopes_runtime_cgv_client_to_selector_only():
     import ui  # noqa: F401 - triggers runtime wiring
-    from engines.cgv_browser_client import CgvBrowserClient as WiredClient
+    from engines.cgv_browser_client import CgvBrowserClient as BaseClient
     from ui.cgv_booking_dialog import CgvBookingDialog as WiredDialog
     from ui.cgv_booking_dialog import CgvBrowserClient as DialogClient
     from ui.cgv_booking_dialog_runtime import CgvBookingDialog as RuntimeDialog
 
     assert WiredDialog is RuntimeDialog
-    assert WiredClient is CgvBrowserClient
     assert DialogClient is CgvBrowserClient
+    assert BaseClient is not CgvBrowserClient
+    assert BaseClient.__module__ == "engines.cgv_browser_client"
 
 
 def test_seat_guide_visual_is_hidden_without_destroying_guide_state():
