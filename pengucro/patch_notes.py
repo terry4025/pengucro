@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.39",
+        changes=(
+            "CGV 미오픈 저장 영화명과 실제 오픈 영화명 간 표준 식별 브릿지 적용",
+            "UI 영화 목록 및 히스토리 템플릿의 중복 영화명 정규화",
+        ),
+    ),
+    PatchNote(
         version="6.38",
         changes=(
             "CGV 시간 우선순위와 좌석 우선순위 통합 사다리(Ladder) 감시 지원",
