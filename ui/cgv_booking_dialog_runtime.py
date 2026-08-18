@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 import customtkinter as ctk
 
@@ -21,7 +20,7 @@ def parse_manual_seat_priorities(raw: str, people: int) -> list[tuple[str, ...]]
     Each group must contain exactly ``people`` seats in one contiguous row.
     Physical-seat existence is intentionally not required here because this
     feature is specifically for unpublished dates whose seat map is not yet
-    available.  The booking engine still resolves the labels against the real
+    available. The booking engine still resolves the labels against the real
     seat map when the target screening opens.
     """
 
@@ -87,11 +86,14 @@ class CgvBookingDialog(BaseCgvBookingDialog):
             border_color=theme.CONTROL_BORDER,
             corner_radius=theme.ROUNDED_MD,
         )
+        # CustomTkinter wrappers do not always expose the same Tk packing parent
+        # as the logical widget. The load button is a known direct child and is
+        # already packed, so anchor the new controls after that stable sibling.
         self.manual_seat_frame.pack(
             fill="x",
             padx=theme.SPACE_3,
             pady=(0, theme.SPACE_1),
-            before=self.seat_list,
+            after=self.load_seats_button,
         )
 
         title_row = ctk.CTkFrame(self.manual_seat_frame, fg_color="transparent")
@@ -255,9 +257,11 @@ class CgvBookingDialog(BaseCgvBookingDialog):
         self._render_priorities()
 
     def _render_priorities(self) -> None:
-        super()._render_priorities()
+        BaseCgvBookingDialog._render_priorities(self)
         self._refresh_manual_seat_ui()
 
     def _set_people(self, new_people: int) -> None:
-        super()._set_people(new_people)
+        # Keep the method compatible with the repository's unbound
+        # SimpleNamespace state tests; zero-argument super() rejects those mocks.
+        BaseCgvBookingDialog._set_people(self, new_people)
         self._refresh_manual_seat_ui()
