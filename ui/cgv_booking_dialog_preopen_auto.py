@@ -38,6 +38,40 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
             or next(iter(options), "명당 자동 선택"),
         )
 
+    def _preopen_auto_options(self) -> dict[str, str]:
+        """Return the normal seat strategy list even for duck-typed fixtures."""
+
+        builder = getattr(self, "_auto_seat_options", None)
+        if callable(builder):
+            try:
+                return dict(builder())
+            except (AttributeError, TypeError):
+                # Historical unit tests deliberately call the final dialog
+                # methods with SimpleNamespace objects that only expose the
+                # state needed by the method under test. Fall through to the
+                # equivalent lightweight option construction below.
+                pass
+
+        try:
+            people = max(1, min(int(getattr(self, "people", 2) or 2), 8))
+        except (TypeError, ValueError):
+            people = 2
+        guide = getattr(self, "current_guide", None)
+        if guide is not None and bool(getattr(guide, "dedicated", False)):
+            return {
+                "명당 자동 선택": "",
+                f"균형 최우선 · H열 중앙 {people}석": "balanced",
+                f"몰입형 · F–G열 중앙 {people}석": "immersive",
+                f"편안형 · I–J열 중앙 {people}석": "comfortable",
+                f"추천 등급순 · 중앙 {people}석": "best",
+            }
+        return {
+            "명당 자동 선택": "",
+            f"최우선 중앙 명당 {people}석": "best",
+            f"추천 중앙 구역 {people}석": "recommended",
+            f"취향 추천 구역 {people}석": "preference",
+        }
+
     def _refresh_preopen_auto_controls(self) -> None:
         menu = getattr(self, "auto_seat_menu", None)
         variable = getattr(self, "auto_seat_var", None)
@@ -64,7 +98,7 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
             variable.set("명당 자동 선택")
             return
 
-        options = dict(self._auto_seat_options())
+        options = CgvBookingDialog._preopen_auto_options(self)
         self.auto_seat_modes = options
         menu.configure(values=list(options), state="normal")
         label = CgvBookingDialog._label_for_auto_mode(
@@ -76,7 +110,7 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
 
     def _update_seat_guide(self) -> None:
         # Keep these wrapper methods callable as unbound functions with the
-        # repository's SimpleNamespace dialog fixtures.  zero-argument super()
+        # repository's SimpleNamespace dialog fixtures. zero-argument super()
         # requires ``self`` to be an actual subclass instance and broke the
         # historical tests once this final runtime layer was installed.
         ControlsCgvBookingDialog._update_seat_guide(self)
@@ -118,7 +152,7 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
         mode = str(self.auto_seat_modes.get(label, "") or "").strip()
         if not mode:
             CgvBookingDialog._clear_auto_preference(self)
-            self._update_confirm_state()
+            CgvBookingDialog._update_confirm_state(self)
             return
 
         self.auto_seat_preference = mode
@@ -134,14 +168,14 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
                 ),
                 text_color=theme.TINT_SUCCESS_FG,
             )
-            self._update_confirm_state()
+            CgvBookingDialog._update_confirm_state(self)
             return
 
         # With a real map present, keep the mature preview behavior while also
         # retaining the mode as a runtime fallback if manually saved groups are
         # unavailable on the target screening.
         ControlsCgvBookingDialog._auto_select_seats(self, label)
-        self._update_confirm_state()
+        CgvBookingDialog._update_confirm_state(self)
 
     def _clear_priorities(self) -> None:
         CgvBookingDialog._clear_auto_preference(self)
