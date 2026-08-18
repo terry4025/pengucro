@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v641_patch_notes_are_short_and_exact():
+    note = notes_for("6.41")
+
+    assert note is not None
+    assert note.changes == (
+        "네이버페이 보안 키패드 4행 2열 및 숫자 4·7 인식 정확도 개선",
+        "키패드 인접 버튼 텍스트 노이즈 배제 및 중심 글리프 매칭 강화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v628_patch_notes_are_short_and_exact():
     note = notes_for("6.28")
 

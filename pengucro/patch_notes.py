@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.41",
+        changes=(
+            "네이버페이 보안 키패드 4행 2열 및 숫자 4·7 인식 정확도 개선",
+            "키패드 인접 버튼 텍스트 노이즈 배제 및 중심 글리프 매칭 강화",
+        ),
+    ),
+    PatchNote(
         version="6.40",
         changes=(
             "CGV 용산아이파크몰 IMAX 미오픈 상태에서 명당 좌석 번호 사전 프리셋 지정 지원",

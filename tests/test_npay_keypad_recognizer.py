@@ -39,6 +39,31 @@ def test_npay_keypad_recognition_on_sample_image() -> None:
     assert cells["5"].row == 2 and cells["5"].col == 2
     assert cells["9"].row == 2 and cells["9"].col == 3
     assert cells["2"].row == 3 and cells["2"].col == 1
-    assert cells["7"].row == 3 and cells["2"].col == 1
+    assert cells["7"].row == 3 and cells["7"].col == 2
     assert cells["1"].row == 3 and cells["1"].col == 3
     assert cells["3"].row == 4 and cells["3"].col == 2
+
+
+def test_npay_keypad_recognition_on_second_sample_image() -> None:
+    sample_path = Path(r"C:\Users\Administrator\.gemini\antigravity\brain\6f859b83-e5c9-4d39-9883-805d23fcb21b\.user_uploaded\media_1787060821365.png")
+    if not sample_path.exists():
+        return
+
+    img = Image.open(sample_path)
+    cells = NpayKeypadRecognizer.recognize_keypad_image(img)
+
+    for digit in "0123456789":
+        assert digit in cells, f"Digit {digit} not recognized"
+        assert cells[digit].confidence >= 0.70
+
+    assert cells["9"].row == 1 and cells["9"].col == 1
+    assert cells["0"].row == 1 and cells["0"].col == 2
+    assert cells["5"].row == 1 and cells["5"].col == 3
+    assert cells["4"].row == 2 and cells["4"].col == 1
+    assert cells["8"].row == 2 and cells["8"].col == 2
+    assert cells["2"].row == 2 and cells["2"].col == 3
+    assert cells["6"].row == 3 and cells["6"].col == 1
+    assert cells["1"].row == 3 and cells["1"].col == 2
+    assert cells["3"].row == 3 and cells["3"].col == 3
+    assert cells["7"].row == 4 and cells["7"].col == 2
+

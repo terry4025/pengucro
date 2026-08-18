@@ -190,23 +190,47 @@ class NpayKeypadRecognizer:
                 if not white_pixels:
                     continue
 
-                min_x = min(x for x, y in white_pixels)
-                max_x = max(x for x, y in white_pixels)
-                min_y = min(y for x, y in white_pixels)
-                max_y = max(y for x, y in white_pixels)
+                # Group white pixels into distinct horizontal clusters to isolate
+                # the digit from any neighboring text spillover (e.g. 전체삭제)
+                xs = [x for x, y in white_pixels]
+                clusters: list[list[int]] = []
+                cur_xs: list[int] = []
+                for x in sorted(set(xs)):
+                    if not cur_xs or x - cur_xs[-1] <= 4:
+                        cur_xs.append(x)
+                    else:
+                        clusters.append(cur_xs)
+                        cur_xs = [x]
+                if cur_xs:
+                    clusters.append(cur_xs)
+
+                # Select the cluster closest to the horizontal center of the cell
+                cell_mid_x = cw / 2.0
+                best_cluster_xs = set(
+                    min(clusters, key=lambda cl: abs(sum(cl) / float(len(cl)) - cell_mid_x))
+                )
+                cluster_pixels = [
+                    (x, y) for x, y in white_pixels if x in best_cluster_xs
+                ]
+
+                min_x = min(x for x, y in cluster_pixels)
+                max_x = max(x for x, y in cluster_pixels)
+                min_y = min(y for x, y in cluster_pixels)
+                max_y = max(y for x, y in cluster_pixels)
 
                 glyph = cell_crop.crop((min_x, min_y, max_x + 1, max_y + 1))
                 digit, conf = cls.match_glyph_bitmap(glyph)
 
-                if digit is not None:
-                    result[digit] = KeypadCell(
-                        digit=digit,
-                        row=r + 1,
-                        col=c + 1,
-                        bbox=(abs_x1, abs_y1, abs_x2, abs_y2),
-                        center=(cx, cy),
-                        confidence=conf,
-                    )
+                if digit is not None and conf >= 0.50:
+                    if digit not in result or conf > result[digit].confidence:
+                        result[digit] = KeypadCell(
+                            digit=digit,
+                            row=r + 1,
+                            col=c + 1,
+                            bbox=(abs_x1, abs_y1, abs_x2, abs_y2),
+                            center=(cx, cy),
+                            confidence=conf,
+                        )
 
         return result
 

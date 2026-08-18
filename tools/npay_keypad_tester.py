@@ -4,6 +4,7 @@
 네이버페이 가상 보안 키패드 인식 및 클릭 시뮬레이터 (NPay Keypad Tester)
 - 펭크로와 동일한 다크 테마 UI
 - 클립보드(Ctrl+V) 또는 파일에서 네이버페이 키패드 이미지 로드
+- Chrome 슬롯 1(포트 9333) 실시간 키패드 1회 캡처 & F5 자동 연속 캡처 데이터셋 수집
 - Lucide Eye(눈 모양) ON/OFF 비밀번호 표시/숨김 토글
 - 키패드 0~9 번호 자동 인식 및 6자리 클릭 순서 시각적 오버레이 시뮬레이션
 """
@@ -11,8 +12,10 @@
 from __future__ import annotations
 
 import base64
+import glob
 import io
 import os
+import random
 import sys
 import threading
 import time
@@ -29,9 +32,6 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk
 
 from engines.npay_keypad_recognizer import KeypadCell, NpayKeypadRecognizer
-
-# Sample base64 image (user's real Naver Pay keypad screenshot)
-_SAMPLE_FILE = _PROJECT_ROOT / "data" / "npay_sample.b64"
 
 
 def _create_lucide_eye_icon(size: tuple[int, int] = (18, 18), color: str = "#9ca3af") -> ctk.CTkImage:
@@ -98,8 +98,8 @@ class NpayKeypadTesterApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("네이버페이 키패드 인식 & 클릭 시뮬레이터 (NPay Keypad Tester)")
-        self.geometry("1100x820")
-        self.minsize(980, 720)
+        self.geometry("1140x860")
+        self.minsize(1020, 740)
         self.configure(fg_color=self.THEME_BG)
 
         self.current_image: Image.Image | None = None
@@ -107,6 +107,13 @@ class NpayKeypadTesterApp(ctk.CTk):
         self.is_simulating = False
         self.simulation_stop = threading.Event()
         self.eye_visible = False
+
+        self.is_auto_capturing = False
+        self.auto_capture_stop = threading.Event()
+        self.dataset_dir = _PROJECT_ROOT / "data" / "npay_captures"
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.dataset_files: list[Path] = []
+        self.dataset_index = -1
 
         self.icon_eye = _create_lucide_eye_icon((18, 18), color="#9ca3af")
         self.icon_eye_off = _create_lucide_eye_off_icon((18, 18), color="#9ca3af")
@@ -136,7 +143,7 @@ class NpayKeypadTesterApp(ctk.CTk):
 
         badge = ctk.CTkLabel(
             title_box,
-            text="v1.0 독립 검증 도구",
+            text="v1.1 실시간 자동 수집기 탑재",
             font=ctk.CTkFont(family="Pretendard, Malgun Gothic", size=11),
             text_color=self.THEME_ACCENT_GREEN,
             fg_color="#0d2b1d",
@@ -149,7 +156,7 @@ class NpayKeypadTesterApp(ctk.CTk):
         # Main Body (Split into Left Controls / Right Visualizer)
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=16, pady=16)
-        body.columnconfigure(0, weight=0, minsize=380)
+        body.columnconfigure(0, weight=0, minsize=400)
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
@@ -160,20 +167,23 @@ class NpayKeypadTesterApp(ctk.CTk):
             border_color=self.THEME_BORDER,
             border_width=1,
             corner_radius=10,
-            width=380,
+            width=400,
         )
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
         # Card 1: 비밀번호 설정
         self._build_card_password(left_panel)
 
-        # Card 2: 이미지 불러오기
+        # Card 2: Chrome 슬롯 1 연동 및 F5 연속 캡처 수집기
+        self._build_card_chrome_capture(left_panel)
+
+        # Card 3: 수집된 데이터셋 및 이미지 불러오기
         self._build_card_image_source(left_panel)
 
-        # Card 3: 시뮬레이션 제어
+        # Card 4: 시뮬레이션 제어
         self._build_card_simulation(left_panel)
 
-        # Card 4: 실시간 인식 & 시뮬레이션 로그
+        # Card 5: 실시간 인식 & 시뮬레이션 로그
         self._build_card_logs(left_panel)
 
         # Right Panel: Canvas Visualizer
@@ -230,13 +240,92 @@ class NpayKeypadTesterApp(ctk.CTk):
         )
         self.eye_button.grid(row=0, column=1, sticky="e")
 
+    def _build_card_chrome_capture(self, parent: ctk.CTkFrame) -> None:
+        card = ctk.CTkFrame(parent, fg_color=self.THEME_ELEVATED, corner_radius=8)
+        card.pack(fill="x", pady=(0, 12))
+
+        ctk.CTkLabel(
+            card,
+            text="🌐 Chrome 슬롯 1 (포트 9333) 자동 캡처 수집기",
+            font=ctk.CTkFont(family="Pretendard, Malgun Gothic", size=13, weight="bold"),
+            text_color=self.THEME_ACCENT_GREEN,
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(
+            card,
+            text="슬롯 1 Chrome의 네이버페이 비밀번호 모달에서 키패드를 가져옵니다.",
+            font=ctk.CTkFont(size=11),
+            text_color=self.THEME_TEXT_MUTED,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        # 1-shot capture button
+        ctk.CTkButton(
+            card,
+            text="📸 현재 열린 Chrome 키패드 즉시 가져오기 (1회)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=34,
+            fg_color="#0369a1",
+            hover_color="#0284c7",
+            command=self._capture_single_from_chrome,
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        # Auto capture settings
+        settings_frame = ctk.CTkFrame(card, fg_color=self.THEME_CARD, corner_radius=6)
+        settings_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        row1 = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        row1.pack(fill="x", padx=8, pady=(8, 4))
+        row1.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(row1, text="수집 반복 횟수:", font=ctk.CTkFont(size=11), text_color=self.THEME_TEXT_SECONDARY).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.capture_count_var = ctk.StringVar(value="30")
+        self.capture_count_menu = ctk.CTkOptionMenu(
+            row1,
+            values=["10", "30", "50", "100"],
+            variable=self.capture_count_var,
+            width=80,
+            height=26,
+            font=ctk.CTkFont(size=11),
+        )
+        self.capture_count_menu.grid(row=0, column=1, sticky="e")
+
+        row2 = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        row2.pack(fill="x", padx=8, pady=(0, 8))
+        row2.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(row2, text="F5 새로고침 간격:", font=ctk.CTkFont(size=11), text_color=self.THEME_TEXT_SECONDARY).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.capture_delay_var = ctk.StringVar(value="1.0초")
+        self.capture_delay_menu = ctk.CTkOptionMenu(
+            row2,
+            values=["0.5초", "1.0초", "1.5초", "2.0초"],
+            variable=self.capture_delay_var,
+            width=80,
+            height=26,
+            font=ctk.CTkFont(size=11),
+        )
+        self.capture_delay_menu.grid(row=0, column=1, sticky="e")
+
+        # Auto capture button
+        self.auto_capture_btn = ctk.CTkButton(
+            card,
+            text="🔄 F5 자동 연속 캡처 & 데이터셋 수집 시작",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=34,
+            fg_color="#15803d",
+            hover_color="#16a34a",
+            command=self._start_auto_capture,
+        )
+        self.auto_capture_btn.pack(fill="x", padx=12, pady=(0, 8))
+
     def _build_card_image_source(self, parent: ctk.CTkFrame) -> None:
         card = ctk.CTkFrame(parent, fg_color=self.THEME_ELEVATED, corner_radius=8)
         card.pack(fill="x", pady=(0, 12))
 
         ctk.CTkLabel(
             card,
-            text="🖼️ 키패드 이미지 입력",
+            text="🖼️ 키패드 이미지 입력 및 데이터셋 탐색",
             font=ctk.CTkFont(family="Pretendard, Malgun Gothic", size=13, weight="bold"),
             text_color=self.THEME_TEXT_PRIMARY,
         ).pack(anchor="w", padx=12, pady=(10, 6))
@@ -267,16 +356,66 @@ class NpayKeypadTesterApp(ctk.CTk):
             command=self._open_file,
         ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
+        # Dataset browsing controls
+        ds_row = ctk.CTkFrame(card, fg_color="transparent")
+        ds_row.pack(fill="x", padx=12, pady=(0, 6))
+        ds_row.columnconfigure((0, 1, 2), weight=1)
+
         ctk.CTkButton(
-            card,
-            text="⚡ 기본 샘플 이미지 다시 로드",
+            ds_row,
+            text="◀ 이전 캡처",
             font=ctk.CTkFont(size=11),
             height=28,
+            fg_color=self.THEME_CARD,
+            hover_color="#333842",
+            command=lambda: self._browse_dataset(-1),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+
+        ctk.CTkButton(
+            ds_row,
+            text="🎲 랜덤 캡처",
+            font=ctk.CTkFont(size=11),
+            height=28,
+            fg_color=self.THEME_CARD,
+            hover_color="#333842",
+            command=self._load_random_capture,
+        ).grid(row=0, column=1, sticky="ew", padx=(2, 2))
+
+        ctk.CTkButton(
+            ds_row,
+            text="다음 캡처 ▶",
+            font=ctk.CTkFont(size=11),
+            height=28,
+            fg_color=self.THEME_CARD,
+            hover_color="#333842",
+            command=lambda: self._browse_dataset(1),
+        ).grid(row=0, column=2, sticky="ew", padx=(2, 0))
+
+        open_row = ctk.CTkFrame(card, fg_color="transparent")
+        open_row.pack(fill="x", padx=12, pady=(0, 8))
+        open_row.columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            open_row,
+            text="📂 캡처 폴더 열기",
+            font=ctk.CTkFont(size=11),
+            height=26,
+            fg_color="transparent",
+            text_color=self.THEME_ACCENT_BLUE,
+            hover_color=self.THEME_CARD,
+            command=self._open_captures_folder,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 2))
+
+        ctk.CTkButton(
+            open_row,
+            text="⚡ 기본 샘플 다시 로드",
+            font=ctk.CTkFont(size=11),
+            height=26,
             fg_color="transparent",
             text_color=self.THEME_TEXT_SECONDARY,
             hover_color=self.THEME_CARD,
             command=self._load_default_sample,
-        ).pack(fill="x", padx=12, pady=(0, 8))
+        ).grid(row=0, column=1, sticky="ew", padx=(2, 0))
 
     def _build_card_simulation(self, parent: ctk.CTkFrame) -> None:
         card = ctk.CTkFrame(parent, fg_color=self.THEME_ELEVATED, corner_radius=8)
@@ -342,7 +481,7 @@ class NpayKeypadTesterApp(ctk.CTk):
 
         ctk.CTkLabel(
             header_row,
-            text="📋 실시간 분석 및 시뮬레이션 로그",
+            text="📋 실시간 분석 및 수집 로그",
             font=ctk.CTkFont(family="Pretendard, Malgun Gothic", size=12, weight="bold"),
             text_color=self.THEME_TEXT_PRIMARY,
         ).grid(row=0, column=0, sticky="w")
@@ -366,7 +505,7 @@ class NpayKeypadTesterApp(ctk.CTk):
             border_width=1,
             font=ctk.CTkFont(family="Consolas, Malgun Gothic", size=11),
             text_color="#e5e7eb",
-            height=200,
+            height=180,
         )
         self.log_box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
@@ -381,7 +520,7 @@ class NpayKeypadTesterApp(ctk.CTk):
 
         self.status_label = ctk.CTkLabel(
             top_bar,
-            text="키패드 이미지를 불러오거나 시뮬레이션을 시작하세요.",
+            text="키패드 이미지를 불러오거나 Chrome 캡처를 실행하세요.",
             font=ctk.CTkFont(family="Pretendard, Malgun Gothic", size=12),
             text_color=self.THEME_TEXT_SECONDARY,
         )
@@ -417,7 +556,7 @@ class NpayKeypadTesterApp(ctk.CTk):
         )
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
-        # Canvas Click to copy coords
+        # Canvas Click to inspect coords
         self.canvas.bind("<Button-1>", self._on_canvas_click)
 
     def _toggle_eye(self) -> None:
@@ -441,6 +580,7 @@ class NpayKeypadTesterApp(ctk.CTk):
             "warning": "⚠️ ",
             "error": "❌ ",
             "click": "👉 ",
+            "capture": "📸 ",
         }.get(level, "• ")
         self.log_box.insert("end", f"[{ts}] {prefix}{text}\n")
         self.log_box.see("end")
@@ -455,7 +595,240 @@ class NpayKeypadTesterApp(ctk.CTk):
             else:
                 dot.configure(text="○", text_color=self.THEME_TEXT_MUTED)
 
+    # -------------------------------------------------------------------------
+    # Chrome Slot 1 Live Capture and Automated F5 Sampling
+    # -------------------------------------------------------------------------
+    def _capture_single_from_chrome(self) -> None:
+        self._log("Chrome 슬롯 1 (포트 9333) 연결 및 키패드 탐색 중...", "info")
+        threading.Thread(target=self._run_single_capture_thread, daemon=True).start()
+
+    def _run_single_capture_thread(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9333")
+                if not browser.contexts:
+                    self.after(0, lambda: self._log("Chrome 슬롯 1에 열린 브라우저 컨텍스트가 없습니다.", "error"))
+                    return
+
+                ctx = browser.contexts[0]
+                target_page = None
+                for page in reversed(ctx.pages):
+                    url = (page.url or "").casefold()
+                    if "pay.naver.com" in url or "/pw/check" in url:
+                        target_page = page
+                        break
+
+                if target_page is None and ctx.pages:
+                    # Fallback to active/latest tab
+                    target_page = ctx.pages[-1]
+
+                if target_page is None:
+                    self.after(0, lambda: self._log("Chrome 슬롯 1에서 네이버페이 탭을 찾지 못했습니다.", "error"))
+                    return
+
+                shot_bytes = target_page.screenshot()
+                img = Image.open(io.BytesIO(shot_bytes))
+
+                # Save timestamped copy into dataset
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                save_path = self.dataset_dir / f"npay_keypad_{ts}.png"
+                img.save(save_path)
+
+                self.after(0, lambda i=img, p=save_path: self._on_single_capture_success(i, p))
+        except Exception as exc:
+            self.after(0, lambda e=exc: self._log(f"Chrome 캡처 실패: {e}", "error"))
+
+    def _on_single_capture_success(self, img: Image.Image, save_path: Path) -> None:
+        self._set_image(img, f"Chrome 슬롯 1 실시간 캡처 ({save_path.name})")
+        self._log(f"캡처 이미지가 데이터셋 폴더에 저장되었습니다: {save_path.name}", "capture")
+
+    def _start_auto_capture(self) -> None:
+        if self.is_auto_capturing:
+            self.auto_capture_stop.set()
+            self.is_auto_capturing = False
+            self.auto_capture_btn.configure(text="🔄 F5 자동 연속 캡처 & 데이터셋 수집 시작", fg_color="#15803d")
+            self._log("자동 연속 캡처가 사용자에 의해 중지되었습니다.", "warning")
+            return
+
+        try:
+            total_count = int(self.capture_count_var.get())
+        except Exception:
+            total_count = 30
+
+        delay_str = self.capture_delay_var.get().replace("초", "").strip()
+        try:
+            delay_sec = float(delay_str)
+        except Exception:
+            delay_sec = 1.0
+
+        self.is_auto_capturing = True
+        self.auto_capture_stop.clear()
+        self.auto_capture_btn.configure(text="⏹️ 연속 캡처 수집 중지", fg_color="#ef4444")
+
+        self._log(f"🚀 F5 자동 연속 캡처 시작: 총 {total_count}회 반복 (새로고침 간격: {delay_sec}s)...", "info")
+        threading.Thread(
+            target=self._run_auto_capture_thread,
+            args=(total_count, delay_sec),
+            daemon=True,
+        ).start()
+
+    def _run_auto_capture_thread(self, total_count: int, delay_sec: float) -> None:
+        success_count = 0
+        captured_files = []
+
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9333")
+                if not browser.contexts:
+                    self.after(0, lambda: self._log("Chrome 슬롯 1에 열린 브라우저가 없습니다.", "error"))
+                    return
+
+                ctx = browser.contexts[0]
+                target_page = None
+                for page in reversed(ctx.pages):
+                    url = (page.url or "").casefold()
+                    if "pay.naver.com" in url or "/pw/check" in url:
+                        target_page = page
+                        break
+
+                if target_page is None and ctx.pages:
+                    target_page = ctx.pages[-1]
+
+                if target_page is None:
+                    self.after(0, lambda: self._log("네이버페이 비밀번호 탭을 찾을 수 없습니다.", "error"))
+                    return
+
+                for cycle in range(1, total_count + 1):
+                    if self.auto_capture_stop.is_set():
+                        break
+
+                    # Capture screenshot
+                    shot_bytes = target_page.screenshot()
+                    img = Image.open(io.BytesIO(shot_bytes))
+
+                    # Save to dataset
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    file_name = f"npay_{ts}_{cycle:03d}.png"
+                    save_path = self.dataset_dir / file_name
+                    img.save(save_path)
+                    captured_files.append(save_path)
+
+                    # Real-time recognition accuracy verification
+                    cells = NpayKeypadRecognizer.recognize_keypad_image(img)
+                    digits_found = [k for k in cells if cells[k].digit is not None]
+                    is_all_digits = (len(digits_found) == 10)
+                    if is_all_digits:
+                        success_count += 1
+
+                    # Update UI in main thread
+                    self.after(
+                        0,
+                        lambda c=cycle, t=total_count, fn=file_name, ok=is_all_digits, df=len(digits_found), im=img: (
+                            self._on_auto_capture_step(c, t, fn, ok, df, im)
+                        ),
+                    )
+
+                    # Trigger F5 reload to shuffle keypad
+                    if cycle < total_count and not self.auto_capture_stop.is_set():
+                        try:
+                            target_page.reload()
+                        except Exception:
+                            pass
+                        time.sleep(delay_sec)
+
+        except Exception as exc:
+            self.after(0, lambda e=exc: self._log(f"자동 캡처 루프 오류: {e}", "error"))
+        finally:
+            self.after(
+                0,
+                lambda sc=success_count, tc=len(captured_files), total=total_count: (
+                    self._finish_auto_capture_ui(sc, tc, total)
+                ),
+            )
+
+    def _on_auto_capture_step(
+        self, cycle: int, total: int, filename: str, is_ok: bool, digit_count: int, img: Image.Image
+    ) -> None:
+        status_text = "10개 숫자 100% 정상 인식" if is_ok else f"일부 숫자 누락 ({digit_count}/10)"
+        log_level = "success" if is_ok else "warning"
+        self._log(f"[{cycle}/{total}회] 저장: {filename} · {status_text}", log_level)
+        self.status_label.configure(text=f"자동 수집 진행 중 [{cycle}/{total}] · {filename}")
+        self._set_image(img, f"자동 수집 #{cycle} ({filename})")
+
+    def _finish_auto_capture_ui(self, success_count: int, captured_count: int, total: int) -> None:
+        self.is_auto_capturing = False
+        self.auto_capture_btn.configure(text="🔄 F5 자동 연속 캡처 & 데이터셋 수집 시작", fg_color="#15803d")
+        if captured_count > 0:
+            rate = (success_count / float(captured_count)) * 100.0
+            self._log("=" * 45, "info")
+            self._log(f"🎉 자동 캡처 수집 완료! 총 {captured_count}장 수집됨 (성공률: {rate:.1f}% [{success_count}/{captured_count}])", "success")
+            self._log(f"📂 저장 위치: {self.dataset_dir}", "capture")
+            self._refresh_dataset_list()
+        else:
+            self._log("수집된 이미지가 없습니다.", "warning")
+
+    # -------------------------------------------------------------------------
+    # Dataset Explorer & Image Loading
+    # -------------------------------------------------------------------------
+    def _open_captures_folder(self) -> None:
+        try:
+            os.startfile(str(self.dataset_dir))
+        except Exception as exc:
+            self._log(f"폴더 열기 실패: {exc}", "error")
+
+    def _refresh_dataset_list(self) -> None:
+        files = sorted(self.dataset_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        self.dataset_files = files
+
+    def _browse_dataset(self, delta: int) -> None:
+        self._refresh_dataset_list()
+        if not self.dataset_files:
+            messagebox.showinfo("알림", "수집된 캡처 이미지가 없습니다. 자동 캡처를 먼저 실행해보세요.")
+            return
+
+        self.dataset_index += delta
+        if self.dataset_index < 0:
+            self.dataset_index = len(self.dataset_files) - 1
+        elif self.dataset_index >= len(self.dataset_files):
+            self.dataset_index = 0
+
+        target_file = self.dataset_files[self.dataset_index]
+        try:
+            img = Image.open(target_file)
+            self._set_image(img, f"데이터셋 [{self.dataset_index + 1}/{len(self.dataset_files)}]: {target_file.name}")
+        except Exception as exc:
+            self._log(f"이미지 로드 실패 ({target_file.name}): {exc}", "error")
+
+    def _load_random_capture(self) -> None:
+        self._refresh_dataset_list()
+        if not self.dataset_files:
+            messagebox.showinfo("알림", "수집된 캡처 이미지가 없습니다. 자동 캡처를 먼저 실행해보세요.")
+            return
+
+        self.dataset_index = random.randint(0, len(self.dataset_files) - 1)
+        target_file = self.dataset_files[self.dataset_index]
+        try:
+            img = Image.open(target_file)
+            self._set_image(img, f"랜덤 샘플 [{self.dataset_index + 1}/{len(self.dataset_files)}]: {target_file.name}")
+        except Exception as exc:
+            self._log(f"이미지 로드 실패 ({target_file.name}): {exc}", "error")
+
     def _load_default_sample(self) -> None:
+        # Check if dataset has captures first
+        self._refresh_dataset_list()
+        if self.dataset_files:
+            latest = self.dataset_files[-1]
+            try:
+                img = Image.open(latest)
+                self._set_image(img, f"최근 수집된 캡처: {latest.name}")
+                return
+            except Exception:
+                pass
+
         sample_path = _PROJECT_ROOT / "scratch" / "sample_b64.txt"
         if sample_path.exists():
             try:
@@ -477,7 +850,7 @@ class NpayKeypadTesterApp(ctk.CTk):
             except Exception:
                 pass
 
-        self._log("기본 샘플 이미지를 찾지 못했습니다. 클립보드(Ctrl+V)나 파일 열기를 이용해주세요.", "warning")
+        self._log("기본 샘플 이미지를 찾지 못했습니다. 클립보드(Ctrl+V)나 Chrome 캡처를 이용해주세요.", "warning")
 
     def _paste_from_clipboard(self) -> None:
         try:
@@ -485,7 +858,6 @@ class NpayKeypadTesterApp(ctk.CTk):
             if isinstance(grabbed, Image.Image):
                 self._set_image(grabbed, "클립보드에서 붙여넣은 이미지")
             elif isinstance(grabbed, list) and grabbed:
-                # File path in clipboard
                 file_path = grabbed[0]
                 img = Image.open(file_path)
                 self._set_image(img, f"클립보드 파일: {Path(file_path).name}")
@@ -549,7 +921,6 @@ class NpayKeypadTesterApp(ctk.CTk):
             self.after(50, lambda: self._draw_overlay(active_step, active_digit))
             return
 
-        # Scale image to fit canvas while preserving aspect ratio
         img_w, img_h = self.current_image.size
         scale = min((canvas_w - 40) / float(img_w), (canvas_h - 40) / float(img_h), 1.0)
         scale = max(0.2, scale)
@@ -557,11 +928,9 @@ class NpayKeypadTesterApp(ctk.CTk):
         render_w = int(img_w * scale)
         render_h = int(img_h * scale)
 
-        # Create overlay image
         overlay = self.current_image.copy().resize((render_w, render_h), Image.Resampling.BILINEAR)
         draw = ImageDraw.Draw(overlay)
 
-        # Draw bounding boxes for recognized cells
         pw = self.password_var.get().strip()
         step_order_for_digit: dict[str, list[int]] = {}
         for step_idx, char in enumerate(pw, start=1):
@@ -575,7 +944,6 @@ class NpayKeypadTesterApp(ctk.CTk):
 
             is_active = (active_digit is not None and key == active_digit)
 
-            # Border color
             if is_active:
                 border_color = "#facc15"  # Vibrant Yellow glow
                 fill_color = (250, 204, 21, 60)
@@ -588,7 +956,6 @@ class NpayKeypadTesterApp(ctk.CTk):
                 border_color = "#6b7280"
                 draw.rectangle([x1, y1, x2, y2], outline=border_color, width=1)
 
-            # Draw step badge if this key is part of password
             if cell.digit in step_order_for_digit:
                 steps = step_order_for_digit[cell.digit]
                 badge_text = " ".join(f"[{s}]" for s in steps)
@@ -597,14 +964,12 @@ class NpayKeypadTesterApp(ctk.CTk):
                 draw.rectangle([bx - 2, by - 2, bx + len(badge_text) * 7 + 4, by + 16], fill="#1e1b4b")
                 draw.text((bx, by), badge_text, fill="#38bdf8")
 
-        # Center on canvas
         self.canvas.delete("all")
         self._tk_img = ImageTk.PhotoImage(overlay)
         cx = canvas_w // 2
         cy = canvas_h // 2
         self.canvas.create_image(cx, cy, image=self._tk_img)
 
-        # Store transform metadata for click translation
         self._canvas_meta = {
             "scale": scale,
             "offset_x": cx - render_w // 2,
@@ -618,7 +983,6 @@ class NpayKeypadTesterApp(ctk.CTk):
         img_x = int((event.x - meta["offset_x"]) / meta["scale"])
         img_y = int((event.y - meta["offset_y"]) / meta["scale"])
 
-        # Check if hit any cell
         for key, cell in self.recognized_cells.items():
             x1, y1, x2, y2 = cell.bbox
             if x1 <= img_x <= x2 and y1 <= img_y <= y2:
@@ -649,7 +1013,6 @@ class NpayKeypadTesterApp(ctk.CTk):
             messagebox.showwarning("알림", "키패드 이미지를 먼저 분석해주세요.")
             return
 
-        # Check missing digits
         missing = [d for d in pw if d not in self.recognized_cells]
         if missing:
             messagebox.showerror(
@@ -663,7 +1026,6 @@ class NpayKeypadTesterApp(ctk.CTk):
         self.start_btn.configure(text="⏹️ 시뮬레이션 중지", fg_color="#ef4444")
         self._update_dots(0)
 
-        # Run sequential playback in thread
         delay_ms = int(self.speed_slider.get())
         threading.Thread(target=self._run_simulation_thread, args=(pw, delay_ms), daemon=True).start()
 
