@@ -21,6 +21,7 @@ a = Analysis(
         'engines.cgv_engine_hardened',
         'engines.cgv_engine_guarded',
         'engines.cgv_engine_runtime',
+        'engines.cgv_engine_watchdog',
         'engines.cgv_client',
         'engines.cgv_browser_client',
         'engines.cgv_browser_client_runtime',
