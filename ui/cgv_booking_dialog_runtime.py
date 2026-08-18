@@ -63,15 +63,38 @@ class CgvBookingDialog(BaseCgvBookingDialog):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._expand_dialog_for_seat_map()
         self._hide_visual_seat_guide()
         self._install_manual_seat_controls()
         self._refresh_manual_seat_ui()
+
+    def _expand_dialog_for_seat_map(self) -> None:
+        """Use more of the available screen height for the seat viewport."""
+
+        try:
+            self.update_idletasks()
+            geometry = str(self.geometry())
+            match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", geometry)
+            if not match:
+                return
+            width, height, pos_x, pos_y = (int(value) for value in match.groups())
+            screen_height = int(self.winfo_screenheight())
+            target_height = min(760, max(height, screen_height - 60))
+            if target_height <= height:
+                return
+            lift = (target_height - height) // 2
+            self.geometry(
+                f"{width}x{target_height}+{max(0, pos_x)}+{max(0, pos_y - lift)}"
+            )
+            self.minsize(900, 560)
+        except Exception:
+            pass
 
     def _hide_visual_seat_guide(self) -> None:
         """Hide the guide card while preserving its recommendation model.
 
         ``BaseCgvBookingDialog._update_seat_guide`` continues to build
-        ``current_guide`` and update the hidden labels.  Auto-seat selection can
+        ``current_guide`` and update the hidden labels. Auto-seat selection can
         therefore keep using the same recommendation data without spending
         scarce vertical space on the explanatory card.
         """
