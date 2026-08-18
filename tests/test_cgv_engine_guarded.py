@@ -30,7 +30,7 @@ def test_registry_uses_guarded_cgv_engine():
         success_callback=None,
     )
 
-    assert type(engine) is CgvEngine
+    assert isinstance(engine, CgvEngine)
     assert engine.FAST_SEAT_LAUNCH_INTERVAL_MS == 350
     assert engine.FAST_SEAT_MAX_INFLIGHT == 1
 

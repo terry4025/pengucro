@@ -9,6 +9,18 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v626_patch_notes_are_short_and_exact():
+    note = notes_for("6.26")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 미오픈 회차 감시 주기를 최대 1~2초로 단축",
+        "CGV 좌석 선택 후 결제 전 확인 안내창 자동 처리",
+        "CGV 결제수단 진입 지연 및 중복 클릭 방지 개선",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v625_patch_notes_are_short_and_exact():
     note = notes_for("6.25")
 

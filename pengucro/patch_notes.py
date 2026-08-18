@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.26",
+        changes=(
+            "CGV 미오픈 회차 감시 주기를 최대 1~2초로 단축",
+            "CGV 좌석 선택 후 결제 전 확인 안내창 자동 처리",
+            "CGV 결제수단 진입 지연 및 중복 클릭 방지 개선",
+        ),
+    ),
+    PatchNote(
         version="6.25",
         changes=(
             "키이스케이프 최종 서버시각 정밀도 보존 및 보정 로그 추가",
