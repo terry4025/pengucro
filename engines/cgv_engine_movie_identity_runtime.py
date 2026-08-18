@@ -102,23 +102,24 @@ def select_schedule(
 def _has_schedule_hint(
     payload: Any, movie: str, auditorium: str = ""
 ) -> bool:
+    """Return whether the target movie has begun appearing on the target date.
+
+    This is deliberately movie-only.  A regular 2D screening appearing before
+    the requested IMAX screening is useful evidence that the target date is
+    being published, so it should accelerate the pre-open watcher even though
+    the requested auditorium is not available yet.  Auditorium/format matching
+    remains strict in ``select_schedule`` when choosing the actual screening.
+    """
+
     if not isinstance(payload, dict):
         return False
-    auditorium_key = _compact(auditorium)
+    del auditorium  # Kept for the historical call signature; hints are movie-only.
     for item in schedule_items(payload):
         item_format = str(
             item.get("movkndDsplEnm") or item.get("movkndDsplNm") or ""
         )
-        if not schedule_matches_movie(item, movie, item_format):
-            continue
-        if auditorium_key:
-            screen_text = " ".join(
-                str(item.get(key, "") or "")
-                for key in ("expoScnsNm", "scnsNm", "movkndDsplEnm", "movkndDsplNm")
-            )
-            if auditorium_key not in _compact(screen_text):
-                continue
-        return True
+        if schedule_matches_movie(item, movie, item_format):
+            return True
     return False
 
 
