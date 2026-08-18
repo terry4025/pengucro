@@ -23,7 +23,7 @@ class CgvEngine(GuardedCgvEngine):
 
     # The base engine used 20 seconds for a completely unpublished target date.
     # That can lose the first seats even though the seat/hold path itself is
-    # fast.  Two seconds matches the already-supported schedule-hint cadence and
+    # fast. Two seconds matches the already-supported schedule-hint cadence and
     # avoids the former 20-second blind window without turning this into a tight
     # polling loop.
     PREOPEN_IDLE_INTERVAL = 2.0
@@ -34,11 +34,10 @@ class CgvEngine(GuardedCgvEngine):
         """Click only CGV's intermediate pre-payment confirmation button.
 
         The first checkout click on the seat-summary page can open a bottom
-        sheet titled "결제 전 확인해 주세요".  Its button has the same visible
+        sheet titled "결제 전 확인해 주세요". Its button has the same visible
         text ("결제하기") as the page-level checkout button, so a generic second
-        click is risky once /mpy/main has started rendering.  Scope the click to
-        an ancestor containing the confirmation copy and cancellation/admission
-        guidance shown by CGV.
+        click is risky once /mpy/main has started rendering. Scope the click to
+        the button's own modal ancestor containing CGV's confirmation copy.
         """
 
         try:
@@ -64,11 +63,12 @@ class CgvEngine(GuardedCgvEngine):
                   for (const button of candidates) {
                     let scope = button;
                     for (let depth = 0; scope && depth < 10; depth += 1, scope = scope.parentElement) {
+                      if (scope === document.body || scope === document.documentElement) break;
                       const text = clean(scope.innerText || scope.textContent);
                       const confirmationTitle = text.includes('결제전확인');
                       const confirmationDetails =
                         text.includes('취소/환불') || text.includes('입장시유의사항') ||
-                        text.includes('상영관입장') || text.includes('관람');
+                        text.includes('상영관입장');
                       if (!confirmationTitle || !confirmationDetails) continue;
                       if (typeof button.scrollIntoView === 'function') {
                         button.scrollIntoView({block: 'center', inline: 'center'});
@@ -138,7 +138,7 @@ class CgvEngine(GuardedCgvEngine):
 
     def log(self, message: str, level: str = "info") -> None:
         # The base loop owns schedule state transitions and contains the old
-        # cadence in its human-readable messages.  Keep those logs truthful
+        # cadence in its human-readable messages. Keep those logs truthful
         # without duplicating the entire reservation loop here.
         if message == "[CGV] 미오픈 대기 · 20초 간격으로 시간표 확인":
             message = (
