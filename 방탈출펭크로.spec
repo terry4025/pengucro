@@ -39,6 +39,7 @@ a = Analysis(
         'ui.scrollable',
         'ui.cgv_booking_dialog',
         'ui.cgv_booking_dialog_runtime',
+        'ui.cgv_booking_dialog_controls',
         'ui.reservation_form',
         'ui.reservation_form_runtime',
         'ui.update_dialog',
