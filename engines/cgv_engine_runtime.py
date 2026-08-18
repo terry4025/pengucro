@@ -22,6 +22,10 @@ class CgvEngine(GuardedCgvEngine):
     transitions:
 
     * target-date schedule polling remains fast but bounded;
+    * the visitor/seat hand-off can use CGV's already-captured first seat API
+      response instead of waiting for the whole seat DOM to finish painting;
+    * a successful API hold gets a longer React/UI synchronization grace period
+      before the base engine considers releasing it and using browser fallback;
     * CGV's intermediate checkout confirmation is acknowledged;
     * an existing member session is reused;
     * every CGV operation stays on persistent Chrome slot 1 / port 9333;
@@ -30,8 +34,26 @@ class CgvEngine(GuardedCgvEngine):
       before ``선택완료`` is submitted.
     """
 
-    PREOPEN_IDLE_INTERVAL = 2.0
-    SCHEDULE_HINT_INTERVAL = 1.0
+    # Keep pre-open traffic bounded, but remove most of the old 2-second blind
+    # window. A partial publication is more valuable, so it gets the tighter
+    # cadence while the existing 403/429 policy can still slow requests down.
+    PREOPEN_IDLE_INTERVAL = 0.75
+    SCHEDULE_HINT_INTERVAL = 0.5
+
+    # The base visitor loop sleeps 350 ms between state checks. Once the official
+    # page has accepted the visitor count, polling DOM readiness is local work;
+    # checking it more frequently avoids adding hundreds of milliseconds after
+    # the actual target screening appears. Corrective clicks remain rate-limited
+    # separately so this does not repeatedly submit the visitor form.
+    VISITOR_READY_POLL_INTERVAL_MS = 60
+    VISITOR_ACTION_RETRY_MS = 700
+
+    # A successful direct hold is more valuable than shaving a second from UI
+    # rendering. The previous 40 * 25 ms window could release an already-won
+    # hold because React had not enabled 선택완료 yet. Give that state up to about
+    # three seconds while avoiding repeated seat toggles when the exact group is
+    # already selected and only the submit button is lagging.
+    API_UI_SYNC_ATTEMPTS = 120
 
     @staticmethod
     def _context_has_member_session(context) -> bool:
@@ -87,6 +109,166 @@ class CgvEngine(GuardedCgvEngine):
             metadata["cgv"] = cgv
             data["engine_metadata"] = metadata
         return super().make_reservation_thread(data)
+
+    def _captured_initial_seat_ready(self) -> bool:
+        captured = getattr(self, "_initial_seat_response", None)
+        if not isinstance(captured, dict):
+            return False
+        status = int(captured.get("status", 0) or 0)
+        return 200 <= status < 300 and isinstance(captured.get("data"), dict)
+
+    @staticmethod
+    def _click_visitor_count(page, people: int) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    r"""
+                    people => {
+                      const clean = value => (value || '').replace(/\s+/g, '');
+                      const nodes = Array.from(document.querySelectorAll('*'));
+                      const labels = nodes.filter(node =>
+                        node.children.length === 0 && clean(node.textContent) === '일반'
+                      );
+                      for (const label of labels) {
+                        let box = label;
+                        for (let depth = 0; box && depth < 7; depth += 1, box = box.parentElement) {
+                          const target = Array.from(box.querySelectorAll('button')).find(button =>
+                            !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+                            clean(button.textContent) === String(people)
+                          );
+                          if (target) {
+                            target.click();
+                            return true;
+                          }
+                        }
+                      }
+                      return false;
+                    }
+                    """,
+                    max(1, min(int(people), 8)),
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _click_visitor_submit(page) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    r"""
+                    () => {
+                      const clean = value => (value || '').replace(/\s+/g, '');
+                      const visible = node => {
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                               rect.width > 0 && rect.height > 0;
+                      };
+                      const target = Array.from(
+                        document.querySelectorAll('button, a, div[role="button"]')
+                      ).find(node =>
+                        visible(node) && !node.disabled &&
+                        node.getAttribute('aria-disabled') !== 'true' &&
+                        clean(node.textContent) === '선택'
+                      );
+                      if (!target) return false;
+                      target.click();
+                      return true;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _select_visitors(self, page, people: int) -> bool:
+        """Open the seat modal without adding avoidable post-detection latency.
+
+        Visitor controls are only retried after a bounded recovery interval.
+        Once CGV's own first seat response has arrived, the fast monitor can use
+        that response immediately even if React is still painting seat buttons.
+        """
+
+        target = self._current_page(page)
+        if target is None:
+            return False
+        self._sync_runtime_handles_from_page(target)
+
+        start_time = time.monotonic()
+        target_num = max(1, min(int(people), 8))
+        visitor_chosen = False
+        last_people_attempt = -1.0
+        submit_clicked_at = -1.0
+        last_snapshot: dict = {}
+
+        while (
+            not self.stop_event.is_set()
+            and time.monotonic() - start_time < self.VISITOR_SELECTION_TIMEOUT
+        ):
+            last_snapshot = self._seat_modal_snapshot(target)
+            if int(last_snapshot.get("seatCount", 0) or 0) > 0:
+                self._sync_runtime_handles_from_page(target)
+                return True
+
+            if last_snapshot.get("modalOpen"):
+                if self._captured_initial_seat_ready():
+                    self.log(
+                        "[CGV] 최초 좌석 API 응답 수신 · 좌석 DOM 렌더 완료를 기다리지 않고 고속 선점 준비를 계속합니다.",
+                        "info",
+                    )
+                    self._sync_runtime_handles_from_page(target)
+                    return True
+            else:
+                now = time.monotonic()
+                if (
+                    not visitor_chosen
+                    and (
+                        last_people_attempt < 0
+                        or now - last_people_attempt
+                        >= self.VISITOR_ACTION_RETRY_MS / 1000.0
+                    )
+                ):
+                    last_people_attempt = now
+                    visitor_chosen = self._click_visitor_count(target, target_num)
+
+                # Give React at least one local readiness tick after visitor
+                # selection. If the submit button is not ready yet, retry this
+                # local DOM action on the next 60 ms tick without re-clicking the
+                # visitor count and without issuing another seat API request.
+                if visitor_chosen and submit_clicked_at < 0:
+                    if self._click_visitor_submit(target):
+                        submit_clicked_at = now
+
+                # If CGV never opened the modal, allow one clean corrective
+                # visitor-selection cycle rather than hammering both controls.
+                if (
+                    submit_clicked_at >= 0
+                    and now - submit_clicked_at
+                    >= self.VISITOR_ACTION_RETRY_MS / 1000.0
+                ):
+                    visitor_chosen = False
+                    submit_clicked_at = -1.0
+
+            try:
+                target.wait_for_timeout(self.VISITOR_READY_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.VISITOR_READY_POLL_INTERVAL_MS / 1000.0):
+                    break
+
+        last_snapshot = self._seat_modal_snapshot(target) or last_snapshot
+        if int(last_snapshot.get("seatCount", 0) or 0) > 0:
+            self._sync_runtime_handles_from_page(target)
+            return True
+        if last_snapshot.get("modalOpen"):
+            self.log(
+                "CGV 좌석 모달은 열렸지만 좌석 데이터가 제한 시간 안에 로드되지 않았습니다.",
+                "warning",
+            )
+        else:
+            self.log("CGV 관람 인원 선택 및 좌석 모달 열기에 실패했습니다.", "error")
+        return False
 
     @staticmethod
     def _exact_seat_selection_snapshot(page, target_ids: list[str]) -> dict:
@@ -219,9 +401,11 @@ class CgvEngine(GuardedCgvEngine):
 
         observed_snapshot = False
         cleaned_extras = False
+        last_snapshot: dict = {}
         for attempt in range(self.API_UI_SYNC_ATTEMPTS):
             snapshot = self._exact_seat_selection_snapshot(page, target_ids)
             if snapshot:
+                last_snapshot = snapshot
                 observed_snapshot = True
                 if snapshot.get("ready"):
                     if cleaned_extras:
@@ -233,12 +417,20 @@ class CgvEngine(GuardedCgvEngine):
                 if snapshot.get("extras"):
                     cleaned_extras = True
 
-            # Give React a few frames between corrective clicks so one click is
-            # not accidentally toggled twice while state propagation is pending.
-            if attempt == 0 or attempt % 4 == 0:
-                if not self._apply_exact_seat_selection(page, target_ids):
-                    if snapshot and snapshot.get("missing"):
-                        return False
+            missing = list(snapshot.get("missing") or []) if snapshot else []
+            extras = list(snapshot.get("extras") or []) if snapshot else []
+            exact_group_selected = bool(snapshot) and not missing and not extras
+
+            # If the exact held group is already selected, do not keep toggling
+            # it simply because React has not enabled 선택완료 yet. Otherwise make
+            # bounded corrective attempts, but a temporary missing/unavailable
+            # DOM node no longer releases a successful hold immediately.
+            should_apply = (
+                not exact_group_selected
+                and (attempt == 0 or attempt % 4 == 0)
+            )
+            if should_apply:
+                self._apply_exact_seat_selection(page, target_ids)
 
             try:
                 page.wait_for_timeout(self.API_UI_SYNC_INTERVAL_MS)
@@ -247,7 +439,17 @@ class CgvEngine(GuardedCgvEngine):
 
         # Preserve legacy mocked-page compatibility when no DOM snapshot can be
         # observed; the submit helper still checks the enabled button itself.
-        return not observed_snapshot
+        if not observed_snapshot:
+            return True
+
+        selected = list(last_snapshot.get("selectedIds") or [])
+        self.log(
+            "[CGV] 임시선점은 유지했지만 좌석 화면 동기화가 약 "
+            f"{self.API_UI_SYNC_ATTEMPTS * self.API_UI_SYNC_INTERVAL_MS / 1000.0:.1f}초 내 "
+            f"완료되지 않았습니다 · 선택 상태 {len(selected)}/{len(target_ids)}석",
+            "warning",
+        )
+        return False
 
     def _select_api_seats_in_ui(self, page, payload, selected) -> bool:
         self._sync_seat_payload_to_ui(page, payload)
