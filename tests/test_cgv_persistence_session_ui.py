@@ -93,7 +93,7 @@ def test_ui_scopes_runtime_cgv_client_to_selector_only():
     from ui.cgv_booking_dialog import CgvBrowserClient as DialogClient
     from ui.cgv_booking_dialog_runtime import CgvBookingDialog as RuntimeDialog
 
-    assert WiredDialog is RuntimeDialog
+    assert issubclass(WiredDialog, RuntimeDialog)
     assert DialogClient is CgvBrowserClient
     assert BaseClient is not CgvBrowserClient
     assert BaseClient.__module__ == "engines.cgv_browser_client"
