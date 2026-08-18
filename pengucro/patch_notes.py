@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.27",
+        changes=(
+            "버전 업데이트 후 이름·전화번호·인원수 설정 유지 안정화",
+            "CGV 기존 로그인 탭과 세션 재사용 및 브라우저 단절 복구 개선",
+            "CGV 미오픈 날짜에서 좌석도 없이 수동 좌석 우선순위 입력 지원",
+            "CGV 수동 좌석 UI 배치 오류와 인원수 변경 회귀 오류 수정",
+        ),
+    ),
+    PatchNote(
         version="6.26",
         changes=(
             "CGV 미오픈 회차 감시 주기를 최대 1~2초로 단축",
