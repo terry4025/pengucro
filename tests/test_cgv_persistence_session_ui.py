@@ -50,8 +50,6 @@ def test_member_session_is_reused_without_login_navigation():
         def cookies(_url):
             return [{"name": "accessToken", "value": "present"}]
 
-    # Deliberately no goto/evaluate methods: this proves the fast session check
-    # returns before the historical /mem/login navigation path is touched.
     page = object()
     assert engine._ensure_member_session(page, Context()) is True
     assert any("로그인 세션 확인" in message for message, _level in logs)
@@ -67,15 +65,17 @@ def test_secret_failure_does_not_abort_plain_config_persistence(monkeypatch, tmp
     monkeypatch.setattr(store, "_protect", fail_protect)
     assert store.set("reservation_name", "홍길동") is False
 
-    # ReservationForm can continue to this ordinary config save even when the
-    # secret backend fails. This is the path that preserves people/thread/etc.
     save_json("config.json", {"people": "2", "remember_personal_info": True})
     assert load_json("config.json", {})["people"] == "2"
 
 
-def test_ui_module_exports_runtime_cgv_dialog():
+def test_ui_module_exports_runtime_cgv_dialog_and_client():
     import ui  # noqa: F401 - triggers runtime wiring
+    from engines.cgv_browser_client import CgvBrowserClient as WiredClient
     from ui.cgv_booking_dialog import CgvBookingDialog as WiredDialog
+    from ui.cgv_booking_dialog import CgvBrowserClient as DialogClient
     from ui.cgv_booking_dialog_runtime import CgvBookingDialog as RuntimeDialog
 
     assert WiredDialog is RuntimeDialog
+    assert WiredClient is CgvBrowserClient
+    assert DialogClient is CgvBrowserClient
