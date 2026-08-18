@@ -13,6 +13,11 @@ class CgvBrowserClient(BaseCgvBrowserClient):
     Healthy CGV tabs remain open between selector reads. Recoverable disconnects
     discard only the broken page and retry once on the same persistent slot-1
     profile so CGV/Naver Pay login state is never silently switched to slot 2/3.
+
+    Schedule/reference behavior itself remains the base policy so partially-open
+    target dates can still show historical candidates for movies that have not
+    published yet. Exact target-day seat-map selection is handled by the dialog
+    runtime instead of deleting those useful candidates here.
     """
 
     @staticmethod
@@ -117,26 +122,3 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                 chrome.release()
         if last_error:
             raise last_error
-
-    def fetch_schedule_with_reference(self, *args, **kwargs):
-        """Never mix a previous-date template into an already-open target day.
-
-        The base helper intentionally gathers recent dates for pre-open seat-map
-        references. It also returned those historical template rows alongside
-        exact target-date rows, which allowed a 24th selection to accidentally
-        carry a 23rd schedule into the seat viewer. When the target date has real
-        schedules, expose only those exact rows; historical data remains embedded
-        only as ``_pengucroSeatReference`` metadata for layout assistance.
-        """
-
-        schedules, reference_date, reference_only = super().fetch_schedule_with_reference(
-            *args, **kwargs
-        )
-        if not reference_only:
-            exact = tuple(
-                item for item in schedules
-                if not bool(item.get("_pengucroPreopen"))
-            )
-            if exact:
-                return exact, reference_date, False
-        return schedules, reference_date, reference_only
