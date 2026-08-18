@@ -6,7 +6,7 @@ from engines.doomescape_engine import DoomEscapeEngine
 from engines.cgv_engine_guarded import CgvEngine
 from engines.dpsnnn_engine import DpsnnnEngine
 from engines.jigubyeol_engine import JigubyeolEngine
-from engines.keyescape_engine_single_page import KeyescapeEngine
+from engines.keyescape_engine_runtime import KeyescapeEngine
 from engines.naver_engine import NaverEngine
 from engines.zeroworld_gu_engine import ZeroWorldGuEngine
 from engines.zeroworld_shin_engine import ZeroWorldShinEngine
