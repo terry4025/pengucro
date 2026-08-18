@@ -57,6 +57,7 @@ class CgvBrowserClient(BaseCgvBrowserClient):
             raise CgvError("CGV 데이터 조회에 필요한 브라우저 모듈을 찾지 못했습니다.") from exc
 
         last_error: Exception | None = None
+        broken_page = None
         for attempt in range(2):
             chrome = browser_session.start_isolated(log=self._emit)
             if chrome is None:
@@ -88,14 +89,23 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                     result = operation(page)
                     if attempt > 0:
                         self._emit("[CGV] 브라우저 자동 복구 성공", "success")
+
+                    # A reconnect should normally produce a fresh Page object.
+                    # If a browser/mock context hands back the exact object that
+                    # was already classified as disconnected, do not leave that
+                    # object in the reusable-tab pool even if this operation
+                    # happened to complete. Healthy fresh pages remain open.
+                    if broken_page is not None and page is broken_page:
+                        self._discard_broken_page(page)
                     return result
             except Exception as exc:
                 last_error = exc
                 recoverable = self._is_recoverable_browser_error(exc)
                 if recoverable:
                     # A disconnected target must not survive in the reusable-tab
-                    # pool. This also preserves the base client's retry cleanup
-                    # contract used by the browser recovery tests.
+                    # pool. Remember its identity so a reconnect cannot silently
+                    # recycle the same object as a supposedly healthy tab.
+                    broken_page = page
                     self._discard_broken_page(page)
                     if attempt == 0:
                         self._emit("[CGV] 브라우저 연결 끊김 · 손상 탭 정리 후 1회 자동 복구", "warning")
@@ -105,7 +115,7 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                 raise
             finally:
                 # Keep healthy tabs/profile alive across normal reads; only a
-                # recoverable failure closes its broken page above.
+                # recoverable failure (or recycled broken object) is closed.
                 chrome.release()
         if last_error:
             raise last_error

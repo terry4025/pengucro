@@ -258,10 +258,14 @@ class CgvBookingDialog(BaseCgvBookingDialog):
 
     def _render_priorities(self) -> None:
         BaseCgvBookingDialog._render_priorities(self)
-        self._refresh_manual_seat_ui()
+        refresh = getattr(self, "_refresh_manual_seat_ui", None)
+        if callable(refresh):
+            refresh()
 
     def _set_people(self, new_people: int) -> None:
         # Keep the method compatible with the repository's unbound
         # SimpleNamespace state tests; zero-argument super() rejects those mocks.
         BaseCgvBookingDialog._set_people(self, new_people)
-        self._refresh_manual_seat_ui()
+        refresh = getattr(self, "_refresh_manual_seat_ui", None)
+        if callable(refresh):
+            refresh()
