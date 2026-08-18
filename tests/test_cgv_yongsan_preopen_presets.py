@@ -76,7 +76,7 @@ def test_odd_party_keeps_both_equally_centered_variants():
     assert groups[1] == ("H22", "H23", "H24")
 
 
-def test_preopen_dropdown_stages_concrete_group_and_enables_visible_add_button():
+def test_preopen_dropdown_stages_and_commits_concrete_priority_without_seat_map():
     add_button = DummyControl()
     status_label = DummyControl()
     confirm_button = DummyControl()
@@ -109,6 +109,43 @@ def test_preopen_dropdown_stages_concrete_group_and_enables_visible_add_button()
     assert add_button.options["state"] == "normal"
     assert add_button.options["text"] == "명당 우선순위 추가"
     assert "F21, F22, F23, F24" in status_label.options["text"]
+
+    CgvBookingDialog._add_priority_group(dialog)
+
+    assert dialog.priority_groups == [("F21", "F22", "F23", "F24")]
+    assert dialog.current_seats == set()
+    assert add_button.options["state"] == "disabled"
+    assert add_button.options["text"] == "명당 우선순위 추가"
+    assert dialog.auto_seat_preference == "immersive"
+    assert "1순위로 F21, F22, F23, F24" in status_label.options["text"]
+
+
+def test_same_mode_can_stage_next_centered_candidate_after_first_priority():
+    add_button = DummyControl()
+    status_label = DummyControl()
+    label = "균형 최우선 · H열 중앙 3석"
+    dialog = SimpleNamespace(
+        auto_seat_modes={"명당 자동 선택": "", label: "balanced"},
+        auto_seat_preference="balanced",
+        auto_seat_preference_label=label,
+        seats=(),
+        current_seats=set(),
+        priority_groups=[("H21", "H22", "H23")],
+        people=3,
+        selected_site=SimpleNamespace(site_no="0013"),
+        auditorium_var=DummyVar("IMAX관 · IMAX LASER 2D"),
+        movie_var=DummyVar("오디세이"),
+        preferred_times=["07:00"],
+        selected_schedule=SimpleNamespace(),
+        add_priority_button=add_button,
+        status_label=status_label,
+        confirm_button=DummyControl(),
+        auto_seat_var=DummyVar(label),
+    )
+
+    CgvBookingDialog._auto_select_seats(dialog, label)
+
+    assert dialog.current_seats == {"H22", "H23", "H24"}
 
 
 def test_final_selector_still_inherits_movie_identity_runtime():
