@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.37",
+        changes=(
+            "CGV 관람인원 선택 화면에서 세션 만료 시 로그인 후 자동 복귀 지원",
+            "CGV 1~8인 관람인원 버튼 선택 검증 및 DOM 구조 변화 대응 강화",
+        ),
+    ),
+    PatchNote(
         version="6.36",
         changes=(
             "CGV 좌석 클릭 반영 속도 향상을 위한 DOM MutationObserver 도입",
