@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.25",
+        changes=(
+            "키이스케이프 최종 서버시각 정밀도 보존 및 보정 로그 추가",
+            "키이스케이프 Chrome 예약 endpoint 연결 예열 강화",
+            "키이스케이프 예약 POST의 DNS·TLS·첫응답 지연 측정 추가",
+            "키이스케이프 1~3페이지에 동일 최적화 런타임 적용",
+        ),
+    ),
+    PatchNote(
         version="6.24",
         changes=(
             "키이스케이프 1페이지 모드의 실시간 슬롯 검증 독립 시작",
