@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from engines.cgv_client import CGV_HOME_URL
 from engines.cgv_engine_visitor_runtime import CgvEngine as VisitorCgvEngine
 
 
@@ -13,6 +14,32 @@ class CgvEngine(VisitorCgvEngine):
     normalized text is exactly '일반', prefer the smallest wrapper, then search
     its ancestors for the requested numeric button.
     """
+
+    def _open_visitor_route(self, page, payload: dict[str, Any]) -> bool:
+        """Apply the restored screening query to a freshly rendered visitor page."""
+
+        if self.stop_event.is_set():
+            return False
+        if self._login_required(page):
+            if not self._wait_for_manual_login(page):
+                return False
+
+        # sessionStorage is consumed by the visitor-page React tree.  Updating
+        # it while an old visitor page is already mounted is not sufficient;
+        # navigate to the route again so the exact detected screening is used.
+        self._restore_visitor_query(page, payload)
+        try:
+            page.goto(
+                f"{CGV_HOME_URL}/cnm/selectVisitorCnt",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception as exc:
+            self.log(
+                f"[CGV] 회차 상태 복원 후 관람인원 페이지 재진입 실패: {exc.__class__.__name__}",
+                "warning",
+            )
+        return super()._open_visitor_route(page, payload)
 
     @staticmethod
     def _visitor_ui_snapshot(page, people: int) -> dict[str, Any]:
