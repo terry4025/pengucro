@@ -15,6 +15,18 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_reliability_wrapper_does_not_override_submit_or_trusted_fire_gate():
+    # This PR may improve observation/recovery, but it must not move the proven
+    # Fast Path fire point or replace the final browser submission routine.
+    assert "_submit" not in KeyescapeEngine.__dict__
+    assert "_wait_for_trusted_fire" not in KeyescapeEngine.__dict__
+    assert KeyescapeEngine.FIRE_LEAD == runtime._BaseKeyescapeEngine.FIRE_LEAD
+    assert (
+        KeyescapeEngine.TRUSTED_FIRE_EXTRA_SECONDS
+        == runtime._BaseKeyescapeEngine.TRUSTED_FIRE_EXTRA_SECONDS
+    )
+
+
 def test_timing_parameters_only_make_first_read_more_conservative():
     samples = [
         {"read_rtt_ms": 100.0},
@@ -126,6 +138,42 @@ def test_two_date_template_rebuilds_trust_after_mismatch(monkeypatch):
     assert slot_id == "1798"
     assert len(sources) == 2
     assert key not in store["entries"]
+
+
+def test_live_timing_records_trusted_mismatch_for_multi_page_runs(monkeypatch):
+    engine = make_engine()
+    engine._trusted_slot_id = "2498"
+    engine.open_at = 100.0
+    engine.clock = SimpleNamespace(now=lambda: 100.70)
+    store = {"version": 1, "entries": {}}
+
+    monkeypatch.setattr(runtime, "load_json", lambda *_args, **_kwargs: store)
+    monkeypatch.setattr(runtime, "save_json", lambda _name, value: store.update(value))
+
+    def fake_base_remember(self, state):
+        state["timing_sample"] = {
+            "read_rtt_ms": 700.0,
+            "publish_delay_ms": 700.0,
+        }
+
+    monkeypatch.setattr(
+        runtime._BaseKeyescapeEngine,
+        "_remember_slot_timing",
+        fake_base_remember,
+    )
+    state = {
+        "slot_id": "2499",
+        "target_date": "2026-08-24",
+        "zizum_num": "23",
+        "theme_num": "88",
+    }
+
+    engine._remember_slot_timing(state)
+
+    key = engine._trusted_health_key("2026-08-24", "23", "88")
+    assert state["trusted_mismatch_recorded"] is True
+    assert store["entries"][key]["trusted_id"] == "2498"
+    assert store["entries"][key]["live_id"] == "2499"
 
 
 def test_http_validator_starts_independently_of_browser_prewarm(monkeypatch):
