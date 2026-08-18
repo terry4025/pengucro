@@ -5,8 +5,10 @@ from engines.cgv_client import CgvSeatGroup
 from engines.cgv_engine_priority_ladder import CgvEngine
 from engines.cgv_engine_visitor_dom_runtime import CgvEngine as VisitorDomCgvEngine
 from ui.cgv_booking_dialog_preopen_auto import CgvBookingDialog
-from ui.reservation_form import ReservationForm as BaseReservationForm
-from ui.reservation_form_runtime import ReservationForm as RuntimeReservationForm
+from ui.reservation_form_runtime import (
+    BaseReservationForm,
+    ReservationForm as RuntimeReservationForm,
+)
 
 
 def _schedule(time_text: str, seq: str, *, auditorium="IMAX관", format_name="IMAX LASER 2D"):
