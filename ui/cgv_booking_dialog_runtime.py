@@ -91,6 +91,23 @@ class CgvBookingDialog(BaseCgvBookingDialog):
             except Exception:
                 pass
 
+    @classmethod
+    def _seat_reference_schedule(cls, self):
+        """Use the exact target-day schedule whenever it is already open.
+
+        Historical seat references are only a pre-open aid. The base selector
+        preferred an embedded previous-day reference even when the selected
+        target-day row had a real ``scnsNo``, which made 2026-08-24 open a
+        2026-08-23 seat page. Real schedules must always win; only synthetic
+        pre-open rows may fall back to the historical layout reference.
+        """
+
+        selected = getattr(self, "selected_schedule", None) or {}
+        if selected and not bool(selected.get("_pengucroPreopen")):
+            if str(selected.get("scnsNo", "") or ""):
+                return selected
+        return BaseCgvBookingDialog._seat_reference_schedule(self)
+
     def _install_manual_seat_controls(self) -> None:
         seat_panel = self.load_seats_button.master
 
@@ -218,8 +235,6 @@ class CgvBookingDialog(BaseCgvBookingDialog):
             border_color=theme.HAIRLINE_COLOR,
             corner_radius=theme.ROUNDED_MD,
         )
-        # auto_seat_menu is a direct packed child of the same seat panel, so the
-        # summary is safely anchored above it and therefore above the seat map.
         self.priority_summary_frame.pack(
             fill="x",
             padx=theme.SPACE_3,
