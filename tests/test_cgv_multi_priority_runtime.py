@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import engines.cgv_chrome_session as cgv_chrome_session
 import ui.reservation_form_runtime as reservation_form_runtime
+from engines.cgv_client import parse_seat_groups
 from engines.cgv_engine_runtime import CgvEngine
 from pengucro.models import ReservationRequest
 from ui.cgv_booking_dialog_runtime import CgvBookingDialog
@@ -89,6 +90,18 @@ def test_engine_prefers_structured_priority_order():
     assert serialized == "C8,C9 | C11,C12 | D8,D9"
 
 
+def test_three_priorities_remain_valid_for_every_supported_people_count():
+    for people in range(1, 9):
+        groups = [
+            [f"{row}{8 + offset}" for offset in range(people)]
+            for row in ("C", "D", "E")
+        ]
+        serialized = CgvEngine._serialize_structured_seat_groups(groups, people)
+        parsed = parse_seat_groups(serialized, people)
+
+        assert [list(group.seats) for group in parsed] == groups
+
+
 def test_active_group_normalization_clears_stale_selection(monkeypatch):
     logs = []
     engine = _engine(logs)
@@ -125,6 +138,42 @@ def test_active_group_normalization_clears_stale_selection(monkeypatch):
     assert engine._normalize_active_seat_group(page, ["11", "12"]) is True
     assert applied == [("11", "12")]
     assert any("이전 선택 상태를 정리" in message for message, _level in logs)
+
+
+def test_active_group_does_not_release_on_first_transient_missing_dom_state(monkeypatch):
+    engine = _engine()
+    snapshots = iter(
+        [
+            {
+                "ready": False,
+                "extras": [],
+                "missing": ["11"],
+                "selectedIds": ["12"],
+            },
+            {
+                "ready": True,
+                "extras": [],
+                "missing": [],
+                "selectedIds": ["11", "12"],
+            },
+        ]
+    )
+    apply_calls = []
+
+    monkeypatch.setattr(
+        engine,
+        "_exact_seat_selection_snapshot",
+        lambda _page, _ids: next(snapshots),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_apply_exact_seat_selection",
+        lambda _page, ids: apply_calls.append(tuple(ids)) or False,
+    )
+
+    page = SimpleNamespace(wait_for_timeout=lambda _milliseconds: None)
+    assert engine._normalize_active_seat_group(page, ["11", "12"]) is True
+    assert apply_calls == [("11", "12")]
 
 
 def test_cgv_slot_manager_acquires_only_slot_one(monkeypatch):
