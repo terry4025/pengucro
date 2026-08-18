@@ -18,7 +18,6 @@ here:
 from __future__ import annotations
 
 import asyncio
-import statistics
 import time
 from datetime import datetime
 
@@ -239,7 +238,7 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
                 target_date, zizum_num, theme_num, target_time
             )
         finally:
-            state = self._live_slot_state or {}
+            state = self._live_slot_state if isinstance(self._live_slot_state, dict) else {}
             state.setdefault(
                 "boundary_fetch_started_ms",
                 None if started_delta is None else round(float(started_delta), 1),
@@ -264,6 +263,23 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
         ):
             if state.get(key) is not None:
                 sample.setdefault(key, state[key])
+
+        trusted_id = str(self._trusted_slot_id or "")
+        live_id = str(state.get("slot_id") or "")
+        if (
+            trusted_id
+            and live_id
+            and trusted_id != live_id
+            and not state.get("trusted_mismatch_recorded")
+        ):
+            target_date = str(state.get("target_date", "") or "")
+            zizum_num = str(state.get("zizum_num", "") or "")
+            theme_num = str(state.get("theme_num", "") or "")
+            if all((target_date, zizum_num, theme_num)):
+                self._record_trusted_mismatch(
+                    target_date, zizum_num, theme_num, trusted_id, live_id
+                )
+                state["trusted_mismatch_recorded"] = True
 
     def _adaptive_shared_wait_seconds(self) -> float:
         state = self._live_slot_state or {}
@@ -387,13 +403,6 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
                     f"1페이지 HTTP 실시간 검증 완료 · ID {live_slot_id} 일치"
                 )
                 return
-            self._record_trusted_mismatch(
-                target_date,
-                zizum_num,
-                theme_num,
-                trusted_before,
-                live_slot_id,
-            )
             self.log(
                 "[경고] 검증 시간표 슬롯 ID와 실제 슬롯 ID가 달라 "
                 f"실시간 ID {live_slot_id}를 우선 사용합니다. "
