@@ -3,42 +3,60 @@ from __future__ import annotations
 import time
 
 from engines.cgv_engine_guarded import CgvEngine as GuardedCgvEngine
+from engines.cgv_client import CGV_HOME_URL
 
 
 class CgvEngine(GuardedCgvEngine):
     """Production CGV runtime policy layered over the guarded engine.
 
-    Keep the existing seat/hold fast path intact while tightening two edges of
+    Keep the existing seat/hold fast path intact while tightening the edges of
     the end-to-end flow:
 
     * target-date schedule polling no longer sleeps for as long as 20 seconds
       while the date is completely unpublished;
     * CGV's intermediate "결제 전 확인" sheet is acknowledged before waiting
-      for the payment-method page.
+      for the payment-method page;
+    * a valid login already present in the persistent Chrome profile is reused
+      immediately instead of navigating that tab through /mem/login again.
 
     The schedule cadence remains bounded and the base engine's existing
     403/429 backoff still reduces concurrency and slows retries when CGV asks us
     to back off.
     """
 
-    # The base engine used 20 seconds for a completely unpublished target date.
-    # That can lose the first seats even though the seat/hold path itself is
-    # fast. Two seconds matches the already-supported schedule-hint cadence and
-    # avoids the former 20-second blind window without turning this into a tight
-    # polling loop.
     PREOPEN_IDLE_INTERVAL = 2.0
     SCHEDULE_HINT_INTERVAL = 1.0
 
     @staticmethod
-    def _click_checkout_confirmation(page) -> bool:
-        """Click only CGV's intermediate pre-payment confirmation button.
+    def _context_has_member_session(context) -> bool:
+        try:
+            return any(
+                str(cookie.get("name", "")) in {"accessToken", "refresh_token"}
+                and bool(cookie.get("value"))
+                for cookie in context.cookies(CGV_HOME_URL)
+            )
+        except Exception:
+            return False
 
-        The first checkout click on the seat-summary page can open a bottom
-        sheet titled "결제 전 확인해 주세요". Its button has the same visible
-        text ("결제하기") as the page-level checkout button, so a generic second
-        click is risky once /mpy/main has started rendering. Scope the click to
-        the button's own modal ancestor containing CGV's confirmation copy.
-        """
+    def _ensure_member_session(self, page, context) -> bool:
+        # The historical verifier always navigated to /mem/login first and used
+        # CGV's redirect as the session check.  That visibly replaced a tab the
+        # user had already logged into and could trigger a needless login flow.
+        # A valid first-party CGV auth cookie in the same persistent context is
+        # enough to reuse the session; the normal booking request remains the
+        # final authority and the base login flow is retained when no cookie is
+        # available.
+        if self._context_has_member_session(context):
+            self.log(
+                "[CGV] 기존 Chrome의 로그인 세션 확인 · 현재 CGV 탭을 그대로 재사용합니다.",
+                "success",
+            )
+            return True
+        return super()._ensure_member_session(page, context)
+
+    @staticmethod
+    def _click_checkout_confirmation(page) -> bool:
+        """Click only CGV's intermediate pre-payment confirmation button."""
 
         try:
             result = page.evaluate(
@@ -137,9 +155,6 @@ class CgvEngine(GuardedCgvEngine):
         return ready
 
     def log(self, message: str, level: str = "info") -> None:
-        # The base loop owns schedule state transitions and contains the old
-        # cadence in its human-readable messages. Keep those logs truthful
-        # without duplicating the entire reservation loop here.
         if message == "[CGV] 미오픈 대기 · 20초 간격으로 시간표 확인":
             message = (
                 f"[CGV] 미오픈 대기 · {self.PREOPEN_IDLE_INTERVAL:g}초 간격으로 "
