@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.28",
+        changes=(
+            "CGV 좌석 선택창 및 좌석도 표시 영역 세로 크기 확대",
+            "CGV 명당 가이드 카드 숨김 및 좌석도 시인성 개선",
+            "CGV 명당 자동 선택 및 수동 좌석 우선순위 기능 유지",
+        ),
+    ),
+    PatchNote(
         version="6.27",
         changes=(
             "버전 업데이트 후 이름·전화번호·인원수 설정 유지 안정화",

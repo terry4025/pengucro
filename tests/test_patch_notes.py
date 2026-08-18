@@ -9,6 +9,31 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v628_patch_notes_are_short_and_exact():
+    note = notes_for("6.28")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 좌석 선택창 및 좌석도 표시 영역 세로 크기 확대",
+        "CGV 명당 가이드 카드 숨김 및 좌석도 시인성 개선",
+        "CGV 명당 자동 선택 및 수동 좌석 우선순위 기능 유지",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v627_patch_notes_are_short_and_exact():
+    note = notes_for("6.27")
+
+    assert note is not None
+    assert note.changes == (
+        "버전 업데이트 후 이름·전화번호·인원수 설정 유지 안정화",
+        "CGV 기존 로그인 탭과 세션 재사용 및 브라우저 단절 복구 개선",
+        "CGV 미오픈 날짜에서 좌석도 없이 수동 좌석 우선순위 입력 지원",
+        "CGV 수동 좌석 UI 배치 오류와 인원수 변경 회귀 오류 수정",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v626_patch_notes_are_short_and_exact():
     note = notes_for("6.26")
 

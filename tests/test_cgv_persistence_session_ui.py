@@ -143,9 +143,9 @@ def test_dialog_expands_height_to_show_more_seat_map():
     assert state["minsize"] == (900, 560)
 
 
-def test_v627_release_contract_is_complete():
-    assert __version__ == "6.27"
-    assert __release_sequence__ == 6270001
-    note = notes_for("6.27")
+def test_v628_release_contract_is_complete():
+    assert __version__ == "6.28"
+    assert __release_sequence__ == 6280001
+    note = notes_for("6.28")
     assert note is not None
     assert any("CGV" in change for change in note.changes)
