@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.31",
+        changes=(
+            "CGV 미오픈 회차 및 목표 영화 선공개 감시 주기 단축",
+            "CGV 회차 감지 후 인원 선택 및 좌석 고속 감시 진입 지연 개선",
+            "CGV 좌석 임시선점 확보 시 React 화면 동기화 대기 시간 및 안정성 강화",
+        ),
+    ),
+    PatchNote(
         version="6.30",
         changes=(
             "CGV 다중 좌석 우선순위 요약 칩 표시 및 개별 삭제 지원",
