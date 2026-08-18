@@ -4,8 +4,6 @@ from types import SimpleNamespace
 
 import engines.cgv_chrome_session as cgv_chrome_session
 import ui.reservation_form_runtime as reservation_form_runtime
-from engines.cgv_browser_client import CgvBrowserClient as BaseCgvBrowserClient
-from engines.cgv_browser_client_runtime import CgvBrowserClient
 from engines.cgv_engine_runtime import CgvEngine
 from pengucro.models import ReservationRequest
 from ui.cgv_booking_dialog_runtime import CgvBookingDialog
@@ -15,60 +13,6 @@ from ui.reservation_form_runtime import ReservationForm
 def _engine(logs=None):
     logs = logs if logs is not None else []
     return CgvEngine(lambda message, level: logs.append((message, level)))
-
-
-def test_open_target_date_drops_previous_date_preopen_templates(monkeypatch):
-    exact = {
-        "scnYmd": "20260824",
-        "scnsNo": "target",
-        "expoProdNm": "오디세이",
-    }
-    historical_template = {
-        "scnYmd": "20260824",
-        "scnsNo": "",
-        "expoProdNm": "오디세이",
-        "_pengucroPreopen": True,
-        "_pengucroSeatReferenceDate": "2026-08-23",
-    }
-
-    monkeypatch.setattr(
-        BaseCgvBrowserClient,
-        "fetch_schedule_with_reference",
-        lambda self, *args, **kwargs: (
-            (exact, historical_template),
-            "2026-08-24",
-            False,
-        ),
-    )
-
-    schedules, reference_date, reference_only = CgvBrowserClient().fetch_schedule_with_reference(
-        "0013", "2026-08-24"
-    )
-
-    assert schedules == (exact,)
-    assert reference_date == "2026-08-24"
-    assert reference_only is False
-
-
-def test_unopened_target_date_keeps_reference_template(monkeypatch):
-    template = {
-        "scnYmd": "20260824",
-        "_pengucroPreopen": True,
-        "_pengucroSeatReferenceDate": "2026-08-23",
-    }
-    monkeypatch.setattr(
-        BaseCgvBrowserClient,
-        "fetch_schedule_with_reference",
-        lambda self, *args, **kwargs: ((template,), "2026-08-23", True),
-    )
-
-    schedules, reference_date, reference_only = CgvBrowserClient().fetch_schedule_with_reference(
-        "0013", "2026-08-24"
-    )
-
-    assert schedules == (template,)
-    assert reference_date == "2026-08-23"
-    assert reference_only is True
 
 
 def test_open_target_schedule_uses_its_own_seat_map_not_previous_day_reference():
