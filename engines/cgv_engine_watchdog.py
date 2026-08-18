@@ -10,7 +10,7 @@ from engines.cgv_engine_runtime import CgvEngine as RuntimeCgvEngine
 class CgvEngine(RuntimeCgvEngine):
     """Long-running CGV schedule watcher layered over the fast runtime.
 
-    The booking/seat/hold path remains owned by ``cgv_engine_runtime``. This
+    The booking/seat/hold path remains owned by ``cgv_engine_runtime``.  This
     layer only changes the pre-open schedule watcher so it can stay alive for
     hours or days without holding the user's maximum hedge count open
     continuously.
@@ -21,13 +21,15 @@ class CgvEngine(RuntimeCgvEngine):
       burst and at most two hedged requests;
     * one schedule race has a hard six-second deadline so a broken fetch cannot
       pin the watcher forever;
-    * a 401 receives one soft same-tab refresh/retry. If CGV really requires a
+    * a 401 receives one soft same-tab refresh/retry.  If CGV really requires a
       fresh login, the normal loop remains alive and keeps backing off rather
       than terminating the reservation task.
     """
 
-    PREOPEN_IDLE_INTERVAL = 2.5
-    SCHEDULE_HINT_INTERVAL = 0.5
+    SCHEDULE_LONG_IDLE_INTERVAL = 2.5
+    SCHEDULE_BURST_INTERVAL = 0.5
+    PREOPEN_IDLE_INTERVAL = SCHEDULE_LONG_IDLE_INTERVAL
+    SCHEDULE_HINT_INTERVAL = SCHEDULE_BURST_INTERVAL
 
     SCHEDULE_REQUEST_TIMEOUT_MS = 6000
     SCHEDULE_BURST_SECONDS = 45.0
@@ -83,13 +85,27 @@ class CgvEngine(RuntimeCgvEngine):
                 "info",
             )
 
-    def _effective_schedule_concurrency(self, requested: int) -> int:
-        requested = max(1, int(requested or 1))
-        burst = (
+    def _schedule_burst_active(self) -> bool:
+        return (
             self._schedule_watch_state == "hint"
             or time.monotonic() < self._schedule_burst_until
         )
-        if not burst:
+
+    def _sync_schedule_poll_interval(self) -> None:
+        # The mature base loop reads ``self.PREOPEN_IDLE_INTERVAL`` only after
+        # each race. Keep that compatibility point dynamic so a generic target-
+        # date schedule change can temporarily receive the same 0.5-second
+        # cadence as a target-movie hint, then automatically fall back to the
+        # low-load 2.5-second cadence when the burst expires.
+        self.PREOPEN_IDLE_INTERVAL = (
+            self.SCHEDULE_BURST_INTERVAL
+            if self._schedule_burst_active()
+            else self.SCHEDULE_LONG_IDLE_INTERVAL
+        )
+
+    def _effective_schedule_concurrency(self, requested: int) -> int:
+        requested = max(1, int(requested or 1))
+        if not self._schedule_burst_active():
             return 1
         return min(requested, int(self.SCHEDULE_BURST_MAX_CONCURRENCY))
 
@@ -291,6 +307,7 @@ class CgvEngine(RuntimeCgvEngine):
         improving the common fast-response case.
         """
 
+        self._sync_schedule_poll_interval()
         effective = self._effective_schedule_concurrency(concurrency)
         result = self._run_schedule_race_once(page, url, effective)
 
@@ -306,6 +323,7 @@ class CgvEngine(RuntimeCgvEngine):
                 result = self._run_schedule_race_once(page, url, effective)
 
         self._update_schedule_watch_health(result)
+        self._sync_schedule_poll_interval()
         return result
 
     def log(self, message: str, level: str = "info") -> None:
