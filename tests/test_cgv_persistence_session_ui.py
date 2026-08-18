@@ -143,9 +143,56 @@ def test_dialog_expands_height_to_show_more_seat_map():
     assert state["minsize"] == (900, 560)
 
 
-def test_v628_release_contract_is_complete():
-    assert __version__ == "6.28"
-    assert __release_sequence__ == 6280001
-    note = notes_for("6.28")
+def test_cgv_npay_password_eye_toggle():
+    class Entry:
+        def __init__(self):
+            self.show = "•"
+
+        def configure(self, show):
+            self.show = show
+
+    class Button:
+        def __init__(self):
+            self.image = None
+
+        def configure(self, image):
+            self.image = image
+
+    entry = Entry()
+    btn = Button()
+    form = SimpleNamespace(
+        cgv_npay_password_entry=entry,
+        cgv_npay_eye_button=btn,
+        cgv_npay_eye_visible=False,
+        _icon_eye=object(),
+        _icon_eye_off=object(),
+    )
+
+    from ui.reservation_form import ReservationForm
+    ReservationForm._toggle_cgv_npay_eye(form)
+    assert form.cgv_npay_eye_visible is True
+    assert entry.show == ""
+    assert btn.image is form._icon_eye_off
+
+    ReservationForm._toggle_cgv_npay_eye(form)
+    assert form.cgv_npay_eye_visible is False
+    assert entry.show == "•"
+    assert btn.image is form._icon_eye
+
+
+def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    store = SecretStore()
+    store.set("cgv_npay_password", "123456")
+    assert store.get("cgv_npay_password") == "123456"
+
+    store.delete("cgv_npay_password")
+    assert store.get("cgv_npay_password") == ""
+
+
+def test_v629_release_contract_is_complete():
+    assert __version__ == "6.29"
+    assert __release_sequence__ == 6290001
+    note = notes_for("6.29")
     assert note is not None
-    assert any("CGV" in change for change in note.changes)
+    assert any("네이버페이" in change for change in note.changes)

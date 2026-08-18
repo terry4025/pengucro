@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import io
 import re
 import threading
 import time
 import urllib.parse
 from typing import Any
 
+from PIL import Image
+
 from engines import browser_session
 from engines.base_engine import BaseEngine
+from engines.npay_keypad_recognizer import NpayKeypadRecognizer
 from engines.cgv_client import (
     CGV_BFF_BOOKING_URL,
     CGV_BFF_CONTENT_URL,
@@ -1927,8 +1931,74 @@ class CgvEngine(BaseEngine):
         self.log(f"[CGV] 네이버페이 마지막 '{text or '결제하기'}' 클릭 완료", "info")
         return True
 
-    def _wait_for_cgv_payment_confirmation(self, cgv_page, naver_page) -> bool:
+    def _enter_naver_pay_password(self, page, npay_password: str) -> bool:
+        """Locates the Naver Pay virtual keypad on page, visually matches 0-9 digits, and clicks them."""
+        try:
+            self.log("[CGV] 네이버페이 가상 보안 키패드 감지 · 6자리 비밀번호 자동 입력을 시작합니다.", "info")
+            keypad_selectors = [
+                "table[class*='SecureKeyboard_keyboard']",
+                "table[class*='keyboard']",
+                "table[class*='Secure']",
+                "[class*='SecureKeyboard'] table",
+            ]
+            keypad_loc = None
+            for sel in keypad_selectors:
+                loc = page.locator(sel).first
+                try:
+                    if loc.is_visible(timeout=1000):
+                        keypad_loc = loc
+                        break
+                except Exception:
+                    continue
+
+            if keypad_loc is None:
+                screenshot_bytes = page.screenshot()
+            else:
+                screenshot_bytes = keypad_loc.screenshot()
+
+            img = Image.open(io.BytesIO(screenshot_bytes))
+            cells = NpayKeypadRecognizer.recognize_keypad_image(img)
+
+            missing_digits = [d for d in npay_password if d not in cells]
+            if missing_digits:
+                self.log(
+                    f"[CGV] 키패드에서 일부 숫자({missing_digits})를 인식하지 못했습니다. 수동 입력을 진행해주세요.",
+                    "warning",
+                )
+                return False
+
+            for digit in npay_password:
+                cell = cells[digit]
+                if keypad_loc is not None:
+                    cell_btn = keypad_loc.locator(
+                        f"tr:nth-child({cell.row}) td:nth-child({cell.col}) button"
+                    ).first
+                    try:
+                        if cell_btn.is_visible(timeout=500):
+                            cell_btn.click()
+                        else:
+                            keypad_loc.click(position={"x": cell.center[0], "y": cell.center[1]})
+                    except Exception:
+                        keypad_loc.click(position={"x": cell.center[0], "y": cell.center[1]})
+                else:
+                    page.mouse.click(cell.center[0], cell.center[1])
+
+                page.wait_for_timeout(80)
+
+            self.log("[CGV] 네이버페이 결제 비밀번호 6자리 자동 입력 완료", "success")
+            return True
+        except Exception as exc:
+            self.log(
+                f"[CGV] 네이버페이 가상 키패드 입력 중 오류: {format_exception(exc)}",
+                "warning",
+            )
+            return False
+
+    def _wait_for_cgv_payment_confirmation(
+        self, cgv_page, naver_page, npay_password: str = ""
+    ) -> bool:
         auth_reported = False
+        password_entered = False
         deadline = time.monotonic() + self.NPAY_COMPLETION_TIMEOUT_SECONDS
         while time.monotonic() < deadline and not self.stop_event.is_set():
             pages = []
@@ -1982,6 +2052,33 @@ class CgvEngine(BaseEngine):
                         "warning",
                     )
                     return False
+
+                # Handle virtual keypad password entry
+                if not password_entered:
+                    keypad_found = False
+                    for sel in (
+                        "table[class*='SecureKeyboard_keyboard']",
+                        "table[class*='keyboard']",
+                        "table[class*='Secure']",
+                    ):
+                        try:
+                            if candidate.locator(sel).first.is_visible(timeout=300):
+                                keypad_found = True
+                                break
+                        except Exception:
+                            continue
+
+                    if keypad_found or "/pw/check" in path:
+                        if npay_password and len(npay_password) == 6 and npay_password.isdigit():
+                            if self._enter_naver_pay_password(candidate, npay_password):
+                                password_entered = True
+                        elif not auth_reported:
+                            auth_reported = True
+                            self.log(
+                                "[CGV] 네이버페이 결제 비밀번호 입력이 필요합니다. 열린 Chrome에서 입력해주세요.",
+                                "warning",
+                            )
+
                 if not auth_reported and any(
                     phrase in body
                     for phrase in ("결제 비밀번호", "비밀번호 입력", "본인인증", "생체인증")
@@ -2003,7 +2100,9 @@ class CgvEngine(BaseEngine):
         )
         return False
 
-    def _proceed_naver_pay_checkout(self, page, developer_mode: bool = False) -> bool:
+    def _proceed_naver_pay_checkout(
+        self, page, developer_mode: bool = False, npay_password: str = ""
+    ) -> bool:
         """Run the two CGV checkout steps, then drive the official Naver Pay page."""
         try:
             self.log("[CGV] 좌석 선점 완료 · 네이버페이 결제 흐름을 시작합니다.", "info")
@@ -2030,6 +2129,10 @@ class CgvEngine(BaseEngine):
                 return False
             if not self._click_naver_final_payment(naver_pay_page):
                 return False
+            if npay_password:
+                return self._wait_for_cgv_payment_confirmation(
+                    page, naver_pay_page, npay_password
+                )
             return self._wait_for_cgv_payment_confirmation(page, naver_pay_page)
         except Exception as exc:
             self.log(
@@ -2994,9 +3097,11 @@ class CgvEngine(BaseEngine):
                         )
                 keep_open = True
                 if held:
+                    npay_password = str(cgv.get("npay_password", "")).strip()
                     checkout_completed = self._proceed_naver_pay_checkout(
                         page,
                         developer_mode=developer_mode,
+                        npay_password=npay_password,
                     )
                     self._report_checkout_outcome(
                         checkout_completed=checkout_completed,

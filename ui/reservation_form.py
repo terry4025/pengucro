@@ -1,4 +1,5 @@
 import customtkinter as ctk
+from PIL import Image, ImageDraw
 import ui.theme as theme
 from data.themes import (
     ZEROWORLD_THEMES,
@@ -42,8 +43,45 @@ PRESERVED_CONFIG_KEYS = (
     "yescaptcha_enabled",
     "yescaptcha_test_mode",
     "yescaptcha_client_key",
-    "yescaptcha_soft_id",
 )
+
+
+def _create_lucide_eye_icon(size: tuple[int, int] = (16, 16), color: str = "#8E8E93") -> ctk.CTkImage:
+    scale = 4
+    w, h = size[0] * scale, size[1] * scale
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    sw = int(1.8 * scale)
+
+    # Eye contours
+    draw.arc([int(2 * scale), int(4 * scale), int(22 * scale), int(20 * scale)], start=200, end=340, fill=color, width=sw)
+    draw.arc([int(2 * scale), int(2 * scale), int(22 * scale), int(18 * scale)], start=20, end=160, fill=color, width=sw)
+
+    # Pupil
+    r = int(3.2 * scale)
+    cx, cy = int(12 * scale), int(11 * scale)
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=sw)
+
+    res = img.resize(size, Image.Resampling.LANCZOS)
+    return ctk.CTkImage(light_image=res, dark_image=res, size=size)
+
+
+def _create_lucide_eye_off_icon(size: tuple[int, int] = (16, 16), color: str = "#8E8E93") -> ctk.CTkImage:
+    scale = 4
+    w, h = size[0] * scale, size[1] * scale
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    sw = int(1.8 * scale)
+
+    # Lower curve
+    draw.arc([int(2 * scale), int(2 * scale), int(22 * scale), int(18 * scale)], start=20, end=160, fill=color, width=sw)
+    # Upper arc
+    draw.arc([int(2 * scale), int(4 * scale), int(22 * scale), int(20 * scale)], start=200, end=250, fill=color, width=sw)
+    # Diagonal slash
+    draw.line([int(3 * scale), int(3 * scale), int(21 * scale), int(21 * scale)], fill=color, width=sw)
+
+    res = img.resize(size, Image.Resampling.LANCZOS)
+    return ctk.CTkImage(light_image=res, dark_image=res, size=size)
 
 
 class DatePickerDialog(ctk.CTkToplevel):
@@ -1036,6 +1074,71 @@ class ReservationForm(ctk.CTkFrame):
         self._setup_entry_focus(self.cgv_nonmember_phone_entry)
         self._setup_entry_focus(self.cgv_nonmember_password_entry)
 
+        self._icon_eye = _create_lucide_eye_icon((16, 16), color="#8E8E93")
+        self._icon_eye_off = _create_lucide_eye_off_icon((16, 16), color="#8E8E93")
+        self.cgv_npay_eye_visible = False
+
+        self.cgv_npay_frame = ctk.CTkFrame(self.cgv_auth_frame, fg_color="transparent")
+        self.cgv_npay_frame.grid(
+            row=3, column=0, columnspan=2, sticky="ew",
+            padx=theme.SPACE_2, pady=(theme.SPACE_1, theme.SPACE_1)
+        )
+        self.cgv_npay_frame.columnconfigure(0, weight=0)
+        self.cgv_npay_frame.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            self.cgv_npay_frame,
+            text="네이버페이 비밀번호",
+            font=theme.FONT_BODY_SM,
+            text_color=theme.TEXT_MUTE,
+        ).grid(row=0, column=0, sticky="w", padx=(0, theme.SPACE_2))
+
+        self.cgv_npay_entry_box = ctk.CTkFrame(self.cgv_npay_frame, fg_color="transparent")
+        self.cgv_npay_entry_box.grid(row=0, column=1, sticky="ew")
+        self.cgv_npay_entry_box.columnconfigure(0, weight=1)
+
+        self.cgv_npay_password_entry = ctk.CTkEntry(
+            self.cgv_npay_entry_box,
+            placeholder_text="비밀번호 6자리",
+            show="•",
+            fg_color=theme.SURFACE_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            text_color=theme.TEXT_PRIMARY,
+            placeholder_text_color=theme.TEXT_MUTE,
+            height=theme.H_CONTROL,
+            corner_radius=theme.ROUNDED_MD,
+        )
+        self.cgv_npay_password_entry.grid(row=0, column=0, sticky="ew", padx=(0, theme.SPACE_1))
+        self._setup_entry_focus(self.cgv_npay_password_entry)
+
+        self.cgv_npay_eye_button = ctk.CTkButton(
+            self.cgv_npay_entry_box,
+            image=self._icon_eye,
+            text="",
+            width=32,
+            height=theme.H_CONTROL,
+            fg_color=theme.SURFACE_COLOR,
+            hover_color=theme.CARD_COLOR,
+            border_color=theme.HAIRLINE_COLOR,
+            border_width=1,
+            corner_radius=theme.ROUNDED_MD,
+            command=self._toggle_cgv_npay_eye,
+        )
+        self.cgv_npay_eye_button.grid(row=0, column=1, sticky="e")
+
+        self.cgv_npay_hint = ctk.CTkLabel(
+            self.cgv_auth_frame,
+            text="네이버페이 결제창에서 6자리 비밀번호를 자동 입력합니다. (미입력 시 수동 입력)",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_TERTIARY,
+            anchor="w",
+            justify="left",
+        )
+        self.cgv_npay_hint.grid(
+            row=4, column=0, columnspan=2, sticky="ew",
+            padx=theme.SPACE_2, pady=(0, theme.SPACE_2)
+        )
+
         self.catalog_auto_refresh_var = ctk.BooleanVar(value=True)
         self.catalog_auto_refresh_checkbox = ctk.CTkCheckBox(
             self.advanced_frame,
@@ -1749,6 +1852,8 @@ class ReservationForm(ctk.CTkFrame):
             self.cgv_nonmember_birth_entry,
             self.cgv_nonmember_phone_entry,
             self.cgv_nonmember_password_entry,
+            self.cgv_npay_password_entry,
+            self.cgv_npay_eye_button,
         )
         for widget in widgets:
             try:
@@ -2022,6 +2127,15 @@ class ReservationForm(ctk.CTkFrame):
             )
             self.cgv_nonmember_frame.grid_forget()
         self.auto_save()
+
+    def _toggle_cgv_npay_eye(self) -> None:
+        self.cgv_npay_eye_visible = not getattr(self, "cgv_npay_eye_visible", False)
+        if self.cgv_npay_eye_visible:
+            self.cgv_npay_password_entry.configure(show="")
+            self.cgv_npay_eye_button.configure(image=self._icon_eye_off)
+        else:
+            self.cgv_npay_password_entry.configure(show="•")
+            self.cgv_npay_eye_button.configure(image=self._icon_eye)
 
     def _on_date_change(self, event=None):
         """Auto-detect weekday/weekend from the entered date."""
@@ -2305,6 +2419,11 @@ class ReservationForm(ctk.CTkFrame):
                 "nonmember_birth": self.cgv_nonmember_birth_entry.get().strip(),
                 "nonmember_phone": self.cgv_nonmember_phone_entry.get().strip(),
                 "nonmember_password": self.cgv_nonmember_password_entry.get(),
+                "npay_password": (
+                    self.cgv_npay_password_entry.get().strip()
+                    if hasattr(self, "cgv_npay_password_entry")
+                    else ""
+                ),
             }
         try:
             request = ReservationRequest.from_mapping(self.current_site, raw_values)
@@ -2491,6 +2610,7 @@ class ReservationForm(ctk.CTkFrame):
         stored_cgv_birth = self.secret_store.get("cgv_nonmember_birth")
         stored_cgv_phone = self.secret_store.get("cgv_nonmember_phone")
         stored_cgv_password = self.secret_store.get("cgv_nonmember_password")
+        stored_cgv_npay_password = self.secret_store.get("cgv_npay_password")
         # Drop any captcha key left over from an earlier version so the secret
         # store does not keep a credential nothing uses.
         try:
@@ -2509,6 +2629,8 @@ class ReservationForm(ctk.CTkFrame):
                 self.cgv_nonmember_phone_entry.insert(0, stored_cgv_phone)
             if stored_cgv_password:
                 self.cgv_nonmember_password_entry.insert(0, stored_cgv_password)
+            if stored_cgv_npay_password and hasattr(self, "cgv_npay_password_entry"):
+                self.cgv_npay_password_entry.insert(0, stored_cgv_npay_password)
             return
         self._is_initializing = True
         config_migrated = False
@@ -2720,6 +2842,9 @@ class ReservationForm(ctk.CTkFrame):
             if cgv_password:
                 self.cgv_nonmember_password_entry.delete(0, "end")
                 self.cgv_nonmember_password_entry.insert(0, cgv_password)
+            if stored_cgv_npay_password and hasattr(self, "cgv_npay_password_entry"):
+                self.cgv_npay_password_entry.delete(0, "end")
+                self.cgv_npay_password_entry.insert(0, stored_cgv_npay_password)
             if "cgv_nonmember_birth" in config or "cgv_nonmember_phone" in config:
                 if cgv_birth:
                     self.secret_store.set("cgv_nonmember_birth", cgv_birth)
@@ -2791,6 +2916,12 @@ class ReservationForm(ctk.CTkFrame):
                 self.secret_store.set("cgv_nonmember_phone", cgv_phone)
             else:
                 self.secret_store.delete("cgv_nonmember_phone")
+            if hasattr(self, "cgv_npay_password_entry"):
+                cgv_npay_password = self.cgv_npay_password_entry.get().strip()
+                if cgv_npay_password:
+                    self.secret_store.set("cgv_npay_password", cgv_npay_password)
+                else:
+                    self.secret_store.delete("cgv_npay_password")
 
             config = {
                 "site": site_name,

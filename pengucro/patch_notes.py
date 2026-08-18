@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.29",
+        changes=(
+            "CGV 네이버페이 6자리 결제 비밀번호 자동 입력 지원",
+            "CGV 고급설정에 네이버페이 비밀번호 입력란 및 눈(Eye) 토글 버튼 추가",
+            "네이버페이 가상 키패드 0~9 위치 고속 자동 인식 엔진 탑재",
+        ),
+    ),
+    PatchNote(
         version="6.28",
         changes=(
             "CGV 좌석 선택창 및 좌석도 표시 영역 세로 크기 확대",
