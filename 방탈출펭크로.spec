@@ -25,6 +25,7 @@ a = Analysis(
         'engines.cgv_engine_pairwise',
         'engines.cgv_engine_pairwise_observer',
         'engines.cgv_engine_visitor_runtime',
+        'engines.cgv_engine_visitor_dom_runtime',
         'engines.cgv_client',
         'engines.cgv_browser_client',
         'engines.cgv_browser_client_runtime',
