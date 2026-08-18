@@ -9,6 +9,19 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v624_patch_notes_are_short_and_exact():
+    note = notes_for("6.24")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 1페이지 모드의 실시간 슬롯 검증 독립 시작",
+        "키이스케이프 다중 실행 시 슬롯 공유 대기 및 자체 조회 폴백 개선",
+        "키이스케이프 시간표 불일치 감지 시 단일 템플릿 격리 및 자동 복구",
+        "키이스케이프 오픈 경계 조회 및 서버 지연 측정 보강",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v623_patch_notes_are_short_and_exact():
     note = notes_for("6.23")
 

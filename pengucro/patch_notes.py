@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.24",
+        changes=(
+            "키이스케이프 1페이지 모드의 실시간 슬롯 검증 독립 시작",
+            "키이스케이프 다중 실행 시 슬롯 공유 대기 및 자체 조회 폴백 개선",
+            "키이스케이프 시간표 불일치 감지 시 단일 템플릿 격리 및 자동 복구",
+            "키이스케이프 오픈 경계 조회 및 서버 지연 측정 보강",
+        ),
+    ),
+    PatchNote(
         version="6.23",
         changes=(
             "키이스케이프 1페이지 모드의 단일 탭 HTTP 실시간 슬롯 검증 유지",
