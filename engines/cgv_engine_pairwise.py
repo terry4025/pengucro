@@ -1,92 +1,208 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from engines.cgv_engine_watchdog import CgvEngine as WatchdogCgvEngine
 
 
 class CgvEngine(WatchdogCgvEngine):
-    """Final CGV engine with pair-aware seat-modal synchronization.
+    """Final CGV engine with adaptive seat-modal synchronization.
 
-    CGV's seat UI does not behave like a plain checkbox list when more than one
-    visitor is selected.  While at least two visitor slots remain, clicking the
-    front seat of a contiguous block selects that seat and the immediately next
-    seat as one pair.  An odd final visitor is selected with one last click.
+    CGV can auto-select one neighbouring seat when a visitor clicks a seat while
+    two or more visitor slots remain. The partner is not reliably "the next seat":
+    depending on CGV's current grouping, B18 can select B17+B18 while B19 can
+    select B19+B20.
 
-    The API hold path already holds the exact N target seats.  This layer only
-    mirrors that already-held block into CGV's React UI without clicking every
-    target seat individually (which could expand 2 seats into 4, 3 into 6,
-    etc.).
+    The API hold path already owns the exact N target seats. This layer mirrors
+    that held set into CGV's React UI by observing the result of each click
+    instead of predicting the partner direction. A click is kept only when every
+    newly selected seat still belongs to the held target group.
     """
 
-    # Give React enough time to apply the automatic partner selection before a
-    # corrective action is considered.  The overall synchronization budget is
-    # still inherited from the runtime layer (about three seconds).
-    PAIR_ACTION_SETTLE_SECONDS = 0.65
+    # Local React observation only; these values do not change CGV API polling.
+    # Most click updates land within one or two frames. Keep a bounded grace for
+    # slower paints without the old 650 ms fixed pause after every click.
+    PAIR_ACTION_SETTLE_SECONDS = 0.30
+    PAIR_CLEAR_SETTLE_SECONDS = 0.35
+    PAIR_MAX_BACKTRACKS = 4
 
     @staticmethod
     def _unique_ids(values) -> list[str]:
-        return list(dict.fromkeys(str(value or "") for value in values if str(value or "")))
+        return list(
+            dict.fromkeys(
+                str(value or "")
+                for value in values
+                if str(value or "")
+            )
+        )
 
     @classmethod
-    def _pairwise_click_plan(cls, target_ids: list[str]) -> tuple[str, ...]:
-        """Return the front-seat anchors CGV needs for a contiguous N-seat block.
+    def _extract_attach_pairs(
+        cls, payload: Mapping[str, Any] | dict[str, Any]
+    ) -> tuple[tuple[str, str], ...]:
+        """Read only explicit two-seat ``attachGroupNo`` groups from CGV data.
 
-        Examples:
-        1 -> [B10]
-        2 -> [B10]                 (CGV adds B11)
-        3 -> [B10, B12]            (B10+B11, then B12)
-        5 -> [B10, B12, B14]       (2+2+1)
-        8 -> [B10, B12, B14, B16]  (2+2+2+2)
+        The current CGV page state exposes ``attachGroupNo`` on seat objects.
+        Its exact semantics may vary by auditorium, so this metadata is only a
+        candidate-order hint. Every click result is still verified against the
+        real selected-seat state before it is accepted.
         """
 
-        target = cls._unique_ids(target_ids)
-        return tuple(target[index] for index in range(0, len(target), 2))
+        groups: dict[str, list[str]] = {}
+
+        def walk(value: Any) -> None:
+            if isinstance(value, Mapping):
+                seat_id = str(value.get("seatLocNo", "") or "").strip()
+                group_no = str(value.get("attachGroupNo", "") or "").strip()
+                if seat_id and group_no:
+                    groups.setdefault(group_no, []).append(seat_id)
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    walk(child)
+
+        walk(payload)
+        result: list[tuple[str, str]] = []
+        for seat_ids in groups.values():
+            unique = cls._unique_ids(seat_ids)
+            # Be deliberately conservative. A group with a different cardinality
+            # may represent another CGV seat product rather than the normal pair
+            # behaviour we are trying to mirror.
+            if len(unique) == 2:
+                result.append((unique[0], unique[1]))
+        return tuple(result)
 
     @classmethod
-    def _pairwise_prefix_state(
+    def _missing_runs(
         cls,
         target_ids: list[str],
         selected_ids: list[str],
-    ) -> tuple[str, str | None, int | None]:
-        """Classify the current React selection against CGV's 2+2+...(+1) rule."""
+    ) -> list[list[str]]:
+        """Return contiguous runs in the target order that are still missing."""
 
         target = cls._unique_ids(target_ids)
-        selected = cls._unique_ids(selected_ids)
-        count = len(selected)
-        total = len(target)
-        if not target:
-            return "invalid", None, None
+        selected = set(cls._unique_ids(selected_ids))
+        runs: list[list[str]] = []
+        current: list[str] = []
+        for seat_id in target:
+            if seat_id not in selected:
+                current.append(seat_id)
+            elif current:
+                runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        return runs
 
-        # Stable intermediate states are 0, 2, 4, ... seats, plus the exact
-        # final count for an odd-sized party.
-        valid_counts = set(range(0, total, 2))
-        valid_counts.add(total)
-        if count not in valid_counts:
-            return "invalid", None, None
-        if set(selected) != set(target[:count]):
-            return "invalid", None, None
-        if count == total:
-            return "complete", None, total
+    @classmethod
+    def _adaptive_anchor_candidates(
+        cls,
+        target_ids: list[str],
+        selected_ids: list[str],
+        rejected: set[str] | None = None,
+        attach_pairs: tuple[tuple[str, str], ...] = (),
+        learned_pairs: Mapping[str, tuple[str, ...]] | None = None,
+    ) -> tuple[str, ...]:
+        """Order candidate clicks without assuming left/right partner direction.
 
-        remaining = total - count
-        expected = count + (2 if remaining >= 2 else 1)
-        return "advance", target[count], expected
+        Priority:
+        1) an explicit CGV two-seat attach group fully inside the missing target;
+        2) a previously observed anchor whose whole result stayed in target;
+        3) for odd missing runs, an interior seat (both neighbours are targets);
+        4) for even runs, endpoints first so a valid pair partition can be
+           discovered with the fewest probes;
+        5) remaining missing seats as a last observation-based fallback.
+        """
+
+        target = cls._unique_ids(target_ids)
+        selected = set(cls._unique_ids(selected_ids))
+        rejected = set(rejected or ())
+        missing = [seat_id for seat_id in target if seat_id not in selected]
+        missing_set = set(missing)
+        if not missing:
+            return ()
+        if len(missing) == 1:
+            return () if missing[0] in rejected else (missing[0],)
+
+        ordered: list[str] = []
+
+        def add(value: str) -> None:
+            if value in missing_set and value not in rejected and value not in ordered:
+                ordered.append(value)
+
+        target_pos = {seat_id: index for index, seat_id in enumerate(target)}
+
+        # Explicit CGV metadata is useful when present, but never trusted without
+        # observing the click result.
+        for pair in attach_pairs:
+            pair_set = set(pair)
+            if len(pair_set) == 2 and pair_set.issubset(missing_set):
+                anchor = min(pair_set, key=lambda item: target_pos.get(item, 10**9))
+                add(anchor)
+
+        for anchor, observed in (learned_pairs or {}).items():
+            observed_set = set(observed)
+            if (
+                anchor in missing_set
+                and len(observed_set) >= 2
+                and observed_set.issubset(missing_set)
+            ):
+                add(anchor)
+
+        runs = cls._missing_runs(target, list(selected))
+
+        # Odd runs: choose from the middle first. If CGV auto-pairs either left
+        # or right, both outcomes remain inside the requested target block.
+        odd_runs = [run for run in runs if len(run) >= 3 and len(run) % 2 == 1]
+        odd_runs.sort(key=len, reverse=True)
+        for run in odd_runs:
+            center = (len(run) - 1) / 2
+            for index in sorted(
+                range(1, len(run) - 1),
+                key=lambda idx: (abs(idx - center), idx),
+            ):
+                add(run[index])
+
+        # Even runs have to consume their endpoints eventually. Probe endpoints
+        # before interior seats; a wrong outward pair is rolled back immediately.
+        even_runs = [run for run in runs if len(run) >= 2 and len(run) % 2 == 0]
+        even_runs.sort(key=len, reverse=True)
+        for run in even_runs:
+            add(run[0])
+            add(run[-1])
+            for seat_id in run[1:-1]:
+                add(seat_id)
+
+        # Remaining odd/eccentric runs, including layouts split by an already
+        # selected pair.
+        for run in runs:
+            if len(run) >= 3:
+                for seat_id in run[1:-1]:
+                    add(seat_id)
+            if len(run) >= 2:
+                add(run[0])
+                add(run[-1])
+
+        for seat_id in missing:
+            add(seat_id)
+        return tuple(ordered)
 
     @staticmethod
     def _dedupe_snapshot(snapshot: dict[str, Any], target_ids: list[str]) -> dict[str, Any]:
-        """Normalize duplicate selected-seat DOM representations.
-
-        CGV can render the same selected seat both in the map and in its selected
-        seat summary.  Counting DOM nodes instead of seatLocNo values produced
-        misleading states such as 4/2 and 6/3 even when only N unique seats were
-        selected.  Treat seatLocNo as the identity.
-        """
+        """Normalize duplicate selected-seat DOM representations by seatLocNo."""
 
         if not isinstance(snapshot, dict):
             return {}
-        target = list(dict.fromkeys(str(value or "") for value in target_ids if str(value or "")))
+        target = list(
+            dict.fromkeys(
+                str(value or "")
+                for value in target_ids
+                if str(value or "")
+            )
+        )
         selected = list(
             dict.fromkeys(
                 str(value or "")
@@ -110,7 +226,7 @@ class CgvEngine(WatchdogCgvEngine):
 
     @staticmethod
     def _click_pair_anchor(page, seat_id: str) -> bool:
-        """Click one front-seat anchor and let CGV select its automatic partner."""
+        """Click one CGV seat and let the official UI decide its partner."""
 
         try:
             result = page.evaluate(
@@ -146,155 +262,274 @@ class CgvEngine(WatchdogCgvEngine):
         except Exception:
             return False
 
-    @staticmethod
-    def _click_first_selected_seat(page) -> bool:
-        """Remove one currently-selected CGV block when recovery is necessary."""
-
-        try:
-            result = page.evaluate(
-                r"""
-                () => {
-                  const visible = node => {
-                    if (!node) return false;
-                    const style = window.getComputedStyle(node);
-                    const rect = node.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' &&
-                           rect.width > 0 && rect.height > 0;
-                  };
-                  const isSelected = node => {
-                    const classes = String(node.className || '').toLowerCase();
-                    const tokens = new Set(classes.split(/[\s_\-]+/));
-                    return node.title === '선택됨' ||
-                           node.getAttribute('aria-pressed') === 'true' ||
-                           node.getAttribute('aria-selected') === 'true' ||
-                           tokens.has('selected') || tokens.has('active') || tokens.has('on');
-                  };
-                  const node = Array.from(
-                    document.querySelectorAll('button[data-seatlocno]')
-                  ).find(item => visible(item) && isSelected(item));
-                  if (!node) return false;
-                  node.click();
-                  return true;
-                }
-                """
-            )
-            return bool(result)
-        except Exception:
-            return False
-
     def _exact_seat_selection_snapshot(self, page, target_ids: list[str]) -> dict:
         raw = WatchdogCgvEngine._exact_seat_selection_snapshot(page, target_ids)
         return self._dedupe_snapshot(raw, target_ids)
+
+    def _pairwise_wait(self, page) -> None:
+        try:
+            page.wait_for_timeout(self.API_UI_SYNC_INTERVAL_MS)
+        except Exception:
+            time.sleep(self.API_UI_SYNC_INTERVAL_MS / 1000.0)
+
+    def _wait_for_selection_change(
+        self,
+        page,
+        target_ids: list[str],
+        before_ids: set[str],
+        timeout_seconds: float,
+        *,
+        wanted_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Observe local React state until the selected-seat set changes."""
+
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        last: dict[str, Any] = {}
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            snapshot = self._exact_seat_selection_snapshot(page, target_ids)
+            if snapshot:
+                last = snapshot
+                selected = set(self._unique_ids(snapshot.get("selectedIds", ())))
+                if wanted_ids is not None:
+                    if selected == wanted_ids:
+                        return snapshot
+                elif selected != before_ids or snapshot.get("ready"):
+                    return snapshot
+            self._pairwise_wait(page)
+        return last
+
+    def _clear_selected_state(
+        self,
+        page,
+        target_ids: list[str],
+        *,
+        deadline: float,
+    ) -> bool:
+        """Clear CGV's current selected blocks with observed, bounded clicks."""
+
+        for _ in range(max(2, len(target_ids) + 3)):
+            if time.monotonic() >= deadline or self.stop_event.is_set():
+                return False
+            snapshot = self._exact_seat_selection_snapshot(page, target_ids)
+            selected = self._unique_ids(snapshot.get("selectedIds", ())) if snapshot else []
+            if not selected:
+                return True
+
+            before = set(selected)
+            anchor = selected[0]
+            if not self._click_pair_anchor(page, anchor):
+                return False
+            changed = self._wait_for_selection_change(
+                page,
+                target_ids,
+                before,
+                min(
+                    self.PAIR_CLEAR_SETTLE_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                ),
+            )
+            after = set(self._unique_ids(changed.get("selectedIds", ()))) if changed else before
+            if after == before:
+                return False
+        snapshot = self._exact_seat_selection_snapshot(page, target_ids)
+        return not self._unique_ids(snapshot.get("selectedIds", ())) if snapshot else False
+
+    @staticmethod
+    def _reject_equivalent_pair_anchors(
+        rejected_by_state: dict[frozenset[str], set[str]],
+        before_state: frozenset[str],
+        anchor: str,
+        added: set[str],
+        attach_pairs: tuple[tuple[str, str], ...],
+        learned_pairs: Mapping[str, tuple[str, ...]],
+    ) -> None:
+        rejected = rejected_by_state.setdefault(before_state, set())
+        rejected.add(anchor)
+        if len(added) != 2:
+            return
+        for candidate, observed in learned_pairs.items():
+            if set(observed) == added:
+                rejected.add(candidate)
+        for pair in attach_pairs:
+            if set(pair) == added:
+                rejected.update(pair)
+
+    def _select_api_seats_in_ui(self, page, payload, selected) -> bool:
+        # The payload is already available from the official seat response that
+        # won the hold race; extracting metadata is local work and adds no API
+        # request or network delay.
+        self._active_attach_pairs = self._extract_attach_pairs(
+            payload if isinstance(payload, Mapping) else {}
+        )
+        try:
+            return super()._select_api_seats_in_ui(page, payload, selected)
+        finally:
+            self._active_attach_pairs = ()
 
     def _normalize_active_seat_group(self, page, seat_ids: list[str]) -> bool:
         target_ids = self._unique_ids(seat_ids)
         if not target_ids:
             return False
 
+        target_set = set(target_ids)
+        attach_pairs = tuple(getattr(self, "_active_attach_pairs", ()) or ())
+        rejected_by_state: dict[frozenset[str], set[str]] = {}
+        learned_pairs: dict[str, tuple[str, ...]] = {}
+        # (before_set, anchor, added_set) entries are enough for bounded
+        # backtracking when an initially-valid pair later creates a dead end.
+        history: list[tuple[frozenset[str], str, frozenset[str]]] = []
         observed_snapshot = False
         last_snapshot: dict[str, Any] = {}
-        reset_mode = False
-        reset_pending: tuple[int, float] | None = None
-        pair_pending: tuple[int, int, float, str] | None = None
-        recovered_state = False
+        backtracks = 0
+        click_count = 0
+        rollback_count = 0
 
-        for _attempt in range(self.API_UI_SYNC_ATTEMPTS):
-            if self.stop_event.is_set():
+        budget_seconds = (
+            self.API_UI_SYNC_ATTEMPTS * self.API_UI_SYNC_INTERVAL_MS / 1000.0
+        )
+        deadline = time.monotonic() + budget_seconds
+
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            snapshot = self._exact_seat_selection_snapshot(page, target_ids)
+            if not snapshot:
+                self._pairwise_wait(page)
+                continue
+
+            observed_snapshot = True
+            last_snapshot = snapshot
+            selected = self._unique_ids(snapshot.get("selectedIds", ()))
+            selected_set = set(selected)
+
+            if snapshot.get("ready"):
+                if click_count or rollback_count:
+                    self.log(
+                        "[CGV] 적응형 좌석 동기화 완료 · "
+                        f"{len(target_ids)}/{len(target_ids)}석 · "
+                        f"선택 클릭 {click_count}회"
+                        + (f" · 즉시 보정 {rollback_count}회" if rollback_count else ""),
+                        "info",
+                    )
+                return True
+
+            # Exact N seats are already mirrored. React may only be late enabling
+            # 선택완료, so never touch a seat in this state.
+            if selected_set == target_set and len(selected) == len(target_ids):
+                self._pairwise_wait(page)
+                continue
+
+            # Any outside target seat is a stale or auto-attached partner. Clear
+            # the UI state before continuing; the API hold remains untouched.
+            if not selected_set.issubset(target_set):
+                rollback_count += 1
+                if not self._clear_selected_state(page, target_ids, deadline=deadline):
+                    break
+                history.clear()
+                continue
+
+            state_key = frozenset(selected_set)
+            rejected = rejected_by_state.get(state_key, set())
+            candidates = self._adaptive_anchor_candidates(
+                target_ids,
+                selected,
+                rejected,
+                attach_pairs=attach_pairs,
+                learned_pairs=learned_pairs,
+            )
+
+            if not candidates:
+                # The current accepted branch cannot finish. Backtrack by
+                # rejecting the pair that led here, clear the UI, and rebuild.
+                if history and backtracks < self.PAIR_MAX_BACKTRACKS:
+                    before_state, branch_anchor, added = history[-1]
+                    self._reject_equivalent_pair_anchors(
+                        rejected_by_state,
+                        before_state,
+                        branch_anchor,
+                        set(added),
+                        attach_pairs,
+                        learned_pairs,
+                    )
+                    backtracks += 1
+                    rollback_count += 1
+                    if not self._clear_selected_state(page, target_ids, deadline=deadline):
+                        break
+                    history.clear()
+                    continue
                 break
 
-            snapshot = self._exact_seat_selection_snapshot(page, target_ids)
-            now = time.monotonic()
-            if snapshot:
-                observed_snapshot = True
-                last_snapshot = snapshot
-                selected = self._unique_ids(snapshot.get("selectedIds", ()))
-                selected_count = len(selected)
+            anchor = candidates[0]
+            before = set(selected_set)
+            if not self._click_pair_anchor(page, anchor):
+                rejected_by_state.setdefault(state_key, set()).add(anchor)
+                self._pairwise_wait(page)
+                continue
 
-                if snapshot.get("ready"):
-                    if recovered_state:
-                        self.log(
-                            "[CGV] CGV 2석 자동선택 규칙에 맞춰 좌석 화면 상태를 복구했습니다.",
-                            "info",
-                        )
-                    return True
+            click_count += 1
+            changed = self._wait_for_selection_change(
+                page,
+                target_ids,
+                before,
+                min(
+                    self.PAIR_ACTION_SETTLE_SECONDS,
+                    max(0.0, deadline - time.monotonic()),
+                ),
+            )
+            after = set(self._unique_ids(changed.get("selectedIds", ()))) if changed else before
 
-                # When a previous/buggy attempt left an impossible state, clear
-                # the UI first. Clicking one selected anchor lets CGV remove the
-                # associated pair; repeat only after the selected count falls.
-                if reset_mode:
-                    if selected_count == 0:
-                        reset_mode = False
-                        reset_pending = None
-                        pair_pending = None
-                        recovered_state = True
-                    else:
-                        if reset_pending is not None:
-                            before_count, started = reset_pending
-                            if selected_count < before_count:
-                                reset_pending = None
-                            elif now - started < self.PAIR_ACTION_SETTLE_SECONDS:
-                                self._pairwise_wait(page)
-                                continue
-                            else:
-                                reset_pending = None
-                        if reset_pending is None:
-                            if self._click_first_selected_seat(page):
-                                reset_pending = (selected_count, now)
-                        self._pairwise_wait(page)
-                        continue
+            if after == before:
+                # Do not double-click an anchor whose React update did not
+                # materialize in the bounded observation window.
+                rejected_by_state.setdefault(state_key, set()).add(anchor)
+                continue
 
-                # After an anchor click, never click its partner manually. Wait
-                # for React to materialize the expected 2-seat (or final 1-seat)
-                # prefix before issuing the next anchor.
-                if pair_pending is not None:
-                    from_count, expected_count, started, _anchor = pair_pending
-                    expected_set = set(target_ids[:expected_count])
-                    selected_set = set(selected)
-                    if selected_count == expected_count and selected_set == expected_set:
-                        pair_pending = None
-                    elif (
-                        selected_count > expected_count
-                        or snapshot.get("extras")
-                        or not selected_set.issubset(expected_set)
-                    ):
-                        reset_mode = True
-                        pair_pending = None
-                        recovered_state = True
-                        self._pairwise_wait(page)
-                        continue
-                    elif now - started < self.PAIR_ACTION_SETTLE_SECONDS:
-                        self._pairwise_wait(page)
-                        continue
-                    else:
-                        # A half-applied pair is safer to reset than to click the
-                        # same anchor again, which can toggle an already-selected
-                        # pair off after a delayed React update.
-                        reset_mode = True
-                        pair_pending = None
-                        recovered_state = True
-                        self._pairwise_wait(page)
-                        continue
+            # Keep any observed 1-seat or 2-seat change as long as the official
+            # UI stayed entirely inside the exact held target. This deliberately
+            # avoids assuming a fixed 2+2+... pattern.
+            if before.issubset(after) and after.issubset(target_set):
+                added = after - before
+                if added:
+                    learned_pairs[anchor] = tuple(
+                        value for value in target_ids if value in added
+                    )
+                    history.append((state_key, anchor, frozenset(added)))
+                    continue
 
-                state, anchor, expected_count = self._pairwise_prefix_state(
-                    target_ids,
-                    selected,
+            # Wrong-direction partner (for example B18 -> B17+B18): immediately
+            # click the same anchor again and verify that CGV returned to the
+            # exact pre-click state before trying another candidate.
+            rejected_by_state.setdefault(state_key, set()).add(anchor)
+            rollback_count += 1
+            if after - target_set:
+                self.log(
+                    "[CGV] 좌석 자동묶음 방향 보정 · "
+                    f"{anchor} 클릭이 목표 밖 좌석을 함께 선택해 즉시 되돌립니다.",
+                    "info",
                 )
-                if state == "complete":
-                    # Exact N unique seats are selected; only wait for CGV to
-                    # enable 선택완료. Do not touch any seat again.
-                    self._pairwise_wait(page)
-                    continue
-                if state == "invalid":
-                    reset_mode = True
-                    recovered_state = True
-                    self._pairwise_wait(page)
+
+            if self._click_pair_anchor(page, anchor):
+                rolled = self._wait_for_selection_change(
+                    page,
+                    target_ids,
+                    after,
+                    min(
+                        self.PAIR_CLEAR_SETTLE_SECONDS,
+                        max(0.0, deadline - time.monotonic()),
+                    ),
+                    wanted_ids=before,
+                )
+                rolled_set = (
+                    set(self._unique_ids(rolled.get("selectedIds", ())))
+                    if rolled
+                    else after
+                )
+                if rolled_set == before:
                     continue
 
-                if anchor and expected_count is not None:
-                    if self._click_pair_anchor(page, anchor):
-                        pair_pending = (selected_count, expected_count, now, anchor)
-
-            self._pairwise_wait(page)
+            # Exact rollback failed: use the bounded clear routine rather than
+            # stacking more speculative clicks on top of an unknown React state.
+            if not self._clear_selected_state(page, target_ids, deadline=deadline):
+                break
+            history.clear()
 
         # Preserve legacy mocked-page compatibility when no DOM snapshot can be
         # observed; the submit helper still validates the actual button state.
@@ -303,15 +538,9 @@ class CgvEngine(WatchdogCgvEngine):
 
         selected = self._unique_ids(last_snapshot.get("selectedIds", ()))
         self.log(
-            "[CGV] 임시선점은 유지했지만 pair-aware 좌석 화면 동기화가 약 "
-            f"{self.API_UI_SYNC_ATTEMPTS * self.API_UI_SYNC_INTERVAL_MS / 1000.0:.1f}초 내 "
-            f"완료되지 않았습니다 · 고유 선택 상태 {len(selected)}/{len(target_ids)}석",
+            "[CGV] 임시선점은 유지했지만 적응형 좌석 화면 동기화가 약 "
+            f"{budget_seconds:.1f}초 내 완료되지 않았습니다 · "
+            f"고유 선택 상태 {len(selected)}/{len(target_ids)}석",
             "warning",
         )
         return False
-
-    def _pairwise_wait(self, page) -> None:
-        try:
-            page.wait_for_timeout(self.API_UI_SYNC_INTERVAL_MS)
-        except Exception:
-            time.sleep(self.API_UI_SYNC_INTERVAL_MS / 1000.0)
