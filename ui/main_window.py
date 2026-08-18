@@ -2513,10 +2513,22 @@ class MainWindow(ctk.CTk):
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
             except Exception:
                 pass
+        site_name = self.site_var.get() if hasattr(self, "site_var") else ""
+        catalog_configs = getattr(self, "catalog_configs", {})
+        is_cgv = (
+            site_name == "CGV"
+            or "CGV" in str(site_name)
+            or catalog_configs.get(site_name, {}).get("engine_id") == "cgv"
+        )
+        if is_cgv:
+            success_msg = "축하합니다! 영화 예약에 성공하였습니다. 웹사이트 또는 예매 내역을 확인해주세요."
+        else:
+            success_msg = "축하합니다! 방탈출 예약에 성공하였습니다. 웹사이트 또는 예약 내역을 확인해주세요."
+
         SuccessDialog(
             self,
             title="예약 성공",
-            message="축하합니다! 방탈출 예약에 성공하였습니다. 웹사이트 또는 예약 내역을 확인해주세요.",
+            message=success_msg,
         )
 
     def _start_jigubyeol_theme_fetcher(self):
