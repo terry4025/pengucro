@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.35",
+        changes=(
+            "CGV 좌석 자동 선택 시 상영관별 좌우 파트너 방향 적응형 동기화 지원",
+            "CGV 3인 예매 시 가운데 좌석 우선 탐색 및 잘못된 좌석 롤백 처리",
+            "CGV 영화 예매 성공 알림 메시지 문구 개선",
+        ),
+    ),
+    PatchNote(
         version="6.34",
         changes=(
             "CGV 좌석 선점 완료 후 네이버페이 결제 진입 시 상속 시그니처 오류 수정",
