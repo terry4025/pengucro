@@ -2,6 +2,8 @@ import pytest
 
 from engines.cgv_browser_client_runtime import CgvBrowserClient
 from engines.cgv_engine_runtime import CgvEngine
+from pengucro import __release_sequence__, __version__
+from pengucro.patch_notes import notes_for
 from pengucro.storage import SecretStore, load_json, save_json
 from ui.cgv_booking_dialog_runtime import parse_manual_seat_priorities
 
@@ -39,6 +41,19 @@ def test_browser_client_prefers_latest_existing_cgv_tab():
 
     client = CgvBrowserClient()
     assert client._pick_existing_cgv_page(context) is latest
+
+
+def test_broken_reused_page_is_discarded_before_retry():
+    class Page:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    page = Page()
+    CgvBrowserClient._discard_broken_page(page)
+    assert page.close_calls == 1
 
 
 def test_member_session_is_reused_without_login_navigation():
@@ -79,3 +94,11 @@ def test_ui_module_exports_runtime_cgv_dialog_and_client():
     assert WiredDialog is RuntimeDialog
     assert WiredClient is CgvBrowserClient
     assert DialogClient is CgvBrowserClient
+
+
+def test_v627_release_contract_is_complete():
+    assert __version__ == "6.27"
+    assert __release_sequence__ == 6270001
+    note = notes_for("6.27")
+    assert note is not None
+    assert any("CGV" in change for change in note.changes)

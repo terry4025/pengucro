@@ -10,13 +10,9 @@ from engines.cgv_client import CGV_HOME_URL, CgvError
 class CgvBrowserClient(BaseCgvBrowserClient):
     """CGV browser client that reuses one persistent CGV tab whenever possible.
 
-    The base client opened a fresh tab for every catalog/schedule/seat read and
-    closed it afterwards.  That was safe but noisy and made a user who had
-    already logged in feel as if the app was starting a new CGV session for each
-    action.  This runtime keeps the persistent Chrome/profile behavior but
-    prefers an already-open CGV tab in the same context.  Only when no usable
-    CGV tab exists does it create one, and that page is intentionally left open
-    for the next operation.
+    Successful operations keep the selected CGV tab alive. If Playwright/CDP
+    reports a recoverable disconnect, that page is no longer a safe reuse
+    candidate, so it is closed before the one supported reconnect attempt.
     """
 
     @staticmethod
@@ -45,6 +41,15 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                 continue
         return None
 
+    @staticmethod
+    def _discard_broken_page(page: Any) -> None:
+        if page is None:
+            return
+        try:
+            page.close()
+        except Exception:
+            pass
+
     def _with_page(self, operation: Callable[[Any], Any]):
         try:
             from playwright.sync_api import sync_playwright
@@ -56,6 +61,7 @@ class CgvBrowserClient(BaseCgvBrowserClient):
             chrome = browser_session.start_isolated(log=self._emit)
             if chrome is None:
                 raise CgvError("CGV 데이터 조회용 Chrome을 시작하지 못했습니다.")
+            page = None
             try:
                 with sync_playwright() as playwright:
                     browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
@@ -85,16 +91,21 @@ class CgvBrowserClient(BaseCgvBrowserClient):
                     return result
             except Exception as exc:
                 last_error = exc
-                if attempt == 0 and self._is_recoverable_browser_error(exc):
-                    self._emit("[CGV] 브라우저 연결 끊김 · 1회 자동 복구", "warning")
-                    continue
-                if attempt > 0:
+                recoverable = self._is_recoverable_browser_error(exc)
+                if recoverable:
+                    # A disconnected target must not survive in the reusable-tab
+                    # pool. This also preserves the base client's retry cleanup
+                    # contract used by the browser recovery tests.
+                    self._discard_broken_page(page)
+                    if attempt == 0:
+                        self._emit("[CGV] 브라우저 연결 끊김 · 손상 탭 정리 후 1회 자동 복구", "warning")
+                        continue
+                if attempt > 0 and recoverable:
                     self._emit("[CGV] 브라우저 자동 복구 실패", "error")
                 raise
             finally:
-                # Release only the Pengucro slot lease.  The persistent Chrome
-                # process and the selected CGV tab remain alive and keep the
-                # authenticated profile/session for the next operation.
+                # Keep healthy tabs/profile alive across normal reads; only a
+                # recoverable failure closes its broken page above.
                 chrome.release()
         if last_error:
             raise last_error
