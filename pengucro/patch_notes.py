@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.30",
+        changes=(
+            "CGV 다중 좌석 우선순위 요약 칩 표시 및 개별 삭제 지원",
+            "CGV 다중 우선순위 좌석 확보 시 이전 선택 좌석 자동 해제 안정화",
+            "CGV 브라우저 작업을 1번 슬롯 기본 프로필로 고정하여 세션 분리 방지",
+            "CGV 오픈된 목표 날짜 회차 선택 시 정확한 당일 좌석도 표시",
+        ),
+    ),
+    PatchNote(
         version="6.29",
         changes=(
             "CGV 네이버페이 6자리 결제 비밀번호 자동 입력 지원",
