@@ -8,6 +8,7 @@ from engines.cgv_browser_client import CgvBrowserClient as BaseCgvBrowserClient
 from engines.cgv_browser_client_runtime import CgvBrowserClient
 from engines.cgv_engine_runtime import CgvEngine
 from pengucro.models import ReservationRequest
+from ui.cgv_booking_dialog_runtime import CgvBookingDialog
 from ui.reservation_form_runtime import ReservationForm
 
 
@@ -68,6 +69,39 @@ def test_unopened_target_date_keeps_reference_template(monkeypatch):
     assert schedules == (template,)
     assert reference_date == "2026-08-23"
     assert reference_only is True
+
+
+def test_open_target_schedule_uses_its_own_seat_map_not_previous_day_reference():
+    exact = {
+        "scnYmd": "20260824",
+        "scnsNo": "target-24",
+        "_pengucroSeatReference": {
+            "scnYmd": "20260823",
+            "scnsNo": "reference-23",
+        },
+        "_pengucroSeatReferenceDate": "2026-08-23",
+    }
+    dialog = SimpleNamespace(selected_schedule=exact, schedules=(exact,))
+
+    selected = CgvBookingDialog._seat_reference_schedule(dialog)
+
+    assert selected["scnYmd"] == "20260824"
+    assert selected["scnsNo"] == "target-24"
+
+
+def test_preopen_schedule_still_uses_previous_day_reference_for_layout():
+    reference = {"scnYmd": "20260823", "scnsNo": "reference-23"}
+    template = {
+        "scnYmd": "20260824",
+        "scnsNo": "",
+        "_pengucroPreopen": True,
+        "_pengucroSeatReference": reference,
+    }
+    dialog = SimpleNamespace(selected_schedule=template, schedules=(template,))
+
+    selected = CgvBookingDialog._seat_reference_schedule(dialog)
+
+    assert selected == reference
 
 
 def test_structured_seat_groups_survive_reservation_form_boundary(monkeypatch):
