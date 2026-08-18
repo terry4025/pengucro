@@ -34,39 +34,46 @@ from engines.npay_keypad_recognizer import KeypadCell, NpayKeypadRecognizer
 _SAMPLE_FILE = _PROJECT_ROOT / "data" / "npay_sample.b64"
 
 
-def _create_lucide_eye_icon(size: tuple[int, int] = (20, 20), color: str = "#9ca3af") -> ctk.CTkImage:
-    scale = 4
-    w, h = size[0] * scale, size[1] * scale
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+def _create_lucide_eye_icon(size: tuple[int, int] = (18, 18), color: str = "#9ca3af") -> ctk.CTkImage:
+    scale = 8
+    canvas_dim = 24
+    canvas_size = canvas_dim * scale
+    img = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     sw = int(1.8 * scale)
 
-    # Eye curves
-    draw.arc([int(2 * scale), int(4 * scale), int(22 * scale), int(20 * scale)], start=200, end=340, fill=color, width=sw)
-    draw.arc([int(2 * scale), int(2 * scale), int(22 * scale), int(18 * scale)], start=20, end=160, fill=color, width=sw)
+    # Eye contours (24x24 viewBox)
+    draw.arc([2 * scale, 4 * scale, 22 * scale, 20 * scale], start=200, end=340, fill=color, width=sw)
+    draw.arc([2 * scale, 4 * scale, 22 * scale, 20 * scale], start=20, end=160, fill=color, width=sw)
 
     # Pupil
-    r = int(3.2 * scale)
-    cx, cy = int(12 * scale), int(11 * scale)
+    r = int(3.3 * scale)
+    cx, cy = 12 * scale, 12 * scale
     draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=sw)
 
     res = img.resize(size, Image.Resampling.LANCZOS)
     return ctk.CTkImage(light_image=res, dark_image=res, size=size)
 
 
-def _create_lucide_eye_off_icon(size: tuple[int, int] = (20, 20), color: str = "#9ca3af") -> ctk.CTkImage:
-    scale = 4
-    w, h = size[0] * scale, size[1] * scale
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+def _create_lucide_eye_off_icon(size: tuple[int, int] = (18, 18), color: str = "#9ca3af") -> ctk.CTkImage:
+    scale = 8
+    canvas_dim = 24
+    canvas_size = canvas_dim * scale
+    img = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     sw = int(1.8 * scale)
 
     # Lower eye curve
-    draw.arc([int(2 * scale), int(2 * scale), int(22 * scale), int(18 * scale)], start=20, end=160, fill=color, width=sw)
-    # Upper left arc
-    draw.arc([int(2 * scale), int(4 * scale), int(22 * scale), int(20 * scale)], start=200, end=250, fill=color, width=sw)
+    draw.arc([2 * scale, 4 * scale, 22 * scale, 20 * scale], start=20, end=150, fill=color, width=sw)
+    # Upper eye arcs
+    draw.arc([2 * scale, 4 * scale, 22 * scale, 20 * scale], start=200, end=240, fill=color, width=sw)
+    draw.arc([2 * scale, 4 * scale, 22 * scale, 20 * scale], start=290, end=340, fill=color, width=sw)
+    # Pupil arc
+    r = int(3.3 * scale)
+    cx, cy = 12 * scale, 12 * scale
+    draw.arc([cx - r, cy - r, cx + r, cy + r], start=60, end=210, fill=color, width=sw)
     # Diagonal slash
-    draw.line([int(3 * scale), int(3 * scale), int(21 * scale), int(21 * scale)], fill=color, width=sw)
+    draw.line([3 * scale, 3 * scale, 21 * scale, 21 * scale], fill=color, width=sw)
 
     res = img.resize(size, Image.Resampling.LANCZOS)
     return ctk.CTkImage(light_image=res, dark_image=res, size=size)

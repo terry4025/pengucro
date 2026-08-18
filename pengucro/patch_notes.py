@@ -17,6 +17,12 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.31",
+        changes=(
+            "CGV 네이버페이 비밀번호 눈(Eye) 아이콘 렌더링 및 여백 개선",
+        ),
+    ),
+    PatchNote(
         version="6.30",
         changes=(
             "CGV 다중 좌석 우선순위 요약 칩 표시 및 개별 삭제 지원",
