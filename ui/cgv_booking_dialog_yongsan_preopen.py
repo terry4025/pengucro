@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+
+from engines.cgv_client import is_contiguous_seat_group
 from engines.cgv_yongsan_preopen_presets import (
     is_yongsan_imax_target,
     yongsan_imax_preopen_groups,
@@ -43,6 +46,14 @@ class CgvBookingDialog(MovieIdentityCgvBookingDialog):
             button.configure(text="좌석도 선택 추가")
         except Exception:
             pass
+
+    @staticmethod
+    def _seat_label_sort_key(value: str) -> tuple[str, int]:
+        text = str(value or "")
+        return (
+            re.sub(r"\d", "", text),
+            int(re.sub(r"\D", "", text) or 0),
+        )
 
     def _auto_select_seats(self, label: str) -> None:
         # Preserve all existing behavior first: this stores auto_seat_preference
@@ -104,38 +115,53 @@ class CgvBookingDialog(MovieIdentityCgvBookingDialog):
         CgvBookingDialog._update_confirm_state(self)
 
     def _add_priority_group(self) -> None:
-        preopen_without_map = not bool(getattr(self, "seats", None))
-        staged = tuple(getattr(self, "current_seats", set()) or ())
-        before = len(getattr(self, "priority_groups", []) or [])
+        # When there is no seat map, do not call the base implementation because
+        # it always re-renders the seat viewport and would replace the useful
+        # pre-open placeholder with an empty map.  Only the priority chips need
+        # to change here.
+        if not bool(getattr(self, "seats", None)):
+            current = set(getattr(self, "current_seats", set()) or set())
+            people = max(1, min(int(getattr(self, "people", 1) or 1), 8))
+            if not is_contiguous_seat_group(current, people):
+                return
 
-        MovieIdentityCgvBookingDialog._add_priority_group(self)
+            group = tuple(
+                sorted(current, key=CgvBookingDialog._seat_label_sort_key)
+            )
+            priorities = getattr(self, "priority_groups", None)
+            if priorities is None:
+                self.priority_groups = []
+                priorities = self.priority_groups
+            if group not in priorities:
+                priorities.append(group)
 
-        if not preopen_without_map:
-            CgvBookingDialog._reset_priority_add_button_text(self)
-            return
+            self.current_seats.clear()
+            auto_var = getattr(self, "auto_seat_var", None)
+            if auto_var is not None and hasattr(auto_var, "set"):
+                auto_var.set("명당 자동 선택")
+            button = getattr(self, "add_priority_button", None)
+            if button is not None and hasattr(button, "configure"):
+                button.configure(text="명당 우선순위 추가", state="disabled")
 
-        after = len(getattr(self, "priority_groups", []) or [])
-        button = getattr(self, "add_priority_button", None)
-        if button is not None and hasattr(button, "configure"):
-            button.configure(text="명당 우선순위 추가", state="disabled")
-        if after > before:
-            group = self.priority_groups[-1]
+            renderer = getattr(self, "_render_priorities", None)
+            if callable(renderer):
+                renderer()
+            else:
+                CgvBookingDialog._update_confirm_state(self)
+
             status = getattr(self, "status_label", None)
             if status is not None and hasattr(status, "configure"):
                 status.configure(
                     text=(
-                        f"{after}순위로 {', '.join(group)}를 추가했습니다. "
+                        f"{len(priorities)}순위로 {', '.join(group)}를 추가했습니다. "
                         "같은 명당 모드를 다시 선택하면 다음 중앙 후보를 추가할 수 있습니다."
                     ),
                     text_color=theme.TINT_SUCCESS_FG,
                 )
-        elif staged:
-            status = getattr(self, "status_label", None)
-            if status is not None and hasattr(status, "configure"):
-                status.configure(
-                    text="이미 저장된 미오픈 명당 묶음이거나 현재 인원수와 맞지 않습니다.",
-                    text_color=theme.ACCENT_YELLOW,
-                )
+            return
+
+        MovieIdentityCgvBookingDialog._add_priority_group(self)
+        CgvBookingDialog._reset_priority_add_button_text(self)
 
     def _seats_loaded(self, seats, *, generation: int | None = None) -> None:
         MovieIdentityCgvBookingDialog._seats_loaded(
