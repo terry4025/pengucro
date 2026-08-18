@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import engines.cgv_chrome_session as cgv_chrome_session
 import ui.reservation_form_runtime as reservation_form_runtime
-from engines.cgv_client import parse_seat_groups
+from engines.cgv_client import CgvSeat, parse_seat_groups
 from engines.cgv_engine_runtime import CgvEngine
 from pengucro.models import ReservationRequest
 from ui.cgv_booking_dialog_runtime import CgvBookingDialog
@@ -100,6 +100,46 @@ def test_three_priorities_remain_valid_for_every_supported_people_count():
         parsed = parse_seat_groups(serialized, people)
 
         assert [list(group.seats) for group in parsed] == groups
+
+
+def test_second_priority_can_win_for_every_supported_people_count():
+    for people in range(1, 9):
+        groups = [
+            [f"{row}{8 + offset}" for offset in range(people)]
+            for row in ("C", "D", "E")
+        ]
+        parsed = parse_seat_groups(
+            CgvEngine._serialize_structured_seat_groups(groups, people),
+            people,
+        )
+        available_second = [
+            CgvSeat(
+                f"loc-{label}",
+                label,
+                "D",
+                int(label[1:]),
+                True,
+            )
+            for label in groups[1]
+        ]
+        available_third = [
+            CgvSeat(
+                f"loc-{label}",
+                label,
+                "E",
+                int(label[1:]),
+                True,
+            )
+            for label in groups[2]
+        ]
+
+        chosen = CgvEngine.choose_available_api_group(
+            tuple(available_second + available_third),
+            parsed,
+        )
+
+        assert chosen is not None
+        assert list(chosen[0].seats) == groups[1]
 
 
 def test_active_group_normalization_clears_stale_selection(monkeypatch):
