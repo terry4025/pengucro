@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v644_patch_notes_are_short_and_exact():
+    note = notes_for("6.44")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 미오픈 장시간 감시 안정성 및 서버 차단 방지 강화",
+        "상영 날짜 신규 등록 감지 시 즉시 초고속 집중 감시로 전환",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v643_patch_notes_are_short_and_exact():
     note = notes_for("6.43")
 

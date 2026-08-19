@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.44",
+        changes=(
+            "CGV 미오픈 장시간 감시 안정성 및 서버 차단 방지 강화",
+            "상영 날짜 신규 등록 감지 시 즉시 초고속 집중 감시로 전환",
+        ),
+    ),
+    PatchNote(
         version="6.43",
         changes=(
             "CGV 미오픈 감시 중 단계별(영화/상영관/시간 등) 판정 퍼널 로그 추가",
