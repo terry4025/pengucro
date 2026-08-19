@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.43",
+        changes=(
+            "CGV 미오픈 감시 중 단계별(영화/상영관/시간 등) 판정 퍼널 로그 추가",
+            "미오픈 회차 미진입 원인 및 실제 시간 매핑 세부 사유 가시화",
+        ),
+    ),
+    PatchNote(
         version="6.42",
         changes=(
             "CGV 미오픈 날짜 참고시간과 실제 오픈 시간(최대 90분 오차) 자동 매핑 지원",

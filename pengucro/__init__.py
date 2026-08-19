@@ -1,3 +1,3 @@
 """Core application services for Pengucro."""
-__version__ = "6.42"
-__release_sequence__ = 6420001
+__version__ = "6.43"
+__release_sequence__ = 6430001

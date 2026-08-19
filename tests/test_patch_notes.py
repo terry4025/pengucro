@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v643_patch_notes_are_short_and_exact():
+    note = notes_for("6.43")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 미오픈 감시 중 단계별(영화/상영관/시간 등) 판정 퍼널 로그 추가",
+        "미오픈 회차 미진입 원인 및 실제 시간 매핑 세부 사유 가시화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v642_patch_notes_are_short_and_exact():
     note = notes_for("6.42")
 
