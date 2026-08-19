@@ -147,10 +147,13 @@ def _time_minutes(value: Any) -> int | None:
 
 
 def _schedule_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
-    return tuple(
+    core = tuple(
         str(item.get(key, "") or "")
-        for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq", "scnsrtTm")
+        for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq")
     )
+    if core[2] or core[3]:
+        return core
+    return (*core, str(item.get("scnsrtTm", "") or ""))
 
 
 def _chronological_key(item: Mapping[str, Any]) -> tuple[int, tuple[str, ...]]:
