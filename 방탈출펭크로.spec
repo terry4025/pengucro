@@ -30,6 +30,7 @@ a = Analysis(
         'engines.cgv_engine_priority_ladder_runtime',
         'engines.cgv_engine_movie_identity_runtime',
         'engines.cgv_engine_funnel_runtime',
+        'engines.cgv_engine_preopen_sentinel_runtime',
         'engines.cgv_movie_identity',
         'engines.cgv_preopen_matching',
         'engines.cgv_yongsan_preopen_presets',
