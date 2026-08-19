@@ -11,6 +11,7 @@ from engines.cgv_engine_priority_ladder_runtime import CgvEngine as PriorityRunt
 from engines.cgv_movie_identity import strip_matching_format_suffix
 from engines.cgv_preopen_matching import (
     context_matches,
+    has_booking_identity,
     matching_schedule_candidates,
     rank_preopen_schedules,
 )
@@ -143,6 +144,48 @@ def test_preopen_never_selects_controlled_schedule():
         "IMAX LASER 2D",
         include_controlled=True,
     ) is True
+
+
+def test_partial_publication_without_real_screening_ids_is_not_selectable():
+    partial = _schedule("1400")
+    partial["scnsNo"] = ""
+    partial["scnSseq"] = ""
+    assert has_booking_identity(partial) is False
+    assert matching_schedule_candidates(
+        _payload(partial),
+        movie="오디세이",
+        auditorium="IMAX관",
+        format_name="IMAX LASER 2D",
+    ) == []
+
+
+def test_preopen_does_not_fall_through_to_partial_exact_time_row():
+    partial = _schedule("1400")
+    partial["scnsNo"] = ""
+    partial["scnSseq"] = ""
+    token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    try:
+        chosen = select_schedule(
+            _payload(partial),
+            movie="오디세이",
+            auditorium="IMAX관",
+            format_name="IMAX LASER 2D",
+            preferred_times=["14:00"],
+        )
+    finally:
+        _PREOPEN_SELECTION_ACTIVE.reset(token)
+    assert chosen is None
+
+
+def test_preopen_never_books_a_far_unselected_time_as_safety_fallback():
+    candidates = [_schedule("0900"), _schedule("2200", seq="2")]
+    assert rank_preopen_schedules(candidates, ["14:00"]) == []
+
+
+def test_midnight_reference_drift_uses_wrapped_time_distance():
+    candidates = [_schedule("0010"), _schedule("2200", seq="2")]
+    ranked = rank_preopen_schedules(candidates, ["23:50"])
+    assert ranked[0]["scnsrtTm"] == "0010"
 
 
 def test_missing_separate_format_still_normalizes_unmistakable_movie_suffix():
