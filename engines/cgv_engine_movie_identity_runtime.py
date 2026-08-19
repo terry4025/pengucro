@@ -15,6 +15,7 @@ from engines.cgv_engine_priority_ladder_runtime import CgvEngine as PriorityLadd
 from engines.cgv_movie_identity import schedule_matches_movie
 from engines.cgv_preopen_matching import (
     context_matches as _resilient_context_matches,
+    has_booking_identity,
     matching_schedule_candidates,
     rank_preopen_schedules,
     select_preopen_schedule,
@@ -78,9 +79,9 @@ def select_schedule(
 ) -> dict[str, Any] | None:
     """Select a real CGV screening while surviving pre-open publication drift.
 
-    Open-date bookings preserve the historical exact-time behavior. Pre-open
+    Open-date bookings preserve the historical exact-time behavior.  Pre-open
     bookings are different: their displayed times came from a reference date,
-    so those values are priorities rather than immutable screening IDs. During
+    so those values are priorities rather than immutable screening IDs.  During
     the pre-open -> real transition we therefore map each saved time to the
     nearest real matching screening, while still requiring the same movie and
     premium-format family and still rejecting ``cntlYn=Y`` controlled rows.
@@ -89,7 +90,10 @@ def select_schedule(
     preferred_values = tuple(preferred_times)
 
     if _PREOPEN_SELECTION_ACTIVE.get():
-        chosen = select_preopen_schedule(
+        # Do not fall through to the historical selector here. During partial
+        # publication it can accept an exact-time row before CGV has populated
+        # the real screening IDs, which causes a premature visitor-page jump.
+        return select_preopen_schedule(
             payload,
             movie=movie,
             show_time=show_time,
@@ -97,8 +101,6 @@ def select_schedule(
             preferred_times=preferred_values,
             format_name=format_name,
         )
-        if chosen is not None:
-            return chosen
 
     legacy = _legacy_select_schedule(
         payload,
@@ -126,10 +128,10 @@ def _has_schedule_hint(
 ) -> bool:
     """Return whether the target movie has begun appearing on the target date.
 
-    This is deliberately movie-only. A regular 2D screening appearing before
+    This is deliberately movie-only.  A regular 2D screening appearing before
     the requested IMAX screening is useful evidence that the target date is
     being published, so it should accelerate the pre-open watcher even though
-    the requested auditorium is not available yet. Auditorium/format matching
+    the requested auditorium is not available yet.  Auditorium/format matching
     remains strict enough in ``select_schedule`` to prevent crossing formats.
     """
 
@@ -223,9 +225,10 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
                 include_controlled=True,
             )
         ]
+        identified = [item for item in context_items if has_booking_identity(item)]
         selectable = [
             item
-            for item in context_items
+            for item in identified
             if str(item.get("cntlYn", "N") or "N").upper() != "Y"
         ]
         signature = (
@@ -262,8 +265,17 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
             )
             return
 
-        controlled = len(context_items) - len(selectable)
-        if context_items and not selectable and controlled:
+        incomplete = len(context_items) - len(identified)
+        if context_items and not identified and incomplete:
+            self.log(
+                f"[CGV] 목표 상영관 정보 {incomplete}개 부분 공개 · scnsNo/scnSseq 등 "
+                "실제 회차 ID 완성 대기 · 조기 진입하지 않습니다.",
+                "warning",
+            )
+            return
+
+        controlled = len(identified) - len(selectable)
+        if identified and not selectable and controlled:
             self.log(
                 f"[CGV] 목표 상영관 회차 ID {controlled}개 선공개 · cntlYn=Y 잠금 상태 · "
                 "해제 즉시 자동 진입하도록 고속 감시를 유지합니다.",
