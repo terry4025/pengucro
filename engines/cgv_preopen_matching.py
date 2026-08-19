@@ -75,9 +75,9 @@ def context_matches(
     """Match the requested auditorium/format without crossing experience families.
 
     CGV occasionally changes display labels at publication time, for example
-    ``IMAX관 · IMAX LASER 2D`` to ``IMAX · IMAX 2D``. Exact/substring matching
+    ``IMAX관 · IMAX LASER 2D`` to ``IMAX · IMAX 2D``.  Exact/substring matching
     remains preferred, but known premium-format families may bridge harmless
-    label drift. A requested IMAX screening can never fall through to regular
+    label drift.  A requested IMAX screening can never fall through to regular
     2D/3D because the experience family must still agree.
     """
 
@@ -111,6 +111,13 @@ def context_matches(
     return True
 
 
+def has_booking_identity(item: Mapping[str, Any]) -> bool:
+    return all(
+        str(item.get(key, "") or "").strip()
+        for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq")
+    )
+
+
 def matching_schedule_candidates(
     payload: Mapping[str, Any],
     *,
@@ -131,6 +138,8 @@ def matching_schedule_candidates(
             include_controlled=include_controlled,
         ):
             continue
+        if not has_booking_identity(item):
+            continue
         candidates.append(item)
     return candidates
 
@@ -144,6 +153,11 @@ def _time_minutes(value: Any) -> int | None:
     if hour > 29 or minute > 59:
         return None
     return hour * 60 + minute
+
+
+def _time_distance_minutes(left: int, right: int) -> int:
+    direct = abs(left - right)
+    return min(direct, abs((left + 1440) - right), abs(left - (right + 1440)))
 
 
 def _schedule_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
@@ -179,7 +193,7 @@ def rank_preopen_schedules(
     """Map reference-day time priorities onto the real published schedule.
 
     One nearest real screening is assigned to each saved reference-time priority
-    while the drift stays within the bounded window. Any remaining matching
+    while the drift stays within the bounded window.  Any remaining matching
     screenings are appended as safety fallbacks so a changed/extra target-date
     slot can still win when the primary mapped slots have no usable seats.
     """
@@ -206,7 +220,7 @@ def rank_preopen_schedules(
             observed = _time_minutes(item.get("scnsrtTm"))
             if observed is None:
                 continue
-            ranked.append((abs(observed - target), _chronological_key(item), item))
+            ranked.append((_time_distance_minutes(observed, target), _chronological_key(item), item))
         if not ranked:
             continue
         ranked.sort(key=lambda value: (value[0], value[1]))
@@ -220,16 +234,27 @@ def rank_preopen_schedules(
             value for value in (_time_minutes(pref) for pref in preferences) if value is not None
         ]
 
-        def fallback_key(item: Mapping[str, Any]):
+        def fallback_distance(item: Mapping[str, Any]) -> int:
             observed = _time_minutes(item.get("scnsrtTm"))
             if observed is None or not preference_minutes:
-                return (10**9, *_chronological_key(item))
-            return (
-                min(abs(observed - target) for target in preference_minutes),
-                *_chronological_key(item),
+                return 10**9
+            return min(
+                _time_distance_minutes(observed, target)
+                for target in preference_minutes
             )
 
-        remaining.sort(key=fallback_key)
+        # Keep additional real slots only when they are still plausibly the
+        # shifted counterpart of at least one saved reference time. This gives
+        # the seat-priority ladder alternatives without silently booking a
+        # completely different morning/evening screening.
+        remaining = [
+            item
+            for item in remaining
+            if fallback_distance(item) <= max(0, int(drift_window_minutes))
+        ]
+        remaining.sort(
+            key=lambda item: (fallback_distance(item), *_chronological_key(item))
+        )
         ordered.extend(remaining)
 
     return ordered
