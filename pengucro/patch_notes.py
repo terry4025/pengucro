@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.42",
+        changes=(
+            "CGV 미오픈 날짜 참고시간과 실제 오픈 시간(최대 90분 오차) 자동 매핑 지원",
+            "CGV 상영관·포맷 표시 변경 대응 및 미완성 부분 공개 회차 선택 방지",
+        ),
+    ),
+    PatchNote(
         version="6.41",
         changes=(
             "네이버페이 보안 키패드 4행 2열 및 숫자 4·7 인식 정확도 개선",

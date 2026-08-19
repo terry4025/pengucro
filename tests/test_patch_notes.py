@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v642_patch_notes_are_short_and_exact():
+    note = notes_for("6.42")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 미오픈 날짜 참고시간과 실제 오픈 시간(최대 90분 오차) 자동 매핑 지원",
+        "CGV 상영관·포맷 표시 변경 대응 및 미완성 부분 공개 회차 선택 방지",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v641_patch_notes_are_short_and_exact():
     note = notes_for("6.41")
 
