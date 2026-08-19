@@ -16,12 +16,14 @@ def _token_key(value: Any) -> str:
 
 
 def strip_matching_format_suffix(title: Any, format_name: Any = "") -> str:
-    """Strip only a trailing parenthetical that clearly describes the format.
+    """Strip a trailing parenthetical only when it is clearly a format suffix.
 
     CGV can expose the same movie as ``movNm=오디세이`` while ``expoProdNm`` is
-    ``오디세이(IMAX LASER 2D)``.  Arbitrary title parentheses must remain part
-    of the movie name, so the suffix is removed only when it agrees with the
-    separately supplied CGV format field.
+    ``오디세이(IMAX LASER 2D)``. Arbitrary title parentheses must remain part
+    of the movie name. When the separate format field exists it still has the
+    strongest say; when it is temporarily missing during pre-open publication,
+    an unmistakable CGV format marker is sufficient to keep movie identity
+    stable across the transition.
     """
 
     text = str(title or "").strip()
@@ -33,11 +35,14 @@ def strip_matching_format_suffix(title: Any, format_name: Any = "") -> str:
 
     suffix = match.group(1).strip()
     suffix_key = _token_key(suffix)
-    format_key = _token_key(format_name)
-    if not suffix_key or not format_key:
+    if not suffix_key:
         return text
 
     has_format_marker = any(marker in suffix.upper() for marker in _FORMAT_MARKERS)
+    format_key = _token_key(format_name)
+    if not format_key:
+        return text[: match.start()].strip() if has_format_marker else text
+
     compatible = suffix_key == format_key or (
         has_format_marker
         and (suffix_key in format_key or format_key in suffix_key)
