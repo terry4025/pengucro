@@ -112,8 +112,11 @@ def context_matches(
 
 
 def has_booking_identity(item: Mapping[str, Any]) -> bool:
+    def present(value: Any) -> bool:
+        return value is not None and bool(str(value).strip())
+
     return all(
-        str(item.get(key, "") or "").strip()
+        present(item.get(key))
         for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq")
     )
 
@@ -193,9 +196,9 @@ def rank_preopen_schedules(
     """Map reference-day time priorities onto the real published schedule.
 
     One nearest real screening is assigned to each saved reference-time priority
-    while the drift stays within the bounded window.  Any remaining matching
-    screenings are appended as safety fallbacks so a changed/extra target-date
-    slot can still win when the primary mapped slots have no usable seats.
+    while the drift stays within the bounded window. Additional matching slots
+    are retained only inside that same window, giving the seat-priority ladder
+    safe alternatives without silently booking a completely different time.
     """
 
     unique: dict[tuple[str, ...], dict[str, Any]] = {}
