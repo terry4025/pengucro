@@ -78,16 +78,19 @@ def test_hint_state_cannot_pin_half_second_mode_after_burst_expires():
     assert engine.SCHEDULE_HINT_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
 
 
-def test_movie_no_is_recovered_from_real_reference_schedule():
+def test_movie_no_is_recovered_from_reference_schedule_without_waiting_on_fetch():
     engine, _logs = _engine()
     engine._preopen_sentinel_reference_date = "20260819"
     requested_urls: list[str] = []
 
-    def fake_fetch(_page, url, *, timeout_ms):
+    def fake_step(_page, *, key, url, timeout_ms):
         requested_urls.append(str(url))
-        return {"ok": True, "status": 200, "data": _payload(_schedule())}
+        return {
+            "state": "done",
+            "result": {"ok": True, "status": 200, "data": _payload(_schedule())},
+        }
 
-    engine._fetch_same_origin_json = fake_fetch
+    engine._background_json_step = fake_step
     engine._maybe_discover_mov_no(
         object(),
         site_no="0013",
@@ -100,49 +103,90 @@ def test_movie_no_is_recovered_from_real_reference_schedule():
     assert "scnYmd=20260819" in requested_urls[0]
 
 
-def test_date_sentinel_moves_from_unlisted_to_listed_and_bursts_once():
+def test_reference_movie_id_discovery_can_span_multiple_async_ticks():
+    engine, _logs = _engine()
+    engine._preopen_sentinel_reference_date = "20260819"
+    states = iter(
+        [
+            {"state": "started"},
+            {"state": "running"},
+            {
+                "state": "done",
+                "result": {
+                    "ok": True,
+                    "status": 200,
+                    "data": _payload(_schedule()),
+                },
+            },
+        ]
+    )
+    engine._background_json_step = lambda *_args, **_kwargs: next(states)
+
+    for _ in range(3):
+        engine._maybe_discover_mov_no(
+            object(),
+            site_no="0013",
+            target_date="20260826",
+            target_payload=_payload(),
+        )
+
+    assert engine._preopen_sentinel_mov_no == "30001323"
+    assert engine._preopen_live_reference_pending == ""
+
+
+def test_date_sentinel_runs_in_background_then_bursts_when_date_appears():
     engine, logs = _engine()
     engine._preopen_sentinel_mov_no = "30001323"
-    responses = iter(
+    states = iter(
         [
+            {"state": "started"},
+            {"state": "running"},
             {
-                "ok": True,
-                "status": 200,
-                "data": {"statusCode": 0, "data": [{"scnYmd": "20260825"}]},
-            },
-            {
-                "ok": True,
-                "status": 200,
-                "data": {"statusCode": 0, "data": [{"scnYmd": "20260826"}]},
+                "state": "done",
+                "result": {
+                    "ok": True,
+                    "status": 200,
+                    "data": {
+                        "statusCode": 0,
+                        "data": [{"scnYmd": "20260826"}],
+                    },
+                },
             },
         ]
     )
     calls: list[str] = []
 
-    def fake_fetch(_page, url, *, timeout_ms):
+    def fake_step(_page, *, key, url, timeout_ms):
         calls.append(str(url))
-        return next(responses)
+        return next(states)
 
-    engine._fetch_same_origin_json = fake_fetch
+    engine._background_json_step = fake_step
     engine._schedule_burst_until = 0.0
     engine._preopen_sentinel_last_probe = 0.0
-    engine._maybe_probe_date_sentinel(
-        object(), site_no="0013", target_date="20260826"
-    )
-    assert engine._preopen_sentinel_date_listed is False
 
-    engine._preopen_sentinel_last_probe = 0.0
     engine._maybe_probe_date_sentinel(
         object(), site_no="0013", target_date="20260826"
     )
+    assert engine._preopen_live_date_pending is True
+    assert engine._preopen_sentinel_date_listed is None
+
+    engine._maybe_probe_date_sentinel(
+        object(), site_no="0013", target_date="20260826"
+    )
+    assert engine._preopen_live_date_pending is True
+
+    engine._maybe_probe_date_sentinel(
+        object(), site_no="0013", target_date="20260826"
+    )
+    assert engine._preopen_live_date_pending is False
     assert engine._preopen_sentinel_date_listed is True
     assert engine._schedule_burst_until > time.monotonic()
     assert engine.PREOPEN_IDLE_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
     assert engine.SCHEDULE_HINT_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
     assert any("목표 날짜 2026-08-26 게시 감지" in message for message, _ in logs)
 
-    # Once listed, the sentinel has completed its job and must stop producing
-    # extra traffic even after the burst itself expires.
+    # Once listed, the helper has completed its job and never creates more date
+    # traffic, even after the short high-speed burst expires.
     call_count = len(calls)
     engine._schedule_burst_until = 0.0
     engine._preopen_sentinel_last_probe = 0.0
@@ -152,12 +196,34 @@ def test_date_sentinel_moves_from_unlisted_to_listed_and_bursts_once():
     assert len(calls) == call_count
 
 
+def test_unlisted_date_is_rechecked_after_interval_without_stopping_main_watch():
+    engine, logs = _engine()
+    engine._preopen_sentinel_mov_no = "30001323"
+    engine._background_json_step = lambda *_args, **_kwargs: {
+        "state": "done",
+        "result": {
+            "ok": True,
+            "status": 200,
+            "data": {"statusCode": 0, "data": [{"scnYmd": "20260825"}]},
+        },
+    }
+
+    engine._preopen_sentinel_last_probe = 0.0
+    engine._maybe_probe_date_sentinel(
+        object(), site_no="0013", target_date="20260826"
+    )
+
+    assert engine._preopen_sentinel_date_listed is False
+    assert engine.stop_event.is_set() is False
+    assert any("아직 영화별 상영일 목록에 없습니다" in message for message, _ in logs)
+
+
 def test_sentinel_error_is_fail_open_and_never_stops_schedule_watch():
     engine, logs = _engine()
     engine._preopen_sentinel_mov_no = "30001323"
-    engine._fetch_same_origin_json = lambda _page, _url, *, timeout_ms: {
-        "ok": False,
-        "status": 429,
+    engine._background_json_step = lambda *_args, **_kwargs: {
+        "state": "done",
+        "result": {"ok": False, "status": 429},
     }
 
     engine._maybe_probe_date_sentinel(
@@ -172,7 +238,7 @@ def test_sentinel_error_is_fail_open_and_never_stops_schedule_watch():
     )
 
 
-def test_real_bookable_schedule_wins_without_waiting_for_secondary_sentinel(monkeypatch):
+def test_real_bookable_schedule_wins_without_running_secondary_probe(monkeypatch):
     engine, _logs = _engine()
     payload = _payload(_schedule("1350"))
     monkeypatch.setattr(
@@ -185,10 +251,10 @@ def test_real_bookable_schedule_wins_without_waiting_for_secondary_sentinel(monk
         },
     )
 
-    def must_not_fetch(*_args, **_kwargs):
-        raise AssertionError("secondary sentinel must not delay a real booking row")
+    def must_not_probe(*_args, **_kwargs):
+        raise AssertionError("secondary probe must not delay a real booking row")
 
-    engine._fetch_same_origin_json = must_not_fetch
+    engine._background_json_step = must_not_probe
     token = _PREOPEN_SELECTION_ACTIVE.set(True)
     try:
         result = engine._race_schedule(
