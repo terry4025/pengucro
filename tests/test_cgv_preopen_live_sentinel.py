@@ -4,7 +4,7 @@ import time
 
 from engines.cgv_engine_funnel_runtime import CgvEngine as FunnelCgvEngine
 from engines.cgv_engine_movie_identity_runtime import _PREOPEN_SELECTION_ACTIVE
-from engines.cgv_engine_preopen_sentinel_runtime import CgvEngine
+from engines.cgv_engine_preopen_live_runtime import CgvEngine
 from engines.registry import EngineRegistry
 
 
@@ -69,11 +69,13 @@ def test_hint_state_cannot_pin_half_second_mode_after_burst_expires():
     assert engine._schedule_burst_active() is False
     engine._sync_schedule_poll_interval()
     assert engine.PREOPEN_IDLE_INTERVAL == engine.SCHEDULE_LONG_IDLE_INTERVAL
+    assert engine.SCHEDULE_HINT_INTERVAL == engine.SCHEDULE_LONG_IDLE_INTERVAL
 
     engine._schedule_burst_until = time.monotonic() + 5.0
     assert engine._schedule_burst_active() is True
     engine._sync_schedule_poll_interval()
     assert engine.PREOPEN_IDLE_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
+    assert engine.SCHEDULE_HINT_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
 
 
 def test_movie_no_is_recovered_from_real_reference_schedule():
@@ -135,6 +137,8 @@ def test_date_sentinel_moves_from_unlisted_to_listed_and_bursts_once():
     )
     assert engine._preopen_sentinel_date_listed is True
     assert engine._schedule_burst_until > time.monotonic()
+    assert engine.PREOPEN_IDLE_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
+    assert engine.SCHEDULE_HINT_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
     assert any("목표 날짜 2026-08-26 게시 감지" in message for message, _ in logs)
 
     # Once listed, the sentinel has completed its job and must stop producing
