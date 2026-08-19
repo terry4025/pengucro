@@ -86,13 +86,15 @@ def select_schedule(
     premium-format family and still rejecting ``cntlYn=Y`` controlled rows.
     """
 
+    preferred_values = tuple(preferred_times)
+
     if _PREOPEN_SELECTION_ACTIVE.get():
         chosen = select_preopen_schedule(
             payload,
             movie=movie,
             show_time=show_time,
             auditorium=auditorium,
-            preferred_times=preferred_times,
+            preferred_times=preferred_values,
             format_name=format_name,
         )
         if chosen is not None:
@@ -103,7 +105,7 @@ def select_schedule(
         movie=movie,
         show_time=show_time,
         auditorium=auditorium,
-        preferred_times=preferred_times,
+        preferred_times=preferred_values,
         format_name=format_name,
     )
     if legacy is not None:
@@ -114,7 +116,7 @@ def select_schedule(
         movie=movie,
         show_time=show_time,
         auditorium=auditorium,
-        preferred_times=preferred_times,
+        preferred_times=preferred_values,
         format_name=format_name,
     )
 
@@ -167,7 +169,13 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
         cgv = metadata.get("cgv", {})
         if not isinstance(cgv, Mapping):
             return False
-        return bool(cgv.get("is_preopen") or cgv.get("reference_only"))
+
+        def enabled(value: Any) -> bool:
+            if isinstance(value, str):
+                return value.strip().casefold() in {"1", "true", "yes", "y", "on"}
+            return bool(value)
+
+        return enabled(cgv.get("is_preopen")) or enabled(cgv.get("reference_only"))
 
     def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         preopen = self._preopen_requested(reservation_data or {})
@@ -185,7 +193,7 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
             _PREOPEN_SELECTION_ACTIVE.reset(token)
 
     @staticmethod
-    def _schedule_key(item: Mapping[str, Any]) -> tuple[str, ...]:
+    def _diagnostic_schedule_key(item: Mapping[str, Any]) -> tuple[str, ...]:
         return tuple(
             str(item.get(key, "") or "")
             for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq", "scnsrtTm")
@@ -224,7 +232,7 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
             tuple(
                 sorted(
                     (
-                        *self._schedule_key(item),
+                        *self._diagnostic_schedule_key(item),
                         str(item.get("cntlYn", "N") or "N").upper(),
                         str(item.get("expoScnsNm") or item.get("scnsNm") or ""),
                         str(item.get("movkndDsplEnm") or item.get("movkndDsplNm") or ""),
