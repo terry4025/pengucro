@@ -1,0 +1,14 @@
+{
+  "statusCode": 0,
+  "statusMessage": "조회 되었습니다.",
+  "data": [
+    {"scnYmd": "20260818", "hldyYn": null},
+    {"scnYmd": "20260819", "hldyYn": null},
+    {"scnYmd": "20260820", "hldyYn": null},
+    {"scnYmd": "20260821", "hldyYn": null},
+    {"scnYmd": "20260822", "hldyYn": null},
+    {"scnYmd": "20260823", "hldyYn": null},
+    {"scnYmd": "20260824", "hldyYn": null},
+    {"scnYmd": "20260825", "hldyYn": null}
+  ]
+}
