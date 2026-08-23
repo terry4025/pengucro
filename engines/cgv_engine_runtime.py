@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import base64
+from contextvars import ContextVar
+import json
+import math
 import time
+from typing import Any, Mapping
 
 import engines.cgv_engine as _base_cgv_engine
 from engines.cgv_chrome_session import CgvBrowserSessionProxy
 from engines.cgv_engine_guarded import CgvEngine as GuardedCgvEngine
-from engines.cgv_client import CGV_HOME_URL
+from engines.cgv_client import CGV_COMPANY_CODE, CGV_HOME_URL
+
+
+_MEMBER_SESSION_GUARD_ACTIVE: ContextVar[bool] = ContextVar(
+    "pengucro_cgv_member_session_guard_active",
+    default=True,
+)
 
 
 # The historical base engine calls its module-level ``browser_session`` from
@@ -55,25 +66,250 @@ class CgvEngine(GuardedCgvEngine):
     # already selected and only the submit button is lagging.
     API_UI_SYNC_ATTEMPTS = 120
 
+    MEMBER_SESSION_EXPIRY_LEEWAY_SECONDS = 60.0
+    MEMBER_SESSION_PROBE_INTERVAL_MS = 60_000
+    MEMBER_SESSION_GUARD_READ_INTERVAL_SECONDS = 5.0
+    MEMBER_SESSION_PROBE_URL = (
+        f"{CGV_HOME_URL}/api/v1/mypage/tkt/mblTkt/"
+        f"searchMblTktTabPrdtypList?coCd={CGV_COMPANY_CODE}&custNo="
+    )
+    MEMBER_SESSION_AUTH_ERROR_CODES = {"-1001", "-1002", "401"}
+
+    @staticmethod
+    def _context_member_tokens(context) -> dict[str, str]:
+        tokens = {"accessToken": "", "refresh_token": ""}
+        try:
+            for cookie in context.cookies(CGV_HOME_URL):
+                name = str(cookie.get("name", "") or "")
+                if name in tokens:
+                    tokens[name] = str(cookie.get("value", "") or "").strip()
+        except Exception:
+            pass
+        return tokens
+
     @staticmethod
     def _context_has_member_session(context) -> bool:
+        return any(CgvEngine._context_member_tokens(context).values())
+
+    @staticmethod
+    def _jwt_expiry(access_token: str) -> float | None:
+        parts = str(access_token or "").strip().split(".")
+        if len(parts) != 3 or not parts[1]:
+            return None
         try:
-            return any(
-                str(cookie.get("name", "")) in {"accessToken", "refresh_token"}
-                and bool(cookie.get("value"))
-                for cookie in context.cookies(CGV_HOME_URL)
+            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+            expiry = payload.get("exp") if isinstance(payload, Mapping) else None
+            if isinstance(expiry, bool):
+                return None
+            value = float(expiry)
+            return value if math.isfinite(value) else None
+        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    @classmethod
+    def _jwt_is_fresh(cls, access_token: str) -> bool | None:
+        expiry = cls._jwt_expiry(access_token)
+        if expiry is None:
+            return None
+        return expiry > time.time() + cls.MEMBER_SESSION_EXPIRY_LEEWAY_SECONDS
+
+    @classmethod
+    def _member_probe_auth_error(cls, result: Mapping[str, Any]) -> bool:
+        try:
+            if int(result.get("status", 0) or 0) == 401:
+                return True
+        except (TypeError, ValueError):
+            pass
+        payload = result.get("data")
+        if not isinstance(payload, Mapping):
+            return False
+        codes = [payload.get("statusCode")]
+        nested = payload.get("data")
+        if isinstance(nested, Mapping):
+            codes.append(nested.get("statusCode"))
+        return any(str(code).strip() in cls.MEMBER_SESSION_AUTH_ERROR_CODES for code in codes)
+
+    @classmethod
+    def _probe_member_session(cls, page, access_token: str) -> bool | None:
+        try:
+            result = page.evaluate(
+                r"""
+                async ({url, accessToken, timeoutMs}) => {
+                  const controller = new AbortController();
+                  const timer = setTimeout(() => controller.abort(), timeoutMs);
+                  try {
+                    const headers = new Headers({
+                      'Accept': 'application/json',
+                      'Accept-Language': 'ko-KR',
+                    });
+                    if (accessToken) {
+                      headers.set('Authorization', `Bearer ${accessToken}`);
+                    }
+                    const response = await fetch(url, {
+                      method: 'GET', cache: 'no-store', credentials: 'include',
+                      headers, signal: controller.signal,
+                    });
+                    let data = null;
+                    try { data = await response.json(); } catch (_) {}
+                    return {ok: response.ok, status: response.status, data};
+                  } catch (error) {
+                    return {ok: false, status: 0, data: null, error: String(error)};
+                  } finally {
+                    clearTimeout(timer);
+                  }
+                }
+                """,
+                {
+                    "url": cls.MEMBER_SESSION_PROBE_URL,
+                    "accessToken": str(access_token or ""),
+                    "timeoutMs": 3000,
+                },
             )
         except Exception:
+            return None
+        if not isinstance(result, Mapping):
+            return None
+        if cls._member_probe_auth_error(result):
             return False
+        try:
+            status = int(result.get("status", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        # This read-only endpoint authenticates before validating custNo. A
+        # valid session therefore returns either 200 or the expected 400 input
+        # error when the intentionally blank custNo reaches domain validation.
+        if status in {200, 400} and isinstance(result.get("data"), Mapping):
+            return True
+        return None
+
+    @classmethod
+    def _install_member_session_guard(cls, page) -> dict[str, Any]:
+        try:
+            result = page.evaluate(
+                r"""
+                ({url, intervalMs, authCodes}) => {
+                  if (window.__pengucroMemberSessionProbe) {
+                    return {...window.__pengucroMemberSessionProbe};
+                  }
+                  const state = window.__pengucroMemberSessionProbe = {
+                    unauthorized: false, checkedAt: 0, inFlight: false,
+                  };
+                  const run = async () => {
+                    if (state.inFlight || state.unauthorized) return;
+                    state.inFlight = true;
+                    try {
+                      const item = String(document.cookie || '').split('; ')
+                        .find(value => value.startsWith('accessToken='));
+                      let token = item ? item.slice('accessToken='.length) : '';
+                      try { token = decodeURIComponent(token); } catch (_) {}
+                      const headers = new Headers({
+                        'Accept': 'application/json',
+                        'Accept-Language': 'ko-KR',
+                      });
+                      if (token) headers.set('Authorization', `Bearer ${token}`);
+                      const response = await fetch(url, {
+                        method: 'GET', cache: 'no-store', credentials: 'include', headers,
+                      });
+                      let data = null;
+                      try { data = await response.json(); } catch (_) {}
+                      const codes = [data && data.statusCode,
+                        data && data.data && data.data.statusCode]
+                        .map(value => String(value ?? '').trim());
+                      if (response.status === 401 || codes.some(code => authCodes.includes(code))) {
+                        state.unauthorized = true;
+                      }
+                      state.checkedAt = Date.now();
+                    } catch (_) {
+                      // Network/WAF failures are handled by the existing schedule
+                      // backoff and must not be mistaken for an expired login.
+                    } finally {
+                      state.inFlight = false;
+                    }
+                  };
+                  run();
+                  state.timer = setInterval(run, intervalMs);
+                  return {...state, timer: Boolean(state.timer)};
+                }
+                """,
+                {
+                    "url": cls.MEMBER_SESSION_PROBE_URL,
+                    "intervalMs": cls.MEMBER_SESSION_PROBE_INTERVAL_MS,
+                    "authCodes": sorted(cls.MEMBER_SESSION_AUTH_ERROR_CODES),
+                },
+            )
+            return dict(result) if isinstance(result, Mapping) else {}
+        except Exception:
+            return {}
+
+    def _recover_member_session(self, page, context) -> bool:
+        recovered = super()._ensure_member_session(page, context)
+        if recovered:
+            self._install_member_session_guard(page)
+        return recovered
 
     def _ensure_member_session(self, page, context) -> bool:
-        if self._context_has_member_session(context):
+        if not _MEMBER_SESSION_GUARD_ACTIVE.get():
+            return True
+        tokens = self._context_member_tokens(context)
+        access_token = tokens["accessToken"]
+        freshness = self._jwt_is_fresh(access_token) if access_token else False
+        if freshness is False:
+            self.log(
+                "[CGV] 저장된 회원 accessToken이 만료됐거나 없어 공식 로그인/갱신 경로로 전환합니다.",
+                "warning",
+            )
+            return self._recover_member_session(page, context)
+
+        if freshness is True or self._probe_member_session(page, access_token) is True:
             self.log(
                 "[CGV] 슬롯 1의 기존 Chrome 로그인 세션 확인 · 현재 CGV 탭을 그대로 재사용합니다.",
                 "success",
             )
+            self._install_member_session_guard(page)
             return True
-        return super()._ensure_member_session(page, context)
+
+        self.log(
+            "[CGV] 저장된 회원 세션의 인증 만료/무효 가능성을 감지해 공식 로그인/갱신 경로로 전환합니다.",
+            "warning",
+        )
+        return self._recover_member_session(page, context)
+
+    def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
+        if not _MEMBER_SESSION_GUARD_ACTIVE.get():
+            return super()._race_schedule(page, url, concurrency)
+        now = time.monotonic()
+        try:
+            page_url = str(getattr(page, "url", "") or "")
+        except Exception:
+            page_url = ""
+        page_signature = (id(page), page_url)
+        previous_signature = getattr(self, "_member_guard_page_signature", None)
+        last_read = float(getattr(self, "_member_guard_last_read", 0.0) or 0.0)
+        should_read = (
+            page_signature != previous_signature
+            or now - last_read >= self.MEMBER_SESSION_GUARD_READ_INTERVAL_SECONDS
+        )
+        if should_read:
+            self._member_guard_page_signature = page_signature
+            self._member_guard_last_read = now
+            state = self._install_member_session_guard(page)
+            if state.get("unauthorized"):
+                context = getattr(page, "context", None) or getattr(self, "_context", None)
+                self.log(
+                    "[CGV] 감시 중 회원 세션 만료를 감지했습니다. 로그인/토큰 갱신 후 감시를 계속합니다.",
+                    "warning",
+                )
+                if context is None or not self._recover_member_session(page, context):
+                    return {
+                        "ok": False,
+                        "status": 401,
+                        "statuses": [401],
+                        "error": "member-session-expired",
+                        "elapsedMs": 0.0,
+                    }
+                self._member_guard_page_signature = None
+        return super()._race_schedule(page, url, concurrency)
 
     @staticmethod
     def _serialize_structured_seat_groups(value, people: int) -> str:
@@ -97,6 +333,7 @@ class CgvEngine(GuardedCgvEngine):
         data = dict(reservation_data or {})
         metadata = dict(data.get("engine_metadata", {}) or {})
         cgv = dict(metadata.get("cgv", {}) or {})
+        member_booking = str(cgv.get("booking_mode", "회원") or "회원").strip() != "비회원"
         people = max(1, int(data.get("people", 1) or 1))
         structured = self._serialize_structured_seat_groups(
             cgv.get("seat_groups"), people
@@ -108,7 +345,11 @@ class CgvEngine(GuardedCgvEngine):
             cgv["seats"] = structured
             metadata["cgv"] = cgv
             data["engine_metadata"] = metadata
-        return super().make_reservation_thread(data)
+        member_guard_token = _MEMBER_SESSION_GUARD_ACTIVE.set(member_booking)
+        try:
+            return super().make_reservation_thread(data)
+        finally:
+            _MEMBER_SESSION_GUARD_ACTIVE.reset(member_guard_token)
 
     def _captured_initial_seat_ready(self) -> bool:
         captured = getattr(self, "_initial_seat_response", None)

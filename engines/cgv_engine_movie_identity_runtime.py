@@ -26,6 +26,10 @@ _PREOPEN_SELECTION_ACTIVE: ContextVar[bool] = ContextVar(
     "pengucro_cgv_preopen_selection_active",
     default=False,
 )
+_PREOPEN_MOV_NO: ContextVar[str] = ContextVar(
+    "pengucro_cgv_preopen_mov_no",
+    default="",
+)
 
 
 def _compact(value: Any) -> str:
@@ -96,6 +100,7 @@ def select_schedule(
         return select_preopen_schedule(
             payload,
             movie=movie,
+            mov_no=_PREOPEN_MOV_NO.get(),
             show_time=show_time,
             auditorium=auditorium,
             preferred_times=preferred_values,
@@ -182,6 +187,14 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
     def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         preopen = self._preopen_requested(reservation_data or {})
         token = _PREOPEN_SELECTION_ACTIVE.set(preopen)
+        metadata = reservation_data.get("engine_metadata", {})
+        cgv = metadata.get("cgv", {}) if isinstance(metadata, Mapping) else {}
+        mov_no = (
+            str(cgv.get("mov_no") or cgv.get("movNo") or "").strip()
+            if preopen and isinstance(cgv, Mapping)
+            else ""
+        )
+        mov_no_token = _PREOPEN_MOV_NO.set(mov_no)
         self._preopen_diag_signature = None
         try:
             if preopen:
@@ -192,6 +205,7 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
                 )
             return super().make_reservation_thread(reservation_data)
         finally:
+            _PREOPEN_MOV_NO.reset(mov_no_token)
             _PREOPEN_SELECTION_ACTIVE.reset(token)
 
     @staticmethod
@@ -329,6 +343,7 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
         candidates = matching_schedule_candidates(
             payload,
             movie=str(getattr(self, "_priority_movie", "") or ""),
+            mov_no=_PREOPEN_MOV_NO.get(),
             auditorium=str(getattr(self, "_priority_auditorium", "") or ""),
             format_name=str(getattr(self, "_priority_format", "") or ""),
         )

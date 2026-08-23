@@ -47,6 +47,7 @@ def _update_busy(window: object) -> bool:
         getattr(window, "current_status", "idle") in {"running", "stopping"}
         or (engine is not None and getattr(engine, "is_running", False))
         or getattr(window, "_catalog_refresh_running", False)
+        or getattr(window, "_keyescape_cache_running", False)
     )
 
 

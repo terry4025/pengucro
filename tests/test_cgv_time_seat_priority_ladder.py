@@ -27,6 +27,30 @@ def _schedule(time_text: str, seq: str, *, auditorium="IMAX관", format_name="IM
     }
 
 
+def _seat_payload(*available_labels: str):
+    available = set(available_labels)
+    labels = sorted(available | {"Z99"})
+    return {
+        "statusCode": 0,
+        "data": {
+            "items": [
+                {
+                    "seats": [
+                        {
+                            "seatLocNo": label,
+                            "seatRowNm": label[0],
+                            "seatNo": label[1:],
+                            "seatStusCd": "00" if label in available else "01",
+                            "seatSaleYn": "Y",
+                        }
+                        for label in labels
+                    ]
+                }
+            ]
+        },
+    }
+
+
 def test_ordered_candidates_keep_user_time_order_and_never_mix_regular_2d():
     engine = CgvEngine(lambda *_args: None)
     engine._priority_movie = "오디세이"
@@ -86,6 +110,23 @@ def test_manual_seat_priority_is_checked_in_order():
     assert chosen.seats == ("B8", "B9", "B10")
 
 
+def test_priority_preflight_maps_json_auth_expiry_to_unauthorized():
+    engine = CgvEngine(lambda *_args: None)
+    engine._fetch_priority_seat_payload = lambda *_args: {
+        "ok": True,
+        "status": 200,
+        "data": {"statusCode": -1001, "statusMessage": "인증 만료"},
+    }
+
+    group, payload, status = engine._read_schedule_once(
+        object(), _schedule("1400", "1"), 2, allow_initial=False
+    )
+
+    assert group is None
+    assert payload["statusCode"] == -1001
+    assert status == 401
+
+
 def test_time_one_without_target_seats_falls_through_to_time_two(monkeypatch):
     engine = CgvEngine(lambda *_args: None)
     first = _schedule("1400", "1")
@@ -110,13 +151,21 @@ def test_time_one_without_target_seats_falls_through_to_time_two(monkeypatch):
 
     engine._read_schedule_once = read_once
     engine._refresh_priority_schedule_payload = lambda _page: None
-    engine._activate_priority_schedule = lambda _page, _schedule, _people: True
+    events = []
+    engine._activate_priority_schedule = (
+        lambda _page, candidate, _people: events.append(
+            f"activate:{candidate['scnsrtTm']}"
+        )
+        or True
+    )
 
     delegated = {}
 
     def delegated_hold(_self, _page, schedule, groups, _people, _dev, _cgv):
+        events.append(f"hold:{schedule['scnsrtTm']}")
         delegated["time"] = schedule["scnsrtTm"]
         delegated["groups"] = groups
+        assert _self._prepare_api_hold_ui(_page, schedule, _people) is True
         return True, False
 
     monkeypatch.setattr(VisitorDomCgvEngine, "_watch_and_hold_api", delegated_hold)
@@ -134,6 +183,97 @@ def test_time_one_without_target_seats_falls_through_to_time_two(monkeypatch):
     assert [value[0] for value in inspected] == ["1400", "1730"]
     assert delegated["time"] == "1730"
     assert delegated["groups"][0].seats == ("C8", "C9", "C10")
+    assert events == ["hold:1730", "activate:1730"]
+
+
+def test_hold_conflict_tries_next_seat_group_in_same_time(monkeypatch):
+    engine = CgvEngine(lambda *_args: None)
+    first = _schedule("1400", "1")
+    first_group = CgvSeatGroup(("C8", "C9"))
+    second_group = CgvSeatGroup(("B8", "B9"))
+    payload = _seat_payload("C8", "C9", "B8", "B9")
+    engine._priority_movie = "오디세이"
+    engine._priority_auditorium = "IMAX관"
+    engine._priority_format = "IMAX LASER 2D"
+    engine._priority_preferred_times = ["14:00", "17:30"]
+    engine._priority_manual_groups = (first_group, second_group)
+    engine._priority_schedule_payload = {"data": [first]}
+    engine._priority_last_schedule_refresh = 10**9
+    engine._read_schedule_once = (
+        lambda _page, _schedule, _people, *, allow_initial: (
+            first_group,
+            payload,
+            200,
+        )
+    )
+    engine._refresh_priority_schedule_payload = lambda _page: None
+
+    attempts = []
+
+    def delegated_hold(_self, _page, schedule, groups, _people, _dev, _cgv):
+        attempts.append((schedule["scnsrtTm"], groups[0].seats))
+        if len(attempts) == 1:
+            _self._last_fast_monitor_exit_reason = "seat-conflict"
+            return False, False
+        return True, False
+
+    monkeypatch.setattr(VisitorDomCgvEngine, "_watch_and_hold_api", delegated_hold)
+
+    result = engine._watch_and_hold_api(
+        object(), first, engine._priority_manual_groups, 2, True, {}
+    )
+
+    assert result == (True, False)
+    assert attempts == [
+        ("1400", ("C8", "C9")),
+        ("1400", ("B8", "B9")),
+    ]
+
+
+def test_all_seat_groups_lost_moves_to_next_time(monkeypatch):
+    engine = CgvEngine(lambda *_args: None)
+    first = _schedule("1400", "1")
+    second = _schedule("1730", "2")
+    first_group = CgvSeatGroup(("C8", "C9"))
+    second_group = CgvSeatGroup(("B8", "B9"))
+    payload = _seat_payload("C8", "C9", "B8", "B9")
+    engine._priority_movie = "오디세이"
+    engine._priority_auditorium = "IMAX관"
+    engine._priority_format = "IMAX LASER 2D"
+    engine._priority_preferred_times = ["14:00", "17:30"]
+    engine._priority_manual_groups = (first_group, second_group)
+    engine._priority_schedule_payload = {"data": [first, second]}
+    engine._priority_last_schedule_refresh = 10**9
+    engine._read_schedule_once = (
+        lambda _page, _schedule, _people, *, allow_initial: (
+            first_group,
+            payload,
+            200,
+        )
+    )
+    engine._refresh_priority_schedule_payload = lambda _page: None
+
+    attempts = []
+
+    def delegated_hold(_self, _page, schedule, groups, _people, _dev, _cgv):
+        attempts.append((schedule["scnsrtTm"], groups[0].seats))
+        if schedule["scnsrtTm"] == "1400":
+            _self._last_fast_monitor_exit_reason = "seat-conflict"
+            return False, False
+        return True, False
+
+    monkeypatch.setattr(VisitorDomCgvEngine, "_watch_and_hold_api", delegated_hold)
+
+    result = engine._watch_and_hold_api(
+        object(), first, engine._priority_manual_groups, 2, True, {}
+    )
+
+    assert result == (True, False)
+    assert attempts == [
+        ("1400", ("C8", "C9")),
+        ("1400", ("B8", "B9")),
+        ("1730", ("C8", "C9")),
+    ]
 
 
 def test_preopen_auto_mode_can_enable_confirm_without_concrete_seats():

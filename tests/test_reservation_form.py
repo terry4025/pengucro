@@ -45,6 +45,37 @@ class Widget(Value):
         pass
 
 
+def test_keyescape_cache_button_delegates_to_main_window():
+    calls = []
+    form = SimpleNamespace(
+        master=SimpleNamespace(
+            _refresh_all_keyescape_timetables=lambda: calls.append("refresh")
+        )
+    )
+
+    ReservationForm._request_keyescape_cache_refresh(form)
+
+    assert calls == ["refresh"]
+
+
+def test_keyescape_cache_state_disables_button_while_busy():
+    form = SimpleNamespace(
+        _booking_running=False,
+        _keyescape_cache_busy=False,
+        keyescape_cache_status=Widget(),
+        keyescape_cache_btn=Widget(),
+    )
+
+    ReservationForm.set_keyescape_cache_state(form, "12/180 · 저장 10", busy=True)
+
+    assert form._keyescape_cache_busy is True
+    assert form.keyescape_cache_status.config["text"] == "12/180 · 저장 10"
+    assert form.keyescape_cache_btn.config["state"] == "disabled"
+
+    ReservationForm.set_keyescape_cache_state(form, "저장 완료", busy=False)
+    assert form.keyescape_cache_btn.config["state"] == "normal"
+
+
 
 def test_naver_time_picker_uses_selected_item_without_requiring_branch(monkeypatch):
     import engines.time_slot_fetchers as fetchers
@@ -528,6 +559,8 @@ def test_cgv_selection_mirrors_authoritatively_into_reservation_data():
             "show_time": "17:30",
             "preferred_times": ["17:30", "14:00"],
             "seats": "H22,H23",
+            "mov_no": " 30001323 ",
+            "reference_date": "2026-08-19",
         },
     )
 
@@ -539,6 +572,8 @@ def test_cgv_selection_mirrors_authoritatively_into_reservation_data():
     assert request.people == 2
     assert request.reservation_time == "17:30:00"
     assert request.engine_metadata["cgv"]["preferred_times"] == ["17:30", "14:00"]
+    assert request.engine_metadata["cgv"]["mov_no"] == "30001323"
+    assert request.engine_metadata["cgv"]["reference_date"] == "2026-08-19"
 
 
 def test_cgv_dialog_invalidation_rules_for_theater_date_movie_auditorium():

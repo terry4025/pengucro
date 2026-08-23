@@ -70,6 +70,9 @@ class CgvEngine(BaseEngine):
     RATE_LIMIT_BROWSER_MAX_RELOAD_INTERVAL = 15.0
     VISITOR_SELECTION_TIMEOUT = 12.0
     VISITOR_RETRY_INTERVAL_MS = 350
+    SCHEDULE_PROMOTION_ATTEMPTS = 3
+    SCHEDULE_PROMOTION_RETRY_INTERVAL = 0.35
+    SCHEDULE_PROMOTION_REWATCH_INTERVAL = 1.0
     API_UI_SYNC_ATTEMPTS = 40
     API_UI_SYNC_INTERVAL_MS = 25
     CAPTURED_REQUEST_HEADERS = ("authorization", "accept-language")
@@ -90,6 +93,7 @@ class CgvEngine(BaseEngine):
         self._last_fast_monitor_exit_reason = ""
         self._initial_seat_response: dict[str, Any] | None = None
         self._last_fast_retry_after_seconds = 0.0
+        self._developer_hold_cleanup: tuple[dict[str, Any], dict[str, Any]] | None = None
 
     def start_reservation(
         self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False
@@ -734,11 +738,11 @@ class CgvEngine(BaseEngine):
         except Exception:
             pass
 
-    def _cancel_api_hold(self, page, hold_payload, hold_response) -> None:
+    def _cancel_api_hold(self, page, hold_payload, hold_response) -> bool:
         data = hold_response.get("data", {}) if isinstance(hold_response, dict) else {}
         mov_atkt_no = str(data.get("movAtktNo", "")) if isinstance(data, dict) else ""
         if not mov_atkt_no:
-            return
+            return False
         cancel_payload = {
             "coCd": hold_payload.get("coCd", CGV_COMPANY_CODE),
             "movAtktNo": mov_atkt_no,
@@ -747,9 +751,88 @@ class CgvEngine(BaseEngine):
             "custNo": hold_payload.get("custNo", ""),
             "seatPrmpDataList": hold_payload.get("seatPrmpDataList", []),
         }
-        self._post_json(
+        result = self._post_json(
             page, f"{CGV_BFF_CONTENT_URL}/seatTemp/seatTempPrmpCncl", cancel_payload
         )
+        response_data = result.get("data") if isinstance(result, dict) else None
+        api_status = (
+            response_data.get("statusCode")
+            if isinstance(response_data, dict)
+            else None
+        )
+        api_success = api_status is None or str(api_status).strip() in {"", "0"}
+        return bool(
+            isinstance(result, dict)
+            and result.get("ok")
+            and api_success
+        )
+
+    @classmethod
+    def _can_reuse_developer_cleanup_page(cls, page) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(cls._safe_page_url(page))
+            if (
+                parsed.scheme.casefold() != "https"
+                or (parsed.hostname or "").casefold() != "cgv.co.kr"
+                or parsed.port not in {None, 443}
+            ):
+                return False
+            is_closed = getattr(page, "is_closed", None)
+            return not (callable(is_closed) and is_closed())
+        except Exception:
+            return False
+
+    def _release_developer_api_hold(self, page) -> bool:
+        cleanup = self._developer_hold_cleanup
+        if cleanup is None:
+            return False
+        hold_payload, hold_response = cleanup
+        cleanup_page = page if self._can_reuse_developer_cleanup_page(page) else None
+        created_cleanup_pages = []
+
+        def create_cleanup_page():
+            context = getattr(self, "_context", None) or getattr(page, "context", None)
+            if context is None:
+                raise RuntimeError("CGV cleanup context unavailable")
+            fresh_page = context.new_page()
+            created_cleanup_pages.append(fresh_page)
+            fresh_page.goto(
+                CGV_HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            return fresh_page
+
+        try:
+            if cleanup_page is None:
+                cleanup_page = create_cleanup_page()
+            released = self._cancel_api_hold(cleanup_page, hold_payload, hold_response)
+            if not released and cleanup_page is page:
+                cleanup_page = create_cleanup_page()
+                released = self._cancel_api_hold(
+                    cleanup_page, hold_payload, hold_response
+                )
+            if not released:
+                raise RuntimeError("CGV cleanup API rejected the request")
+            self._developer_hold_cleanup = None
+        except Exception as exc:
+            self.log(
+                "[개발자 모드] 임시선점 자동 해제 요청에 실패했습니다 "
+                f"({format_exception(exc)}). 열린 결제 흐름은 그대로 두지 마세요.",
+                "warning",
+            )
+            return False
+        finally:
+            for created_cleanup_page in created_cleanup_pages:
+                try:
+                    created_cleanup_page.close()
+                except Exception:
+                    pass
+        self.log(
+            "[개발자 모드] 검증에 사용한 CGV 임시선점 해제 요청을 완료했습니다.",
+            "info",
+        )
+        return True
 
     @staticmethod
     def _direct_hold_config(
@@ -801,6 +884,7 @@ class CgvEngine(BaseEngine):
         direct_hold: dict[str, Any] | None = None,
         request_headers: dict[str, str] | None = None,
         initial_payload: dict[str, Any] | None = None,
+        max_conflicts: int = 0,
     ) -> bool:
         """Start a same-origin browser monitor with staggered persistent GETs."""
 
@@ -812,7 +896,8 @@ class CgvEngine(BaseEngine):
             result = page.evaluate(
                 r"""
                 ({url, groups, concurrency, intervalMs, maxConsecutiveErrors,
-                  transactionTimeoutMs, directHold, requestHeaders, initialPayload}) => {
+                  transactionTimeoutMs, directHold, requestHeaders, initialPayload,
+                  maxConflicts}) => {
                   const previous = window.__pengucroFastSeatMonitor;
                   if (previous && typeof previous.stop === 'function') previous.stop();
 
@@ -1032,6 +1117,19 @@ class CgvEngine(BaseEngine):
                     state.timer = setInterval(launch, intervalMs);
                     setTimeout(launch, 0);
                   };
+                  const conflictOrResume = () => {
+                    state.conflicts += 1;
+                    if (maxConflicts > 0 && state.conflicts >= maxConflicts) {
+                      state.failureKind = 'seat-conflict';
+                      state.running = false;
+                      state.claiming = false;
+                      state.phase = 'conflicted';
+                      if (state.timer) clearInterval(state.timer);
+                      state.timer = null;
+                      return;
+                    }
+                    resume();
+                  };
                   launch = async () => {
                     if (!state.running || state.claiming || state.hit ||
                         state.blocked || state.unauthorized || state.terminalError ||
@@ -1134,10 +1232,17 @@ class CgvEngine(BaseEngine):
                             state.stop();
                             return;
                           }
-                          if (!price.ok || Number(price.data.statusCode ?? -1) !== 0) {
+                          const priceApiStatus = Number(price.data.statusCode ?? -1);
+                          if (priceApiStatus === -1001 || priceApiStatus === -1002) {
+                            recordApiFailure('price', price.data, priceApiStatus);
+                            state.unauthorized = true;
+                            state.failureKind = 'unauthorized';
+                            state.stop();
+                            return;
+                          }
+                          if (!price.ok || priceApiStatus !== 0) {
                             recordApiFailure('price', price.data);
-                            state.conflicts += 1;
-                            resume();
+                            conflictOrResume();
                             return;
                           }
 
@@ -1171,15 +1276,22 @@ class CgvEngine(BaseEngine):
                             state.stop();
                             return;
                           }
+                          const holdApiStatus = Number(hold.data.statusCode ?? -1);
+                          if (holdApiStatus === -1001 || holdApiStatus === -1002) {
+                            recordApiFailure('hold', hold.data, holdApiStatus);
+                            state.unauthorized = true;
+                            state.failureKind = 'unauthorized';
+                            state.stop();
+                            return;
+                          }
                           const holdData = hold.data.data || {};
                           const held = hold.ok
-                            && Number(hold.data.statusCode ?? -1) === 0
+                            && holdApiStatus === 0
                             && String(holdData.resultCode ?? '0') === '0'
                             && Boolean(holdData.movAtktNo);
                           if (!held) {
                             recordApiFailure('hold', hold.data);
-                            state.conflicts += 1;
-                            resume();
+                            conflictOrResume();
                             return;
                           }
                           state.claiming = false;
@@ -1244,6 +1356,7 @@ class CgvEngine(BaseEngine):
                     "directHold": direct_hold,
                     "requestHeaders": dict(request_headers or {}),
                     "initialPayload": initial_payload,
+                    "maxConflicts": max(0, int(max_conflicts)),
                 },
             )
             return bool(result)
@@ -1302,6 +1415,33 @@ class CgvEngine(BaseEngine):
         except Exception:
             pass
 
+    def _fast_monitor_conflict_limit(self) -> int:
+        """Return how many direct-hold conflicts end one monitor invocation.
+
+        The base single-screen monitor keeps retrying forever. Priority-ladder
+        runtimes temporarily override this hook so a lost race can immediately
+        continue with the next seat group or screening instead of becoming
+        pinned to the first preflight winner.
+        """
+
+        return 0
+
+    def _prepare_api_hold_ui(
+        self,
+        page,
+        schedule: dict[str, Any],
+        people: int,
+    ) -> bool:
+        """Prepare the browser UI after an API hold and before seat sync.
+
+        Ordinary single-screen bookings are already on the correct seat page.
+        The priority ladder overrides this hook for a fallback screening so the
+        latency-sensitive hold happens before the slower route/visitor UI work.
+        """
+
+        del page, schedule, people
+        return True
+
     def _watch_and_hold_api(
         self,
         page,
@@ -1337,6 +1477,7 @@ class CgvEngine(BaseEngine):
         concurrency = preferred_concurrency
         launch_interval_ms = self.FAST_SEAT_LAUNCH_INTERVAL_MS
         backoff = self.MIN_POLL_INTERVAL
+        conflict_limit = max(0, int(self._fast_monitor_conflict_limit()))
         while not self.stop_event.is_set():
             started = self._start_fast_seat_monitor(
                 page,
@@ -1347,6 +1488,7 @@ class CgvEngine(BaseEngine):
                 direct_hold=direct_hold,
                 request_headers=request_headers,
                 initial_payload=initial_payload,
+                max_conflicts=conflict_limit,
             )
             # A captured response is a one-shot seed.  Never replay stale seat
             # availability if the base policy restarts a monitor after errors.
@@ -1391,6 +1533,10 @@ class CgvEngine(BaseEngine):
             hit = snapshot.get("hit") if isinstance(snapshot, dict) else None
             if not isinstance(hit, dict):
                 status = int(snapshot.get("lastStatus", 0) or 0)
+                failure_kind = str(snapshot.get("failureKind", "") or "")
+                if failure_kind == "seat-conflict":
+                    self._last_fast_monitor_exit_reason = "seat-conflict"
+                    return False, False
                 self._last_fast_retry_after_seconds = max(
                     0.0,
                     float(snapshot.get("retryAfterMs", 0) or 0) / 1000.0,
@@ -1458,6 +1604,14 @@ class CgvEngine(BaseEngine):
                 f"· {transaction_ms:.0f}ms",
                 "success",
             )
+            if not self._prepare_api_hold_ui(page, schedule, people):
+                self._cancel_api_hold(page, hold_payload, hold_response)
+                self._last_fast_monitor_exit_reason = "held-schedule-ui-failed"
+                self.log(
+                    "CGV 확보 회차 화면 전환에 실패해 임시선점을 해제하고 안전 경로로 전환합니다.",
+                    "warning",
+                )
+                return False, True
             if not self._select_api_seats_in_ui(page, seat_payload, selected):
                 self._cancel_api_hold(page, hold_payload, hold_response)
                 self._last_fast_monitor_exit_reason = "ui-sync-failed"
@@ -1467,6 +1621,11 @@ class CgvEngine(BaseEngine):
             self._install_cached_hold_responses(page, price_response, hold_response)
             if self._submit_seat_selection(page):
                 self._restore_fetch(page)
+                if developer_mode:
+                    self._developer_hold_cleanup = (
+                        dict(hold_payload),
+                        dict(hold_response),
+                    )
                 return True, False
             self._restore_fetch(page)
             self._cancel_api_hold(page, hold_payload, hold_response)
@@ -2173,6 +2332,33 @@ class CgvEngine(BaseEngine):
             return True
         return False
 
+    def _finish_held_checkout(
+        self,
+        page,
+        *,
+        developer_mode: bool,
+        npay_password: str,
+        site_no: str,
+        movie: str,
+    ) -> bool:
+        """Complete checkout reporting and always release a developer API hold."""
+
+        try:
+            checkout_completed = self._proceed_naver_pay_checkout(
+                page,
+                developer_mode=developer_mode,
+                npay_password=npay_password,
+            )
+            return self._report_checkout_outcome(
+                checkout_completed=checkout_completed,
+                developer_mode=developer_mode,
+                site_no=site_no,
+                movie=movie,
+            )
+        finally:
+            if developer_mode:
+                self._release_developer_api_hold(page)
+
     @staticmethod
     def _query_payload(schedule: dict[str, Any]) -> dict[str, Any]:
         keys = (
@@ -2221,6 +2407,46 @@ class CgvEngine(BaseEngine):
             return not self._is_block_page(page)
         except Exception:
             return False
+
+    def _prepare_published_schedule(
+        self,
+        page,
+        schedule: dict[str, Any],
+        people: int,
+    ) -> bool:
+        """Bound retries while CGV finishes publishing the visitor/seat UI."""
+
+        attempts = max(1, int(self.SCHEDULE_PROMOTION_ATTEMPTS))
+        for attempt in range(attempts):
+            if self.stop_event.is_set():
+                return False
+
+            visitors_ready = False
+            if self._enter_visitor_page(page, schedule):
+                seat_capture_handler = self._begin_initial_seat_response_capture(page)
+                try:
+                    visitors_ready = self._select_visitors(page, people)
+                finally:
+                    self._end_initial_seat_response_capture(
+                        page, seat_capture_handler
+                    )
+            if visitors_ready:
+                return True
+
+            # Never leak a response captured from an incomplete render into the
+            # next official schedule/seat attempt.
+            self._initial_seat_response = None
+            if attempt + 1 >= attempts:
+                break
+            self.silent_tick(
+                "CGV 회차 화면 부분 공개/렌더 지연 · "
+                f"화면 준비 재시도 {attempt + 2}/{attempts}"
+            )
+            if self.stop_event.wait(
+                max(0.0, float(self.SCHEDULE_PROMOTION_RETRY_INTERVAL))
+            ):
+                return False
+        return False
 
     @staticmethod
     def _click_visible_by_text(page, labels: tuple[str, ...]) -> bool:
@@ -2903,6 +3129,7 @@ class CgvEngine(BaseEngine):
 
         metadata = reservation_data.get("engine_metadata", {})
         cgv = metadata.get("cgv", {}) if isinstance(metadata, dict) else {}
+        self._developer_hold_cleanup = None
         site_no = str(reservation_data.get("branch", "")).strip()
         movie = str(cgv.get("movie") or reservation_data.get("themePK", "")).strip()
         auditorium = str(cgv.get("auditorium", "")).strip()
@@ -2957,6 +3184,8 @@ class CgvEngine(BaseEngine):
                 while not self.stop_event.is_set():
                     try:
                         result = self._race_schedule(page, schedule_url, concurrency)
+                        if result.pop("_pengucroResetScheduleBackoff", False):
+                            error_backoff = 1.0
                     except Exception as exc:
                         if self.stop_event.is_set():
                             break
@@ -3015,7 +3244,25 @@ class CgvEngine(BaseEngine):
                                 f"[CGV] 실제 IMAX 회차 감지 · {movie} · {time_label} · {elapsed:.0f}ms · 고속 선점 모드 전환",
                                 "success",
                             )
-                            break
+                            if self._prepare_published_schedule(
+                                page, schedule, people
+                            ):
+                                break
+                            schedule = None
+                            if self.stop_event.is_set():
+                                break
+                            self.log(
+                                "[CGV] 회차는 공개됐지만 인원/좌석 화면이 아직 완성되지 않았습니다. "
+                                "공식 시간표를 다시 확인한 뒤 자동 재진입합니다.",
+                                "warning",
+                            )
+                            self.stop_event.wait(
+                                max(
+                                    0.0,
+                                    float(self.SCHEDULE_PROMOTION_REWATCH_INTERVAL),
+                                )
+                            )
+                            continue
 
                         has_hint = _has_schedule_hint(payload_data, movie, auditorium)
                         if has_hint:
@@ -3055,19 +3302,6 @@ class CgvEngine(BaseEngine):
 
                 if self.stop_event.is_set() or not schedule:
                     return
-                if not self._enter_visitor_page(page, schedule):
-                    keep_open = True
-                    return
-                seat_capture_handler = self._begin_initial_seat_response_capture(page)
-                try:
-                    visitors_ready = self._select_visitors(page, people)
-                finally:
-                    self._end_initial_seat_response_capture(
-                        page, seat_capture_handler
-                    )
-                if not visitors_ready:
-                    keep_open = True
-                    return
                 developer_mode = parse_bool_flag(reservation_data.get("devMode", False))
                 held, use_browser_fallback = self._watch_and_hold_api(
                     page,
@@ -3098,14 +3332,10 @@ class CgvEngine(BaseEngine):
                 keep_open = True
                 if held:
                     npay_password = str(cgv.get("npay_password", "")).strip()
-                    checkout_completed = self._proceed_naver_pay_checkout(
+                    self._finish_held_checkout(
                         page,
                         developer_mode=developer_mode,
                         npay_password=npay_password,
-                    )
-                    self._report_checkout_outcome(
-                        checkout_completed=checkout_completed,
-                        developer_mode=developer_mode,
                         site_no=site_no,
                         movie=movie,
                     )

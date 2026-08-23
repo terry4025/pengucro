@@ -364,101 +364,98 @@ class JigubyeolEngine(BaseEngine):
                 stage = "CSRF 준비"
                 try:
                     if not csrf_token:
-                        csrf_token = await self.get_csrf_token_async(session, worker_name)
+                        async with self.async_csrf_lock:
+                            csrf_token = await self.get_csrf_token_async(session, worker_name)
                     
                     if self.stop_event.is_set():
                         break
-                        
-                    async with self.async_submission_lock:
-                        if self.stop_event.is_set():
-                            break
-                        
-                        # Step 1: 시간 선택 선등록
-                        stage = "시간 선택"
-                        started = time.perf_counter()
-                        step1_response = await self.submit_time_selection_async(session, csrf_token, reservation_data)
-                        step1_rtt = self._elapsed_ms(started)
-                        if step1_response.status in (200, 201):
-                            self._log_http(worker_name, stage, step1_response.status, step1_rtt)
-                        if step1_response.status == 419:
-                            self.log(
-                                f"[{worker_name}] {target_time} 시도 중... "
-                                f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
-                                "warning",
-                            )
-                            csrf_token = None
-                            continue
-                        if step1_response.status not in (200, 201):
-                            await self.handle_error_async(
-                                step1_response,
-                                reservation_data,
-                                stage,
-                                worker_name=worker_name,
-                                rtt_ms=step1_rtt,
-                            )
-                            continue
-                        
-                        # Step 2: 최종 예약 완료
+
+                    # Step 1: 시간 선택 선등록
+                    stage = "시간 선택"
+                    started = time.perf_counter()
+                    step1_response = await self.submit_time_selection_async(session, csrf_token, reservation_data)
+                    step1_rtt = self._elapsed_ms(started)
+                    if step1_response.status in (200, 201):
+                        self._log_http(worker_name, stage, step1_response.status, step1_rtt)
+                    if step1_response.status == 419:
+                        self.log(
+                            f"[{worker_name}] {target_time} 시도 중... "
+                            f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                            "warning",
+                        )
+                        csrf_token = None
+                        continue
+                    if step1_response.status not in (200, 201):
+                        await self.handle_error_async(
+                            step1_response,
+                            reservation_data,
+                            stage,
+                            worker_name=worker_name,
+                            rtt_ms=step1_rtt,
+                        )
+                        continue
+
+                    # Step 2: 최종 예약 완료
+                    try:
+                        decoded_html = await step1_response.text()
+                    except Exception:
+                        decoded_html = str(step1_response)
+
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(decoded_html, 'html.parser')
+                    payment_input = soup.find('input', {'name': 'payment_method'})
+                    payment_method = payment_input.get('value', '1') if payment_input else '1'
+
+                    stage = "최종 예약"
+                    started = time.perf_counter()
+                    step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
+                    step2_rtt = self._elapsed_ms(started)
+                    if step2_response.status in (200, 201):
+                        self._log_http(worker_name, stage, step2_response.status, step2_rtt)
+
+                    if step2_response.status == 419:
+                        self.log(
+                            f"[{worker_name}] {target_time} 시도 중... "
+                            f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                            "warning",
+                        )
+                        csrf_token = None
+                        continue
+
+                    if step2_response.status in (200, 201):
                         try:
-                            decoded_html = await step1_response.text()
-                        except Exception:
-                            decoded_html = str(step1_response)
-                            
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(decoded_html, 'html.parser')
-                        payment_input = soup.find('input', {'name': 'payment_method'})
-                        payment_method = payment_input.get('value', '1') if payment_input else '1'
-                        
-                        stage = "최종 예약"
-                        started = time.perf_counter()
-                        step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
-                        step2_rtt = self._elapsed_ms(started)
-                        if step2_response.status in (200, 201):
-                            self._log_http(worker_name, stage, step2_response.status, step2_rtt)
-                        
-                        if step2_response.status == 419:
-                            self.log(
-                                f"[{worker_name}] {target_time} 시도 중... "
-                                f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
-                                "warning",
-                            )
-                            csrf_token = None
-                            continue
-                            
-                        if step2_response.status in (200, 201):
-                            try:
-                                stage = "완료 정보 확인"
-                                done_url = f"{self.base_url}/reservation/done"
-                                started = time.perf_counter()
-                                async with session.get(done_url) as done_res:
-                                    done_text = await done_res.text()
-                                    self._log_http(
-                                        worker_name,
-                                        stage,
-                                        done_res.status,
-                                        self._elapsed_ms(started),
-                                    )
-                                    self.log(
-                                        f"[{worker_name}] {self._success_message(done_text)}",
-                                        "success",
-                                    )
-                            except Exception as e:
+                            stage = "완료 정보 확인"
+                            done_url = f"{self.base_url}/reservation/done"
+                            started = time.perf_counter()
+                            async with session.get(done_url) as done_res:
+                                done_text = await done_res.text()
+                                self._log_http(
+                                    worker_name,
+                                    stage,
+                                    done_res.status,
+                                    self._elapsed_ms(started),
+                                )
                                 self.log(
-                                    f"[{worker_name}] 예약 성공! (완료 정보 확인 실패 · "
-                                    f"{self._format_exception(e, reservation_data)})",
+                                    f"[{worker_name}] {self._success_message(done_text)}",
                                     "success",
                                 )
-                                
-                            self.notify_success()
-                            break
-                        else:
-                            await self.handle_error_async(
-                                step2_response,
-                                reservation_data,
-                                stage,
-                                worker_name=worker_name,
-                                rtt_ms=step2_rtt,
+                        except Exception as e:
+                            self.log(
+                                f"[{worker_name}] 예약 성공! (완료 정보 확인 실패 · "
+                                f"{self._format_exception(e, reservation_data)})",
+                                "success",
                             )
+
+                        self.notify_success()
+                        break
+                    else:
+                        await self.handle_error_async(
+                            step2_response,
+                            reservation_data,
+                            stage,
+                            worker_name=worker_name,
+                            rtt_ms=step2_rtt,
+                        )
                 except Exception as e:
                     if self.stop_event.is_set():
                         break

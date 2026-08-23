@@ -21,6 +21,7 @@ from ui.log_panel import LogPanel
 from ui.reservation_form import ReservationForm
 from pengucro import __version__
 from pengucro.models import NAVER_MODE, STANDARD_MODE
+from pengucro.patch_notes import PATCH_NOTES
 
 # Monkey-patch MainWindow to avoid start-up network fetch of themes in background
 MainWindow._start_jigubyeol_theme_fetcher = lambda self: None
@@ -135,6 +136,9 @@ class TestUIComponents(unittest.TestCase):
             if text:
                 visible_text.append(str(text))
         rendered = "\n".join(visible_text)
+        self.assertIn(PATCH_NOTES[0].version, rendered)
+        for change in PATCH_NOTES[0].changes:
+            self.assertIn(change, rendered)
         self.assertIn("6.01", rendered)
         self.assertNotIn("v6.01", rendered)
         self.assertIn("6.04", rendered)
@@ -565,6 +569,8 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(float(form.threads_slider.cget("to")), 3.0)
         self.assertEqual(int(form.threads_slider.get()), 3)
         self.assertEqual(form.yescaptcha_frame.winfo_manager(), "grid")
+        self.assertEqual(form.keyescape_cache_frame.winfo_manager(), "grid")
+        self.assertEqual(form.keyescape_cache_btn.cget("text"), "전체 시간표 미리 저장")
 
         self.app.site_var.set("제로월드")
         self.app._on_site_change("제로월드")
@@ -573,6 +579,7 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(form.threads_slider.cget("state"), "normal")
         self.assertEqual(int(form.threads_slider.get()), 47)
         self.assertEqual(form.yescaptcha_frame.winfo_manager(), "")
+        self.assertEqual(form.keyescape_cache_frame.winfo_manager(), "")
         print("[Pass] Naver=1 locked, Keyescape=1-3, standard=1-50 with separate memory.")
 
     def test_7_dynamic_advanced_layout_and_original_loading_reveal(self):

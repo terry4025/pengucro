@@ -1197,6 +1197,35 @@ class ReservationForm(ctk.CTkFrame):
         self.catalog_change_badge.grid(row=0, column=2, sticky="e", padx=(theme.SPACE_2, 0))
         self.catalog_change_badge.bind("<Button-1>", lambda _event: self._show_catalog_pending())
 
+        self.keyescape_cache_frame = ctk.CTkFrame(
+            self.advanced_frame, fg_color="transparent"
+        )
+        self.keyescape_cache_frame.grid(row=5, column=0, sticky="ew", pady=(theme.SPACE_2, 0))
+        self.keyescape_cache_frame.columnconfigure(1, weight=1)
+        self.keyescape_cache_btn = ctk.CTkButton(
+            self.keyescape_cache_frame,
+            text="전체 시간표 미리 저장",
+            width=142,
+            height=theme.H_CONTROL,
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.ELEVATED_COLOR,
+            hover_color=theme.CARD_COLOR,
+            command=self._request_keyescape_cache_refresh,
+        )
+        self.keyescape_cache_btn.grid(row=0, column=0, sticky="w")
+        self.keyescape_cache_status = ctk.CTkLabel(
+            self.keyescape_cache_frame,
+            text="저장 기록 없음",
+            font=theme.FONT_LABEL,
+            text_color=theme.TEXT_TERTIARY,
+            anchor="e",
+        )
+        self.keyescape_cache_status.grid(
+            row=0, column=1, sticky="e", padx=(theme.SPACE_2, 0)
+        )
+        self._keyescape_cache_busy = False
+        self.keyescape_cache_frame.grid_remove()
+
         # Developer test mode lives inside 고급 설정.
         #
         # It used to be gridded onto the form itself at row 10 and shown only in
@@ -1207,7 +1236,7 @@ class ReservationForm(ctk.CTkFrame):
         # stealing height from the log panel, and the log panel has a floor. A
         # second line pushed past it, so the panel would have been clipped.
         self.dev_mode_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
-        self.dev_mode_frame.grid(row=5, column=0, sticky="ew", pady=(theme.SPACE_2, 0))
+        self.dev_mode_frame.grid(row=6, column=0, sticky="ew", pady=(theme.SPACE_2, 0))
         self.dev_mode_frame.columnconfigure(0, weight=1)
 
         self.dev_mode_var = ctk.BooleanVar(value=False)
@@ -1458,6 +1487,10 @@ class ReservationForm(ctk.CTkFrame):
         if hasattr(self.master, "_refresh_current_catalog"):
             self.master._refresh_current_catalog()
 
+    def _request_keyescape_cache_refresh(self):
+        if hasattr(self.master, "_refresh_all_keyescape_timetables"):
+            self.master._refresh_all_keyescape_timetables()
+
     def _show_catalog_pending(self):
         if hasattr(self.master, "_show_catalog_pending"):
             self.master._show_catalog_pending()
@@ -1472,6 +1505,12 @@ class ReservationForm(ctk.CTkFrame):
         self.catalog_change_badge.configure(text=" · ".join(badge_parts))
         if not getattr(self, "_booking_running", False):
             self.catalog_refresh_btn.configure(state="disabled" if busy else "normal")
+
+    def set_keyescape_cache_state(self, text, *, busy=False):
+        self._keyescape_cache_busy = bool(busy)
+        self.keyescape_cache_status.configure(text=str(text))
+        disabled = bool(busy or getattr(self, "_booking_running", False))
+        self.keyescape_cache_btn.configure(state="disabled" if disabled else "normal")
 
     def _site_uses_keyescape(self, site_name=None) -> bool:
         """Return whether a standard-mode site is backed by KeyescapeEngine."""
@@ -1700,8 +1739,16 @@ class ReservationForm(ctk.CTkFrame):
             self.yescaptcha_frame.grid(
                 row=1, column=0, sticky="ew", pady=(0, theme.SPACE_2)
             )
+            cache_frame = getattr(self, "keyescape_cache_frame", None)
+            if cache_frame is not None:
+                cache_frame.grid(
+                    row=5, column=0, sticky="ew", pady=(theme.SPACE_2, 0)
+                )
         else:
             self.yescaptcha_frame.grid_forget()
+            cache_frame = getattr(self, "keyescape_cache_frame", None)
+            if cache_frame is not None:
+                cache_frame.grid_remove()
         if is_cgv:
             self.cgv_auth_frame.grid()
             self._on_cgv_booking_mode_change()
@@ -1855,6 +1902,7 @@ class ReservationForm(ctk.CTkFrame):
             self.remember_personal_checkbox,
             self.catalog_auto_refresh_checkbox,
             self.catalog_refresh_btn,
+            self.keyescape_cache_btn,
             self.cgv_booking_mode,
             self.cgv_nonmember_birth_entry,
             self.cgv_nonmember_phone_entry,
@@ -1869,6 +1917,8 @@ class ReservationForm(ctk.CTkFrame):
                 continue
         if not running:
             self._update_widgets_state()
+            if getattr(self, "_keyescape_cache_busy", False):
+                self.keyescape_cache_btn.configure(state="disabled")
 
     def set_site(self, site_name):
         was_initializing = getattr(self, "_is_initializing", False)
@@ -2420,7 +2470,10 @@ class ReservationForm(ctk.CTkFrame):
                 "show_time": str(self.cgv_selection.get("show_time", "")).strip(),
                 "preferred_times": preferred_times,
                 "is_preopen": bool(self.cgv_selection.get("is_preopen", False)),
-                "reference_date": str(self.cgv_selection.get("reference_date", "")),
+                "mov_no": str(self.cgv_selection.get("mov_no", "")).strip(),
+                "reference_date": str(
+                    self.cgv_selection.get("reference_date", "")
+                ).strip(),
                 "reference_only": bool(self.cgv_selection.get("reference_only", False)),
                 "booking_mode": self.cgv_booking_mode_var.get(),
                 "nonmember_birth": self.cgv_nonmember_birth_entry.get().strip(),

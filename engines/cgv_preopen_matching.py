@@ -4,7 +4,10 @@ import re
 from typing import Any, Iterable, Mapping
 
 from engines.cgv_client import normalize_time, schedule_items
-from engines.cgv_movie_identity import schedule_matches_movie
+from engines.cgv_movie_identity import (
+    schedule_matches_movie,
+    schedule_matches_movie_title_exact,
+)
 
 PREOPEN_TIME_DRIFT_WINDOW_MINUTES = 90
 
@@ -125,15 +128,39 @@ def matching_schedule_candidates(
     payload: Mapping[str, Any],
     *,
     movie: str,
+    mov_no: str = "",
     auditorium: str = "",
     format_name: str = "",
     include_controlled: bool = False,
 ) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
+    """Return selectable rows, preferring the saved CGV movie identity.
+
+    Once a pre-open request has a ``movNo``, another published ``movNo`` can
+    never be accepted merely because its display title is the same. Rows whose
+    movie ID has not been published yet remain usable only through an exact
+    normalized-title match. Exact-ID rows take precedence over those temporary
+    title fallbacks whenever both are present.
+    """
+
+    target_mov_no = str(mov_no or "").strip().casefold()
+    exact_identity: list[dict[str, Any]] = []
+    title_fallbacks: list[dict[str, Any]] = []
     for raw in schedule_items(payload):
         item = dict(raw)
-        if not schedule_matches_movie(item, movie, format_name):
-            continue
+        row_mov_no = str(item.get("movNo") or item.get("mov_no") or "").strip()
+        if target_mov_no:
+            if row_mov_no:
+                if row_mov_no.casefold() != target_mov_no:
+                    continue
+                destination = exact_identity
+            else:
+                if not schedule_matches_movie_title_exact(item, movie, format_name):
+                    continue
+                destination = title_fallbacks
+        else:
+            if not schedule_matches_movie(item, movie, format_name):
+                continue
+            destination = title_fallbacks
         if not context_matches(
             item,
             auditorium,
@@ -143,8 +170,8 @@ def matching_schedule_candidates(
             continue
         if not has_booking_identity(item):
             continue
-        candidates.append(item)
-    return candidates
+        destination.append(item)
+    return exact_identity or title_fallbacks
 
 
 def _time_minutes(value: Any) -> int | None:
@@ -171,6 +198,29 @@ def _schedule_identity(item: Mapping[str, Any]) -> tuple[str, ...]:
     if core[2] or core[3]:
         return core
     return (*core, str(item.get("scnsrtTm", "") or ""))
+
+
+def has_published_seat_inventory(item: Mapping[str, Any]) -> bool:
+    """Return whether CGV reports sellable seats for a published screening.
+
+    Pre-open publication can list a screening whose seat counters are all
+    zero (frSeatCnt=0 with stcnt>0) before sales actually begin. Such rows
+    keep their booking identity but are demoted below identical rows that
+    report stock. Rows without counter fields are treated as bookable so the
+    historical payloads and cancellation-ticket targets stay unaffected.
+    """
+
+    def digits(value):
+        text = "" if value is None else str(value).strip()
+        return int(text) if text.isdigit() else None
+
+    free = digits(item.get("frSeatCnt"))
+    total = digits(item.get("stcnt"))
+    if free is None or total is None:
+        return True
+    if total <= 0:
+        return True
+    return free > 0
 
 
 def _chronological_key(item: Mapping[str, Any]) -> tuple[int, tuple[str, ...]]:
@@ -205,7 +255,19 @@ def rank_preopen_schedules(
     for raw in candidates:
         item = dict(raw)
         unique.setdefault(_schedule_identity(item), item)
-    remaining = sorted(unique.values(), key=_chronological_key)
+    # A published-but-not-yet-selling row (zero seat inventory) must never win
+    # an earlier chronological slot while a stocked counterpart exists.
+    # A row with an explicit zero free-seat count is published metadata, not a
+    # bookable screening. Keep polling until CGV publishes positive inventory
+    # instead of promoting that row to the visitor/seat flow.
+    remaining = sorted(
+        (
+            item
+            for item in unique.values()
+            if has_published_seat_inventory(item)
+        ),
+        key=_chronological_key,
+    )
     if not remaining:
         return []
 
@@ -267,6 +329,7 @@ def select_preopen_schedule(
     payload: Mapping[str, Any],
     *,
     movie: str,
+    mov_no: str = "",
     show_time: str = "",
     auditorium: str = "",
     preferred_times: Iterable[str] = (),
@@ -278,6 +341,7 @@ def select_preopen_schedule(
     candidates = matching_schedule_candidates(
         payload,
         movie=movie,
+        mov_no=mov_no,
         auditorium=auditorium,
         format_name=format_name,
     )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import statistics
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import requests
 
@@ -534,45 +534,94 @@ def parse_site_list(payload: Mapping[str, Any]) -> dict[str, str]:
     return dict(sorted(sites.items(), key=lambda pair: pair[0]))
 
 
-# CGV theaters that operate an official IMAX auditorium in South Korea.
-# Used to focus the booking selector on IMAX-capable sites and eliminate
-# non-IMAX theaters from the selector UI without individual schedule requests.
+# CGV theaters listed by the official IMAX special-cinema page on 2026-08-20.
+# This is a fallback only.  The browser client refreshes the authoritative list
+# from CGV's display-content APIs before filtering the catalog whenever possible.
 CGV_IMAX_SITE_NOS: frozenset[str] = frozenset({
-    "0013",  # 서울 용산아이파크몰 (IMAX GT Laser)
-    "0074",  # 서울 왕십리 (IMAX Laser)
-    "0199",  # 서울 천호 (IMAX Laser)
-    "0059",  # 서울 영등포 (IMAX Laser)
-    "0040",  # 서울 압구정 (IMAX Laser)
-    "0030",  # 경기 일산 (IMAX Laser)
-    "0181",  # 경기 판교 (IMAX Laser)
-    "0286",  # 경기 광교 (IMAX Laser)
-    "0289",  # 경기 동탄 (IMAX Laser)
-    "0105",  # 경기 평택 (IMAX Laser)
-    "0340",  # 경기 평택고덕 (IMAX Laser)
-    "0041",  # 경기 소풍 (IMAX Laser)
-    "0063",  # 경기 의정부 (IMAX)
-    "0039",  # 경기 안산 (IMAX)
-    "0012",  # 경기 수원 (IMAX)
-    "0002",  # 인천 인천 (IMAX Laser)
-    "0044",  # 부산 서면 (IMAX Laser)
-    "0259",  # 부산 센텀시티 (IMAX)
-    "0142",  # 울산 울산삼산 (IMAX Laser)
-    "0087",  # 경남 창원더시티 (IMAX)
-    "0007",  # 대구 대구 (IMAX)
-    "0072",  # 대구 대구스타디움 (IMAX)
-    "0174",  # 대구 대구이시아 (IMAX)
-    "0008",  # 대전 대전 (IMAX)
-    "0099",  # 대전 대전터미널 (IMAX Laser)
-    "0146",  # 충남 천안펜타포트 (IMAX Laser)
-    "0144",  # 충북 청주서문 (IMAX)
-    "0090",  # 광주 광주터미널 (IMAX Laser)
-    "0143",  # 전북 전주효자 (IMAX Laser)
-    "0156",  # 전남 순천신대 (IMAX)
-    "0060",  # 강원 춘천 (IMAX)
-    "0084",  # 강원 원주 (IMAX)
-    "0139",  # 강원 강릉 (IMAX)
-    "0120",  # 제주 제주 (IMAX)
+    "0079",  # 창원더시티
+    "0005",  # 서면
+    "0089",  # 센텀시티
+    "0040",  # 압구정
+    "0059",  # 영등포타임스퀘어
+    "0074",  # 왕십리
+    "0013",  # 용산아이파크몰
+    "0199",  # 천호
+    "0179",  # 전주효자
+    "0268",  # 순천신대
+    "0127",  # 대전터미널
+    "0228",  # 청주(서문)
+    "0128",  # 울산삼산
+    "0293",  # 천안터미널
+    "0110",  # 천안펜타포트
+    "0002",  # 인천
+    "0070",  # 춘천
+    "0257",  # 광교
+    "0106",  # 동탄
+    "0143",  # 소풍
+    "0274",  # 스타필드시티위례
+    "0113",  # 의정부
+    "0054",  # 일산
+    "0181",  # 판교
+    "0052",  # 평택
 })
+
+
+def parse_imax_unit_content_relation_no(payload: Mapping[str, Any]) -> str:
+    """Return the official IMAX theater-guide component relation number."""
+
+    data = payload.get("data", payload)
+    if not isinstance(data, list):
+        return ""
+
+    def components(values: list[Any]) -> Iterator[Mapping[str, Any]]:
+        for component in values:
+            if not isinstance(component, Mapping):
+                continue
+            yield component
+            nested = component.get("scrDspCpotLstSearchResLst", ()) or ()
+            if isinstance(nested, list):
+                yield from components(nested)
+
+    for component in components(data):
+        if not isinstance(component, Mapping):
+            continue
+        title = re.sub(r"\s+", "", str(component.get("title", "")))
+        is_theater_guide = title == "IMAX극장안내" or (
+            str(component.get("screnDispCpotTypCd", "")).strip() == "07"
+            and str(component.get("screnDispCpotCd", "")).strip() == "14"
+        )
+        if not is_theater_guide:
+            continue
+        relation_no = str(component.get("unitCpotRelNo", "")).strip()
+        if relation_no:
+            return relation_no
+        candidates = component.get("scrDspCpotLstSearchResLst", ()) or ()
+        if not isinstance(candidates, list):
+            continue
+        for item in candidates:
+            if not isinstance(item, Mapping):
+                continue
+            relation_no = str(item.get("unitCpotRelNo", "")).strip()
+            if relation_no:
+                return relation_no
+    return ""
+
+
+def parse_imax_site_nos(payload: Mapping[str, Any]) -> frozenset[str]:
+    """Return site numbers from CGV's official IMAX theater-guide detail."""
+
+    data = payload.get("data", payload)
+    if not isinstance(data, Mapping):
+        return frozenset()
+    items = data.get("dspScrdispSiteList", ()) or ()
+    if not isinstance(items, list):
+        return frozenset()
+    return frozenset(
+        site_no
+        for item in items
+        if isinstance(item, Mapping)
+        and (site_no := str(item.get("siteNo", "")).strip())
+    )
 
 
 def is_imax_site(item: Mapping[str, Any] | CgvSite) -> bool:
@@ -598,10 +647,7 @@ def filter_imax_catalog(
 ) -> tuple[tuple[CgvRegion, ...], tuple[CgvSite, ...]]:
     """Filter sites to IMAX theaters and recompute regional counts accordingly."""
     allowed = imax_site_nos if imax_site_nos is not None else CGV_IMAX_SITE_NOS
-    filtered_sites = tuple(
-        site for site in sites
-        if site.site_no in allowed or is_imax_site(site)
-    )
+    filtered_sites = tuple(site for site in sites if site.site_no in allowed)
     counts_by_region: dict[str, int] = {}
     for site in filtered_sites:
         counts_by_region[site.region_code] = counts_by_region.get(site.region_code, 0) + 1
@@ -618,6 +664,7 @@ def parse_site_catalog(
     payload: Mapping[str, Any],
     *,
     imax_only: bool = False,
+    imax_site_nos: frozenset[str] | None = None,
 ) -> tuple[tuple[CgvRegion, ...], tuple[CgvSite, ...]]:
     """Parse CGV's current region/site BFF response without static site data."""
 
@@ -648,7 +695,7 @@ def parse_site_catalog(
         if site_no and name:
             sites.append(CgvSite(site_no, name, region_code))
     if imax_only:
-        return filter_imax_catalog(regions, sites)
+        return filter_imax_catalog(regions, sites, imax_site_nos=imax_site_nos)
     return tuple(regions), tuple(sites)
 
 

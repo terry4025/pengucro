@@ -1,7 +1,13 @@
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 from engines.cgv_browser_client import CgvBrowserClient
+from engines.cgv_client import CgvError
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class _Context:
@@ -407,6 +413,131 @@ def test_empty_imax_site_catalog_raises_error_without_silent_fallback():
         client.fetch_catalog(imax_only=True)
 
 
+def test_fetch_catalog_filters_with_official_dynamic_imax_sites():
+    events = []
+    client = CgvBrowserClient(log=lambda message, level: events.append((message, level)))
+    catalog = {
+        "statusCode": 0,
+        "data": {
+            "regionInfo": [
+                {"comCdval": "02", "comCdvalNm": "경기", "cnt": "2"},
+                {"comCdval": "05", "comCdvalNm": "부산", "cnt": "1"},
+                {"comCdval": "03", "comCdvalNm": "대전", "cnt": "1"},
+            ],
+            "siteInfo": [
+                {"regnGrpCd": "02", "siteNo": "0257", "siteNm": "광교"},
+                {"regnGrpCd": "05", "siteNo": "0089", "siteNm": "센텀시티"},
+                {"regnGrpCd": "03", "siteNo": "0286", "siteNm": "대전가수원"},
+            ],
+        },
+    }
+    components = json.loads(
+        (FIXTURES / "cgv_imax_display_components.json").read_text(encoding="utf-8")
+    )
+    detail = json.loads(
+        (FIXTURES / "cgv_imax_site_detail.json").read_text(encoding="utf-8")
+    )
+    requested_paths = []
+
+    def fetch_json(_page, path):
+        requested_paths.append(path)
+        if "searchAllRegionAndSite" in path:
+            return catalog
+        if "searchSscnsDspCpotList" in path:
+            return components
+        if "searchScrDspCpotDtl" in path:
+            return detail
+        raise AssertionError(path)
+
+    client._with_page = lambda operation: operation(object())
+    client._fetch_json = fetch_json
+
+    snapshot = client.fetch_catalog(imax_only=True)
+
+    assert [site.site_no for site in snapshot.sites] == ["0257", "0089"]
+    assert [(region.code, region.count) for region in snapshot.regions] == [
+        ("02", 1),
+        ("05", 1),
+    ]
+    assert any(
+        path.startswith(
+            "/api/v1/common/meta/dsp/sscnsDsp/searchSscnsDspCpotList?"
+        )
+        and "sscnsNo=1" in path
+        for path in requested_paths
+    )
+    assert any(
+        path.startswith(
+            "/api/v1/common/meta/dsp/scrDsp/searchScrDspCpotDtl?"
+        )
+        and "unitCpotRelNo=64" in path
+        for path in requested_paths
+    )
+    assert any("공식 IMAX 지점 목록 적용 · 25개" in message for message, _ in events)
+
+
+def test_fetch_catalog_uses_corrected_static_imax_fallback_on_dynamic_failure():
+    events = []
+    client = CgvBrowserClient(log=lambda message, level: events.append((message, level)))
+    catalog = {
+        "statusCode": 0,
+        "data": {
+            "regionInfo": [
+                {"comCdval": "02", "comCdvalNm": "경기", "cnt": "2"}
+            ],
+            "siteInfo": [
+                {"regnGrpCd": "02", "siteNo": "0257", "siteNm": "광교"},
+                {"regnGrpCd": "02", "siteNo": "0286", "siteNm": "대전가수원"},
+            ],
+        },
+    }
+
+    def fetch_json(_page, path):
+        if "searchAllRegionAndSite" in path:
+            return catalog
+        raise CgvError("temporary IMAX metadata failure")
+
+    client._with_page = lambda operation: operation(object())
+    client._fetch_json = fetch_json
+
+    snapshot = client.fetch_catalog(imax_only=True)
+
+    assert [site.site_no for site in snapshot.sites] == ["0257"]
+    assert any(
+        "내장 목록으로 계속합니다" in message and level == "warning"
+        for message, level in events
+    )
+
+
+def test_fetch_catalog_does_not_request_imax_metadata_for_full_catalog():
+    client = CgvBrowserClient()
+    catalog = {
+        "statusCode": 0,
+        "data": {
+            "regionInfo": [
+                {"comCdval": "02", "comCdvalNm": "경기", "cnt": "1"}
+            ],
+            "siteInfo": [
+                {"regnGrpCd": "02", "siteNo": "0286", "siteNm": "대전가수원"}
+            ],
+        },
+    }
+    requested_paths = []
+
+    def fetch_json(_page, path):
+        requested_paths.append(path)
+        return catalog
+
+    client._with_page = lambda operation: operation(object())
+    client._fetch_json = fetch_json
+
+    snapshot = client.fetch_catalog(imax_only=False)
+
+    assert [site.site_no for site in snapshot.sites] == ["0286"]
+    assert len(requested_paths) == 1
+    assert "searchAllRegionAndSite" in requested_paths[0]
+
+
 def test_fetch_json_timeout_raises_cgv_error():
     import pytest
     from engines.cgv_client import CgvError
@@ -529,6 +660,5 @@ def test_fetch_seat_map_raises_cgv_request_cancelled_when_event_set():
 
     with pytest.raises(CgvRequestCancelled):
         client.fetch_seat_map({"siteNo": "0013"}, 2, cancel_event=cancel_event)
-
 
 

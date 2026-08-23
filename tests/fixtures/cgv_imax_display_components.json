@@ -1,0 +1,22 @@
+{
+  "statusCode": 0,
+  "statusMessage": "조회 되었습니다.",
+  "data": [
+    {
+      "scrDspCpotLstSearchResLst": [
+        {
+          "unitCpotRelNo": 61,
+          "title": "IMAX 상영작",
+          "screnDispCpotTypCd": "07",
+          "screnDispCpotCd": "01"
+        },
+        {
+          "unitCpotRelNo": 64,
+          "title": "IMAX 극장 안내",
+          "screnDispCpotTypCd": "07",
+          "screnDispCpotCd": "14"
+        }
+      ]
+    }
+  ]
+}

@@ -1,9 +1,45 @@
 from __future__ import annotations
 
+import ctypes
+import os
 import time
 from typing import Any, Mapping
 
+from engines.cgv_client import CGV_BFF_BOOKING_URL
 from engines.cgv_engine_preopen_sentinel_runtime import CgvEngine as SentinelCgvEngine
+
+
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_CONTINUOUS = 0x80000000
+_SCHEDULE_RECOVERY_BACKOFF_KEY = "_pengucroResetScheduleBackoff"
+
+
+def _set_windows_system_sleep_required(
+    required: bool,
+    *,
+    platform_name: str | None = None,
+    kernel32: Any | None = None,
+) -> bool:
+    """Hold or release the calling thread's Windows system-sleep request.
+
+    The booking worker owns this request, so acquire/release happen on the same
+    thread. Other platforms deliberately fail open without importing a
+    platform-specific dependency.
+    """
+
+    platform = os.name if platform_name is None else str(platform_name)
+    if platform != "nt":
+        return False
+    try:
+        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if required else 0)
+        if kernel32 is not None:
+            return bool(kernel32.SetThreadExecutionState(flags))
+        function = ctypes.windll.kernel32.SetThreadExecutionState
+        function.argtypes = (ctypes.c_uint,)
+        function.restype = ctypes.c_uint
+        return bool(function(ctypes.c_uint(flags)))
+    except Exception:
+        return False
 
 
 class CgvEngine(SentinelCgvEngine):
@@ -20,29 +56,277 @@ class CgvEngine(SentinelCgvEngine):
     early signals and are deliberately fail-open.
     """
 
+    PREOPEN_RESUME_GAP_SECONDS = 30.0
+    PREOPEN_HEALTH_STALE_SECONDS = 90.0
+    PREOPEN_AUTH_ALERT_SECONDS = 60.0
+    PREOPEN_ALERT_COOLDOWN_SECONDS = 300.0
+    PREOPEN_RECONNECT_ALERT_AFTER = 3
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._preopen_live_reference_dates: tuple[str, ...] = ()
         self._preopen_live_reference_index = 0
         self._preopen_live_reference_pending = ""
         self._preopen_live_reference_retry_after = 0.0
+        self._preopen_live_catalog_pending = False
         self._preopen_live_date_pending = False
+        self._preopen_power_request_active = False
+        self._reset_unattended_health_state()
+
+    def _reset_unattended_health_state(self) -> None:
+        now = time.monotonic()
+        self._preopen_health_started_at = now
+        self._preopen_health_last_tick = 0.0
+        self._preopen_health_last_success = 0.0
+        self._preopen_health_auth_since = 0.0
+        self._preopen_health_consecutive_failures = 0
+        self._preopen_health_reconnect_failures = 0
+        self._preopen_health_last_alert: dict[str, float] = {}
+        self._preopen_health_degraded: set[str] = set()
 
     def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         self._preopen_live_reference_dates = ()
         self._preopen_live_reference_index = 0
         self._preopen_live_reference_pending = ""
         self._preopen_live_reference_retry_after = 0.0
+        self._preopen_live_catalog_pending = False
         self._preopen_live_date_pending = False
-        return super().make_reservation_thread(reservation_data)
+        self._reset_unattended_health_state()
+
+        self._preopen_power_request_active = _set_windows_system_sleep_required(True)
+        try:
+            if os.name == "nt":
+                if self._preopen_power_request_active:
+                    self.log(
+                        "[CGV] 장시간 감시 중 Windows 시스템 절전 방지를 활성화했습니다.",
+                        "info",
+                    )
+                else:
+                    self.log(
+                        "[CGV][무인 감시 경보] Windows 절전 방지를 활성화하지 못했습니다. "
+                        "전원 설정에서 절전·최대절전을 직접 꺼주세요.",
+                        "error",
+                    )
+            return super().make_reservation_thread(reservation_data)
+        finally:
+            if self._preopen_power_request_active:
+                released = _set_windows_system_sleep_required(False)
+                self._preopen_power_request_active = False
+                if not released:
+                    self.log(
+                        "[CGV] Windows 절전 방지 요청 해제 확인에 실패했습니다.",
+                        "warning",
+                    )
+
+    @staticmethod
+    def _schedule_result_is_healthy(result: Mapping[str, Any]) -> bool:
+        if not result.get("ok") or int(result.get("status", 0) or 0) != 200:
+            return False
+        payload = result.get("data")
+        if isinstance(payload, Mapping):
+            try:
+                return int(payload.get("statusCode", 0) or 0) == 0
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    @staticmethod
+    def _schedule_result_is_unauthorized(result: Mapping[str, Any]) -> bool:
+        statuses = {
+            int(value or 0)
+            for value in result.get("statuses", ())
+            if str(value or "").strip()
+        }
+        status = int(result.get("status", 0) or 0)
+        payload = result.get("data")
+        api_status = 0
+        if isinstance(payload, Mapping):
+            try:
+                api_status = int(payload.get("statusCode", 0) or 0)
+            except (TypeError, ValueError):
+                api_status = 0
+        return status == 401 or 401 in statuses or api_status in {-1001, -1002}
+
+    def _audible_operational_alert(self) -> bool:
+        if os.name != "nt":
+            return False
+        try:
+            import winsound
+
+            winsound.PlaySound(
+                "SystemExclamation",
+                winsound.SND_ALIAS | winsound.SND_ASYNC,
+            )
+            return True
+        except Exception:
+            try:
+                import winsound
+
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                return True
+            except Exception:
+                return False
+
+    def _emit_operational_alert(self, key: str, message: str) -> bool:
+        now = time.monotonic()
+        last = self._preopen_health_last_alert.get(str(key))
+        if last is not None and now - last < self.PREOPEN_ALERT_COOLDOWN_SECONDS:
+            return False
+        self._preopen_health_last_alert[str(key)] = now
+        self._preopen_health_degraded.add(str(key))
+        # Bypass this class's log observer to avoid treating the generated alert
+        # itself as another reconnect/health signal.
+        super().log(f"[CGV][무인 감시 경보] {message}", "error")
+        self._audible_operational_alert()
+        return True
+
+    def _clear_operational_alert(self, key: str, message: str) -> None:
+        if str(key) not in self._preopen_health_degraded:
+            return
+        self._preopen_health_degraded.discard(str(key))
+        self._preopen_health_last_alert.pop(str(key), None)
+        super().log(f"[CGV][무인 감시 복구] {message}", "success")
+
+    def _health_age(self, now: float | None = None) -> float:
+        current = time.monotonic() if now is None else float(now)
+        anchor = self._preopen_health_last_success or self._preopen_health_started_at
+        return max(0.0, current - anchor)
+
+    def _update_schedule_watch_health(self, result: dict[str, Any]) -> None:
+        now = time.monotonic()
+        if self._schedule_result_is_healthy(result):
+            recovered = bool(
+                self._preopen_health_degraded.intersection({"auth", "stale", "network"})
+            )
+            self._preopen_health_last_success = now
+            self._preopen_health_auth_since = 0.0
+            self._preopen_health_consecutive_failures = 0
+            for key in ("auth", "stale", "network"):
+                self._preopen_health_degraded.discard(key)
+                self._preopen_health_last_alert.pop(key, None)
+            if recovered:
+                super().log(
+                    "[CGV][무인 감시 복구] 정상 200 회차 응답을 다시 확인했습니다.",
+                    "success",
+                )
+        else:
+            self._preopen_health_consecutive_failures += 1
+            unauthorized = self._schedule_result_is_unauthorized(result)
+            if unauthorized:
+                if self._preopen_health_auth_since <= 0:
+                    self._preopen_health_auth_since = now
+                if now - self._preopen_health_auth_since >= self.PREOPEN_AUTH_ALERT_SECONDS:
+                    self._emit_operational_alert(
+                        "auth",
+                        "CGV 로그인 인증 만료가 지속되고 있습니다. "
+                        "열린 Chrome 슬롯 1에서 즉시 로그인해주세요.",
+                    )
+
+            age = self._health_age(now)
+            if age >= self.PREOPEN_HEALTH_STALE_SECONDS:
+                reason = (
+                    "로그인 인증 실패"
+                    if unauthorized
+                    else "네트워크 또는 CGV 회차 조회 실패"
+                )
+                self._emit_operational_alert(
+                    "auth" if unauthorized else "stale",
+                    f"정상 200 회차 응답이 {age:.0f}초 동안 없습니다 · {reason}.",
+                )
+
+        # The watchdog owns fingerprint/burst/rate-limit accounting. Our state
+        # is updated first so its periodic health log can never report a stale
+        # watcher as healthy.
+        return super()._update_schedule_watch_health(result)
+
+    def _prepare_resume_recovery(self, page, gap_seconds: float) -> None:
+        self._schedule_last_auth_refresh = 0.0
+        self._preopen_live_reference_pending = ""
+        self._preopen_live_date_pending = False
+        try:
+            page.evaluate(
+                "() => { delete window.__pengucroPreopenAux; return true; }"
+            )
+        except Exception:
+            # The authoritative request immediately below is the real CDP/page
+            # liveness check and will enter the existing reconnect path if dead.
+            pass
+        self._activate_schedule_burst(
+            "절전·네트워크 중단 후 복귀 감지",
+            seconds=max(90.0, self.DATE_SENTINEL_BURST_SECONDS),
+            log_transition=False,
+        )
+        super().log(
+            f"[CGV] 장시간 실행 공백 {gap_seconds:.0f}초 감지 · "
+            "backoff 초기화 신호, 세션 재검증 및 즉시 집중 감시를 시작합니다.",
+            "warning",
+        )
+
+    def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
+        now = time.monotonic()
+        previous_tick = self._preopen_health_last_tick
+        gap_seconds = max(0.0, now - previous_tick) if previous_tick > 0 else 0.0
+        resume_recovery = gap_seconds >= self.PREOPEN_RESUME_GAP_SECONDS
+        self._preopen_health_last_tick = now
+        if resume_recovery:
+            self._prepare_resume_recovery(page, gap_seconds)
+
+        result = super()._race_schedule(page, url, concurrency)
+        result = dict(result) if isinstance(result, Mapping) else {
+            "ok": False,
+            "status": 0,
+            "error": "invalid-schedule-result",
+        }
+        if resume_recovery:
+            result[_SCHEDULE_RECOVERY_BACKOFF_KEY] = True
+        return result
+
+    def log(self, message: str, level: str = "info") -> None:
+        text = str(message or "")
+        if text.startswith("[CGV] 장기 감시 정상 동작 중"):
+            age = self._health_age()
+            if age >= self.PREOPEN_HEALTH_STALE_SECONDS:
+                self._emit_operational_alert(
+                    "auth" if "auth" in self._preopen_health_degraded else "stale",
+                    f"정상 200 회차 응답이 {age:.0f}초 동안 없어 "
+                    "정상 heartbeat를 표시하지 않습니다.",
+                )
+                return
+            text = f"{text} · 최근 정상 200 응답 {age:.0f}초 전"
+
+        reconnect_failure = (
+            "브라우저 재연결 대기 중" in text
+            or "좌석 단계 브라우저 재연결 대기/실패" in text
+        )
+        if reconnect_failure:
+            self._preopen_health_reconnect_failures += 1
+            if (
+                self._preopen_health_reconnect_failures
+                >= self.PREOPEN_RECONNECT_ALERT_AFTER
+            ):
+                self._emit_operational_alert(
+                    "reconnect",
+                    "CGV Chrome 자동 재연결이 반복 실패했습니다. "
+                    "슬롯 1 Chrome과 네트워크 상태를 확인해주세요.",
+                )
+        elif "브라우저 재연결 성공" in text or "Chrome 프로세스 재시작 및 좌석 화면 복구 성공" in text:
+            self._preopen_health_reconnect_failures = 0
+            self._clear_operational_alert(
+                "reconnect", "CGV Chrome 자동 재연결에 성공했습니다."
+            )
+
+        return super().log(text, level)
 
     def _sync_schedule_poll_interval(self) -> None:
         super()._sync_schedule_poll_interval()
-        self.SCHEDULE_HINT_INTERVAL = (
-            self.SCHEDULE_BURST_INTERVAL
-            if self._schedule_burst_active()
-            else self.SCHEDULE_LONG_IDLE_INTERVAL
-        )
+        if self._schedule_burst_active():
+            interval = self.SCHEDULE_BURST_INTERVAL
+        elif self._preopen_sentinel_date_listed is True:
+            interval = self.DATE_LISTED_INTERVAL_SECONDS
+        else:
+            interval = self.SCHEDULE_LONG_IDLE_INTERVAL
+        self.PREOPEN_IDLE_INTERVAL = interval
+        self.SCHEDULE_HINT_INTERVAL = interval
 
     def _activate_schedule_burst(
         self,
@@ -168,6 +452,43 @@ class CgvEngine(SentinelCgvEngine):
             if self._remember_mov_no(mov_no, source="목표 날짜 회차 응답"):
                 self._preopen_live_reference_pending = ""
                 return
+
+        movie = str(getattr(self, "_priority_movie", "") or "").strip()
+        now = time.monotonic()
+        catalog_due = (
+            self._preopen_sentinel_last_catalog_discovery <= 0
+            or now - self._preopen_sentinel_last_catalog_discovery
+            >= self.MOVIE_NO_CATALOG_DISCOVERY_INTERVAL_SECONDS
+        )
+        if movie and (self._preopen_live_catalog_pending or catalog_due):
+            if not self._preopen_live_catalog_pending:
+                self._preopen_sentinel_last_catalog_discovery = now
+            step = self._background_json_step(
+                page,
+                key=f"catalog:{movie}",
+                url=(
+                    f"{CGV_BFF_BOOKING_URL}/searchAtktTopPostrList?"
+                    f"{self._movie_catalog_query(movie)}"
+                ),
+                timeout_ms=self.DATE_SENTINEL_TIMEOUT_MS,
+            )
+            state = str(step.get("state") or "")
+            if state in {"started", "running"}:
+                self._preopen_live_catalog_pending = True
+                return
+            self._preopen_live_catalog_pending = False
+            result = step.get("result")
+            result = dict(result) if isinstance(result, Mapping) else {}
+            data = result.get("data")
+            if result.get("ok") and isinstance(data, Mapping):
+                mov_no = self._extract_catalog_mov_no(
+                    data,
+                    movie=movie,
+                    format_name=str(getattr(self, "_priority_format", "") or ""),
+                )
+                if self._remember_mov_no(mov_no, source="예매 영화 목록 조회"):
+                    self._preopen_live_reference_pending = ""
+                    return
 
         now = time.monotonic()
         if (

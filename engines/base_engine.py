@@ -261,6 +261,7 @@ class BaseEngine:
         start_idx_offset: int = 0,
     ) -> None:
         self.async_submission_lock = asyncio.Lock()
+        self.async_csrf_lock = asyncio.Lock()
         if hasattr(self, "pre_fetch_sessions_async"):
             await self.pre_fetch_sessions_async(num_tasks, reservation_data)
         try:

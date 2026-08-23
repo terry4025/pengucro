@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import ui.theme as theme
 from ui.cgv_booking_dialog_controls import CgvBookingDialog as ControlsCgvBookingDialog
@@ -217,6 +217,40 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
         if hasattr(self, "confirm_button"):
             self.confirm_button.configure(state="normal" if ready else "disabled")
 
+    @staticmethod
+    def _reference_metadata(
+        schedule: Any, fallback_reference_date: str
+    ) -> tuple[str, str]:
+        selected = schedule if isinstance(schedule, Mapping) else {}
+        raw_reference = selected.get("_pengucroSeatReference")
+        reference = raw_reference if isinstance(raw_reference, Mapping) else {}
+
+        # A real selected screening is authoritative. Preopen templates carry
+        # the target date at the top level, so their actual published screening
+        # metadata must come from the nested seat reference instead.
+        actual = selected if selected and not selected.get("_pengucroPreopen") else {}
+        mov_no = str(
+            actual.get("movNo")
+            or actual.get("mov_no")
+            or reference.get("movNo")
+            or reference.get("mov_no")
+            or ""
+        ).strip()
+        raw_date = str(
+            actual.get("scnYmd")
+            or reference.get("scnYmd")
+            or selected.get("_pengucroSeatReferenceDate")
+            or fallback_reference_date
+            or ""
+        ).strip()
+        digits = "".join(char for char in raw_date if char.isdigit())
+        reference_date = (
+            f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+            if len(digits) == 8
+            else raw_date
+        )
+        return mov_no, reference_date
+
     def _confirm(self) -> None:
         if not self.selected_site:
             return
@@ -233,6 +267,9 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
         is_preopen = bool(
             self.reference_only
             or (self.selected_schedule and self.selected_schedule.get("_pengucroPreopen"))
+        )
+        mov_no, reference_date = CgvBookingDialog._reference_metadata(
+            self.selected_schedule, self.reference_date
         )
         region_name = next(
             (
@@ -254,7 +291,8 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
             "show_time": show_time,
             "preferred_times": preferred_times,
             "is_preopen": is_preopen,
-            "reference_date": self.reference_date,
+            "mov_no": mov_no,
+            "reference_date": reference_date,
             "reference_only": self.reference_only,
             "scns_no": "" if is_preopen else str((self.selected_schedule or {}).get("scnsNo", "")),
             "seats": " | ".join(",".join(group) for group in self.priority_groups),

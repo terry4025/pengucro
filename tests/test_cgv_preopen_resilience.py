@@ -4,6 +4,7 @@ import engines.cgv_engine as base_engine_module
 import engines.cgv_engine_priority_ladder as ladder_module
 from engines.cgv_engine_movie_identity_runtime import (
     CgvEngine,
+    _PREOPEN_MOV_NO,
     _PREOPEN_SELECTION_ACTIVE,
     select_schedule,
 )
@@ -25,6 +26,7 @@ def _schedule(
     movie: str = "오디세이",
     seq: str = "1",
     controlled: str = "N",
+    mov_no: str = "",
 ):
     return {
         "siteNo": "0013",
@@ -39,6 +41,7 @@ def _schedule(
         "movkndDsplEnm": format_name,
         "movkndDsplNm": format_name,
         "cntlYn": controlled,
+        "movNo": mov_no,
     }
 
 
@@ -79,6 +82,52 @@ def test_preopen_reference_time_maps_to_nearby_real_time():
     assert chosen["scnsrtTm"] == "1350"
 
 
+def test_preopen_saved_mov_no_wins_over_same_title_row():
+    wrong_same_title = _schedule("1400", seq="1", mov_no="wrong-movie")
+    expected = _schedule("1410", seq="2", mov_no="target-movie")
+    active_token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    movie_token = _PREOPEN_MOV_NO.set("target-movie")
+    try:
+        chosen = select_schedule(
+            _payload(wrong_same_title, expected),
+            movie="오디세이",
+            auditorium="IMAX관",
+            format_name="IMAX LASER 2D",
+            preferred_times=["14:00"],
+        )
+    finally:
+        _PREOPEN_MOV_NO.reset(movie_token)
+        _PREOPEN_SELECTION_ACTIVE.reset(active_token)
+
+    assert chosen == expected
+
+
+def test_preopen_saved_mov_no_uses_exact_title_only_for_unpublished_row_id():
+    wrong_known_id = _schedule("1400", seq="1", mov_no="wrong-movie")
+    ambiguous_unpublished = _schedule(
+        "1405",
+        seq="2",
+        movie="오디세이: 감독판",
+        mov_no="",
+    )
+    safe_unpublished = _schedule("1410", seq="3", mov_no="")
+    active_token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    movie_token = _PREOPEN_MOV_NO.set("target-movie")
+    try:
+        chosen = select_schedule(
+            _payload(wrong_known_id, ambiguous_unpublished, safe_unpublished),
+            movie="오디세이",
+            auditorium="IMAX관",
+            format_name="IMAX LASER 2D",
+            preferred_times=["14:00"],
+        )
+    finally:
+        _PREOPEN_MOV_NO.reset(movie_token)
+        _PREOPEN_SELECTION_ACTIVE.reset(active_token)
+
+    assert chosen == safe_unpublished
+
+
 def test_preopen_first_priority_near_match_beats_later_exact_match():
     candidates = [_schedule("1350"), _schedule("1730", seq="2")]
     ranked = rank_preopen_schedules(candidates, ["14:00", "17:30"])
@@ -99,6 +148,36 @@ def test_preopen_additional_real_slots_remain_safety_fallbacks():
     ]
     ranked = rank_preopen_schedules(candidates, ["14:00", "17:00"])
     assert [item["scnsrtTm"] for item in ranked] == ["1350", "1710", "1420"]
+
+
+def test_preopen_zero_inventory_never_beats_stocked_nearby_schedule():
+    awaiting = _schedule("1400", seq="1")
+    awaiting.update({"frSeatCnt": 0, "stcnt": 400})
+    stocked = _schedule("1420", seq="2")
+    stocked.update({"frSeatCnt": 80, "stcnt": 400})
+
+    ranked = rank_preopen_schedules([awaiting, stocked], ["14:00"])
+
+    assert [item["scnsNo"] for item in ranked] == ["screen-2"]
+
+
+def test_preopen_only_zero_inventory_waits_for_sale_instead_of_selecting():
+    awaiting = _schedule("1400")
+    awaiting.update({"frSeatCnt": "0", "stcnt": "400"})
+
+    token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    try:
+        chosen = select_schedule(
+            _payload(awaiting),
+            movie="오디세이",
+            auditorium="IMAX관",
+            format_name="IMAX LASER 2D",
+            preferred_times=["14:00"],
+        )
+    finally:
+        _PREOPEN_SELECTION_ACTIVE.reset(token)
+
+    assert chosen is None
 
 
 def test_imax_display_label_drift_is_tolerated_without_crossing_regular_2d():
@@ -202,7 +281,9 @@ def test_make_reservation_thread_enables_preopen_context_only_for_scope(monkeypa
     observed = []
 
     def fake_make_reservation_thread(self, reservation_data):
-        observed.append(_PREOPEN_SELECTION_ACTIVE.get())
+        observed.append(
+            (_PREOPEN_SELECTION_ACTIVE.get(), _PREOPEN_MOV_NO.get())
+        )
 
     monkeypatch.setattr(
         PriorityRuntimeCgvEngine,
@@ -211,7 +292,12 @@ def test_make_reservation_thread_enables_preopen_context_only_for_scope(monkeypa
     )
     engine = CgvEngine(log_callback=noop, success_callback=noop)
     engine.make_reservation_thread(
-        {"engine_metadata": {"cgv": {"is_preopen": True}}}
+        {
+            "engine_metadata": {
+                "cgv": {"is_preopen": True, "mov_no": "30001323"}
+            }
+        }
     )
-    assert observed == [True]
+    assert observed == [(True, "30001323")]
     assert _PREOPEN_SELECTION_ACTIVE.get() is False
+    assert _PREOPEN_MOV_NO.get() == ""

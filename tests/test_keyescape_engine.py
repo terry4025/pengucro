@@ -2,6 +2,7 @@ import asyncio
 import pathlib
 import threading
 import time
+from datetime import datetime
 
 import pytest
 
@@ -9,10 +10,12 @@ from engines.keyescape_engine import (
     DEVTOOLS_BLOCK_MARKER,
     DEVTOOLS_GUARD_SCRIPT,
     FALLBACK_SITEKEY,
+    KST,
     KeyescapeEngine,
 )
 from engines.keyescape_coordination import SharedServerClock, SharedSlotLookup
 from engines.yescaptcha_client import DEFAULT_SOFT_ID
+from pengucro.storage import save_json
 
 
 def make_engine():
@@ -676,6 +679,33 @@ def test_fresh_weekend_schedule_group_can_arm_only_one_fast_page(monkeypatch, tm
     ) == ("2828", ("2026-08-15",))
 
 
+def test_trusted_slot_reads_previous_release_reservation_php_cache_key(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    signature, mapping = engine._slot_template_payload(
+        _template_slots(gubun="C")
+    )
+    save_json(engine.SLOT_TEMPLATE_FILE, {
+        "version": 1,
+        "entries": {
+            "https://www.keyescape.com/reservation.php|23|69": [{
+                "date": "2026-08-15",
+                "weekday": 5,
+                "group": "weekday_5",
+                "gubun": "C",
+                "signature": signature,
+                "slots": mapping,
+            }],
+        },
+    })
+
+    assert engine._trusted_slot_from_cache(
+        "2026-08-22", "20:45", "23", "69"
+    ) == ("2828", ("2026-08-15",))
+
+
 def test_weekend_single_schedule_rejects_wrong_server_group(monkeypatch, tmp_path):
     monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
     engine = make_engine()
@@ -686,6 +716,35 @@ def test_weekend_single_schedule_rejects_wrong_server_group(monkeypatch, tmp_pat
     assert engine._trusted_slot_from_cache(
         "2026-08-22", "20:45", "23", "69"
     ) == ("", ())
+
+
+def test_prime_trusted_slot_refreshes_all_published_dates_for_local_history(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    server_now = datetime(2026, 8, 22, 10, 51, tzinfo=KST).timestamp()
+    engine.clock = type("Clock", (), {"now": staticmethod(lambda: server_now)})()
+    requested = []
+
+    async def fetch_slots(target_date, _zizum_num, _theme_num):
+        requested.append(target_date)
+        weekday = datetime.strptime(target_date, "%Y-%m-%d").weekday()
+        gubun = ("A", "A", "A", "A", "B", "C", "D")[weekday]
+        return _template_slots(gubun=gubun)
+
+    engine._fetch_slots = fetch_slots
+
+    slot_id, sources = run(engine._prime_trusted_slot_template(
+        "2026-08-29", "20:45", "23", "69", 8
+    ))
+
+    assert slot_id == "2828"
+    assert sources == ("2026-08-22",)
+    assert requested == [
+        "2026-08-28", "2026-08-27", "2026-08-26", "2026-08-25",
+        "2026-08-24", "2026-08-23", "2026-08-22",
+    ]
 
 
 def test_only_first_standby_page_receives_trusted_fast_slot():

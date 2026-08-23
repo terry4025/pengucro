@@ -71,6 +71,16 @@ def schedule_movie_match_key(item: Mapping[str, Any]) -> str:
     return _compact(schedule_movie_name(item))
 
 
+def schedule_matches_movie_title_exact(
+    item: Mapping[str, Any], movie: Any, format_name: Any = ""
+) -> bool:
+    """Match only the normalized human title, without substring fallbacks."""
+
+    requested = movie_match_key(movie, format_name)
+    canonical = schedule_movie_match_key(item)
+    return bool(requested and canonical and canonical == requested)
+
+
 def schedule_matches_movie(
     item: Mapping[str, Any], movie: Any, format_name: Any = ""
 ) -> bool:
@@ -80,8 +90,7 @@ def schedule_matches_movie(
     if not requested:
         return True
 
-    canonical = schedule_movie_match_key(item)
-    if canonical and canonical == requested:
+    if schedule_matches_movie_title_exact(item, movie, format_name):
         return True
 
     # Preserve the legacy permissive match as a final compatibility fallback.

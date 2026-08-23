@@ -54,6 +54,8 @@ class CgvEngine(VisitorDomCgvEngine):
         self._priority_initial_consumed = False
         self._priority_active_schedule: dict[str, Any] | None = None
         self._priority_active_groups: tuple[CgvSeatGroup, ...] = ()
+        self._priority_claim_returns_on_conflict = False
+        self._priority_page_schedule_key: tuple[str, ...] = ()
 
     @staticmethod
     def _schedule_key(schedule: dict[str, Any] | None) -> tuple[str, ...]:
@@ -64,9 +66,14 @@ class CgvEngine(VisitorDomCgvEngine):
         )
 
     @staticmethod
-    def _time_label(schedule: dict[str, Any]) -> str:
+    def _priority_time_label(schedule: dict[str, Any]) -> str:
         raw = normalize_time(schedule.get("scnsrtTm"))
         return f"{raw[:2]}:{raw[2:]}" if len(raw) == 4 else raw
+
+    def _fast_monitor_conflict_limit(self) -> int:
+        if self._priority_claim_returns_on_conflict:
+            return 1
+        return super()._fast_monitor_conflict_limit()
 
     @staticmethod
     def _synthetic_engine_group(people: int) -> list[str]:
@@ -113,6 +120,8 @@ class CgvEngine(VisitorDomCgvEngine):
         self._priority_initial_consumed = False
         self._priority_active_schedule = None
         self._priority_active_groups = tuple(manual_groups)
+        self._priority_claim_returns_on_conflict = False
+        self._priority_page_schedule_key = ()
 
         # Base CGV still validates that at least one concrete group exists before
         # it reaches our real-seat resolver. Auto-only bookings therefore receive
@@ -130,6 +139,8 @@ class CgvEngine(VisitorDomCgvEngine):
         finally:
             self._priority_active_schedule = None
             self._priority_active_groups = ()
+            self._priority_claim_returns_on_conflict = False
+            self._priority_page_schedule_key = ()
 
     def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
         result = super()._race_schedule(page, url, concurrency)
@@ -166,16 +177,11 @@ class CgvEngine(VisitorDomCgvEngine):
 
         primary_key = self._schedule_key(primary)
         if primary_key and primary_key not in seen:
-            # Keep an already-detected exact screening usable when the latest
-            # cached payload was partial. Its preferred position is recovered on
-            # the next schedule refresh.
-            primary_time = normalize_time(primary.get("scnsrtTm"))
-            preferred_norm = [normalize_time(value) for value in self._priority_preferred_times]
-            try:
-                index = preferred_norm.index(primary_time)
-            except ValueError:
-                index = len(result)
-            result.insert(min(index, len(result)), primary)
+            # A successful current payload containing another valid screening is
+            # authoritative enough to put that live identity ahead of a primary
+            # row that has disappeared. Keep the old row only as a last-resort
+            # fallback for genuinely partial publication responses.
+            result.append(primary)
         return result or [primary]
 
     def _refresh_priority_schedule_payload(self, page) -> None:
@@ -274,6 +280,8 @@ class CgvEngine(VisitorDomCgvEngine):
         seats: tuple[CgvSeat, ...],
         schedule: dict[str, Any],
         people: int,
+        *,
+        excluded: Iterable[Iterable[str]] = (),
     ) -> CgvSeatGroup | None:
         mode = self._priority_auto_mode
         if not mode or not seats:
@@ -286,7 +294,10 @@ class CgvEngine(VisitorDomCgvEngine):
                 schedule.get("movkndDsplEnm") or schedule.get("movkndDsplNm") or ""
             ),
         )
-        excluded: list[tuple[str, ...]] = []
+        excluded_groups: list[tuple[str, ...]] = [
+            tuple(normalize_seat_name(label) for label in group)
+            for group in excluded
+        ]
         available = {
             normalize_seat_name(seat.label)
             for seat in seats
@@ -302,14 +313,14 @@ class CgvEngine(VisitorDomCgvEngine):
                 recommendations,
                 people,
                 mode=mode,
-                excluded=excluded,
+                excluded=excluded_groups,
             )
             if not group:
                 return None
             canonical = tuple(normalize_seat_name(label) for label in group)
             if all(label in available for label in canonical):
                 return CgvSeatGroup(tuple(group))
-            excluded.append(tuple(group))
+            excluded_groups.append(tuple(group))
         return None
 
     def _choose_priority_group(
@@ -317,14 +328,31 @@ class CgvEngine(VisitorDomCgvEngine):
         payload: dict[str, Any],
         schedule: dict[str, Any],
         people: int,
+        *,
+        excluded: Iterable[Iterable[str]] = (),
     ) -> CgvSeatGroup | None:
         seats = parse_api_seats(payload)
         if not seats:
             return None
-        manual = self._manual_available_group(seats, self._priority_manual_groups)
+        excluded_groups = {
+            tuple(normalize_seat_name(label) for label in group)
+            for group in excluded
+        }
+        manual_groups = tuple(
+            group
+            for group in self._priority_manual_groups
+            if tuple(normalize_seat_name(label) for label in group.seats)
+            not in excluded_groups
+        )
+        manual = self._manual_available_group(seats, manual_groups)
         if manual is not None:
             return manual
-        return self._auto_available_group(seats, schedule, people)
+        return self._auto_available_group(
+            seats,
+            schedule,
+            people,
+            excluded=excluded_groups,
+        )
 
     def _read_schedule_once(
         self,
@@ -348,7 +376,10 @@ class CgvEngine(VisitorDomCgvEngine):
         payload = result.get("data")
         if not result.get("ok") or not isinstance(payload, dict):
             return None, None, status
-        if int(payload.get("statusCode", 0) or 0) != 0:
+        api_status = int(payload.get("statusCode", 0) or 0)
+        if api_status in {-1001, -1002}:
+            return None, payload, 401
+        if api_status != 0:
             return None, payload, status
         group = self._choose_priority_group(payload, schedule, people)
         return group, payload, status
@@ -377,6 +408,23 @@ class CgvEngine(VisitorDomCgvEngine):
         finally:
             self._end_initial_seat_response_capture(page, handler)
 
+    def _prepare_api_hold_ui(
+        self,
+        page,
+        schedule: dict[str, Any],
+        people: int,
+    ) -> bool:
+        candidate_key = self._schedule_key(schedule)
+        if (
+            self._priority_claim_returns_on_conflict
+            and candidate_key
+            and candidate_key != self._priority_page_schedule_key
+        ):
+            if not self._activate_priority_schedule(page, schedule, people):
+                return False
+            self._priority_page_schedule_key = candidate_key
+        return super()._prepare_api_hold_ui(page, schedule, people)
+
     def _watch_and_hold_api(
         self,
         page,
@@ -389,6 +437,7 @@ class CgvEngine(VisitorDomCgvEngine):
         self._priority_primary_key = self._schedule_key(schedule)
         self._priority_active_schedule = schedule
         self._priority_active_groups = self._priority_manual_groups
+        self._priority_page_schedule_key = self._schedule_key(schedule)
 
         # A single explicit time with only manual groups already has exactly the
         # desired semantics in the mature monitor. Avoid any extra preflight.
@@ -398,7 +447,6 @@ class CgvEngine(VisitorDomCgvEngine):
             )
 
         pass_no = 0
-        current_page_schedule_key = self._schedule_key(schedule)
         while not self.stop_event.is_set():
             self._refresh_priority_schedule_payload(page)
             candidates = self._ordered_schedule_candidates(schedule)
@@ -413,73 +461,104 @@ class CgvEngine(VisitorDomCgvEngine):
                 allow_initial = (
                     pass_no == 0 and candidate_key == self._priority_primary_key
                 )
-                group, payload, status = self._read_schedule_once(
-                    page,
-                    candidate,
-                    people,
-                    allow_initial=allow_initial,
-                )
+                excluded_groups: set[tuple[str, ...]] = set()
+                candidate_payload: dict[str, Any] | None = None
+                first_candidate_read = True
 
-                if status in {401, 403, 429}:
-                    self._last_fast_monitor_exit_reason = {
-                        401: "unauthorized",
-                        403: "access-forbidden",
-                        429: "rate-limited",
-                    }[status]
-                    self.log(
-                        f"[CGV] 시간 우선순위 좌석 확인 중 HTTP {status} 감지 · "
-                        "추가 시간대 조회를 중단하고 기존 안전 정책으로 전환합니다.",
-                        "warning",
-                    )
-                    # Auto-only mode has no concrete browser fallback group; never
-                    # let the private validation placeholder become a real seat.
-                    if not self._priority_manual_groups:
-                        return False, False
-                    self._priority_active_groups = self._priority_manual_groups
-                    return False, True
+                while not self.stop_event.is_set():
+                    if first_candidate_read:
+                        group, payload, status = self._read_schedule_once(
+                            page,
+                            candidate,
+                            people,
+                            allow_initial=allow_initial,
+                        )
+                        first_candidate_read = False
+                        candidate_payload = payload
+                    else:
+                        payload = candidate_payload
+                        status = 200
+                        group = (
+                            self._choose_priority_group(
+                                payload,
+                                candidate,
+                                people,
+                                excluded=excluded_groups,
+                            )
+                            if isinstance(payload, dict)
+                            else None
+                        )
 
-                if group is None or payload is None:
-                    self.silent_tick(
-                        f"CGV 시간 {index}순위 {self._time_label(candidate)} · "
-                        "좌석 우선순위 일치 좌석 없음 · 다음 시간 확인"
-                    )
-                    continue
-
-                self._priority_active_schedule = candidate
-                self._priority_active_groups = (group,)
-                self.log(
-                    f"[CGV] 시간 {index}순위 {self._time_label(candidate)} · "
-                    f"좌석 우선순위 확보 가능 {', '.join(group.seats)} · 고속 선점 진행",
-                    "success",
-                )
-
-                if candidate_key != current_page_schedule_key:
-                    if not self._activate_priority_schedule(page, candidate, people):
+                    if status in {401, 403, 429}:
+                        self._last_fast_monitor_exit_reason = {
+                            401: "unauthorized",
+                            403: "access-forbidden",
+                            429: "rate-limited",
+                        }[status]
                         self.log(
-                            f"[CGV] {self._time_label(candidate)} 회차 좌석 화면 전환에 실패해 "
-                            "다음 우선순위 확인을 계속합니다.",
+                            f"[CGV] 시간 우선순위 좌석 확인 중 HTTP {status} 감지 · "
+                            "추가 시간대 조회를 중단하고 기존 안전 정책으로 전환합니다.",
                             "warning",
                         )
-                        continue
-                    current_page_schedule_key = candidate_key
-                else:
-                    # Reuse the preflight/captured payload as the first monitor
-                    # seed, so a winning primary screening does not pay another
-                    # seat GET before direct hold.
-                    self._seed_initial_payload(candidate, payload)
+                        # Auto-only mode has no concrete browser fallback group;
+                        # never let its validation placeholder become a real seat.
+                        if not self._priority_manual_groups:
+                            return False, False
+                        self._priority_active_groups = self._priority_manual_groups
+                        return False, True
 
-                clean_cgv = dict(self._priority_original_cgv or cgv)
-                return super()._watch_and_hold_api(
-                    page,
-                    candidate,
-                    (group,),
-                    people,
-                    developer_mode,
-                    clean_cgv,
-                )
+                    if group is None or payload is None:
+                        self.silent_tick(
+                            f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
+                            "좌석 우선순위 일치 좌석 없음 · 다음 시간 확인"
+                        )
+                        break
+
+                    self._priority_active_schedule = candidate
+                    self._priority_active_groups = (group,)
+                    self.log(
+                        f"[CGV] 시간 {index}순위 {self._priority_time_label(candidate)} · "
+                        f"좌석 우선순위 확보 가능 {', '.join(group.seats)} · 고속 선점 진행",
+                        "success",
+                    )
+
+                    # The preflight seat response is a one-shot first monitor
+                    # seed for every candidate.  For a fallback screening this
+                    # lets price/hold finish before the slower route and visitor
+                    # UI transition; the UI is synchronized only after the hold.
+                    self._seed_initial_payload(candidate, payload)
+                    clean_cgv = dict(self._priority_original_cgv or cgv)
+                    self._priority_claim_returns_on_conflict = True
+                    self._last_fast_monitor_exit_reason = ""
+                    try:
+                        held, use_fallback = super()._watch_and_hold_api(
+                            page,
+                            candidate,
+                            (group,),
+                            people,
+                            developer_mode,
+                            clean_cgv,
+                        )
+                    finally:
+                        self._priority_claim_returns_on_conflict = False
+
+                    if held or use_fallback or self.stop_event.is_set():
+                        return held, use_fallback
+                    if self._last_fast_monitor_exit_reason != "seat-conflict":
+                        return held, use_fallback
+
+                    excluded_groups.add(
+                        tuple(normalize_seat_name(label) for label in group.seats)
+                    )
+                    self.silent_tick(
+                        f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
+                        f"{', '.join(group.seats)} 선점 경합 · 다음 좌석 우선순위 확인"
+                    )
 
             pass_no += 1
-            order = " → ".join(self._time_label(item) for item in candidates)
+            order = " → ".join(
+                self._priority_time_label(item) for item in candidates
+            )
             self.silent_tick(
                 f"CGV 시간 우선순위 순환 감시 · {order} · 원하는 좌석 대기"
             )

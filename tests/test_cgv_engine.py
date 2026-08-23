@@ -1,3 +1,5 @@
+import pytest
+
 from engines.cgv_client import CgvSeat, CgvSeatGroup
 from engines.cgv_engine import CgvEngine
 
@@ -167,12 +169,16 @@ def test_fast_monitor_uses_staggered_persistent_requests_with_safe_inflight_cap(
     assert argument["directHold"] is None
     assert argument["requestHeaders"] == {}
     assert argument["initialPayload"] is None
+    assert argument["maxConflicts"] == 0
     assert "headers.set('Authorization', `Bearer ${token}`)" in script
     assert "headers.set('Accept-Language', 'ko-KR')" in script
     assert "queuedPayload" in script
     assert "buildPricePayload" in script
     assert "buildHoldPayload" in script
     assert "state.conflicts += 1" in script
+    assert "state.failureKind = 'seat-conflict'" in script
+    assert "priceApiStatus === -1001 || priceApiStatus === -1002" in script
+    assert "holdApiStatus === -1001 || holdApiStatus === -1002" in script
     assert "resume()" in script
     assert "claiming: false" in script
     assert "state.claiming = true" in script
@@ -285,6 +291,37 @@ def test_watch_seeds_monitor_from_initial_response_before_duplicate_get():
     assert engine._initial_seat_response is None
 
 
+def test_priority_conflict_limit_returns_control_to_caller():
+    starts = []
+    engine = CgvEngine(lambda *_args: None)
+    engine._browser_auth_data = lambda _page: {}
+    engine._fast_monitor_conflict_limit = lambda: 1
+    engine._start_fast_seat_monitor = (
+        lambda *_args, **kwargs: starts.append(kwargs) or True
+    )
+    engine._read_fast_seat_monitor = lambda _page: {
+        "running": False,
+        "claiming": False,
+        "completed": 1,
+        "failureKind": "seat-conflict",
+        "hit": None,
+    }
+    engine._stop_fast_seat_monitor = lambda _page: None
+
+    held, fallback = engine._watch_and_hold_api(
+        object(),
+        {"siteNo": "0013", "scnYmd": "20260818", "scnsNo": "018", "scnSseq": "2"},
+        (CgvSeatGroup(("H22", "H23")),),
+        2,
+        True,
+        {},
+    )
+
+    assert (held, fallback) == (False, False)
+    assert starts[0]["max_conflicts"] == 1
+    assert engine._last_fast_monitor_exit_reason == "seat-conflict"
+
+
 def test_direct_hold_config_prebuilds_schedule_and_sanitizes_customer_data():
     config = CgvEngine._direct_hold_config(
         {
@@ -316,7 +353,7 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     starts = []
 
     class Page:
-        pass
+        url = "https://cgv.co.kr/cnm/selectSeat"
 
     engine = CgvEngine(lambda *_args: None)
     engine.scan_concurrency = 3
@@ -343,6 +380,7 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
         },
     }
     engine._stop_fast_seat_monitor = lambda _page: None
+    engine._prepare_api_hold_ui = lambda *_args: actions.append("prepare") or True
     engine._post_json = lambda *_args: (_ for _ in ()).throw(AssertionError("Python POST must not run"))
     engine._select_api_seats_in_ui = lambda *_args: actions.append("ui") or True
     engine._install_cached_hold_responses = lambda *_args: actions.append("cache")
@@ -361,7 +399,7 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     assert held is True
     assert fallback is False
     assert starts[0]["auth"]["custNo"] == "member"
-    assert actions == ["monitor-with-direct-hold", "ui", "cache", "submit"]
+    assert actions == ["monitor-with-direct-hold", "prepare", "ui", "cache", "submit"]
 
 
 def test_watch_waits_for_inflight_direct_hold_instead_of_restarting_monitor():
@@ -635,12 +673,153 @@ def test_cgv_engine_detects_recoverable_browser_errors():
     ) is False
 
 
-def test_developer_mode_retains_direct_hold():
+def test_schedule_promotion_retries_then_returns_to_authoritative_watch(monkeypatch):
+    import playwright.sync_api as playwright_sync_api
+    import engines.cgv_engine as engine_module
+    from engines import browser_session
+
+    schedule = {
+        "siteNo": "0013",
+        "scnYmd": "20260826",
+        "scnsNo": "01",
+        "scnSseq": "1",
+        "scnsrtTm": "1400",
+        "movNm": "오디세이",
+        "expoScnsNm": "IMAX관",
+        "movkndDsplEnm": "IMAX LASER 2D",
+        "cntlYn": "N",
+    }
+    race_calls = []
+    enter_results = iter((False, True, False, True))
+    visitor_results = iter((False, True))
+    enter_calls = []
+    visitor_calls = []
+    hold_calls = []
+
+    class Page:
+        url = "https://cgv.co.kr/"
+
+        def on(self, *_args):
+            pass
+
+        def goto(self, *_args, **_kwargs):
+            pass
+
+        def is_closed(self):
+            return False
+
+    class Context:
+        def __init__(self):
+            self.pages = [Page()]
+
+        def new_page(self):
+            page = Page()
+            self.pages.append(page)
+            return page
+
+    class Browser:
+        def __init__(self):
+            self.contexts = [Context()]
+
+        def is_connected(self):
+            return True
+
+    class Chromium:
+        def __init__(self, browser):
+            self.browser = browser
+
+        def connect_over_cdp(self, _endpoint):
+            return self.browser
+
+    class Playwright:
+        def __init__(self, browser):
+            self.chromium = Chromium(browser)
+
+    class PlaywrightManager:
+        def __init__(self, browser):
+            self.playwright = Playwright(browser)
+
+        def __enter__(self):
+            return self.playwright
+
+        def __exit__(self, *_args):
+            return False
+
+    class Chrome:
+        endpoint = "http://127.0.0.1:9333"
+
+        def close_if_launched(self):
+            pass
+
+        def release(self):
+            pass
+
+    browser = Browser()
+    monkeypatch.setattr(
+        playwright_sync_api,
+        "sync_playwright",
+        lambda: PlaywrightManager(browser),
+    )
+    monkeypatch.setattr(browser_session, "start_isolated", lambda **_kwargs: Chrome())
+    monkeypatch.setattr(
+        engine_module,
+        "select_schedule",
+        lambda payload, **_kwargs: payload["data"][0],
+    )
+
+    engine = CgvEngine(lambda *_args: None)
+    engine.SCHEDULE_PROMOTION_RETRY_INTERVAL = 0.0
+    engine.SCHEDULE_PROMOTION_REWATCH_INTERVAL = 0.0
+    engine._prepare_authentication = lambda *_args: True
+    engine._is_block_page = lambda _page: False
+    engine._race_schedule = (
+        lambda *_args: race_calls.append("race")
+        or {"ok": True, "status": 200, "elapsedMs": 1, "data": {"data": [schedule]}}
+    )
+    engine._enter_visitor_page = (
+        lambda *_args: enter_calls.append("enter") or next(enter_results)
+    )
+    engine._begin_initial_seat_response_capture = lambda _page: object()
+    engine._end_initial_seat_response_capture = lambda *_args: None
+    engine._select_visitors = (
+        lambda *_args: visitor_calls.append("visitors") or next(visitor_results)
+    )
+    engine._watch_and_hold_api = (
+        lambda *_args: hold_calls.append("hold") or (False, False)
+    )
+    engine._release_browser_lease_when_closed = lambda _chrome: None
+
+    engine.make_reservation_thread(
+        {
+            "branch": "0013",
+            "themePK": "오디세이",
+            "reservationDate": "20260826",
+            "reservationTime": "14:00",
+            "people": 1,
+            "engine_metadata": {
+                "cgv": {
+                    "movie": "오디세이",
+                    "auditorium": "IMAX관",
+                    "format": "IMAX LASER 2D",
+                    "seats": "A1",
+                }
+            },
+        }
+    )
+
+    assert race_calls == ["race", "race"]
+    assert enter_calls == ["enter", "enter", "enter", "enter"]
+    assert visitor_calls == ["visitors", "visitors"]
+    assert hold_calls == ["hold"]
+
+
+def test_developer_mode_retains_then_releases_direct_hold():
     starts = []
+    releases = []
     payload = _seat_payload("H22", "H23")
 
     class Page:
-        pass
+        url = "https://cgv.co.kr/cnm/selectSeat"
 
     engine = CgvEngine(lambda *_args: None)
     engine._browser_auth_data = lambda _page: {"custNo": "cust-dev", "cusgdCd": "01"}
@@ -665,8 +844,8 @@ def test_developer_mode_retains_direct_hold():
     engine._stop_fast_seat_monitor = lambda _page: None
     engine._select_api_seats_in_ui = lambda *_args: True
     engine._install_cached_hold_responses = lambda *_args: None
-    engine._submit_seat_selection = lambda *_args: False
-    engine._cancel_api_hold = lambda *_args: None
+    engine._submit_seat_selection = lambda *_args: True
+    engine._cancel_api_hold = lambda *_args: releases.append(_args) or True
     engine._restore_fetch = lambda *_args: None
 
     held, fallback = engine._watch_and_hold_api(
@@ -679,11 +858,184 @@ def test_developer_mode_retains_direct_hold():
     )
 
     assert len(starts) == 1
+    assert (held, fallback) == (True, False)
     assert starts[0] is not None
     assert starts[0]["auth"]["custNo"] == "cust-dev"
     assert starts[0]["people"] == 2
     assert "searchMovAtktSeatPrcList" in starts[0]["priceUrl"]
     assert "seatTempPrmp" in starts[0]["holdUrl"]
+    assert engine._developer_hold_cleanup is not None
+    assert engine._release_developer_api_hold(Page()) is True
+    assert len(releases) == 1
+    assert engine._developer_hold_cleanup is None
+
+
+def test_developer_hold_cleanup_returns_to_cgv_origin_from_npay_page():
+    actions = []
+
+    class CleanupPage:
+        url = "about:blank"
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+            actions.append(("goto", url))
+
+        def close(self):
+            actions.append(("close", self.url))
+
+    class Context:
+        def new_page(self):
+            actions.append(("new-page", ""))
+            return CleanupPage()
+
+    class NpayPage:
+        url = "https://m.pay.naver.com/o/orderSheet/123"
+
+    engine = CgvEngine(lambda *_args: None)
+    engine._context = Context()
+    engine._developer_hold_cleanup = (
+        {"coCd": "A420", "seatPrmpDataList": []},
+        {"data": {"movAtktNo": "hold-dev-2"}},
+    )
+    engine._cancel_api_hold = (
+        lambda cleanup_page, *_args: actions.append(
+            ("cancel", cleanup_page.url)
+        )
+        or True
+    )
+
+    assert engine._release_developer_api_hold(NpayPage()) is True
+    assert actions == [
+        ("new-page", ""),
+        ("goto", "https://cgv.co.kr"),
+        ("cancel", "https://cgv.co.kr"),
+        ("close", "https://cgv.co.kr"),
+    ]
+
+
+def test_developer_cleanup_reuses_only_open_exact_cgv_origin():
+    class Page:
+        def __init__(self, url, closed=False):
+            self.url = url
+            self.closed = closed
+
+        def is_closed(self):
+            return self.closed
+
+    assert CgvEngine._can_reuse_developer_cleanup_page(
+        Page("https://cgv.co.kr/cnm/selectSeat")
+    )
+    assert not CgvEngine._can_reuse_developer_cleanup_page(
+        Page("https://m.cgv.co.kr/cnm/selectSeat")
+    )
+    assert not CgvEngine._can_reuse_developer_cleanup_page(
+        Page("http://cgv.co.kr/cnm/selectSeat")
+    )
+    assert not CgvEngine._can_reuse_developer_cleanup_page(
+        Page("https://cgv.co.kr/cnm/selectSeat", closed=True)
+    )
+
+
+def test_failed_developer_cleanup_is_retained_for_retry():
+    class CleanupPage:
+        url = "https://cgv.co.kr"
+
+        def goto(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class Context:
+        def new_page(self):
+            return CleanupPage()
+
+    class NpayPage:
+        url = "https://m.pay.naver.com/o/orderSheet/123"
+
+    engine = CgvEngine(lambda *_args: None)
+    cleanup = (
+        {"coCd": "A420", "seatPrmpDataList": []},
+        {"data": {"movAtktNo": "hold-dev-retry"}},
+    )
+    engine._context = Context()
+    engine._developer_hold_cleanup = cleanup
+    engine._cancel_api_hold = lambda *_args: False
+
+    assert engine._release_developer_api_hold(NpayPage()) is False
+    assert engine._developer_hold_cleanup == cleanup
+
+
+def test_stale_apex_cleanup_page_retries_once_on_fresh_page():
+    attempts = []
+
+    class CurrentPage:
+        url = "https://cgv.co.kr/cnm/selectSeat"
+
+        def is_closed(self):
+            return False
+
+    class CleanupPage:
+        url = "about:blank"
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+
+        def close(self):
+            pass
+
+    class Context:
+        def new_page(self):
+            return CleanupPage()
+
+    current = CurrentPage()
+    engine = CgvEngine(lambda *_args: None)
+    engine._context = Context()
+    engine._developer_hold_cleanup = (
+        {"coCd": "A420", "seatPrmpDataList": []},
+        {"data": {"movAtktNo": "hold-dev-stale-page"}},
+    )
+    engine._cancel_api_hold = (
+        lambda cleanup_page, *_args: attempts.append(cleanup_page) or cleanup_page is not current
+    )
+
+    assert engine._release_developer_api_hold(current) is True
+    assert attempts[0] is current
+    assert attempts[1] is not current
+    assert engine._developer_hold_cleanup is None
+
+
+def test_developer_direct_hold_is_released_when_checkout_reporting_raises(monkeypatch):
+    engine = CgvEngine(lambda *_args: None)
+    releases = []
+    page = object()
+
+    monkeypatch.setattr(
+        engine,
+        "_proceed_naver_pay_checkout",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_report_checkout_outcome",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("report failed")),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_release_developer_api_hold",
+        lambda cleanup_page: releases.append(cleanup_page) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="report failed"):
+        engine._finish_held_checkout(
+            page,
+            developer_mode=True,
+            npay_password="",
+            site_no="0257",
+            movie="오디세이",
+        )
+
+    assert releases == [page]
 
 
 def test_already_selected_seat_produces_zero_clicks():

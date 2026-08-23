@@ -9,6 +9,71 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v649_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.49")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 좌석 판매 전 회차의 조기 진입 차단",
+        "CGV 유사 제목 영화 번호 오인식 방지",
+        "CGV 상영 날짜 게시 후 1초 감시 유지",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v648_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.48")
+
+    assert note is not None
+    assert note.changes == (
+        "지구별 예약의 동시 시도 속도 개선",
+        "지구별 인증 만료 시 자동 갱신 후 재시도 안정화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v647_patch_notes_are_short_and_exact():
+    note = notes_for("6.47")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 게시됐지만 좌석 판매 전인 회차를 후순위로 자동 대기",
+        "CGV 영화 번호 미확보 시 예매 목록에서 자동 조회",
+        "CGV 날짜 게시 후 오픈까지 중간 속도 감시 유지",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v646_patch_notes_are_short_and_exact():
+    note = notes_for("6.46")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 미오픈 회차 판매 잠금 해제 즉시 집중 감시",
+        "CGV 공개 회차 번호 변경 시 최신 회차 우선 선점",
+        "CGV 영화 번호 우선 판별로 동명 영화 오선택 방지",
+        "CGV 오픈 직후 화면 지연 시 자동 재조회 및 재시도",
+        "CGV 장시간 감시 중 절전 방지와 연결·로그인 이상 경보",
+        "CGV 만료 세션 재인증 및 감시 장애 자동 복구 강화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v645_patch_notes_are_short_and_exact():
+    note = notes_for("6.45")
+
+    assert note is not None
+    assert note.changes == (
+        "CGV 후순위 시간대 좌석을 화면 전환 전에 즉시 선점하도록 개선",
+        "CGV 좌석 선점 경합 시 다음 좌석·시간 우선순위로 자동 전환",
+        "CGV 오픈 집중 감시에서 응답 지연으로 감속된 동시 조회 수 자동 복구",
+        "CGV 미오픈 감시 시작 시 참고 회차의 영화 번호와 실제 날짜 즉시 재사용",
+        "CGV 공식 IMAX 지점 목록 자동 반영으로 지점 누락 및 오분류 수정",
+        "CGV 고속 API 개발자 테스트 완료 후 사용한 임시선점 자동 해제",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v644_patch_notes_are_short_and_exact():
     note = notes_for("6.44")
 

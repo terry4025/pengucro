@@ -12,6 +12,7 @@ from engines.cgv_preopen_matching import (
     PREOPEN_TIME_DRIFT_WINDOW_MINUTES,
     context_matches,
     has_booking_identity,
+    has_published_seat_inventory,
     rank_preopen_schedules,
 )
 
@@ -143,6 +144,12 @@ class CgvEngine(MovieIdentityCgvEngine):
         ]
         ranked = rank_preopen_schedules(selectable, preferred)
         chosen = ranked[0] if ranked else None
+        awaiting_sale = [
+            item
+            for item in identified
+            if str(item.get("cntlYn", "N") or "N").upper() != "Y"
+            and not has_published_seat_inventory(item)
+        ]
 
         signature = (
             len(items),
@@ -151,6 +158,7 @@ class CgvEngine(MovieIdentityCgvEngine):
             len(identified),
             len(selectable),
             len(ranked),
+            len(awaiting_sale),
             tuple(normalize_time(value) for value in preferred),
             tuple(sorted(self._candidate_signature(item) for item in movie_items)),
         )
@@ -162,7 +170,8 @@ class CgvEngine(MovieIdentityCgvEngine):
         funnel = (
             f"[CGV][미오픈 판정] 전체 {len(items)} → 영화 {len(movie_items)} → "
             f"관/포맷 {len(context_items)} → 회차ID {len(identified)} → "
-            f"판매가능 {len(selectable)} → 시간허용 {len(ranked)} → 최종 {final_time}"
+            f"판매가능 {len(selectable)} → 시간허용 {len(ranked)} → "
+            f"판매대기 {len(awaiting_sale)} → 최종 {final_time}"
         )
         self.log(funnel, "success" if chosen else "info")
 
@@ -212,6 +221,16 @@ class CgvEngine(MovieIdentityCgvEngine):
             self.log(
                 f"[CGV][미오픈 거절] 판매가능 단계 0 · cntlYn=Y 잠금 {len(locked)}개 · "
                 f"잠긴 실제시간 [{self._time_list(locked)}] · 해제 대기",
+                "warning",
+            )
+            return
+
+        stocked = [item for item in selectable if has_published_seat_inventory(item)]
+        if awaiting_sale and not stocked:
+            self.log(
+                f"[CGV][미오픈 거절] 좌석 재고 0 · 실제시간 "
+                f"[{self._time_list(awaiting_sale)}] 회차가 게시됐지만 아직 좌석 판매가 "
+                "시작되지 않았습니다 · 재고 개시 즉시 자동 진입합니다.",
                 "warning",
             )
             return

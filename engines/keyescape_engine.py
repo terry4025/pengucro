@@ -592,10 +592,24 @@ class KeyescapeEngine(BaseEngine):
             target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
         except (TypeError, ValueError):
             return "", ()
-        key = f"{self.site_url.lower()}|{zizum_num}|{theme_num}"
+        canonical_site = self.site_url.rstrip("/").lower()
+        for suffix in ("/reservation.php", "/reservation2.php"):
+            if canonical_site.endswith(suffix):
+                canonical_site = canonical_site[:-len(suffix)]
+                break
+        keys = (
+            f"{canonical_site}|{zizum_num}|{theme_num}",
+            f"{canonical_site}/reservation.php|{zizum_num}|{theme_num}",
+            f"{canonical_site}/reservation2.php|{zizum_num}|{theme_num}",
+        )
         cache = load_json(self.SLOT_TEMPLATE_FILE, {"entries": {}})
         entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
-        history = entries.get(key, []) if isinstance(entries, dict) else []
+        history = []
+        if isinstance(entries, dict):
+            for key in keys:
+                rows = entries.get(key, [])
+                if isinstance(rows, list):
+                    history.extend(rows)
         candidates = []
         seen_dates = set()
         wanted_group = self._schedule_group(target_day)
@@ -653,6 +667,7 @@ class KeyescapeEngine(BaseEngine):
                 slot_id = str(slots.get(target_time, "") or "")
                 if slot_id:
                     return slot_id, (source_day.isoformat(),)
+
         return "", ()
 
     async def _prime_trusted_slot_template(
@@ -664,14 +679,14 @@ class KeyescapeEngine(BaseEngine):
             server_day = datetime.fromtimestamp(self.clock.now(), KST).date()
         except (TypeError, ValueError, OSError):
             return "", ()
-        wanted_group = self._schedule_group(target_day)
+        # Refresh every published date for this theme so each real weekday
+        # schedule remains available locally after it leaves the site window.
         candidates = [
             server_day + timedelta(days=offset)
             for offset in range(max(0, min(int(doing_days or 0), 8)))
             if server_day + timedelta(days=offset) < target_day
-            and self._schedule_group(server_day + timedelta(days=offset)) == wanted_group
         ]
-        for source_day in sorted(candidates, reverse=True)[:4]:
+        for source_day in sorted(candidates, reverse=True):
             try:
                 slots = await self._fetch_slots(
                     source_day.isoformat(), zizum_num, theme_num

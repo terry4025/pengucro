@@ -13,7 +13,10 @@ from engines.cgv_client import (
 )
 from engines.cgv_engine_funnel_runtime import CgvEngine as FunnelCgvEngine
 from engines.cgv_engine_movie_identity_runtime import _PREOPEN_SELECTION_ACTIVE
-from engines.cgv_movie_identity import schedule_matches_movie
+from engines.cgv_movie_identity import (
+    schedule_matches_movie,
+    schedule_matches_movie_title_exact,
+)
 from engines.cgv_preopen_matching import (
     context_matches,
     matching_schedule_candidates,
@@ -37,7 +40,9 @@ class CgvEngine(FunnelCgvEngine):
     DATE_SENTINEL_INTERVAL_SECONDS = 15.0
     DATE_SENTINEL_TIMEOUT_MS = 3500
     DATE_SENTINEL_BURST_SECONDS = 90.0
+    DATE_LISTED_INTERVAL_SECONDS = 1.0
     MOVIE_NO_DISCOVERY_INTERVAL_SECONDS = 300.0
+    MOVIE_NO_CATALOG_DISCOVERY_INTERVAL_SECONDS = 900.0
     SENTINEL_ERROR_LOG_INTERVAL_SECONDS = 600.0
 
     def __init__(self, *args, **kwargs) -> None:
@@ -46,6 +51,7 @@ class CgvEngine(FunnelCgvEngine):
         self._preopen_sentinel_mov_no = ""
         self._preopen_sentinel_last_probe = 0.0
         self._preopen_sentinel_last_discovery = 0.0
+        self._preopen_sentinel_last_catalog_discovery = 0.0
         self._preopen_sentinel_date_listed: bool | None = None
         self._preopen_sentinel_last_error_log = 0.0
 
@@ -75,6 +81,7 @@ class CgvEngine(FunnelCgvEngine):
         ).strip()
         self._preopen_sentinel_last_probe = 0.0
         self._preopen_sentinel_last_discovery = 0.0
+        self._preopen_sentinel_last_catalog_discovery = 0.0
         self._preopen_sentinel_date_listed = None
         self._preopen_sentinel_last_error_log = 0.0
         return super().make_reservation_thread(data)
@@ -172,6 +179,83 @@ class CgvEngine(FunnelCgvEngine):
         )
         return f"{CGV_BFF_BOOKING_URL}/searchSiteScnscYmdListByMov?{query}"
 
+    @staticmethod
+    def _movie_catalog_query(movie: str) -> str:
+        return urllib.parse.urlencode(
+            {
+                "coCd": CGV_COMPANY_CODE,
+                "movNm": str(movie or "").strip(),
+                "div": "",
+                "attrCd": "",
+            }
+        )
+
+    @staticmethod
+    def _extract_catalog_mov_no(
+        payload,
+        *,
+        movie: str,
+        format_name: str = "",
+    ) -> str:
+        """Return one unambiguous exact-title ID from the booking catalog."""
+
+        if not isinstance(payload, Mapping):
+            return ""
+        rows = payload.get("data")
+        if isinstance(rows, Mapping):
+            rows = rows.get("data")
+        if not isinstance(rows, list):
+            return ""
+        matches: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if not schedule_matches_movie_title_exact(row, movie, format_name):
+                continue
+            mov_no = str(row.get("movNo") or "").strip()
+            if mov_no:
+                matches.add(mov_no)
+        return next(iter(matches)) if len(matches) == 1 else ""
+
+    def _maybe_discover_mov_no_from_catalog(self, page) -> None:
+        """Resolve an unknown movie ID through CGV's own booking catalog.
+
+        The reference-date schedule probes only work when the film already has
+        published screenings. Brand-new pre-open titles can be absent there,
+        so one bounded same-origin catalog query keeps the date sentinel
+        usable from day one. Fail-open like every other sentinel helper."""
+
+        if self._preopen_sentinel_mov_no:
+            return
+        now = time.monotonic()
+        if (
+            self._preopen_sentinel_last_catalog_discovery > 0
+            and now - self._preopen_sentinel_last_catalog_discovery
+            < self.MOVIE_NO_CATALOG_DISCOVERY_INTERVAL_SECONDS
+        ):
+            return
+        self._preopen_sentinel_last_catalog_discovery = now
+        movie = str(getattr(self, "_priority_movie", "") or "").strip()
+        if not movie:
+            return
+        result = self._fetch_same_origin_json(
+            page,
+            f"{CGV_BFF_BOOKING_URL}/searchAtktTopPostrList?{self._movie_catalog_query(movie)}",
+            timeout_ms=self.DATE_SENTINEL_TIMEOUT_MS,
+        )
+        data = result.get("data")
+        if result.get("ok") and isinstance(data, Mapping):
+            mov_no = self._extract_catalog_mov_no(
+                data,
+                movie=movie,
+                format_name=str(getattr(self, "_priority_format", "") or ""),
+            )
+            if self._remember_mov_no(mov_no, source="예매 영화 목록 조회"):
+                return
+        # A missing title is normal before CGV lists it; stay quiet and retry
+        # on the next bounded interval without touching the booking path.
+        return
+
     def _extract_target_mov_no(self, payload: Mapping[str, Any]) -> str:
         movie = str(getattr(self, "_priority_movie", "") or "")
         auditorium = str(getattr(self, "_priority_auditorium", "") or "")
@@ -262,6 +346,8 @@ class CgvEngine(FunnelCgvEngine):
             mov_no = self._extract_target_mov_no(target_payload)
             if self._remember_mov_no(mov_no, source="목표 날짜 회차 응답"):
                 return
+
+        self._maybe_discover_mov_no_from_catalog(page)
 
         now = time.monotonic()
         if (

@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from engines.cgv_client import (
     CGV_IMAX_SITE_NOS,
     CgvRegion,
@@ -16,6 +19,8 @@ from engines.cgv_client import (
     parse_api_seats,
     parse_seat_groups,
     parse_dom_seats,
+    parse_imax_site_nos,
+    parse_imax_unit_content_relation_no,
     parse_site_catalog,
     parse_site_list,
     recommend_cgv_seats,
@@ -24,6 +29,9 @@ from engines.cgv_client import (
     schedule_items,
     select_schedule,
 )
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_parse_seat_groups_keeps_priority_and_expands_anchor():
@@ -80,6 +88,31 @@ def test_parse_current_bff_region_and_site_catalog():
     assert regions[0].count == 69
     assert sites[0].site_no == "0013"
     assert sites[0].label == "CGV 용산아이파크몰"
+
+
+def test_parse_official_imax_display_contract_and_site_detail():
+    components = json.loads(
+        (FIXTURES / "cgv_imax_display_components.json").read_text(encoding="utf-8")
+    )
+    detail = json.loads(
+        (FIXTURES / "cgv_imax_site_detail.json").read_text(encoding="utf-8")
+    )
+
+    assert parse_imax_unit_content_relation_no(components) == "64"
+    official_site_nos = parse_imax_site_nos(detail)
+    assert official_site_nos == CGV_IMAX_SITE_NOS
+    assert len(official_site_nos) == 25
+    assert {"0257", "0089", "0013"}.issubset(official_site_nos)
+    assert {"0286", "0259"}.isdisjoint(official_site_nos)
+
+
+def test_parse_imax_component_accepts_official_07_14_identity_without_title():
+    payload = json.loads(
+        (FIXTURES / "cgv_imax_display_components.json").read_text(encoding="utf-8")
+    )
+    payload["data"][0]["scrDspCpotLstSearchResLst"][1]["title"] = ""
+
+    assert parse_imax_unit_content_relation_no(payload) == "64"
 
 
 def test_parse_dom_seats_keeps_unavailable_physical_seats_selectable_as_data():
@@ -335,10 +368,33 @@ def test_filter_imax_catalog_keeps_only_imax_sites_and_recomputes_region_counts(
     assert filtered_regions[1].count == 1
 
 
+def test_filter_imax_catalog_uses_dynamic_codes_without_static_union():
+    regions = (
+        CgvRegion("02", "경기", 2),
+        CgvRegion("03", "대전", 1),
+    )
+    sites = (
+        CgvSite("0257", "광교", "02"),
+        CgvSite("0181", "판교", "02"),
+        CgvSite("0286", "대전가수원", "03"),
+    )
+
+    filtered_regions, filtered_sites = filter_imax_catalog(
+        regions,
+        sites,
+        imax_site_nos=frozenset({"0257"}),
+    )
+
+    assert [site.site_no for site in filtered_sites] == ["0257"]
+    assert [(region.code, region.count) for region in filtered_regions] == [("02", 1)]
+
+
 def test_is_imax_site_detects_by_site_no_and_metadata():
     assert is_imax_site(CgvSite("0013", "용산아이파크몰", "01")) is True
     assert is_imax_site(CgvSite("0001", "강남", "01")) is False
     assert is_imax_site({"siteNo": "0074", "siteNm": "왕십리"}) is True
+    assert is_imax_site({"siteNo": "0257", "siteNm": "광교"}) is True
+    assert is_imax_site({"siteNo": "0286", "siteNm": "대전가수원"}) is False
     assert is_imax_site({"siteNo": "9999", "siteNm": "테스트", "hallNm": "IMAX 3D"}) is True
 
 
@@ -459,5 +515,3 @@ def test_select_schedule_matches_explicit_formats_and_preferred_times():
     assert chosen_pref is not None
     assert chosen_pref["scnsrtTm"] == "1400"
     assert chosen_pref["scnSseq"] == "1"
-
-

@@ -19,6 +19,8 @@ from engines.cgv_client import (
     CgvSite,
     normalize_time,
     parse_api_seats,
+    parse_imax_site_nos,
+    parse_imax_unit_content_relation_no,
     parse_site_catalog,
     schedule_items,
 )
@@ -515,6 +517,41 @@ class CgvBrowserClient:
             raise CgvError(str(data.get("statusMessage") or "CGV가 조회 요청을 처리하지 못했습니다."))
         return data
 
+    def _fetch_official_imax_site_nos(
+        self,
+        page,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> frozenset[str]:
+        """Read the current IMAX sites from CGV's special-cinema content."""
+
+        _check_cancel(cancel_event)
+        component_query = urllib.parse.urlencode(
+            {"coCd": CGV_COMPANY_CODE, "sscnsNo": "1"}
+        )
+        component_payload = self._fetch_json(
+            page,
+            "/api/v1/common/meta/dsp/sscnsDsp/searchSscnsDspCpotList?"
+            f"{component_query}",
+        )
+        relation_no = parse_imax_unit_content_relation_no(component_payload)
+        if not relation_no:
+            raise CgvError("CGV IMAX 극장 안내 구성 정보를 찾지 못했습니다.")
+
+        _check_cancel(cancel_event)
+        detail_query = urllib.parse.urlencode(
+            {"coCd": CGV_COMPANY_CODE, "unitCpotRelNo": relation_no}
+        )
+        detail_payload = self._fetch_json(
+            page,
+            "/api/v1/common/meta/dsp/scrDsp/searchScrDspCpotDtl?"
+            f"{detail_query}",
+        )
+        site_nos = parse_imax_site_nos(detail_payload)
+        if not site_nos:
+            raise CgvError("CGV IMAX 극장 안내의 지점 목록이 비어 있습니다.")
+        return site_nos
+
     def fetch_catalog(
         self, *, imax_only: bool = True, cancel_event: threading.Event | None = None
     ) -> CgvCatalogSnapshot:
@@ -530,7 +567,27 @@ class CgvBrowserClient:
                 page, f"/api/v1/content/site/searchAllRegionAndSite?{query}"
             )
             _check_cancel(cancel_event)
-            regions, sites = parse_site_catalog(payload, imax_only=imax_only)
+            imax_site_nos: frozenset[str] | None = None
+            if imax_only:
+                try:
+                    imax_site_nos = self._fetch_official_imax_site_nos(
+                        page, cancel_event=cancel_event
+                    )
+                    self._emit(
+                        f"[CGV] 공식 IMAX 지점 목록 적용 · {len(imax_site_nos)}개",
+                        "info",
+                    )
+                except CgvError:
+                    self._emit(
+                        "[CGV] 공식 IMAX 지점 목록을 일시적으로 조회하지 못해 "
+                        "내장 목록으로 계속합니다.",
+                        "warning",
+                    )
+            regions, sites = parse_site_catalog(
+                payload,
+                imax_only=imax_only,
+                imax_site_nos=imax_site_nos,
+            )
             if imax_only and not sites:
                 raise CgvError("CGV IMAX 지점 정보를 확인하지 못했습니다.")
             if not regions or not sites:

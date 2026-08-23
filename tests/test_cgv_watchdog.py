@@ -17,7 +17,13 @@ def _payload(*schedules):
     return {"data": {"items": list(schedules)}}
 
 
-def _schedule(seq: str, time_value: str = "1000", *, remaining: int = 100):
+def _schedule(
+    seq: str,
+    time_value: str = "1000",
+    *,
+    remaining: int = 100,
+    controlled: str = "N",
+):
     return {
         "siteNo": "0013",
         "scnYmd": "20260826",
@@ -28,6 +34,7 @@ def _schedule(seq: str, time_value: str = "1000", *, remaining: int = 100):
         "expoScnsNm": "IMAX관",
         "movkndDsplEnm": "IMAX LASER 2D",
         "frSeatCnt": remaining,
+        "cntlYn": controlled,
     }
 
 
@@ -60,6 +67,43 @@ def test_quiet_watch_uses_one_request_and_burst_caps_at_two():
     assert engine.PREOPEN_IDLE_INTERVAL == 0.5
 
 
+def test_burst_restores_configured_concurrency_after_local_downshift():
+    engine = _engine()
+    engine.scan_concurrency = 2
+    engine._schedule_burst_until = time.monotonic() + 10.0
+
+    assert engine._effective_schedule_concurrency(1) == 2
+
+    engine._schedule_burst_until = 0.0
+    assert engine._effective_schedule_concurrency(1) == 1
+
+
+def test_rate_limit_cooldown_keeps_burst_on_one_connection(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(
+        "engines.cgv_engine_watchdog.time.monotonic",
+        lambda: now[0],
+    )
+    engine = _engine()
+    engine.scan_concurrency = 2
+    engine._schedule_burst_until = now[0] + 120.0
+
+    assert engine._effective_schedule_concurrency(1) == 2
+
+    engine._update_schedule_watch_health(
+        {"ok": False, "status": 429, "statuses": [429], "elapsedMs": 20}
+    )
+    assert engine._effective_schedule_concurrency(1) == 1
+
+    engine._update_schedule_watch_health(
+        {"ok": True, "status": 200, "statuses": [200], "data": _payload()}
+    )
+    assert engine._effective_schedule_concurrency(1) == 1
+
+    now[0] += engine.SCHEDULE_RATE_LIMIT_COOLDOWN_SECONDS + 0.1
+    assert engine._effective_schedule_concurrency(1) == 2
+
+
 def test_schedule_fingerprint_ignores_remaining_seat_changes():
     first = CgvEngine._schedule_payload_fingerprint(
         _payload(_schedule("1", remaining=200))
@@ -73,6 +117,31 @@ def test_schedule_fingerprint_ignores_remaining_seat_changes():
 
     assert first == second
     assert changed != first
+
+
+def test_final_registry_unlock_change_reactivates_schedule_burst():
+    engine = EngineRegistry.create(
+        site_name="CGV",
+        mode="",
+        payload={},
+        custom_sites={},
+        log_callback=lambda _message, _level: None,
+        success_callback=None,
+    )
+    locked = _payload(_schedule("1", controlled=" y "))
+    unlocked = _payload(_schedule("1", controlled="n"))
+
+    engine._schedule_fingerprint = engine._schedule_payload_fingerprint(locked)
+    engine._schedule_burst_until = 0.0
+    engine._update_schedule_watch_health({"ok": True, "data": unlocked})
+
+    assert engine._schedule_payload_fingerprint(locked) != engine._schedule_payload_fingerprint(
+        unlocked
+    )
+    assert engine._schedule_burst_until > time.monotonic()
+    engine._sync_schedule_poll_interval()
+    assert engine.PREOPEN_IDLE_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
+    assert engine.SCHEDULE_HINT_INTERVAL == engine.SCHEDULE_BURST_INTERVAL
 
 
 def test_schedule_identity_change_activates_short_burst():
@@ -114,6 +183,60 @@ def test_401_soft_refresh_retries_once(monkeypatch):
 
     assert result["ok"] is True
     assert calls == [1, 1]
+
+
+def test_json_auth_expiry_soft_refreshes_then_recovers(monkeypatch):
+    engine = _engine()
+    responses = iter(
+        [
+            {
+                "ok": True,
+                "status": 200,
+                "statuses": [200],
+                "data": {"statusCode": -1001, "data": []},
+            },
+            {
+                "ok": True,
+                "status": 200,
+                "statuses": [200],
+                "data": _payload(),
+            },
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(
+        engine,
+        "_run_schedule_race_once",
+        lambda _page, _url, concurrency: calls.append(concurrency) or next(responses),
+    )
+    monkeypatch.setattr(engine, "_refresh_schedule_session", lambda _page: True)
+
+    result = engine._race_schedule(SimpleNamespace(), "https://cgv.co.kr/test", 2)
+
+    assert result["ok"] is True
+    assert calls == [1, 1]
+
+
+def test_persistent_json_auth_expiry_is_not_treated_as_empty_schedule(monkeypatch):
+    engine = _engine()
+    monkeypatch.setattr(
+        engine,
+        "_run_schedule_race_once",
+        lambda *_args: {
+            "ok": True,
+            "status": 200,
+            "statuses": [200],
+            "data": {"statusCode": -1002, "data": []},
+        },
+    )
+    monkeypatch.setattr(engine, "_refresh_schedule_session", lambda _page: False)
+
+    result = engine._race_schedule(SimpleNamespace(), "https://cgv.co.kr/test", 2)
+
+    assert result["ok"] is False
+    assert result["status"] == 401
+    assert result["unauthorized"] is True
+    assert result["error"] == "schedule-session-expired"
 
 
 def test_timeout_result_does_not_raise_and_can_be_retried(monkeypatch):

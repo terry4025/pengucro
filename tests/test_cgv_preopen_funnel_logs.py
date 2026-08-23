@@ -60,7 +60,7 @@ def test_funnel_log_explains_time_rejection_with_actual_times():
     messages = [message for message, _level in logs]
     assert any(
         "[CGV][미오픈 판정] 전체 2 → 영화 2 → 관/포맷 2 → 회차ID 2 → "
-        "판매가능 2 → 시간허용 0 → 최종 -" in message
+        "판매가능 2 → 시간허용 0 → 판매대기 0 → 최종 -" in message
         for message in messages
     )
     assert any(
@@ -80,7 +80,10 @@ def test_funnel_log_explains_partial_identity_before_attempt():
     _run(engine, _payload(partial))
 
     messages = [message for message, _level in logs]
-    assert any("회차ID 0 → 판매가능 0 → 시간허용 0 → 최종 -" in message for message in messages)
+    assert any(
+        "회차ID 0 → 판매가능 0 → 시간허용 0 → 판매대기 0 → 최종 -" in message
+        for message in messages
+    )
     assert any(
         "[CGV][미오픈 거절] 회차ID 단계 0" in message
         and "missing=scnsNo+scnSseq" in message
@@ -93,11 +96,30 @@ def test_funnel_log_explains_locked_schedule_before_attempt():
     _run(engine, _payload(_schedule("1400", controlled="Y")))
 
     messages = [message for message, _level in logs]
-    assert any("회차ID 1 → 판매가능 0 → 시간허용 0 → 최종 -" in message for message in messages)
+    assert any(
+        "회차ID 1 → 판매가능 0 → 시간허용 0 → 판매대기 0 → 최종 -" in message
+        for message in messages
+    )
     assert any(
         "[CGV][미오픈 거절] 판매가능 단계 0" in message
         and "cntlYn=Y 잠금 1개" in message
         and "잠긴 실제시간 [14:00]" in message
+        for message in messages
+    )
+
+
+def test_funnel_log_explains_published_schedule_waiting_for_inventory():
+    engine, logs = _engine()
+    awaiting = _schedule("1400")
+    awaiting.update({"frSeatCnt": 0, "stcnt": 400})
+
+    _run(engine, _payload(awaiting))
+
+    messages = [message for message, _level in logs]
+    assert any("시간허용 0 → 판매대기 1 → 최종 -" in message for message in messages)
+    assert any(
+        "[CGV][미오픈 거절] 좌석 재고 0" in message
+        and "재고 개시 즉시 자동 진입" in message
         for message in messages
     )
 
@@ -112,10 +134,7 @@ def test_funnel_log_records_final_drift_mapping_and_deduplicates_same_state():
 
     assert len(logs) == first_count
     messages = [message for message, _level in logs]
-    assert any(
-        "판매가능 2 → 시간허용 1 → 최종 13:50" in message
-        for message in messages
-    )
+    assert any("판매가능 2 → 시간허용 1 → 판매대기 0 → 최종 13:50" in message for message in messages)
     assert any(
         "[CGV][미오픈 선택] 참고 14:00 → 실제 13:50" in message
         and "scnsNo=screen-1" in message

@@ -17,6 +17,14 @@ PLACEHOLDER_SLOT_ID = "9999"
 _cache_lock = threading.Lock()
 
 
+def _canonical_site_url(site_url: str) -> str:
+    value = str(site_url).rstrip("/").lower()
+    for suffix in ("/reservation.php", "/reservation2.php"):
+        if value.endswith(suffix):
+            return value[:-len(suffix)]
+    return value
+
+
 def _slot_time(slot) -> str:
     try:
         return f"{int(slot.get('hh', 0)):02d}:{int(slot.get('mm', 0)):02d}"
@@ -72,7 +80,7 @@ def remember_slot_template(
     except (TypeError, ValueError):
         return False
 
-    key = f"{str(site_url).rstrip('/').lower()}|{zizum_num}|{theme_num}"
+    key = f"{_canonical_site_url(site_url)}|{zizum_num}|{theme_num}"
     with _cache_lock:
         cache = load_json(SLOT_TEMPLATE_FILE, {"version": 1, "entries": {}})
         if not isinstance(cache, dict):

@@ -1,0 +1,33 @@
+{
+  "statusCode": 0,
+  "statusMessage": "조회 되었습니다.",
+  "data": {
+    "dspScrdispSiteList": [
+      {"siteNo": "0079", "siteNm": "창원더시티", "expoSiteNm": "창원더시티", "sortOseq": 1},
+      {"siteNo": "0005", "siteNm": "서면", "expoSiteNm": "서면", "sortOseq": 2},
+      {"siteNo": "0089", "siteNm": "센텀시티", "expoSiteNm": "센텀시티", "sortOseq": 3},
+      {"siteNo": "0040", "siteNm": "압구정", "expoSiteNm": "압구정", "sortOseq": 4},
+      {"siteNo": "0059", "siteNm": "영등포타임스퀘어", "expoSiteNm": "영등포타임스퀘어", "sortOseq": 5},
+      {"siteNo": "0074", "siteNm": "왕십리", "expoSiteNm": "왕십리", "sortOseq": 6},
+      {"siteNo": "0013", "siteNm": "용산아이파크몰", "expoSiteNm": "용산아이파크몰", "sortOseq": 7},
+      {"siteNo": "0199", "siteNm": "천호", "expoSiteNm": "천호", "sortOseq": 8},
+      {"siteNo": "0179", "siteNm": "전주효자", "expoSiteNm": "전주효자", "sortOseq": 9},
+      {"siteNo": "0268", "siteNm": "순천신대", "expoSiteNm": "순천신대", "sortOseq": 10},
+      {"siteNo": "0127", "siteNm": "대전터미널", "expoSiteNm": "대전터미널", "sortOseq": 11},
+      {"siteNo": "0228", "siteNm": "청주(서문)", "expoSiteNm": "청주(서문)", "sortOseq": 12},
+      {"siteNo": "0128", "siteNm": "울산삼산", "expoSiteNm": "울산삼산", "sortOseq": 13},
+      {"siteNo": "0293", "siteNm": "천안터미널", "expoSiteNm": "천안터미널", "sortOseq": 14},
+      {"siteNo": "0110", "siteNm": "천안펜타포트", "expoSiteNm": "천안펜타포트", "sortOseq": 15},
+      {"siteNo": "0002", "siteNm": "인천", "expoSiteNm": "인천", "sortOseq": 16},
+      {"siteNo": "0070", "siteNm": "춘천", "expoSiteNm": "춘천", "sortOseq": 17},
+      {"siteNo": "0257", "siteNm": "광교", "expoSiteNm": "광교", "sortOseq": 18},
+      {"siteNo": "0106", "siteNm": "동탄", "expoSiteNm": "동탄", "sortOseq": 19},
+      {"siteNo": "0143", "siteNm": "소풍", "expoSiteNm": "소풍", "sortOseq": 20},
+      {"siteNo": "0274", "siteNm": "스타필드시티위례", "expoSiteNm": "스타필드시티위례", "sortOseq": 21},
+      {"siteNo": "0113", "siteNm": "의정부", "expoSiteNm": "의정부", "sortOseq": 22},
+      {"siteNo": "0054", "siteNm": "일산", "expoSiteNm": "일산", "sortOseq": 23},
+      {"siteNo": "0181", "siteNm": "판교", "expoSiteNm": "판교", "sortOseq": 24},
+      {"siteNo": "0052", "siteNm": "평택", "expoSiteNm": "평택", "sortOseq": 25}
+    ]
+  }
+}

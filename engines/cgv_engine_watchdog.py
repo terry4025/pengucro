@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from engines.cgv_client import schedule_items
 from engines.cgv_engine_runtime import CgvEngine as RuntimeCgvEngine
@@ -35,6 +35,7 @@ class CgvEngine(RuntimeCgvEngine):
     SCHEDULE_BURST_SECONDS = 45.0
     SCHEDULE_BURST_MAX_CONCURRENCY = 2
     SCHEDULE_AUTH_REFRESH_COOLDOWN_SECONDS = 30.0
+    SCHEDULE_RATE_LIMIT_COOLDOWN_SECONDS = 60.0
     SCHEDULE_HEALTH_LOG_INTERVAL_SECONDS = 1800.0
 
     def __init__(self, log_callback, success_callback=None, **kwargs) -> None:
@@ -43,6 +44,7 @@ class CgvEngine(RuntimeCgvEngine):
         self._schedule_burst_until = 0.0
         self._schedule_fingerprint: tuple[tuple[str, ...], ...] | None = None
         self._schedule_last_auth_refresh = 0.0
+        self._schedule_rate_limit_until = 0.0
         self._schedule_last_health_log = time.monotonic()
         self._schedule_timeout_streak = 0
 
@@ -64,6 +66,7 @@ class CgvEngine(RuntimeCgvEngine):
                     str(item.get("movNo") or item.get("prodNo") or ""),
                     str(item.get("expoScnsNm") or item.get("scnsNm") or ""),
                     str(item.get("movkndDsplEnm") or item.get("movkndDsplNm") or ""),
+                    str(item.get("cntlYn", "N") or "N").strip().upper(),
                 )
             )
         return tuple(sorted(set(identities)))
@@ -100,9 +103,19 @@ class CgvEngine(RuntimeCgvEngine):
 
     def _effective_schedule_concurrency(self, requested: int) -> int:
         requested = max(1, int(requested or 1))
+        if time.monotonic() < self._schedule_rate_limit_until:
+            return 1
         if not self._schedule_burst_active():
             return 1
-        return min(requested, int(self.SCHEDULE_BURST_MAX_CONCURRENCY))
+        # A slow response can temporarily reduce the local loop variable to one.
+        # Once an actual opening hint starts a bounded burst, restore the user's
+        # configured hedge count so that the recovery is real (and matches the
+        # health log) instead of remaining permanently downshifted.
+        configured = max(1, int(getattr(self, "scan_concurrency", requested) or 1))
+        return min(
+            max(requested, configured),
+            int(self.SCHEDULE_BURST_MAX_CONCURRENCY),
+        )
 
     def _run_schedule_race_once(
         self,
@@ -259,8 +272,68 @@ class CgvEngine(RuntimeCgvEngine):
             self.silent_tick("CGV 세션 갱신 대기 · 장기 감시는 계속 유지합니다")
             return False
 
+    @staticmethod
+    def _schedule_api_status(result: Mapping[str, Any]) -> int:
+        payload = result.get("data")
+        if not isinstance(payload, Mapping):
+            return 0
+        try:
+            return int(payload.get("statusCode", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _schedule_result_is_unauthorized(cls, result: Mapping[str, Any]) -> bool:
+        status = int(result.get("status", 0) or 0)
+        statuses = {
+            int(value or 0)
+            for value in result.get("statuses", [])
+            if str(value or "").strip()
+        }
+        return (
+            status == 401
+            or 401 in statuses
+            or cls._schedule_api_status(result) in {-1001, -1002}
+        )
+
+    @staticmethod
+    def _normalize_schedule_auth_failure(result: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(result)
+        statuses = [
+            int(value or 0)
+            for value in result.get("statuses", [])
+            if str(value or "").strip()
+        ]
+        if 401 not in statuses:
+            statuses.append(401)
+        normalized.update(
+            {
+                "ok": False,
+                "status": 401,
+                "statuses": statuses,
+                "unauthorized": True,
+                "error": "schedule-session-expired",
+            }
+        )
+        return normalized
+
     def _update_schedule_watch_health(self, result: dict[str, Any]) -> None:
         now = time.monotonic()
+        status = int(result.get("status", 0) or 0)
+        statuses = {
+            int(value or 0)
+            for value in result.get("statuses", [])
+            if str(value or "").strip()
+        }
+        if status in {403, 429} or statuses.intersection({403, 429}):
+            # A server protection response is different from a merely slow
+            # request. Keep the watcher on one connection for a bounded period
+            # even when an opening burst is active; another protection signal
+            # extends the cooldown.
+            self._schedule_rate_limit_until = max(
+                self._schedule_rate_limit_until,
+                now + self.SCHEDULE_RATE_LIMIT_COOLDOWN_SECONDS,
+            )
         if result.get("ok"):
             self._schedule_timeout_streak = 0
             payload = result.get("data")
@@ -306,16 +379,13 @@ class CgvEngine(RuntimeCgvEngine):
         effective = self._effective_schedule_concurrency(concurrency)
         result = self._run_schedule_race_once(page, url, effective)
 
-        status = int(result.get("status", 0) or 0)
-        statuses = {
-            int(value or 0)
-            for value in result.get("statuses", [])
-            if str(value or "").strip()
-        }
-        unauthorized = status == 401 or 401 in statuses
+        unauthorized = self._schedule_result_is_unauthorized(result)
         if unauthorized and not self.stop_event.is_set():
             if self._refresh_schedule_session(page):
                 result = self._run_schedule_race_once(page, url, effective)
+
+        if self._schedule_result_is_unauthorized(result):
+            result = self._normalize_schedule_auth_failure(result)
 
         self._update_schedule_watch_health(result)
         self._sync_schedule_poll_interval()
