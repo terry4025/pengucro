@@ -1,11 +1,20 @@
+import asyncio
+import hashlib
 import json
 import re
 import threading
 import time
+from collections import OrderedDict
 
+import aiohttp
 import requests
 from bs4 import BeautifulSoup
 
+from engines.async_hot_path import (
+    create_isolated_session,
+    create_shared_connector,
+    drain_response,
+)
 from engines.base_engine import BaseEngine
 from pengucro.diagnostics import format_exception
 
@@ -17,10 +26,56 @@ class JigubyeolEngine(BaseEngine):
     # locks up permanently.
     LOOKUP_TIMEOUT = 5
     SUBMIT_TIMEOUT = 8
+    USE_ASYNC_HOT_PATH = True
+    ERROR_CACHE_SIZE = 64
+    _INPUT_TAG_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+    _NAME_ATTR_RE = re.compile(
+        r"\bname\s*=\s*(['\"]?)payment_method\1(?:\s|/?>)",
+        re.IGNORECASE,
+    )
+    _VALUE_ATTR_RE = re.compile(
+        r"\bvalue\s*=\s*(?:['\"]([^'\"]*)['\"]|([^\s>]+))",
+        re.IGNORECASE,
+    )
 
     def __init__(self, log_callback, success_callback=None, site_url=None):
         super().__init__(log_callback, success_callback)
         self.base_url = site_url if site_url else 'https://www.xn--2e0b040a4xj.com'
+        self._async_error_cache: OrderedDict[str, str] = OrderedDict()
+        self._time_selection_headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': f'{self.base_url}/reservation',
+            'Origin': self.base_url,
+        }
+
+    def _cached_error_message(self, decoded_text, reservation_data=None):
+        raw = str(decoded_text or "")
+        digest = hashlib.blake2s(raw.encode("utf-8", errors="replace"), digest_size=12).hexdigest()
+        cached = self._async_error_cache.get(digest)
+        if cached is not None:
+            self._async_error_cache.move_to_end(digest)
+            return cached
+        message = self._safe_error_message(raw, reservation_data)
+        self._async_error_cache[digest] = message
+        self._async_error_cache.move_to_end(digest)
+        while len(self._async_error_cache) > self.ERROR_CACHE_SIZE:
+            self._async_error_cache.popitem(last=False)
+        return message
+
+    @classmethod
+    def _payment_method_from_html(cls, decoded_html):
+        """Read the one hot-path hidden value without a full DOM allocation."""
+
+        text = str(decoded_html or "")
+        for tag in cls._INPUT_TAG_RE.findall(text):
+            if not cls._NAME_ATTR_RE.search(tag):
+                continue
+            value = cls._VALUE_ATTR_RE.search(tag)
+            if value:
+                return value.group(1) if value.group(1) is not None else value.group(2)
+            return "1"
+        return "1"
 
     @staticmethod
     def _worker_name(task_idx=None):
@@ -238,9 +293,7 @@ class JigubyeolEngine(BaseEngine):
                     except Exception:
                         decoded_html = step1_response.text
                     
-                    soup = BeautifulSoup(decoded_html, 'html.parser')
-                    payment_input = soup.find('input', {'name': 'payment_method'})
-                    payment_method = payment_input.get('value', '1') if payment_input else '1'
+                    payment_method = self._payment_method_from_html(decoded_html)
                     
                     stage = "최종 예약"
                     started = time.perf_counter()
@@ -330,9 +383,6 @@ class JigubyeolEngine(BaseEngine):
         )
 
     async def make_reservation_async_task(self, reservation_data, task_idx):
-        import asyncio
-        import aiohttp
-        
         session = None
         csrf_token = None
         worker_name = self._worker_name(task_idx)
@@ -364,7 +414,12 @@ class JigubyeolEngine(BaseEngine):
                 stage = "CSRF 준비"
                 try:
                     if not csrf_token:
-                        async with self.async_csrf_lock:
+                        refresh_gate = getattr(
+                            self,
+                            "async_csrf_semaphore",
+                            self.async_csrf_lock,
+                        )
+                        async with refresh_gate:
                             csrf_token = await self.get_csrf_token_async(session, worker_name)
                     
                     if self.stop_event.is_set():
@@ -372,12 +427,17 @@ class JigubyeolEngine(BaseEngine):
 
                     # Step 1: 시간 선택 선등록
                     stage = "시간 선택"
+                    await self.wait_async_scan_turn()
+                    if self.stop_event.is_set():
+                        break
                     started = time.perf_counter()
                     step1_response = await self.submit_time_selection_async(session, csrf_token, reservation_data)
                     step1_rtt = self._elapsed_ms(started)
+                    recovery_delay = self.observe_async_response(step1_response, step1_rtt)
                     if step1_response.status in (200, 201):
                         self._log_http(worker_name, stage, step1_response.status, step1_rtt)
                     if step1_response.status == 419:
+                        await drain_response(step1_response)
                         self.log(
                             f"[{worker_name}] {target_time} 시도 중... "
                             f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
@@ -392,6 +452,7 @@ class JigubyeolEngine(BaseEngine):
                             stage,
                             worker_name=worker_name,
                             rtt_ms=step1_rtt,
+                            recovery_delay=recovery_delay,
                         )
                         continue
 
@@ -399,21 +460,21 @@ class JigubyeolEngine(BaseEngine):
                     try:
                         decoded_html = await step1_response.text()
                     except Exception:
+                        await drain_response(step1_response)
                         decoded_html = str(step1_response)
 
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(decoded_html, 'html.parser')
-                    payment_input = soup.find('input', {'name': 'payment_method'})
-                    payment_method = payment_input.get('value', '1') if payment_input else '1'
+                    payment_method = self._payment_method_from_html(decoded_html)
 
                     stage = "최종 예약"
                     started = time.perf_counter()
                     step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
                     step2_rtt = self._elapsed_ms(started)
+                    final_recovery_delay = self.observe_async_response(step2_response, step2_rtt)
                     if step2_response.status in (200, 201):
                         self._log_http(worker_name, stage, step2_response.status, step2_rtt)
 
                     if step2_response.status == 419:
+                        await drain_response(step2_response)
                         self.log(
                             f"[{worker_name}] {target_time} 시도 중... "
                             f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
@@ -423,6 +484,7 @@ class JigubyeolEngine(BaseEngine):
                         continue
 
                     if step2_response.status in (200, 201):
+                        await drain_response(step2_response)
                         try:
                             stage = "완료 정보 확인"
                             done_url = f"{self.base_url}/reservation/done"
@@ -455,17 +517,21 @@ class JigubyeolEngine(BaseEngine):
                             stage,
                             worker_name=worker_name,
                             rtt_ms=step2_rtt,
+                            recovery_delay=final_recovery_delay,
                         )
                 except Exception as e:
                     if self.stop_event.is_set():
                         break
                     csrf_token = None
+                    recovery_delay = self.observe_async_network_failure()
                     self.log(
                         f"[{worker_name}] {target_time} 시도 중... ({stage} 오류 · "
-                        f"{self._format_exception(e, reservation_data)} · CSRF 초기화 후 재시도)",
+                        f"{self._format_exception(e, reservation_data)} · "
+                        f"복구 간격 {max(0.1, recovery_delay):.1f}초 · "
+                        "CSRF 초기화 후 재시도)",
                         "warning",
                     )
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(max(0.1, recovery_delay))
         finally:
             is_pooled = hasattr(self, "session_pool") and len(self.session_pool) > 0
             if not is_pooled:
@@ -496,14 +562,11 @@ class JigubyeolEngine(BaseEngine):
             '_token': csrf_token,
         }
         
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': f'{self.base_url}/reservation',
-            'Origin': self.base_url,
-        }
-        
-        return await session.post(f'{self.base_url}/reservation/create', data=form_data, headers=headers)
+        return await session.post(
+            f'{self.base_url}/reservation/create',
+            data=form_data,
+            headers=self._time_selection_headers,
+        )
 
     async def submit_reservation_async(self, session, csrf_token, reservation_data, payment_method):
         time_val = reservation_data['reservationTime']
@@ -545,15 +608,19 @@ class JigubyeolEngine(BaseEngine):
         step_name,
         worker_name="작업 1",
         rtt_ms=0.0,
+        recovery_delay=0.0,
     ):
         time_slot = reservation_data['reservationTime'][:5]
         try:
             decoded_text = await response.text()
         except Exception:
+            await drain_response(response)
             decoded_text = str(response)
             
-        error_message = self._safe_error_message(decoded_text, reservation_data)
+        error_message = self._cached_error_message(decoded_text, reservation_data)
         response_meta = f"{step_name} 거절 · HTTP {response.status} · RTT {rtt_ms:.0f}ms"
+        if recovery_delay:
+            response_meta += f" · 서버 복구 간격 {recovery_delay:.1f}초"
             
         if "이미 예약" in error_message:
             retry_reason = "이미 예약된 시간대 · 다시 열릴 때까지 재시도"
@@ -567,40 +634,40 @@ class JigubyeolEngine(BaseEngine):
         )
 
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
-        import aiohttp
-        import asyncio
         self.log(f"지구별 연결 예열 시작 · 세션 {num_sessions}개", "info")
         
         self.session_pool = []
+        self._shared_connector = create_shared_connector(num_sessions)
         
         async def fetch_one(idx):
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            session = aiohttp.ClientSession(
+            session = create_isolated_session(
+                self._shared_connector,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT),
             )
             try:
+                await self.wait_async_scan_turn()
                 csrf = await self.get_csrf_token_async(session, f"예열 {idx + 1}")
                 return session, csrf
             except Exception as e:
-                await session.close()
                 self.log(
                     f"[예열 {idx + 1}] CSRF 준비 실패 · {self._format_exception(e)} · "
-                    "해당 세션 제외",
+                    "실행 중 해당 세션 자동 복구",
                     "warning",
                 )
-                return None
+                return session, None
                 
         tasks = [fetch_one(i) for i in range(num_sessions)]
         results = await asyncio.gather(*tasks)
         
-        for res in results:
-            if res:
-                self.session_pool.append(res)
+        self.session_pool.extend(results)
                 
+        prepared = sum(1 for _session, token in self.session_pool if token)
         self.log(
-            f"지구별 연결 예열 완료 · 성공 {len(self.session_pool)}/{num_sessions}",
+            f"지구별 연결 예열 완료 · CSRF 준비 {prepared}/{num_sessions} · "
+            "전체 세션 연속 스캔 시작",
             "info",
         )

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
+from engines.async_hot_path import AsyncHotPathScheduler
 from pengucro import logging_setup
 from pengucro.diagnostics import format_exception
 from pengucro.models import BookingEvent, BookingEventType, BookingResult
-
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +115,9 @@ class BaseEngine:
         # consumer and each line retains its concrete engine class.
         logging_setup.persist_log_line(self.__class__.__name__, message, log_type)
 
-        if "시도 중" in message:
+        # ``silent_tick`` already counted the attempt before emitting its first
+        # visible warning line.  Do not count that diagnostic line a second time.
+        if "시도 중" in message and not message.startswith("⚠️ "):
             error_part = "재시도"
             if "시도 중... (" in message:
                 error_part = message.split("시도 중... (", 1)[1].rstrip(")")
@@ -262,9 +266,18 @@ class BaseEngine:
     ) -> None:
         self.async_submission_lock = asyncio.Lock()
         self.async_csrf_lock = asyncio.Lock()
-        if hasattr(self, "pre_fetch_sessions_async"):
-            await self.pre_fetch_sessions_async(num_tasks, reservation_data)
+        if getattr(self, "USE_ASYNC_HOT_PATH", False):
+            self.async_request_scheduler = AsyncHotPathScheduler(num_tasks)
+            self.async_csrf_semaphore = asyncio.Semaphore(max(1, min(num_tasks, 8)))
+            self.log(
+                f"비동기 연속 스캔 시작 · 최대 동시 요청 {num_tasks}개 · "
+                f"초기 요청 간격 {self.async_request_scheduler.spacing_seconds * 1000:.1f}ms · "
+                "응답 완료 슬롯 즉시 재투입",
+                "info",
+            )
         try:
+            if hasattr(self, "pre_fetch_sessions_async"):
+                await self.pre_fetch_sessions_async(num_tasks, reservation_data)
             workers = [
                 asyncio.create_task(
                     self.make_reservation_async_task(reservation_data, start_idx_offset + index),
@@ -291,6 +304,37 @@ class BaseEngine:
                 continue
         if hasattr(self, "session_pool"):
             self.session_pool = []
+        connector = getattr(self, "_shared_connector", None)
+        if connector is not None:
+            try:
+                result = connector.close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
+            self._shared_connector = None
+
+    async def wait_async_scan_turn(self) -> float:
+        scheduler = getattr(self, "async_request_scheduler", None)
+        if scheduler is None:
+            return 0.0
+        return await scheduler.wait_turn(self.stop_event)
+
+    def observe_async_response(self, response, rtt_ms: float) -> float:
+        scheduler = getattr(self, "async_request_scheduler", None)
+        if scheduler is None:
+            return 0.0
+        return scheduler.observe_response(
+            int(getattr(response, "status", 0) or 0),
+            rtt_ms,
+            getattr(response, "headers", None),
+        )
+
+    def observe_async_network_failure(self) -> float:
+        scheduler = getattr(self, "async_request_scheduler", None)
+        if scheduler is None:
+            return 0.0
+        return scheduler.observe_network_failure()
 
     # How long workers get to wind down *after* stop_event has been set. This is
     # not a limit on how long a run may take: a booking that opens tomorrow waits

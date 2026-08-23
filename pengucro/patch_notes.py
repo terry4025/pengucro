@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.53",
+        changes=(
+            "지구별·제로월드 연속 슬롯 조회 시 연결 재사용과 분산 스케줄링으로 탐색 가속",
+            "HTTP 오류 및 과부하 응답 발생 시 자동 지연 복구로 요청 안정화",
+        ),
+    ),
+    PatchNote(
         version="6.52",
         changes=(
             "단편선 오픈 직전 주문 필드 사전 준비로 오픈 즉시 빠른 주문 생성",

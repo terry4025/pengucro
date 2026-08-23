@@ -692,7 +692,9 @@ class MainWindow(ctk.CTk):
 
         # Worker threads only write to this queue. Tk widgets are touched by
         # the main-thread polling loop below.
-        self.engine_event_queue = queue.Queue()
+        # Keep every engine event visible (no coalescing/batching), while using
+        # the lower-overhead unbounded queue for high-rate 50-worker scans.
+        self.engine_event_queue = queue.SimpleQueue()
         self._ui_polling = True
 
         # Dragging variables

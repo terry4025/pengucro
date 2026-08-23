@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
+from html import unescape
 
 import requests
 from bs4 import BeautifulSoup
-
 
 SELECT_URL = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
 SUBJECT_BY_BRANCH = {"1": "A", "2": "B", "4": "A", "5": "A"}
@@ -91,6 +91,71 @@ def parse_time_slots(html: str) -> list[ZeroWorldTimeSlot]:
             )
         )
     return slots
+
+
+_TIME_ELEMENT_RE = re.compile(
+    r"<(?P<tag>a|button)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_CLASS_RE = re.compile(r"\bclass\s*=\s*(['\"])(.*?)\1", re.IGNORECASE | re.DOTALL)
+_SLOT_ACTION_RE = re.compile(r"fun_theme_time_select\('([^']+)'", re.IGNORECASE)
+_ANY_TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
+
+
+def find_target_time_slot(
+    html: str,
+    target_time: str,
+) -> tuple[ZeroWorldTimeSlot | None, int]:
+    """Find one target slot without building a full BeautifulSoup tree.
+
+    Live responses consist of independent ``a``/``button`` time elements.  The
+    regex path keeps the 50-worker event loop free; unfamiliar markup falls
+    back to the compatibility parser instead of silently changing behaviour.
+    """
+
+    normalized_target = str(target_time or "")[:5].zfill(5)
+    candidates: list[ZeroWorldTimeSlot] = []
+    slot_count = 0
+    recognized_markup = False
+
+    for element in _TIME_ELEMENT_RE.finditer(str(html or "")):
+        attrs = element.group("attrs")
+        label = unescape(_HTML_TAG_RE.sub(" ", element.group("body")))
+        time_match = _ANY_TIME_RE.search(label)
+        if not time_match:
+            continue
+        recognized_markup = True
+        slot_count += 1
+        slot_time = time_match.group(1).zfill(5)
+        if slot_time != normalized_target:
+            continue
+
+        action_match = _SLOT_ACTION_RE.search(attrs)
+        class_match = _CLASS_RE.search(attrs)
+        classes = set((class_match.group(2) if class_match else "").lower().split())
+        disabled = bool(
+            re.search(r"(?:^|\s)disabled(?:\s*=|\s|$)", attrs, re.IGNORECASE)
+        ) or bool(classes.intersection({"disable", "disabled", "close", "sold-out"}))
+        candidates.append(
+            ZeroWorldTimeSlot(
+                time=slot_time,
+                slot_id=action_match.group(1) if action_match else "",
+                available=bool(action_match) and not disabled,
+            )
+        )
+
+    if recognized_markup:
+        if not candidates:
+            return None, slot_count
+        return next((slot for slot in candidates if slot.available), candidates[0]), slot_count
+
+    # Preserve compatibility if the provider changes its element shape.
+    slots = parse_time_slots(html)
+    matching = [slot for slot in slots if slot.time == normalized_target]
+    if not matching:
+        return None, len(slots)
+    return next((slot for slot in matching if slot.available), matching[0]), len(slots)
 
 
 def fetch_themes(branch_id: str, reservation_date: str | None = None, timeout: float = 8.0) -> dict[str, str]:

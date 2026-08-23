@@ -1,5 +1,6 @@
 from engines.zeroworld_catalog import (
     calendar_contains_date,
+    find_target_time_slot,
     parse_theme_list,
     parse_time_slots,
     subject_for_branch,
@@ -58,6 +59,37 @@ def test_parse_time_slots_keeps_disabled_future_buttons():
         ("09:45", False),
         ("10:55", True),
     ]
+
+
+def test_fast_target_parser_keeps_count_and_closed_slot_id():
+    html = """
+    <a class="choice-time__time" href="javascript:fun_theme_time_select('435','0')">
+      <span>11:00</span>
+    </a>
+    <a class="choice-time__time disabled"
+       href="javascript:fun_theme_time_select('901','1')"><strong>21:20</strong></a>
+    """
+
+    slot, count = find_target_time_slot(html, "21:20")
+
+    assert count == 2
+    assert slot is not None
+    assert slot.slot_id == "901"
+    assert slot.available is False
+
+
+def test_fast_target_parser_prefers_available_duplicate():
+    html = """
+    <button class="disabled" onclick="fun_theme_time_select('old')">09:45</button>
+    <button onclick="fun_theme_time_select('new')">09:45</button>
+    """
+
+    slot, count = find_target_time_slot(html, "09:45")
+
+    assert count == 2
+    assert slot is not None
+    assert slot.slot_id == "new"
+    assert slot.available is True
 
 
 def test_calendar_date_detection_matches_live_markup_contract():

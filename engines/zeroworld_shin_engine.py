@@ -13,12 +13,13 @@ from typing import Any
 import aiohttp
 from bs4 import BeautifulSoup
 
+from engines.async_hot_path import create_isolated_session, create_shared_connector
 from engines.base_engine import BaseEngine
 from engines.zeroworld_catalog import (
     ZeroWorldTimeSlot,
     calendar_contains_date,
     decode_body,
-    parse_time_slots,
+    find_target_time_slot,
     subject_for_branch,
 )
 from pengucro.diagnostics import format_exception, write_redacted_debug_text
@@ -41,6 +42,8 @@ class ZeroWorldContext:
 class ZeroWorldShinEngine(BaseEngine):
     """Reservation adapter for the current Sinbiweb ZeroWorld site."""
 
+    USE_ASYNC_HOT_PATH = True
+
     SELECT_URL = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
     ACTION_URL = "https://zeroworldkorea.com/core/res/rev.act.php"
     PAYMENT_URL = "https://zeroworldkorea.com/core/res/rev.make.mutong.php"
@@ -62,6 +65,8 @@ class ZeroWorldShinEngine(BaseEngine):
         }
         self.supported_branches = set(self.subject_by_branch) or set(self.SUPPORTED_BRANCHES)
         self._last_messages: dict[str, float] = {}
+        self._slot_lookup_key: tuple[str, str, str] | None = None
+        self._slot_lookup_payload: dict[str, str] = {}
 
     @staticmethod
     def _elapsed_ms(started: float) -> float:
@@ -155,6 +160,51 @@ class ZeroWorldShinEngine(BaseEngine):
     def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         asyncio.run(self.make_reservation_async_task(reservation_data, 0))
 
+    async def pre_fetch_sessions_async(
+        self,
+        num_sessions: int,
+        reservation_data: dict[str, Any],
+    ) -> None:
+        """Warm isolated booking sessions over one shared DNS/TLS connector."""
+
+        context = self._build_context(reservation_data)
+        self.session_pool = []
+        self._shared_connector = create_shared_connector(num_sessions)
+        timeout = aiohttp.ClientTimeout(total=8)
+        self.log(f"제로월드 연결·예약 단계 예열 시작 · 세션 {num_sessions}개", "info")
+
+        async def prepare_one(index: int):
+            session = create_isolated_session(
+                self._shared_connector,
+                headers=self._headers(context),
+                timeout=timeout,
+            )
+            try:
+                await self.wait_async_scan_turn()
+                prepared = await self._prestage_session(
+                    session,
+                    context,
+                    f"예열 {index + 1}",
+                )
+                return session, prepared, ""
+            except Exception as exc:
+                self.log(
+                    f"[예열 {index + 1}] 예약 단계 예열 실패 · "
+                    f"{self._format_exception(exc, context)} · 실행 중 자동 복구",
+                    "warning",
+                )
+                return session, False, ""
+
+        self.session_pool = list(
+            await asyncio.gather(*(prepare_one(index) for index in range(num_sessions)))
+        )
+        prepared_count = sum(1 for _session, prepared, _slot in self.session_pool if prepared)
+        self.log(
+            f"제로월드 연결·예약 단계 예열 완료 · 준비 {prepared_count}/{num_sessions} · "
+            "전체 세션 연속 스캔 시작",
+            "info",
+        )
+
     async def make_reservation_async_task(self, reservation_data: dict[str, Any], task_idx: int) -> None:
         try:
             context = self._build_context(reservation_data)
@@ -169,19 +219,30 @@ class ZeroWorldShinEngine(BaseEngine):
             f"{context.reservation_date} {context.target_time}",
             "info",
         )
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(headers=self._headers(context), timeout=timeout) as session:
+        pooled = bool(getattr(self, "session_pool", []))
+        if pooled:
+            session, session_prepared, preselected_slot_id = self.session_pool[
+                task_idx % len(self.session_pool)
+            ]
+        else:
+            session = aiohttp.ClientSession(
+                headers=self._headers(context),
+                timeout=aiohttp.ClientTimeout(total=8),
+            )
             session_prepared = False
             preselected_slot_id = ""
+        try:
             while not self.stop_event.is_set():
                 stage = "예약 단계 사전 준비"
                 try:
+                    await self.wait_async_scan_turn()
+                    if self.stop_event.is_set():
+                        return
                     if not session_prepared:
                         session_prepared = await self._prestage_session(
                             session, context, worker_name
                         )
                         if not session_prepared:
-                            await asyncio.sleep(0.15)
                             continue
 
                     stage = "슬롯 조회"
@@ -190,7 +251,6 @@ class ZeroWorldShinEngine(BaseEngine):
                     )
                     if target_slot is None:
                         self.silent_tick(f"{context.target_time} 슬롯 대기")
-                        await asyncio.sleep(0.15)
                         continue
 
                     if not target_slot.available:
@@ -207,7 +267,6 @@ class ZeroWorldShinEngine(BaseEngine):
                             ):
                                 preselected_slot_id = target_slot.slot_id
                         self.silent_tick(f"{context.target_time} 슬롯 대기")
-                        await asyncio.sleep(0.15)
                         continue
 
                     slot_id = target_slot.slot_id
@@ -236,20 +295,25 @@ class ZeroWorldShinEngine(BaseEngine):
                     preselected_slot_id = ""
                     await asyncio.sleep(0.4)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    recovery_delay = self.observe_async_network_failure()
                     self._log_throttled(
                         f"network:{stage}",
                         f"[{worker_name}] {stage} 통신 오류 · {self._format_exception(exc, context)} · "
-                        "0.5초 후 재시도",
+                        f"복구 간격 {max(0.5, recovery_delay):.1f}초 후 재시도",
                     )
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(max(0.5, recovery_delay))
                 except Exception as exc:
+                    recovery_delay = self.observe_async_network_failure()
                     self._log_throttled(
                         f"unexpected:{stage}",
                         f"[{worker_name}] {stage} 처리 오류 · {self._format_exception(exc, context)} · "
-                        "0.5초 후 재시도",
+                        f"복구 간격 {max(0.5, recovery_delay):.1f}초 후 재시도",
                         "error",
                     )
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(max(0.5, recovery_delay))
+        finally:
+            if not pooled:
+                await session.close()
 
     async def _wait_for_date(
         self,
@@ -311,55 +375,62 @@ class ZeroWorldShinEngine(BaseEngine):
         context: ZeroWorldContext,
         worker_name: str = "작업 1",
     ) -> ZeroWorldTimeSlot | None:
-        payload = {
-            "act": "theme_time_list",
-            "zizum_num": context.branch,
-            "rev_days": context.reservation_date,
-            "theme_num": context.theme,
-        }
+        lookup_key = (context.branch, context.reservation_date, context.theme)
+        if lookup_key != self._slot_lookup_key:
+            self._slot_lookup_key = lookup_key
+            self._slot_lookup_payload = {
+                "act": "theme_time_list",
+                "zizum_num": context.branch,
+                "rev_days": context.reservation_date,
+                "theme_num": context.theme,
+            }
         started = time.perf_counter()
-        async with session.post(self.select_url, data=payload) as response:
+        async with session.post(self.select_url, data=self._slot_lookup_payload) as response:
             status = response.status
             if response.status != 200:
                 await response.read()
                 rtt_ms = self._elapsed_ms(started)
+                recovery_delay = self.observe_async_response(response, rtt_ms)
+                recovery_detail = (
+                    f" · 서버 복구 간격 {recovery_delay:.1f}초"
+                    if recovery_delay
+                    else ""
+                )
                 self._log_throttled(
                     f"slot-http:{status}",
                     f"[{worker_name}] 슬롯 조회 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms · "
-                    "서버 응답 오류로 재시도",
+                    f"서버 응답 오류{recovery_detail}로 재시도",
                     "warning",
                 )
                 return None
             body = decode_body(await response.read())
         rtt_ms = self._elapsed_ms(started)
-        slots = parse_time_slots(body)
-        matching_slots = [slot for slot in slots if slot.time == context.target_time]
-        if matching_slots:
-            slot = next(
-                (candidate for candidate in matching_slots if candidate.available),
-                matching_slots[0],
-            )
+        recovery_delay = self.observe_async_response(response, rtt_ms)
+        slot, slot_count = find_target_time_slot(body, context.target_time)
+        if slot is not None:
             if slot.available:
                 self._log_http(
                     worker_name,
                     "슬롯 조회",
                     status,
                     rtt_ms,
-                    f"조회 {len(slots)}개 · {context.target_time} 발견 · 슬롯 ID {slot.slot_id}",
+                    f"조회 {slot_count}개 · {context.target_time} 발견 · 슬롯 ID {slot.slot_id}",
                 )
             else:
                 slot_detail = f" · 슬롯 ID {slot.slot_id}" if slot.slot_id else ""
                 self._log_throttled(
                     f"slot:{context.target_time}",
                     f"[{worker_name}] 슬롯 조회 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms · "
-                    f"조회 {len(slots)}개 · {context.target_time} 예약불가{slot_detail} · 재시도",
+                    f"조회 {slot_count}개 · {context.target_time} 예약불가{slot_detail} · 재시도",
                     "info",
                 )
             return slot
+        recovery_detail = f" · 서버 복구 간격 {recovery_delay:.1f}초" if recovery_delay else ""
         self._log_throttled(
             f"slot:{context.target_time}",
             f"[{worker_name}] 슬롯 조회 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms · "
-            f"조회 {len(slots)}개 · {context.target_time} 미공개 또는 예약불가 · 재시도",
+            f"조회 {slot_count}개 · {context.target_time} 미공개 또는 예약불가"
+            f"{recovery_detail} · 재시도",
             "info",
         )
         return None
@@ -478,13 +549,23 @@ class ZeroWorldShinEngine(BaseEngine):
         async with session.post(self.select_url, data=data) as response:
             await response.read()
             status = response.status
+            recovery_delay = self.observe_async_response(
+                response,
+                self._elapsed_ms(started),
+            )
         succeeded = 200 <= status < 300
         self._log_http(
             worker_name,
             stage,
             status,
             self._elapsed_ms(started),
-            "" if succeeded else "사전 준비 실패 · 재시도",
+            ""
+            if succeeded
+            else (
+                "사전 준비 실패"
+                f"{f' · 서버 복구 간격 {recovery_delay:.1f}초' if recovery_delay else ''}"
+                " · 재시도"
+            ),
             "info" if succeeded else "warning",
         )
         return succeeded

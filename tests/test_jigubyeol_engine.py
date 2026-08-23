@@ -141,6 +141,13 @@ def test_success_message_does_not_include_account_amount_or_deadline():
     assert "2026-08-14" not in message
 
 
+def test_payment_method_uses_fast_attribute_order_independent_parser():
+    assert JigubyeolEngine._payment_method_from_html(
+        '<input value="2" type="hidden" name="payment_method">'
+    ) == "2"
+    assert JigubyeolEngine._payment_method_from_html("<html>no hidden value</html>") == "1"
+
+
 def test_async_reservation_requests_run_concurrently():
     async def scenario():
         engine = make_engine()
@@ -158,7 +165,7 @@ def test_async_reservation_requests_run_concurrently():
             nonlocal active_submissions, max_active_submissions, completed
             active_submissions += 1
             max_active_submissions = max(max_active_submissions, active_submissions)
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.12)
             active_submissions -= 1
             completed += 1
             if completed >= 2:
@@ -180,7 +187,7 @@ def test_async_reservation_requests_run_concurrently():
     asyncio.run(scenario())
 
 
-def test_async_csrf_refresh_is_serialized():
+def test_async_csrf_refresh_uses_bounded_parallel_recovery():
     async def scenario():
         engine = make_engine()
         active_refreshes = 0
@@ -211,6 +218,78 @@ def test_async_csrf_refresh_is_serialized():
 
         await engine.run_async_tasks(reservation_data(), 2)
 
-        assert max_active_refreshes == 1
+        assert max_active_refreshes == 2
 
     asyncio.run(scenario())
+
+
+def test_error_html_is_parsed_once_while_every_attempt_is_still_logged(monkeypatch):
+    logs = []
+    engine = make_engine(logs)
+    parses = 0
+    original = engine._safe_error_message
+
+    def counted(body, data=None):
+        nonlocal parses
+        parses += 1
+        return original(body, data)
+
+    monkeypatch.setattr(engine, "_safe_error_message", counted)
+    response_body = "<html><body>아직 예약할 수 없습니다.</body></html>"
+
+    asyncio.run(
+        engine.handle_error_async(
+            AsyncResponse(422, response_body),
+            reservation_data(),
+            "시간 선택",
+        )
+    )
+    asyncio.run(
+        engine.handle_error_async(
+            AsyncResponse(422, response_body),
+            reservation_data(),
+            "시간 선택",
+        )
+    )
+
+    assert parses == 1
+    assert len(logs) == 2
+
+
+def test_configured_fifty_workers_can_all_remain_in_flight():
+    async def scenario():
+        engine = make_engine()
+        active = 0
+        peak = 0
+        all_started = asyncio.Event()
+
+        async def prefetch(num_sessions, _reservation_data):
+            engine.session_pool = [
+                (AsyncSession(), f"csrf-{idx}") for idx in range(num_sessions)
+            ]
+
+        async def submit_time_selection(_session, _csrf_token, _reservation_data):
+            return AsyncResponse(200, '<input name="payment_method" value="1">')
+
+        async def submit_reservation(_session, _csrf_token, _reservation_data, _payment_method):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active == 50:
+                all_started.set()
+                engine.stop_event.set()
+            await asyncio.wait_for(all_started.wait(), timeout=1.0)
+            active -= 1
+            return AsyncResponse(419, "CSRF expired")
+
+        engine.pre_fetch_sessions_async = prefetch
+        engine.submit_time_selection_async = submit_time_selection
+        engine.submit_reservation_async = submit_reservation
+
+        await asyncio.wait_for(
+            engine.run_async_tasks(reservation_data(), 50),
+            timeout=2.0,
+        )
+        return peak
+
+    assert asyncio.run(scenario()) == 50

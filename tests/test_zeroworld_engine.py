@@ -3,8 +3,8 @@ import asyncio
 import pytest
 
 import engines.zeroworld_shin_engine as zeroworld_shin
-from engines.zeroworld_shin_engine import ZeroWorldShinEngine
 from engines.zeroworld_catalog import ZeroWorldTimeSlot
+from engines.zeroworld_shin_engine import ZeroWorldShinEngine
 from pengucro.models import BookingResult
 
 
@@ -257,6 +257,9 @@ def test_worker_skips_calendar_and_reuses_closed_slot_preselection(monkeypatch):
 
         async def __aexit__(self, *_args):
             return False
+
+        async def close(self):
+            return None
 
     async def fake_prestage(_session, _context, _worker_name):
         calls["prestage"] += 1
