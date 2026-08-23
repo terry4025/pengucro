@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.52",
+        changes=(
+            "단편선 오픈 직전 주문 필드 사전 준비로 오픈 즉시 빠른 주문 생성",
+            "지구별 슬롯 미오픈 상태에서 시간 선택을 미리 준비해 오픈 즉시 선점 속도 개선",
+        ),
+    ),
+    PatchNote(
         version="6.51",
         changes=(
             "키이스케이프 전체 지점·테마의 공개 시간표 일괄 저장 기능 추가",

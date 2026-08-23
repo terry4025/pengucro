@@ -255,6 +255,8 @@ class DpsnnnEngine(BaseEngine):
     POLL_INTERVAL = 0.04
     WORKER_STAGGER = 0.20
     REQUEST_TIMEOUT = 8.0
+    PAYLOAD_PRESTAGE_SECONDS = 3.0
+    PAYLOAD_MAX_AGE_SECONDS = 15.0
 
     def __init__(
         self,
@@ -414,6 +416,54 @@ class DpsnnnEngine(BaseEngine):
             missing = ", ".join(sorted(required.difference(values)))
             raise ValueError(f"예약 주문 필드가 부족합니다: {missing}")
         return values
+
+    @classmethod
+    def _payload_prestage_due(
+        cls,
+        date_str: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        current = now or datetime.now()
+        seconds_until_open = (
+            calculate_dpsnnn_open_datetime(date_str) - current
+        ).total_seconds()
+        return (
+            -cls.PAYLOAD_MAX_AGE_SECONDS
+            <= seconds_until_open
+            <= cls.PAYLOAD_PRESTAGE_SECONDS
+        )
+
+    @classmethod
+    def _prepared_payload_usable(
+        cls,
+        payload: dict[str, str] | None,
+        slot_id: str,
+        prepared_at: float,
+        *,
+        date_str: str = "",
+        now_monotonic: float | None = None,
+    ) -> bool:
+        if not payload or str(payload.get("prod_idx", "")) != str(slot_id):
+            return False
+        required = ("start_day", "start_timestamp", "end_day", "end_timestamp")
+        if any(not str(payload.get(field, "")).strip() for field in required):
+            return False
+        try:
+            start_timestamp = int(str(payload["start_timestamp"]))
+            end_timestamp = int(str(payload["end_timestamp"]))
+            if start_timestamp <= 0 or end_timestamp < start_timestamp:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if date_str:
+            target_day = date_str.replace("-", "")
+            start_day = str(payload["start_day"]).replace("-", "")
+            if start_day != target_day:
+                return False
+        current = time.monotonic() if now_monotonic is None else now_monotonic
+        age = current - prepared_at
+        return 0.0 <= age <= cls.PAYLOAD_MAX_AGE_SECONDS
 
     def _add_order(
         self,
@@ -980,6 +1030,11 @@ class DpsnnnEngine(BaseEngine):
         target_time = str(reservation_data.get("reservationTime", ""))[:5]
         session = create_dpsnnn_session()
         reserve_url = urllib.parse.urljoin(branch["base_url"] + "/", branch["reserve_path"].lstrip("/"))
+        prepared_payload: dict[str, str] | None = None
+        prepared_slot_id = ""
+        payload_prepared_at = 0.0
+        prestage_retry_after = 0.0
+        prestage_completed_slot_id = ""
         current_stage = "예약 홈 예열"
         try:
             started = time.perf_counter()
@@ -1035,7 +1090,65 @@ class DpsnnnEngine(BaseEngine):
                         diagnostics=poll_diagnostics,
                     )
                     target = next((item for item in slots if item.time == target_time), None)
+                    if (
+                        prepared_slot_id
+                        and target is not None
+                        and target.slot_id != prepared_slot_id
+                    ):
+                        prepared_payload = None
+                        prepared_slot_id = ""
+                        payload_prepared_at = 0.0
+                        prestage_completed_slot_id = ""
+
                     if target is None or not target.available:
+                        now_monotonic = time.monotonic()
+                        if (
+                            target is not None
+                            and target.slot_id
+                            and self._payload_prestage_due(date_str)
+                            and now_monotonic >= prestage_retry_after
+                            and target.slot_id != prestage_completed_slot_id
+                            and not self._prepared_payload_usable(
+                                prepared_payload,
+                                target.slot_id,
+                                payload_prepared_at,
+                                date_str=date_str,
+                                now_monotonic=now_monotonic,
+                            )
+                        ):
+                            current_stage = "예약 주문 필드 사전 구성"
+                            try:
+                                candidate = self._build_order_payload(
+                                    session,
+                                    branch,
+                                    target.slot_id,
+                                    date_str,
+                                    worker_label,
+                                )
+                                candidate_prepared_at = time.monotonic()
+                                if not self._prepared_payload_usable(
+                                    candidate,
+                                    target.slot_id,
+                                    candidate_prepared_at,
+                                    date_str=date_str,
+                                    now_monotonic=candidate_prepared_at,
+                                ):
+                                    raise ValueError(
+                                        "사전 구성한 예약 주문 필드가 유효하지 않습니다."
+                                    )
+                                prepared_payload = candidate
+                                prepared_slot_id = target.slot_id
+                                payload_prepared_at = candidate_prepared_at
+                                prestage_completed_slot_id = target.slot_id
+                                self.log(
+                                    f"[{worker_label}] [사전 준비] slotId={target.slot_id} · "
+                                    "예약 상세 조회 2단계 완료",
+                                    "info",
+                                )
+                            except (requests.RequestException, ValueError, KeyError):
+                                prestage_retry_after = time.monotonic() + 0.25
+                                raise
+
                         message = (
                             f"{target_time} 오픈 대기"
                             if target is not None
@@ -1079,23 +1192,48 @@ class DpsnnnEngine(BaseEngine):
                             f"slotId={target.slot_id} · 주문 생성 단계로 이동",
                             "info",
                         )
-                        current_stage = "예약 주문 필드 구성"
-                        payload = self._build_order_payload(
-                            session,
-                            branch,
+                        if self._prepared_payload_usable(
+                            prepared_payload,
                             target.slot_id,
-                            date_str,
-                            worker_label,
-                        )
+                            payload_prepared_at,
+                            date_str=date_str,
+                        ):
+                            payload = prepared_payload
+                            self.log(
+                                f"[{worker_label}] [빠른 경로] slotId={target.slot_id} · "
+                                "사전 구성한 주문 필드 사용",
+                                "info",
+                            )
+                        else:
+                            current_stage = "예약 주문 필드 구성"
+                            payload = self._build_order_payload(
+                                session,
+                                branch,
+                                target.slot_id,
+                                date_str,
+                                worker_label,
+                            )
                         current_stage = "예약 주문 생성"
-                        order_code, message = self._add_order(
-                            session, branch, payload, worker_label
-                        )
+                        try:
+                            order_code, message = self._add_order(
+                                session, branch, payload, worker_label
+                            )
+                        except Exception:
+                            prepared_payload = None
+                            prepared_slot_id = ""
+                            payload_prepared_at = 0.0
+                            prestage_completed_slot_id = ""
+                            raise
                         if order_code:
                             # This event is set while holding submission_lock. Any
                             # worker that already observed the same slot must pass
                             # the same lock and will exit before creating an order.
                             self._order_claimed.set()
+                        else:
+                            prepared_payload = None
+                            prepared_slot_id = ""
+                            payload_prepared_at = 0.0
+                            prestage_completed_slot_id = ""
                     finally:
                         self.submission_lock.release()
 

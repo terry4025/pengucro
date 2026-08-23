@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Lock
 from threading import Event
@@ -120,6 +120,188 @@ def test_order_payload_combines_detail_and_calendar_hidden_fields():
     assert payload["prod_idx"] == "12"
     assert payload["start_timestamp"] == "1786201200"
     assert payload["unselected_end_day"] == "false"
+
+
+def test_payload_prestaging_starts_three_seconds_before_open():
+    open_at = calculate_dpsnnn_open_datetime("2026-08-15")
+
+    assert not DpsnnnEngine._payload_prestage_due(
+        "2026-08-15", now=open_at - timedelta(seconds=3.001)
+    )
+    assert DpsnnnEngine._payload_prestage_due(
+        "2026-08-15", now=open_at - timedelta(seconds=3)
+    )
+    assert DpsnnnEngine._payload_prestage_due(
+        "2026-08-15", now=open_at + timedelta(seconds=15)
+    )
+    assert not DpsnnnEngine._payload_prestage_due(
+        "2026-08-15", now=open_at + timedelta(seconds=15.001)
+    )
+
+
+def test_prepared_payload_requires_matching_slot_valid_timestamps_and_fresh_age():
+    payload = {
+        "prod_idx": "12",
+        "start_day": "2026-08-09",
+        "start_timestamp": "1786201200",
+        "end_day": "2026-08-09",
+        "end_timestamp": "1786201200",
+    }
+
+    assert DpsnnnEngine._prepared_payload_usable(
+        payload,
+        "12",
+        100.0,
+        date_str="2026-08-09",
+        now_monotonic=102.0,
+    )
+    assert not DpsnnnEngine._prepared_payload_usable(
+        payload, "99", 100.0, now_monotonic=102.0
+    )
+    assert not DpsnnnEngine._prepared_payload_usable(
+        payload, "12", 100.0, now_monotonic=116.0
+    )
+    payload["start_timestamp"] = "invalid"
+    assert not DpsnnnEngine._prepared_payload_usable(
+        payload, "12", 100.0, now_monotonic=102.0
+    )
+
+    payload["start_timestamp"] = "1786201200"
+    payload["start_day"] = "2026-08-10"
+    assert not DpsnnnEngine._prepared_payload_usable(
+        payload,
+        "12",
+        100.0,
+        date_str="2026-08-09",
+        now_monotonic=102.0,
+    )
+
+
+def test_closed_slot_payload_is_built_before_open_and_reused(monkeypatch):
+    fetch_count = 0
+    build_calls = []
+    add_calls = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        cookies = []
+
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+        def close(self):
+            return None
+
+    def fake_fetch(*_args, **_kwargs):
+        nonlocal fetch_count
+        fetch_count += 1
+        return [ZeroWorldTimeSlot("22:30", "12", fetch_count >= 2)]
+
+    payload = {
+        "prod_idx": "12",
+        "start_day": "2026-08-09",
+        "start_timestamp": "1786201200",
+        "end_day": "2026-08-09",
+        "end_timestamp": "1786201200",
+    }
+
+    def fake_build(*_args, **_kwargs):
+        build_calls.append(fetch_count)
+        return dict(payload)
+
+    def fake_add(_session, _branch, submitted, *_args, **_kwargs):
+        add_calls.append((fetch_count, submitted))
+        return "ORDER-1", "SUCCESS"
+
+    monkeypatch.setattr(module, "create_dpsnnn_session", Session)
+    monkeypatch.setattr(module, "fetch_exact_dpsnnn_slots", fake_fetch)
+    engine = DpsnnnEngine(lambda *_args: None)
+    monkeypatch.setattr(engine, "_payload_prestage_due", lambda *_args: True)
+    monkeypatch.setattr(engine, "_build_order_payload", fake_build)
+    monkeypatch.setattr(engine, "_add_order", fake_add)
+    monkeypatch.setattr(engine, "_complete_checkout", lambda *_args: (True, "ORDER-1"))
+
+    engine.make_reservation_thread(
+        {
+            "branch": "seongsu",
+            "themePK": "문장",
+            "reservationDate": "2026-08-09",
+            "reservationTime": "22:30:00",
+        }
+    )
+
+    assert build_calls == [1]
+    assert add_calls == [(2, payload)]
+
+
+def test_failed_order_discards_prestaged_payload_before_retry(monkeypatch):
+    fetch_count = 0
+    build_calls = []
+    add_calls = 0
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        cookies = []
+
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+        def close(self):
+            return None
+
+    def fake_fetch(*_args, **_kwargs):
+        nonlocal fetch_count
+        fetch_count += 1
+        return [ZeroWorldTimeSlot("22:30", "12", fetch_count >= 2)]
+
+    payload = {
+        "prod_idx": "12",
+        "start_day": "2026-08-09",
+        "start_timestamp": "1786201200",
+        "end_day": "2026-08-09",
+        "end_timestamp": "1786201200",
+    }
+
+    def fake_build(*_args, **_kwargs):
+        build_calls.append(fetch_count)
+        return dict(payload)
+
+    def fake_add(*_args, **_kwargs):
+        nonlocal add_calls
+        add_calls += 1
+        if add_calls == 1:
+            return "", "SOLD_OUT"
+        return "ORDER-2", "SUCCESS"
+
+    monkeypatch.setattr(module, "create_dpsnnn_session", Session)
+    monkeypatch.setattr(module, "fetch_exact_dpsnnn_slots", fake_fetch)
+    engine = DpsnnnEngine(lambda *_args: None)
+    monkeypatch.setattr(engine, "_payload_prestage_due", lambda *_args: True)
+    monkeypatch.setattr(engine, "_build_order_payload", fake_build)
+    monkeypatch.setattr(engine, "_add_order", fake_add)
+    monkeypatch.setattr(engine, "_complete_checkout", lambda *_args: (True, "ORDER-2"))
+
+    engine.make_reservation_thread(
+        {
+            "branch": "seongsu",
+            "themePK": "문장",
+            "reservationDate": "2026-08-09",
+            "reservationTime": "22:30:00",
+        }
+    )
+
+    assert build_calls == [1, 3]
+    assert add_calls == 2
 
 
 def test_engine_clamps_parallel_workers_to_measured_limit(monkeypatch):

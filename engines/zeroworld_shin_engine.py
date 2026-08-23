@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from engines.base_engine import BaseEngine
 from engines.zeroworld_catalog import (
+    ZeroWorldTimeSlot,
     calendar_contains_date,
     decode_body,
     parse_time_slots,
@@ -170,32 +171,69 @@ class ZeroWorldShinEngine(BaseEngine):
         )
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(headers=self._headers(context), timeout=timeout) as session:
-            date_open = False
+            session_prepared = False
+            preselected_slot_id = ""
             while not self.stop_event.is_set():
-                stage = "날짜 조회"
+                stage = "예약 단계 사전 준비"
                 try:
-                    if not date_open:
-                        date_open = await self._wait_for_date(session, context, worker_name)
-                        if not date_open:
+                    if not session_prepared:
+                        session_prepared = await self._prestage_session(
+                            session, context, worker_name
+                        )
+                        if not session_prepared:
                             await asyncio.sleep(0.15)
                             continue
 
                     stage = "슬롯 조회"
-                    slot_id = await self._find_slot(session, context, worker_name)
-                    if not slot_id:
+                    target_slot = await self._find_target_slot(
+                        session, context, worker_name
+                    )
+                    if target_slot is None:
                         self.silent_tick(f"{context.target_time} 슬롯 대기")
                         await asyncio.sleep(0.15)
                         continue
+
+                    if not target_slot.available:
+                        if (
+                            target_slot.slot_id
+                            and target_slot.slot_id != preselected_slot_id
+                        ):
+                            stage = "시간 선택 사전 준비"
+                            if await self._prepare_time_slot(
+                                session,
+                                target_slot.slot_id,
+                                worker_name,
+                                "시간 선택 사전 준비",
+                            ):
+                                preselected_slot_id = target_slot.slot_id
+                        self.silent_tick(f"{context.target_time} 슬롯 대기")
+                        await asyncio.sleep(0.15)
+                        continue
+
+                    slot_id = target_slot.slot_id
 
                     stage = "예약 제출"
                     async with self.async_submission_lock:
                         if self.stop_event.is_set():
                             return
+                        if preselected_slot_id != slot_id:
+                            stage = "시간 선택 준비"
+                            if not await self._prepare_time_slot(
+                                session, slot_id, worker_name, "시간 선택 준비"
+                            ):
+                                continue
+                            preselected_slot_id = slot_id
+                        stage = "예약 제출"
                         result = await self._submit(session, context, slot_id, worker_name)
                     if result:
                         self.log(f"[{worker_name}] 🎉 {result.message}", "success")
                         self.notify_success(result)
                         return
+                    # A pre-open time selection can be accepted at the HTTP
+                    # layer without becoming active server-side.  Refresh it on
+                    # the next attempt only when the fast-path submission fails.
+                    session_prepared = False
+                    preselected_slot_id = ""
                     await asyncio.sleep(0.4)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     self._log_throttled(
@@ -262,6 +300,17 @@ class ZeroWorldShinEngine(BaseEngine):
         context: ZeroWorldContext,
         worker_name: str = "작업 1",
     ) -> str:
+        target_slot = await self._find_target_slot(session, context, worker_name)
+        if target_slot is not None and target_slot.available:
+            return target_slot.slot_id
+        return ""
+
+    async def _find_target_slot(
+        self,
+        session: aiohttp.ClientSession,
+        context: ZeroWorldContext,
+        worker_name: str = "작업 1",
+    ) -> ZeroWorldTimeSlot | None:
         payload = {
             "act": "theme_time_list",
             "zizum_num": context.branch,
@@ -280,12 +329,17 @@ class ZeroWorldShinEngine(BaseEngine):
                     "서버 응답 오류로 재시도",
                     "warning",
                 )
-                return ""
+                return None
             body = decode_body(await response.read())
         rtt_ms = self._elapsed_ms(started)
         slots = parse_time_slots(body)
-        for slot in slots:
-            if slot.time == context.target_time and slot.available:
+        matching_slots = [slot for slot in slots if slot.time == context.target_time]
+        if matching_slots:
+            slot = next(
+                (candidate for candidate in matching_slots if candidate.available),
+                matching_slots[0],
+            )
+            if slot.available:
                 self._log_http(
                     worker_name,
                     "슬롯 조회",
@@ -293,23 +347,30 @@ class ZeroWorldShinEngine(BaseEngine):
                     rtt_ms,
                     f"조회 {len(slots)}개 · {context.target_time} 발견 · 슬롯 ID {slot.slot_id}",
                 )
-                return slot.slot_id
+            else:
+                slot_detail = f" · 슬롯 ID {slot.slot_id}" if slot.slot_id else ""
+                self._log_throttled(
+                    f"slot:{context.target_time}",
+                    f"[{worker_name}] 슬롯 조회 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms · "
+                    f"조회 {len(slots)}개 · {context.target_time} 예약불가{slot_detail} · 재시도",
+                    "info",
+                )
+            return slot
         self._log_throttled(
             f"slot:{context.target_time}",
             f"[{worker_name}] 슬롯 조회 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms · "
             f"조회 {len(slots)}개 · {context.target_time} 미공개 또는 예약불가 · 재시도",
             "info",
         )
-        return ""
+        return None
 
-    async def _submit(
+    async def _prestage_session(
         self,
         session: aiohttp.ClientSession,
         context: ZeroWorldContext,
-        slot_id: str,
         worker_name: str = "작업 1",
-    ) -> BookingResult | None:
-        await self._post_and_discard(
+    ) -> bool:
+        theme_list_ready = await self._post_and_discard(
             session,
             {
                 "act": "theme_list",
@@ -319,9 +380,9 @@ class ZeroWorldShinEngine(BaseEngine):
                 "s_subj": context.subject,
             },
             worker_name,
-            "테마 목록 준비",
+            "테마 목록 사전 준비",
         )
-        await self._post_and_discard(
+        theme_ready = await self._post_and_discard(
             session,
             {
                 "act": "theme_select",
@@ -330,14 +391,31 @@ class ZeroWorldShinEngine(BaseEngine):
                 "theme_time_num": "",
             },
             worker_name,
-            "테마 선택 준비",
+            "테마 선택 사전 준비",
         )
-        await self._post_and_discard(
+        return theme_list_ready and theme_ready
+
+    async def _prepare_time_slot(
+        self,
+        session: aiohttp.ClientSession,
+        slot_id: str,
+        worker_name: str = "작업 1",
+        stage: str = "시간 선택 준비",
+    ) -> bool:
+        return await self._post_and_discard(
             session,
             {"act": "theme_time_select", "theme_time_num": slot_id},
             worker_name,
-            "시간 선택 준비",
+            stage,
         )
+
+    async def _submit(
+        self,
+        session: aiohttp.ClientSession,
+        context: ZeroWorldContext,
+        slot_id: str,
+        worker_name: str = "작업 1",
+    ) -> BookingResult | None:
         action_data = {
             "name": context.name,
             "mobile": context.phone,
@@ -395,19 +473,21 @@ class ZeroWorldShinEngine(BaseEngine):
         data: dict[str, str],
         worker_name: str,
         stage: str,
-    ) -> None:
+    ) -> bool:
         started = time.perf_counter()
         async with session.post(self.select_url, data=data) as response:
             await response.read()
             status = response.status
+        succeeded = 200 <= status < 300
         self._log_http(
             worker_name,
             stage,
             status,
             self._elapsed_ms(started),
-            "" if status == 200 else "비정상 응답이지만 기존 제출 흐름 유지",
-            "info" if status == 200 else "warning",
+            "" if succeeded else "사전 준비 실패 · 재시도",
+            "info" if succeeded else "warning",
         )
+        return succeeded
 
     @staticmethod
     def _submission_accepted(body: str, final_url: str, history_urls: list[str]) -> bool:

@@ -9,6 +9,39 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v652_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.52")
+
+    assert note is not None
+    assert note.changes == (
+        "단편선 오픈 직전 주문 필드 사전 준비로 오픈 즉시 빠른 주문 생성",
+        "지구별 슬롯 미오픈 상태에서 시간 선택을 미리 준비해 오픈 즉시 선점 속도 개선",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v651_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.51")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 전체 지점·테마의 공개 시간표 일괄 저장 기능 추가",
+        "키이스케이프 요일별 시간표 저장 진행률과 미공개 상태 안내",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
+def test_v650_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.50")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 공개 시간표를 요일별로 자동 보관해 최근 동일 요일 슬롯 빠른 제출",
+        "이전 버전에서 저장한 키이스케이프 시간표를 업데이트 후에도 자동 연동",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v649_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.49")
 

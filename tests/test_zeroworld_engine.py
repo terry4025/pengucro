@@ -4,6 +4,7 @@ import pytest
 
 import engines.zeroworld_shin_engine as zeroworld_shin
 from engines.zeroworld_shin_engine import ZeroWorldShinEngine
+from engines.zeroworld_catalog import ZeroWorldTimeSlot
 from pengucro.models import BookingResult
 
 
@@ -120,7 +121,7 @@ def test_slot_http_failure_log_has_worker_status_rtt_and_retry_reason():
     assert "재시도" in message
 
 
-def test_submit_log_records_each_stage_and_acceptance_evidence(monkeypatch):
+def test_prestaged_submit_log_records_each_stage_and_acceptance_evidence(monkeypatch):
     logs = []
     engine = ZeroWorldShinEngine(
         "https://zero.example",
@@ -153,17 +154,160 @@ def test_submit_log_records_each_stage_and_acceptance_evidence(monkeypatch):
         return BookingResult(True, "완료")
 
     monkeypatch.setattr(engine, "_complete_payment", fake_complete)
+    assert asyncio.run(engine._prestage_session(session, context, "작업 2"))
+    assert asyncio.run(
+        engine._prepare_time_slot(session, "SLOT-17", "작업 2", "시간 선택 사전 준비")
+    )
     result = asyncio.run(engine._submit(session, context, "SLOT-17", "작업 2"))
 
     assert result and result.success
+    assert [data["act"] for _url, data in session.posts] == [
+        "theme_list",
+        "theme_select",
+        "theme_time_select",
+        "make",
+    ]
     text = "\n".join(message for message, _level in logs)
-    for stage in ("테마 목록 준비", "테마 선택 준비", "시간 선택 준비", "예약 제출"):
+    for stage in (
+        "테마 목록 사전 준비",
+        "테마 선택 사전 준비",
+        "시간 선택 사전 준비",
+        "예약 제출",
+    ):
         assert stage in text
     assert "HTTP 200" in text
     assert "RTT" in text
     assert "슬롯 ID SLOT-17" in text
     assert "예약 제출 승인 경로 확인" in text
     assert "secret" not in text
+
+
+def test_closed_slot_id_is_exposed_for_time_selection_prestaging():
+    engine = make_engine()
+    context = engine._build_context(
+        {
+            "branch": "1",
+            "reservationDate": "2026-08-14",
+            "reservationTime": "11:00:00",
+            "themePK": "28",
+            "name": "테스트",
+            "phone": "01012345678",
+            "people": "2",
+        }
+    )
+    session = SequenceSession(
+        [
+            FakeResponse(
+                body=(
+                    b'<a class="disabled" '
+                    b'href="javascript:fun_theme_time_select(\'SLOT-CLOSED\')">11:00</a>'
+                )
+            )
+        ]
+    )
+
+    target = asyncio.run(engine._find_target_slot(session, context, "작업 1"))
+
+    assert target is not None
+    assert target.slot_id == "SLOT-CLOSED"
+    assert target.available is False
+
+
+def test_submit_fast_path_posts_only_final_reservation_action(monkeypatch):
+    engine = make_engine()
+    context = engine._build_context(
+        {
+            "branch": "1",
+            "reservationDate": "2026-08-14",
+            "reservationTime": "11:00:00",
+            "themePK": "28",
+            "name": "테스트",
+            "phone": "01012345678",
+            "people": "2",
+        }
+    )
+    session = SequenceSession(
+        [
+            FakeResponse(
+                body=b'<form action="rev.make.mutong.php"><input name="code" value="x"></form>',
+                url="https://zero.example/rev.make.mutong.php",
+            )
+        ]
+    )
+
+    async def fake_complete(*_args, **_kwargs):
+        return BookingResult(True, "완료")
+
+    monkeypatch.setattr(engine, "_complete_payment", fake_complete)
+    result = asyncio.run(engine._submit(session, context, "SLOT-17", "작업 1"))
+
+    assert result and result.success
+    assert len(session.posts) == 1
+    assert session.posts[0][0] == engine.action_url
+    assert session.posts[0][1]["act"] == "make"
+
+
+def test_worker_skips_calendar_and_reuses_closed_slot_preselection(monkeypatch):
+    engine = make_engine()
+    calls = {"prestage": 0, "find": 0, "prepare": [], "submit": 0}
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def fake_prestage(_session, _context, _worker_name):
+        calls["prestage"] += 1
+        return True
+
+    async def fake_find(_session, _context, _worker_name):
+        calls["find"] += 1
+        return ZeroWorldTimeSlot("11:00", "SLOT-17", calls["find"] >= 2)
+
+    async def fake_prepare(_session, slot_id, _worker_name, stage):
+        calls["prepare"].append((slot_id, stage))
+        return True
+
+    async def fake_submit(_session, _context, slot_id, _worker_name):
+        calls["submit"] += 1
+        assert slot_id == "SLOT-17"
+        return BookingResult(True, "완료")
+
+    async def fail_date_poll(*_args, **_kwargs):
+        raise AssertionError("날짜 캘린더를 조회하면 안 됩니다.")
+
+    monkeypatch.setattr(zeroworld_shin.aiohttp, "ClientSession", lambda **_kwargs: Session())
+    monkeypatch.setattr(engine, "_prestage_session", fake_prestage)
+    monkeypatch.setattr(engine, "_find_target_slot", fake_find)
+    monkeypatch.setattr(engine, "_prepare_time_slot", fake_prepare)
+    monkeypatch.setattr(engine, "_submit", fake_submit)
+    monkeypatch.setattr(engine, "_wait_for_date", fail_date_poll)
+
+    async def run_worker():
+        engine.async_submission_lock = asyncio.Lock()
+        await engine.make_reservation_async_task(
+            {
+                "branch": "1",
+                "reservationDate": "2026-08-14",
+                "reservationTime": "11:00:00",
+                "themePK": "28",
+                "name": "테스트",
+                "phone": "01012345678",
+                "people": "2",
+            },
+            0,
+        )
+
+    asyncio.run(run_worker())
+
+    assert calls == {
+        "prestage": 1,
+        "find": 2,
+        "prepare": [("SLOT-17", "시간 선택 사전 준비")],
+        "submit": 1,
+    }
 
 
 def test_debug_file_contains_structure_summary_without_raw_sensitive_html(tmp_path, monkeypatch):
