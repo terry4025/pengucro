@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.54",
+        changes=(
+            "캐치테이블 전용 예약 엔진 및 실시간 슬롯 선점 기능 추가",
+            "캐치테이블 회원 로그인 및 비로그인 익명 선점 모드 지원",
+        ),
+    ),
+    PatchNote(
         version="6.53",
         changes=(
             "지구별·제로월드 연속 슬롯 조회 시 연결 재사용과 분산 스케줄링으로 탐색 가속",
