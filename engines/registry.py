@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from engines.doomescape_engine import DoomEscapeEngine
+from engines.catchtable_engine import CatchTableEngine
 from engines.cgv_engine_preopen_live_runtime import CgvEngine
+from engines.doomescape_engine import DoomEscapeEngine
 from engines.dpsnnn_engine import DpsnnnEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.keyescape_engine_runtime import KeyescapeEngine
@@ -39,6 +40,11 @@ class EngineRegistry:
             import importlib
 
             engine = importlib.import_module("engines.tripcom_engine").TripComEngine(**common)
+        elif site_name == "캐치테이블":
+            engine = CatchTableEngine(
+                site_url=payload.get("site_url", "https://app.catchtable.co.kr"),
+                **common,
+            )
         elif site_name == "CGV":
             engine = CgvEngine(**common)
         elif site_name == "제로월드":
@@ -80,6 +86,8 @@ class EngineRegistry:
                 engine = importlib.import_module("engines.tripcom_engine").TripComEngine(**common)
             elif engine_id == "cgv":
                 engine = CgvEngine(**common)
+            elif engine_id == "catchtable":
+                engine = CatchTableEngine(site_url=site.get("url", ""), **common)
             elif engine_id == "sinbiworld":
                 engine = ZeroWorldShinEngine(
                     site_url=site.get("url", ""),

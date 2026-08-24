@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v654_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.54")
+
+    assert note is not None
+    assert note.changes == (
+        "캐치테이블 전용 예약 엔진 및 실시간 슬롯 선점 기능 추가",
+        "캐치테이블 회원 로그인 및 비로그인 익명 선점 모드 지원",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v653_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.53")
 
