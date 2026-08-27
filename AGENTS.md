@@ -3,6 +3,22 @@
 For every user-facing build starting with v5.70, updating the bundled patch
 notes is part of completing the build.
 
+# Release Git commit rules
+
+- Before creating any user-facing versioned build or publishing any release,
+  always create a Git commit containing the exact source, tests, version,
+  release sequence, spec name, and patch notes used for that build.
+- Build and publish only from that committed revision. Record the commit SHA in
+  the release verification result so the shipped executable can be traced back
+  to its source.
+- The working tree must be clean before the versioned build starts, except for
+  ignored build outputs. Never stage or commit unrelated user changes merely to
+  satisfy this rule; isolate the release in a dedicated branch or worktree when
+  necessary.
+- If verification or a fix changes any tracked file after the release commit,
+  create a new commit and rebuild from that new commit. Never hand off or
+  publish an executable built from uncommitted source.
+
 - Update `pengucro/__init__.py`, the executable name in `방탈출펭크로.spec`, and
   the newest entry in `pengucro/patch_notes.py` to the same display version.
 - Increase the integer `__release_sequence__` in `pengucro/__init__.py` for every
