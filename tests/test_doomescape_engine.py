@@ -138,3 +138,37 @@ def test_http_diagnostic_includes_worker_stage_status_and_rtt():
     assert "status=503" in message
     assert "RTT 123ms" in message
     assert level == "warning"
+
+
+def test_missing_slot_is_classified_as_unopened_or_sold_out():
+    unopened = "<html><body>오픈 전</body></html>"
+    sold_out = (
+        "<div class='tm_box'><p class='name'>나폴리탄</p>"
+        '<a><span class="num">14:00</span>'
+        '<span class="txt">예약마감</span></a></div>'
+    )
+
+    assert DoomEscapeEngine._classify_missing_slot(unopened, "나폴리탄") == "미오픈"
+    assert (
+        DoomEscapeEngine._classify_missing_slot(sold_out, "나폴리탄")
+        == "오픈됨·해당 시간 없음"
+    )
+
+
+def test_missing_slot_log_throttles_and_reports_wait_time():
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    engine._slot_wait_started_at = time.time() - 125
+
+    engine._log_missing_slot("태스크 1", "14:00", "미오픈")
+    engine._log_missing_slot("태스크 2", "14:00", "미오픈")
+
+    assert len(logs) == 1
+    message, level = logs[0]
+    assert "[대기]" in message
+    assert "미오픈" in message
+    assert "대기 125초" in message
+    assert level == "info"

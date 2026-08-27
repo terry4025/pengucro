@@ -363,9 +363,9 @@ def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_pat
     assert store.get("cgv_npay_password") == ""
 
 
-def test_v653_release_contract_is_complete():
-    assert __version__ == "6.53"
-    assert __release_sequence__ == 6530001
-    note = notes_for("6.53")
+def test_v655_release_contract_is_complete():
+    assert __version__ == "6.55"
+    assert __release_sequence__ == 6550001
+    note = notes_for("6.55")
     assert note is not None
-    assert any("스케줄링" in change for change in note.changes)
+    assert any("둠이스케이프" in change for change in note.changes)

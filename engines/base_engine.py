@@ -17,6 +17,25 @@ from pengucro.models import BookingEvent, BookingEventType, BookingResult
 logger = logging.getLogger(__name__)
 
 
+class _QuietProactorLoop(asyncio.ProactorEventLoop):
+    """Proactor loop that swallows the noisy WinError 10022 teardown callback.
+
+    On Windows, closing many pooled connections can make
+    ``_ProactorBasePipeTransport._call_connection_lost`` raise
+    ``OSError(WinError 10022)`` inside an event-loop callback.  The error is
+    harmless (the connection was already closing) but previously flooded the
+    log with hundreds of tracebacks per run.  Dropping only that one
+    known-benign exception keeps every other callback failure visible.
+    """
+
+    def _call_connection_lost(self, exc):
+        try:
+            super()._call_connection_lost(exc)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 10022:
+                raise
+
+
 LogCallback = Callable[[str, str], None]
 SuccessCallback = Callable[[], None]
 StatusCallback = Callable[[int, str], None]
@@ -237,7 +256,10 @@ class BaseEngine:
         monitor.start()
 
     def _run_async_loop(self, reservation_data: dict[str, Any], num_tasks: int) -> None:
-        loop = asyncio.new_event_loop()
+        if hasattr(asyncio, "ProactorEventLoop"):
+            loop = _QuietProactorLoop()
+        else:
+            loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
         try:

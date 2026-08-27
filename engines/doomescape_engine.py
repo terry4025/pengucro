@@ -67,6 +67,7 @@ class DoomEscapeEngine(BaseEngine):
         self._diagnostic_log_state = {}
         self._sync_worker_index = 0
         self._recovery_probe_diag = None
+        self._slot_wait_started_at = None
 
     @staticmethod
     def _describe_exception(exc):
@@ -190,6 +191,44 @@ class DoomEscapeEngine(BaseEngine):
             or "rev_days" in lowered
             or "go=rev.make" in lowered
         )
+
+    @staticmethod
+    def _classify_missing_slot(html_text, theme_name):
+        """Distinguish an unopened day from a sold-out or vanished slot.
+
+        The slot list only renders once the reservation day opens.  A missing
+        time therefore means either "not open yet" (no theme boxes at all) or
+        "open but already gone" (theme box present).  Keeping these apart makes
+        long pre-open waits readable instead of a wall of identical warnings.
+        """
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        if not soup.find_all("div", class_="tm_box"):
+            return "미오픈"
+        for box in soup.find_all("div", class_="tm_box"):
+            name_p = box.find("p", class_="name")
+            if name_p and theme_name in name_p.text:
+                return "오픈됨·해당 시간 없음"
+        return "오픈됨·테마 미표시"
+
+    def _log_missing_slot(self, worker_label, target_time, reason):
+        now = time.time()
+        show_log = False
+        with self._log_lock:
+            if not hasattr(self, "_last_time_err_time") or (
+                now - self._last_time_err_time
+            ) > 10.0:
+                self._last_time_err_time = now
+                show_log = True
+        if show_log:
+            elapsed_text = ""
+            started_at = getattr(self, "_slot_wait_started_at", None)
+            if started_at:
+                elapsed_text = f" · 대기 {now - started_at:.0f}초"
+            self.log(
+                f"[{worker_label}] [대기] {target_time} 슬롯 {reason}"
+                f"{elapsed_text} · 오픈 시까지 계속 조회합니다",
+                "info",
+            )
 
     @staticmethod
     def _is_transient_site_error(exc):
@@ -405,18 +444,8 @@ class DoomEscapeEngine(BaseEngine):
                             break
 
                 if not found_slot:
-                    self.silent_tick(f"아직 열리지 않은 시간대 ({target_time}) 재시도 중")
-                    now = time.time()
-                    show_err = False
-                    with self._log_lock:
-                        if not hasattr(self, "_last_time_err_time") or (now - self._last_time_err_time) > 2.0:
-                            self._last_time_err_time = now
-                            show_err = True
-                    if show_err:
-                        self.log(
-                            f"[{worker_label}] [재시도] 시간표 조회 · {target_time} 슬롯이 없거나 마감 상태 · 100ms 후 재조회",
-                            "warning",
-                        )
+                    reason = self._classify_missing_slot(html_text, theme_name)
+                    self._log_missing_slot(worker_label, target_time, reason)
                     time.sleep(0.1)
                     continue
 
@@ -800,18 +829,8 @@ class DoomEscapeEngine(BaseEngine):
                             break
 
                 if not found_slot:
-                    self.silent_tick(f"[태스크 {task_idx+1}] 아직 열리지 않은 시간대 ({target_time}) 재시도 중")
-                    now = time.time()
-                    show_err = False
-                    with self._log_lock:
-                        if not hasattr(self, "_last_time_err_time") or (now - self._last_time_err_time) > 2.0:
-                            self._last_time_err_time = now
-                            show_err = True
-                    if show_err:
-                        self.log(
-                            f"[{worker_label}] [재시도] 시간표 조회 · {target_time} 슬롯이 없거나 마감 상태 · 100ms 후 재조회",
-                            "warning",
-                        )
+                    reason = self._classify_missing_slot(html_text, theme_name)
+                    self._log_missing_slot(worker_label, target_time, reason)
                     await asyncio.sleep(0.1)
                     continue
 
@@ -1125,6 +1144,7 @@ class DoomEscapeEngine(BaseEngine):
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
         self._reset_async_recovery_state()
         self.session_pool = []
+        self._slot_wait_started_at = time.time()
         self.log(f"Pre-fetching {num_sessions} sessions for Doom Escape...", "info")
         home_url = f"{self.base_url}/layout/res/home.php?go=main"
 
