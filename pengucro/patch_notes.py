@@ -17,6 +17,12 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.62",
+        changes=(
+            "둠이스케이프 서버 복구 지연이 다음 예약의 집중 감시 시작을 늦추지 않도록 보완",
+        ),
+    ),
+    PatchNote(
         version="6.61",
         changes=(
             "키이스케이프 오픈 시각 예약 동작을 브라우저에서 정밀 실행해 제출 지연 단축",

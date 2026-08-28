@@ -643,7 +643,14 @@ class DoomEscapeEngine(BaseEngine):
     def load_learned_open_time(cls, branch):
         data = load_json(cls.OPEN_TIME_MEMORY_FILE, {})
         entry = (data.get("branches") or {}).get(str(branch)) if isinstance(data, dict) else None
-        return str(entry.get("open_time") or "") if isinstance(entry, dict) else ""
+        value = str(entry.get("open_time") or "") if isinstance(entry, dict) else ""
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", value.strip())
+        if not match:
+            return ""
+        # First visibility can be delayed by a site outage. Preserve the exact
+        # transition for diagnostics, but never let a late recovery observation
+        # postpone the next run's active scan inside that minute.
+        return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}:00"
 
     def _record_open_time(self):
         if self._open_time_recorded:
@@ -657,7 +664,7 @@ class DoomEscapeEngine(BaseEngine):
             data = {}
         branches = data.setdefault("branches", {})
         entry = {
-            "open_time": observed.strftime("%H:%M:%S"),
+            "open_time": observed.replace(second=0).strftime("%H:%M:%S"),
             "observed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "server_observed_at": observed.strftime("%Y-%m-%d %H:%M:%S"),
             "server_offset_seconds": round(

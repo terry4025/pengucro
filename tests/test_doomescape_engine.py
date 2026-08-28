@@ -700,9 +700,24 @@ def test_server_date_records_exact_publish_second_and_transition(monkeypatch):
     engine._record_open_time()
 
     entry = saved["branches"]["3"]
-    assert entry["open_time"] == "20:55:58"
+    assert entry["open_time"] == "20:55:00"
+    assert entry["server_observed_at"].endswith("20:55:58")
     assert entry["transition_after"].endswith("20:55:57")
     assert entry["transition_window_ms"] == 1000.0
+
+
+def test_learned_open_time_never_activates_late_from_recovery_second(monkeypatch):
+    import engines.doomescape_engine as module
+
+    monkeypatch.setattr(
+        module,
+        "load_json",
+        lambda *_args, **_kwargs: {
+            "branches": {"3": {"open_time": "20:55:58"}}
+        },
+    )
+
+    assert DoomEscapeEngine.load_learned_open_time("3") == "20:55:00"
 
 
 def test_transport_trace_marks_headers_as_sent():
