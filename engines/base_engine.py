@@ -149,7 +149,35 @@ class BaseEngine:
             self._record_attempt(error_part)
 
         if self.log_callback:
-            self.log_callback(formatted_message, log_type)
+            try:
+                self.log_callback(formatted_message, log_type)
+            except UnicodeEncodeError as exc:
+                # A Windows CP949 console cannot encode warning emoji or some
+                # punctuation. Logging is observational and must never abort an
+                # already-running reservation flow, so retry once with a
+                # callback-safe representation in the failing encoding.
+                safe_message = (
+                    formatted_message.replace("⚠️", "[주의]")
+                    .replace("⚠", "[주의]")
+                    .replace("—", "-")
+                )
+                try:
+                    encoding = str(exc.encoding or "ascii")
+                    safe_message = safe_message.encode(
+                        encoding, errors="replace"
+                    ).decode(encoding, errors="replace")
+                except (LookupError, ValueError):
+                    safe_message = safe_message.encode(
+                        "ascii", errors="replace"
+                    ).decode("ascii")
+                try:
+                    self.log_callback(safe_message, log_type)
+                except Exception:
+                    pass
+            except Exception:
+                # UI/console logging callbacks are non-authoritative. A broken
+                # renderer must not cancel seat monitoring or checkout.
+                pass
 
         event_type = {
             "success": BookingEventType.SUCCESS,

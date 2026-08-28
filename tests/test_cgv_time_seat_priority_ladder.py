@@ -110,6 +110,27 @@ def test_manual_seat_priority_is_checked_in_order():
     assert chosen.seats == ("B8", "B9", "B10")
 
 
+def test_four_person_group_with_one_missing_seat_skips_to_next_full_group():
+    engine = CgvEngine(lambda *_args: None)
+    engine._priority_manual_groups = (
+        CgvSeatGroup(("F21", "F22", "F23", "F24")),
+        CgvSeatGroup(("I21", "I22", "I23", "I24")),
+        CgvSeatGroup(("J22", "J23", "J24", "J25")),
+    )
+    # F24 alone is unavailable. The engine must not partially select the first
+    # group; it should immediately choose the next complete four-seat priority.
+    payload = _seat_payload(
+        "F21", "F22", "F23",
+        "I21", "I22", "I23", "I24",
+        "J22", "J23", "J24", "J25",
+    )
+
+    chosen = engine._choose_priority_group(payload, _schedule("1400", "1"), 4)
+
+    assert chosen is not None
+    assert chosen.seats == ("I21", "I22", "I23", "I24")
+
+
 def test_priority_preflight_maps_json_auth_expiry_to_unauthorized():
     engine = CgvEngine(lambda *_args: None)
     engine._fetch_priority_seat_payload = lambda *_args: {

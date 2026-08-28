@@ -22,6 +22,63 @@ def test_naver_payment_url_accepts_same_tab_instant_pay_shell():
     assert not CgvEngine._is_naver_payment_url("https://cgv.co.kr/mpy/main")
 
 
+def test_naver_login_url_is_distinguished_from_payment_page():
+    assert CgvEngine._is_naver_login_url(
+        "https://nid.naver.com/nidlogin.login?url=https%3A%2F%2Fm.pay.naver.com%2Fz"
+    )
+    assert not CgvEngine._is_naver_login_url(
+        "https://m.pay.naver.com/z/payments/example"
+    )
+
+
+def test_prefilled_naver_login_click_returns_presence_only():
+    class Page:
+        @staticmethod
+        def evaluate(_script, allow_click):
+            assert allow_click is True
+            return {"found": True, "filled": True, "clicked": True}
+
+    assert CgvEngine._click_prefilled_naver_login(Page()) == {
+        "found": True,
+        "filled": True,
+        "clicked": True,
+    }
+
+
+def test_naver_additional_verification_is_detected_without_reading_credentials():
+    class Page:
+        @staticmethod
+        def evaluate(_script):
+            return True
+
+    assert CgvEngine._naver_additional_verification_visible(Page()) is True
+
+
+def test_naver_login_is_resumed_before_developer_mode_stops(monkeypatch):
+    engine = _engine()
+    cgv_page = object()
+    login_page = object()
+    payment_page = object()
+    calls = []
+    monkeypatch.setattr(engine, "_advance_to_cgv_payment_methods", lambda _page: True)
+    monkeypatch.setattr(engine, "_select_cgv_npay_method", lambda _page: True)
+    monkeypatch.setattr(engine, "_accept_cgv_payment_terms", lambda _page: True)
+    monkeypatch.setattr(engine, "_open_naver_payment_page", lambda _page: login_page)
+    monkeypatch.setattr(
+        engine,
+        "_ensure_naver_payment_session",
+        lambda page: calls.append(("login", page)) or payment_page,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_prepare_naver_card",
+        lambda _page: calls.append(("card", _page)) or True,
+    )
+
+    assert engine._proceed_naver_pay_checkout(cgv_page, developer_mode=True) is True
+    assert calls == [("login", login_page)]
+
+
 def test_checkout_runs_two_cgv_stages_before_naver_final_payment(monkeypatch):
     engine = _engine()
     cgv_page = object()

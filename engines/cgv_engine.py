@@ -1964,6 +1964,199 @@ class CgvEngine(BaseEngine):
         return naver_page
 
     @staticmethod
+    def _is_naver_login_url(url: str) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").casefold()
+            path = parsed.path.casefold()
+        except Exception:
+            return False
+        return host == "nid.naver.com" and "nidlogin" in path
+
+    @staticmethod
+    def _click_prefilled_naver_login(page, allow_click: bool = True) -> dict[str, bool]:
+        """Click Naver login only when the saved browser credentials are filled.
+
+        The credential values never leave the page. Only boolean presence flags
+        are returned to Python so logs and crash reports cannot expose them.
+        """
+
+        try:
+            result = page.evaluate(
+                r"""allowClick => {
+                  const visible = node => {
+                    if (!node) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                           rect.width > 0 && rect.height > 0;
+                  };
+                  const idInput = document.querySelector('input#id[name="id"]');
+                  const pwInput = document.querySelector('input#pw[name="pw"]');
+                  const buttons = [
+                    document.querySelector('#loginBtn_row'),
+                    document.querySelector('#loginBtn_column'),
+                  ].filter(button => visible(button));
+                  const button = buttons[0] || null;
+                  const hasId = !!(idInput && String(idInput.value || '').trim());
+                  const hasPassword = !!(pwInput && String(pwInput.value || ''));
+                  const ready = !!button && hasId && hasPassword &&
+                    !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+                  if (ready && allowClick) {
+                    button.scrollIntoView({block: 'center'});
+                    button.click();
+                    return {found: true, filled: true, clicked: true};
+                  }
+                  return {
+                    found: !!(idInput && pwInput && button),
+                    filled: hasId && hasPassword,
+                    clicked: false,
+                  };
+                }""",
+                allow_click,
+            )
+        except Exception:
+            return {"found": False, "filled": False, "clicked": False}
+        if not isinstance(result, dict):
+            return {"found": False, "filled": False, "clicked": False}
+        return {
+            "found": bool(result.get("found")),
+            "filled": bool(result.get("filled")),
+            "clicked": bool(result.get("clicked")),
+        }
+
+    @staticmethod
+    def _naver_additional_verification_visible(page) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    r"""() => {
+                      const text = (document.body && document.body.innerText || '')
+                        .replace(/\s+/g, '');
+                      return text.includes('보안을위해추가확인을해주세요') ||
+                        text.includes('자동입력방지') ||
+                        text.includes('보안문자') ||
+                        text.includes('2단계인증') ||
+                        text.includes('본인확인');
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    def _ensure_naver_payment_session(self, page):
+        """Resume N pay after the dedicated browser is sent through Naver login."""
+
+        initial_url = self._safe_page_url(page)
+        if not (
+            self._is_naver_payment_url(initial_url)
+            or self._is_naver_login_url(initial_url)
+        ):
+            # Compatibility for test doubles and already-normalized wrappers.
+            return page
+
+        deadline = time.monotonic() + self.NPAY_PAGE_TIMEOUT_SECONDS
+        login_clicked = False
+        missing_credentials_reported = False
+        additional_verification_reported = False
+        payment_seen_at: float | None = None
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            candidates = [page]
+            try:
+                page_closed = page.is_closed()
+            except Exception:
+                page_closed = False
+            if page_closed:
+                try:
+                    candidates = [
+                        candidate
+                        for candidate in reversed(list(page.context.pages))
+                        if not candidate.is_closed()
+                        and (
+                            self._is_naver_login_url(self._safe_page_url(candidate))
+                            or self._is_naver_payment_url(self._safe_page_url(candidate))
+                        )
+                    ]
+                except Exception:
+                    candidates = []
+
+            for candidate in candidates:
+                try:
+                    if candidate.is_closed():
+                        continue
+                except Exception:
+                    pass
+                url = self._safe_page_url(candidate)
+                if self._is_naver_login_url(url):
+                    payment_seen_at = None
+                    state = self._click_prefilled_naver_login(
+                        candidate,
+                        allow_click=not login_clicked,
+                    )
+                    if state.get("clicked"):
+                        login_clicked = True
+                        self.log(
+                            "[CGV] 네이버 재로그인 화면 감지 · 저장된 입력으로 로그인 버튼 클릭 완료",
+                            "info",
+                        )
+                    elif state.get("found") and not state.get("filled"):
+                        if not missing_credentials_reported:
+                            missing_credentials_reported = True
+                            self.log(
+                                "[CGV] 네이버 재로그인이 필요하지만 저장된 입력이 없습니다. "
+                                "열린 Chrome에서 로그인하면 결제를 자동으로 계속합니다.",
+                                "warning",
+                            )
+                    elif (
+                        self._naver_additional_verification_visible(candidate)
+                        and not additional_verification_reported
+                    ):
+                        additional_verification_reported = True
+                        # CGV already owns a bounded seat hold at this point.
+                        # Give the user the full confirmation grace instead of
+                        # abandoning it at the shorter page-load deadline.
+                        deadline = max(
+                            deadline,
+                            time.monotonic() + self.NPAY_COMPLETION_TIMEOUT_SECONDS,
+                        )
+                        self.log(
+                            "[CGV] 네이버가 추가 보안 확인을 요구했습니다. "
+                            "열린 Chrome에서 확인을 완료하면 N pay 결제를 자동으로 계속합니다.",
+                            "warning",
+                        )
+                    continue
+                if self._is_naver_payment_url(url):
+                    now = time.monotonic()
+                    if payment_seen_at is None:
+                        payment_seen_at = now
+                    # Give the payment bootstrap a short window to redirect to
+                    # nid.naver.com before treating this as an authenticated page.
+                    if now - payment_seen_at >= 0.75:
+                        try:
+                            candidate.bring_to_front()
+                        except Exception:
+                            pass
+                        if login_clicked:
+                            self.log(
+                                "[CGV] 네이버 재로그인 완료 · N pay 결제 흐름 자동 복귀",
+                                "success",
+                            )
+                        return candidate
+
+            try:
+                page.wait_for_timeout(self.PAYMENT_POLL_INTERVAL_MS)
+            except Exception:
+                if self.stop_event.wait(self.PAYMENT_POLL_INTERVAL_MS / 1000.0):
+                    break
+
+        self.log(
+            "네이버 재로그인 또는 N pay 결제 화면 복귀를 제한시간 안에 확인하지 못했습니다. "
+            "추가 인증 화면을 확인해주세요.",
+            "warning",
+        )
+        return None
+
+    @staticmethod
     def _naver_payment_button_state(page) -> dict[str, Any]:
         try:
             result = page.evaluate(
@@ -2301,6 +2494,9 @@ class CgvEngine(BaseEngine):
             if not self._accept_cgv_payment_terms(page):
                 return False
             naver_pay_page = self._open_naver_payment_page(page)
+            if naver_pay_page is None:
+                return False
+            naver_pay_page = self._ensure_naver_payment_session(naver_pay_page)
             if naver_pay_page is None:
                 return False
             if developer_mode:

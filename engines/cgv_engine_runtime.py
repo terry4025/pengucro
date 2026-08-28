@@ -6,11 +6,13 @@ import json
 import math
 import time
 from typing import Any, Mapping
+from urllib.parse import quote, unquote
 
 import engines.cgv_engine as _base_cgv_engine
 from engines.cgv_chrome_session import CgvBrowserSessionProxy
 from engines.cgv_engine_guarded import CgvEngine as GuardedCgvEngine
 from engines.cgv_client import CGV_COMPANY_CODE, CGV_HOME_URL
+from engines.naver_api import ACCOUNT_QUERY
 
 
 _MEMBER_SESSION_GUARD_ACTIVE: ContextVar[bool] = ContextVar(
@@ -87,6 +89,9 @@ class CgvEngine(GuardedCgvEngine):
     MEMBER_SESSION_AUTH_ERROR_CODES = {"-1001", "-1002", "401"}
     MEMBER_SESSION_CONFIRM_ATTEMPTS = 3
     MEMBER_SESSION_CONFIRM_INTERVAL_MS = 250
+    NAVER_ACCOUNT_PROBE_URL = "https://m.booking.naver.com/graphql?opName=account"
+    NAVER_ACCOUNT_HOME_URL = "https://m.booking.naver.com/"
+    NAVER_ACCOUNT_PROBE_TIMEOUT_MS = 5_000
 
     @staticmethod
     def _context_member_tokens(context) -> dict[str, str]:
@@ -95,10 +100,175 @@ class CgvEngine(GuardedCgvEngine):
             for cookie in context.cookies(CGV_HOME_URL):
                 name = str(cookie.get("name", "") or "")
                 if name in tokens:
-                    tokens[name] = str(cookie.get("value", "") or "").strip()
+                    # CGV stores accessToken URL-encoded. Browser-side booking
+                    # requests decode it before constructing the Bearer header;
+                    # the startup member probe must use the exact same form.
+                    tokens[name] = unquote(
+                        str(cookie.get("value", "") or "").strip()
+                    )
         except Exception:
             pass
         return tokens
+
+    @classmethod
+    def _context_naver_login_state(cls, context) -> bool | None:
+        """Read the live Naver account state using slot 1's shared cookie jar."""
+
+        try:
+            response = context.request.post(
+                cls.NAVER_ACCOUNT_PROBE_URL,
+                data={
+                    "operationName": "account",
+                    "query": ACCOUNT_QUERY,
+                    "variables": {},
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": "https://m.booking.naver.com",
+                    "Referer": cls.NAVER_ACCOUNT_HOME_URL,
+                },
+                timeout=cls.NAVER_ACCOUNT_PROBE_TIMEOUT_MS,
+            )
+            body = response.json()
+        except Exception:
+            return None
+        if int(getattr(response, "status", 0) or 0) != 200:
+            return None
+        data = body.get("data") if isinstance(body, Mapping) else None
+        account = data.get("account") if isinstance(data, Mapping) else None
+        if not isinstance(account, Mapping):
+            return None
+        return bool(account.get("isLoggedIn"))
+
+    def _ensure_naver_session_before_booking(self, page, context) -> bool:
+        """Fail early on a logged-out Naver profile, before a CGV seat is held."""
+
+        state = self._context_naver_login_state(context)
+        if state is True:
+            self.log(
+                "[CGV] 슬롯 1의 영구 Chrome 프로필에서 네이버 로그인 세션 확인 완료",
+                "success",
+            )
+            return True
+        if state is None:
+            self.log(
+                "[CGV] 네이버 로그인 API 확인이 일시적으로 지연됐습니다. "
+                "영구 프로필은 유지하고 N pay 전환 시 다시 확인합니다.",
+                "warning",
+            )
+            return True
+
+        login_page = None
+        created_page = False
+        try:
+            login_page = next(
+                (
+                    candidate
+                    for candidate in context.pages
+                    if not candidate.is_closed()
+                    and self._is_naver_login_url(self._safe_page_url(candidate))
+                ),
+                None,
+            )
+        except Exception:
+            login_page = None
+        if login_page is None:
+            try:
+                login_page = context.new_page()
+                created_page = True
+                return_url = quote(
+                    self.NAVER_ACCOUNT_HOME_URL,
+                    safe="",
+                )
+                login_page.goto(
+                    f"https://nid.naver.com/nidlogin.login?url={return_url}",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+            except Exception:
+                login_page = None
+        if login_page is None:
+            self.log(
+                "[CGV] 네이버 로그인 세션이 없고 로그인 화면도 준비하지 못했습니다.",
+                "error",
+            )
+            return False
+
+        self.log(
+            "[CGV] 네이버 로그인 세션이 없어 예약 감시 전에 자동 로그인 복구를 시작합니다.",
+            "warning",
+        )
+        login_clicked = False
+        credentials_reported = False
+        verification_reported = False
+        deadline = time.monotonic() + self.NPAY_COMPLETION_TIMEOUT_SECONDS
+        try:
+            while time.monotonic() < deadline and not self.stop_event.is_set():
+                state = self._context_naver_login_state(context)
+                if state is True:
+                    self.log(
+                        "[CGV] 네이버 로그인 복구 완료 · 영구 Chrome 프로필에 세션 유지",
+                        "success",
+                    )
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+                    return True
+
+                login_state = self._click_prefilled_naver_login(
+                    login_page,
+                    allow_click=not login_clicked,
+                )
+                if login_state.get("clicked"):
+                    login_clicked = True
+                    self.log(
+                        "[CGV] 저장된 네이버 입력으로 로그인 버튼 클릭 완료",
+                        "info",
+                    )
+                elif login_state.get("found") and not login_state.get("filled"):
+                    if not credentials_reported:
+                        credentials_reported = True
+                        self.log(
+                            "[CGV] 슬롯 1에 저장된 네이버 입력이 없습니다. "
+                            "열린 Chrome에서 로그인하면 예약 감시를 자동으로 시작합니다.",
+                            "warning",
+                        )
+                elif (
+                    self._naver_additional_verification_visible(login_page)
+                    and not verification_reported
+                ):
+                    verification_reported = True
+                    self.log(
+                        "[CGV] 네이버 추가 보안 확인이 필요합니다. "
+                        "열린 Chrome에서 완료하면 예약 감시를 자동으로 시작합니다.",
+                        "warning",
+                    )
+                try:
+                    login_page.wait_for_timeout(500)
+                except Exception:
+                    if self.stop_event.wait(0.5):
+                        break
+        finally:
+            if created_page and login_page is not None:
+                try:
+                    if not login_page.is_closed():
+                        login_page.close()
+                except Exception:
+                    pass
+
+        self.log(
+            "[CGV] 네이버 로그인 복구를 확인하지 못해 결제 불가능한 상태의 예약 시작을 차단했습니다.",
+            "error",
+        )
+        return False
+
+    def _prepare_authentication(self, page, context, cgv: dict[str, Any]) -> bool:
+        if not super()._prepare_authentication(page, context, cgv):
+            return False
+        if str(cgv.get("booking_mode", "회원") or "회원").strip() == "비회원":
+            return True
+        return self._ensure_naver_session_before_booking(page, context)
 
     @staticmethod
     def _context_has_member_session(context) -> bool:

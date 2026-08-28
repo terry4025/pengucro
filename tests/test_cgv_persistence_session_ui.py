@@ -70,6 +70,71 @@ def _jwt_with_exp(exp: float) -> str:
     return f"{encode({'alg': 'RS256'})}.{encode({'exp': exp})}.signature"
 
 
+def test_context_member_tokens_decodes_cgv_cookie_before_bearer_probe():
+    class Context:
+        @staticmethod
+        def cookies(_url):
+            return [
+                {"name": "accessToken", "value": "opaque%2Btoken%2Fvalue%3D"},
+                {"name": "refresh_token", "value": "refresh-token"},
+            ]
+
+    assert CgvEngine._context_member_tokens(Context()) == {
+        "accessToken": "opaque+token/value=",
+        "refresh_token": "refresh-token",
+    }
+
+
+def test_context_naver_login_state_uses_shared_persistent_cookie_request():
+    observed = {}
+
+    class Response:
+        status = 200
+
+        @staticmethod
+        def json():
+            return {"data": {"account": {"isLoggedIn": True}}}
+
+    class Request:
+        @staticmethod
+        def post(url, **kwargs):
+            observed["url"] = url
+            observed.update(kwargs)
+            return Response()
+
+    class Context:
+        request = Request()
+
+    assert CgvEngine._context_naver_login_state(Context()) is True
+    assert observed["url"] == CgvEngine.NAVER_ACCOUNT_PROBE_URL
+    assert observed["data"]["operationName"] == "account"
+    assert observed["timeout"] == CgvEngine.NAVER_ACCOUNT_PROBE_TIMEOUT_MS
+
+
+def test_context_naver_login_state_distinguishes_logged_out_and_unknown():
+    class LoggedOutResponse:
+        status = 200
+
+        @staticmethod
+        def json():
+            return {"data": {"account": {"isLoggedIn": False}}}
+
+    class LoggedOutContext:
+        class request:
+            @staticmethod
+            def post(*_args, **_kwargs):
+                return LoggedOutResponse()
+
+    class BrokenContext:
+        class request:
+            @staticmethod
+            def post(*_args, **_kwargs):
+                raise TimeoutError
+
+    assert CgvEngine._context_naver_login_state(LoggedOutContext()) is False
+    assert CgvEngine._context_naver_login_state(BrokenContext()) is None
+
+
 def test_opaque_member_session_is_reused_after_lightweight_auth_probe():
     logs = []
     engine = CgvEngine(lambda message, level: logs.append((message, level)))
