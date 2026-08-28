@@ -9,6 +9,19 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v657_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.57")
+
+    assert note is not None
+    assert note.changes == (
+        "둠이스케이프 빠른 조회와 지연 복구 응답을 함께 감시해 선점 재개 강화",
+        "둠이스케이프 목표 날짜·인원별 제출값 검증 강화",
+        "지구별 최종 예약 중복 제출 방지",
+        "제로월드 제출·결제 완료 응답 대기 안정화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v656_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.56")
 

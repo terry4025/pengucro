@@ -3,6 +3,8 @@ import json
 import time
 from datetime import datetime
 
+import pytest
+
 from engines.doomescape_engine import DoomEscapeEngine, DoomScanGovernor
 
 
@@ -53,8 +55,9 @@ def test_session_prefetch_caps_scan_connections_and_keeps_submit_session(monkeyp
     elapsed = time.perf_counter() - started
 
     assert engine._scan_session_count == 8
-    assert len(engine.session_pool) == 9
-    assert engine._submit_session is engine.session_pool[-1]
+    assert len(engine.session_pool) == 10
+    assert engine._submit_session is engine.session_pool[-2]
+    assert engine._submit_hedge_session is engine.session_pool[-1]
     assert elapsed < 0.20
 
 
@@ -72,6 +75,18 @@ def test_active_outage_keeps_a_fast_probe_floor_without_a_global_gate():
         * DoomEscapeEngine.LIST_TIMEOUT_SECONDS
         <= DoomEscapeEngine.MAX_SCAN_INFLIGHT
     )
+    slow_fraction = 1 / DoomEscapeEngine.SLOW_LIST_EVERY_N_TASKS
+    expected_inflight = DoomEscapeEngine.ACTIVE_SCAN_RATE_PER_SECOND * (
+        (1 - slow_fraction) * DoomEscapeEngine.LIST_TIMEOUT_SECONDS
+        + slow_fraction * DoomEscapeEngine.SLOW_LIST_TIMEOUT_SECONDS
+    )
+    assert expected_inflight <= DoomEscapeEngine.MAX_SCAN_INFLIGHT
+
+
+def test_list_timeout_keeps_fast_lane_and_periodic_slow_recovery_lane():
+    observed = [DoomEscapeEngine._list_timeout_for_task(index) for index in range(8)]
+
+    assert observed == [4.5, 1.25, 1.25, 1.25, 4.5, 1.25, 1.25, 1.25]
 
 
 def test_governor_does_not_reserve_idle_dispatches_far_ahead():
@@ -209,6 +224,45 @@ def test_timetable_rejects_navigation_date_when_slots_are_for_another_day():
     assert analysis["reason"] == "날짜 미공개"
 
 
+def test_timetable_fails_closed_when_slot_date_is_unknown():
+    html = (
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?go=rev.make.input&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span>'
+        "</a></div>"
+    )
+
+    analysis = DoomEscapeEngine.analyze_timetable(
+        html, "데이투어", "2026-09-05", "19:00"
+    )
+
+    assert analysis["date_verified"] is False
+    assert analysis["date_matches"] is False
+    assert analysis["target_date_verified"] is False
+    assert analysis["slot_id"] is None
+    assert analysis["reason"] == "날짜 미공개"
+
+
+def test_timetable_validates_the_target_anchor_date_not_another_theme_date():
+    html = (
+        '<div class="tm_box"><p class="name">다른테마</p>'
+        '<a href="?rev_days=2026-09-05&theme_time_num=99">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span></a></div>'
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?rev_days=2026-09-04&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span></a></div>'
+    )
+
+    analysis = DoomEscapeEngine.analyze_timetable(
+        html, "데이투어", "2026-09-05", "19:00"
+    )
+
+    assert analysis["date_matches"] is True
+    assert analysis["target_date_verified"] is False
+    assert analysis["slot_id"] is None
+    assert analysis["reason"] == "날짜 미공개"
+
+
 def test_timetable_accepts_only_exact_time_on_the_target_date():
     html = (
         '<div class="tm_box"><p class="name">데이투어</p>'
@@ -246,6 +300,28 @@ def test_price_fields_ignore_attribute_order_and_capacity_rejection_is_not_repos
     assert DoomEscapeEngine._prestage_rejection_requires_refresh(
         200, "<script>alert('가격 정보가 잘못되었습니다')</script>"
     ) is True
+
+
+def test_order_id_parser_does_not_confuse_theme_time_num_with_order_num():
+    rejected = (
+        '<a href="?go=rev.make.input&rev_days=2026-09-05'
+        '&theme_time_num=36">다시 입력</a>'
+    )
+
+    assert DoomEscapeEngine._extract_order_id(rejected) == ""
+    assert DoomEscapeEngine._extract_order_id("location.href='?num=9001'") == "9001"
+    assert DoomEscapeEngine._extract_order_id(
+        '<input value="9002" type="hidden" name="num">'
+    ) == "9002"
+
+
+def test_price_validation_never_falls_back_to_hardcoded_amounts():
+    with pytest.raises(RuntimeError, match="INVALID_PRICE_FIELDS"):
+        DoomEscapeEngine._validated_price_fields({"price": "126000"}, "3")
+
+    assert DoomEscapeEngine._validated_price_fields(
+        {"price": "46000", "price2": "46000", "price3": "66000"}, "3"
+    ) == {"price": "66000", "price2": "46000", "price3": "66000"}
 
 
 def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):

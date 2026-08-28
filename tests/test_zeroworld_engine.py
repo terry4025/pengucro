@@ -74,7 +74,7 @@ class SequenceSession:
         self.responses = iter(responses)
         self.posts = []
 
-    def post(self, url, data=None):
+    def post(self, url, data=None, **kwargs):
         self.posts.append((url, data))
         return next(self.responses)
 

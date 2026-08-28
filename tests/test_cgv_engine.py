@@ -760,7 +760,15 @@ def test_schedule_promotion_retries_then_returns_to_authoritative_watch(monkeypa
         "sync_playwright",
         lambda: PlaywrightManager(browser),
     )
-    monkeypatch.setattr(browser_session, "start_isolated", lambda **_kwargs: Chrome())
+    # The final runtime may install a proxy on the base module during test
+    # collection. Patch the object the engine actually calls, not the original
+    # imported module, so this test is independent of collection order and any
+    # real Chrome debugging ports on the host.
+    monkeypatch.setattr(
+        engine_module.browser_session,
+        "start_isolated",
+        lambda **_kwargs: Chrome(),
+    )
     monkeypatch.setattr(
         engine_module,
         "select_schedule",

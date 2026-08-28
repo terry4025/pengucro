@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.57",
+        changes=(
+            "둠이스케이프 빠른 조회와 지연 복구 응답을 함께 감시해 선점 재개 강화",
+            "둠이스케이프 목표 날짜·인원별 제출값 검증 강화",
+            "지구별 최종 예약 중복 제출 방지",
+            "제로월드 제출·결제 완료 응답 대기 안정화",
+        ),
+    ),
+    PatchNote(
         version="6.56",
         changes=(
             "둠이스케이프 서버 장애 중에도 첫 정상 응답 즉시 선점 재개",

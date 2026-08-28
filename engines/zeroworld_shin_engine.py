@@ -43,6 +43,8 @@ class ZeroWorldShinEngine(BaseEngine):
     """Reservation adapter for the current Sinbiweb ZeroWorld site."""
 
     USE_ASYNC_HOT_PATH = True
+    LOOKUP_TIMEOUT_SECONDS = 8.0
+    SUBMIT_TIMEOUT_SECONDS = 12.0
 
     SELECT_URL = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
     ACTION_URL = "https://zeroworldkorea.com/core/res/rev.act.php"
@@ -170,7 +172,7 @@ class ZeroWorldShinEngine(BaseEngine):
         context = self._build_context(reservation_data)
         self.session_pool = []
         self._shared_connector = create_shared_connector(num_sessions)
-        timeout = aiohttp.ClientTimeout(total=8)
+        timeout = aiohttp.ClientTimeout(total=self.LOOKUP_TIMEOUT_SECONDS)
         self.log(f"제로월드 연결·예약 단계 예열 시작 · 세션 {num_sessions}개", "info")
 
         async def prepare_one(index: int):
@@ -227,7 +229,7 @@ class ZeroWorldShinEngine(BaseEngine):
         else:
             session = aiohttp.ClientSession(
                 headers=self._headers(context),
-                timeout=aiohttp.ClientTimeout(total=8),
+                timeout=aiohttp.ClientTimeout(total=self.LOOKUP_TIMEOUT_SECONDS),
             )
             session_prepared = False
             preselected_slot_id = ""
@@ -499,7 +501,11 @@ class ZeroWorldShinEngine(BaseEngine):
             "s_subj": context.subject,
         }
         started = time.perf_counter()
-        async with session.post(self.action_url, data=action_data) as response:
+        async with session.post(
+            self.action_url,
+            data=action_data,
+            timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT_SECONDS),
+        ) as response:
             body = decode_body(await response.read())
             status = response.status
             final_url = str(response.url)
@@ -620,7 +626,10 @@ class ZeroWorldShinEngine(BaseEngine):
         if not check_code:
             kcp_url = f"{self.home_url}?go=rev.kcp&code={urllib.parse.quote(reservation_code)}"
             started = time.perf_counter()
-            async with session.get(kcp_url) as response:
+            async with session.get(
+                kcp_url,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT_SECONDS),
+            ) as response:
                 check_code = self._extract_value(decode_body(await response.read()), "ck_code")
                 status = response.status
             self._log_http(
@@ -642,7 +651,11 @@ class ZeroWorldShinEngine(BaseEngine):
             "tel": context.phone,
         }
         started = time.perf_counter()
-        async with session.post(self.payment_url, data=payment_data) as response:
+        async with session.post(
+            self.payment_url,
+            data=payment_data,
+            timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT_SECONDS),
+        ) as response:
             payment_body = decode_body(await response.read())
             payment_status = response.status
         self._log_http(
@@ -656,7 +669,10 @@ class ZeroWorldShinEngine(BaseEngine):
         if refresh:
             next_url = urllib.parse.urljoin(self.payment_url, refresh.group(1).strip())
             started = time.perf_counter()
-            async with session.get(next_url) as response:
+            async with session.get(
+                next_url,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT_SECONDS),
+            ) as response:
                 payment_body += decode_body(await response.read())
                 refresh_status = response.status
             self._log_http(

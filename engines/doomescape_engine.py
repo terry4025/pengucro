@@ -68,12 +68,18 @@ class DoomScanGovernor:
 
 class DoomEscapeEngine(BaseEngine):
     LIST_TIMEOUT_SECONDS = 1.25
+    SLOW_LIST_TIMEOUT_SECONDS = 4.5
+    SLOW_LIST_EVERY_N_TASKS = 4
     REQUEST_TIMEOUT_SECONDS = 5
     IDLE_SCAN_RATE_PER_SECOND = 2.0
     ACTIVE_SCAN_RATE_PER_SECOND = 12.0
     MIN_SCAN_RATE_PER_SECOND = 1.0
     ACTIVE_SCAN_FLOOR_PER_SECOND = 8.0
-    MAX_SCAN_INFLIGHT = 16
+    # At 12 dispatches/s, three fast 1.25 s probes plus one 4.5 s probe per
+    # four requests need about 25 simultaneous response slots in the worst
+    # steady state.  Keep spare capacity so slow recovery responses never stop
+    # the fast lane from launching on schedule.
+    MAX_SCAN_INFLIGHT = 32
     MAX_WARM_INFLIGHT = 4
     MAX_SCAN_SESSIONS = 8
     OPEN_ANCHOR_LEAD_SECONDS = 3.0
@@ -133,6 +139,7 @@ class DoomEscapeEngine(BaseEngine):
         self._scan_inflight = None
         self._scan_session_count = 0
         self._submit_session = None
+        self._submit_hedge_session = None
         self._open_anchor_epoch = None
         self._last_slot_reason = None
         self._open_time_recorded = False
@@ -279,7 +286,8 @@ class DoomEscapeEngine(BaseEngine):
 
         soup = BeautifulSoup(html_text or "", "html.parser")
         boxes = soup.find_all("div", class_="tm_box")
-        page_dates = set()
+        anchor_dates = set()
+        hidden_dates = set()
         # Date-navigation links can already contain the future target date while
         # the timetable below is still showing today. Trust only links inside
         # rendered timetable boxes, then fall back to the page's hidden state.
@@ -287,24 +295,28 @@ class DoomEscapeEngine(BaseEngine):
             for anchor in box.find_all("a", href=True):
                 match = re.search(r"rev_days=(\d{4}-\d{2}-\d{2})", anchor["href"])
                 if match:
-                    page_dates.add(match.group(1))
-        if not page_dates:
-            for field in soup.find_all("input"):
-                if (field.get("name") or "").strip() != "rev_days":
-                    continue
-                value = (field.get("value") or "").strip()
-                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-                    page_dates.add(value)
+                    anchor_dates.add(match.group(1))
+        for field in soup.find_all("input"):
+            if (field.get("name") or "").strip() != "rev_days":
+                continue
+            value = (field.get("value") or "").strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                hidden_dates.add(value)
+
+        page_dates = anchor_dates | hidden_dates
 
         date_verified = bool(page_dates)
-        date_matches = not rev_days or not date_verified or rev_days in page_dates
+        date_matches = not rev_days or (date_verified and rev_days in page_dates)
         result = {
             "page_dates": sorted(page_dates),
+            "hidden_dates": sorted(hidden_dates),
             "date_verified": date_verified,
             "date_matches": date_matches,
+            "target_date_verified": not bool(rev_days),
             "theme_found": False,
             "times": [],
             "slot_ids": {},
+            "slot_sources": {},
             "slot_id": None,
             "reason": "미오픈",
         }
@@ -334,18 +346,31 @@ class DoomEscapeEngine(BaseEngine):
             state_text = txt_span.get_text(strip=True) if txt_span else ""
             href = anchor["href"] if anchor is not None else ""
             slot_match = re.search(r"theme_time_num=(\d+)", href)
+            slot_date_match = re.search(r"rev_days=(\d{4}-\d{2}-\d{2})", href)
+            slot_date = slot_date_match.group(1) if slot_date_match else ""
+            if not slot_date and len(hidden_dates) == 1:
+                slot_date = next(iter(hidden_dates))
             closed = cls.SLOT_STATE_CLOSED in state_text or not slot_match
             state = cls.SLOT_STATE_CLOSED if closed else cls.SLOT_STATE_AVAILABLE
             if not any(existing[0] == time_text for existing in result["times"]):
                 result["times"].append((time_text, state))
             if slot_match and not closed:
                 result["slot_ids"].setdefault(time_text, slot_match.group(1))
+                if slot_date:
+                    result["slot_sources"].setdefault(
+                        time_text,
+                        {"slot_id": slot_match.group(1), "rev_days": slot_date},
+                    )
             if target_normalized and target_normalized == cls._normalize_time_text(time_text):
                 target_state = state
-                if not closed and date_matches:
+                target_date_verified = not rev_days or slot_date == rev_days
+                result["target_date_verified"] = target_date_verified
+                if not closed and target_date_verified:
                     result["slot_id"] = slot_match.group(1)
 
-        if not date_matches:
+        if not date_matches or (
+            target_state is not None and not result["target_date_verified"]
+        ):
             result["slot_id"] = None
             result["reason"] = "날짜 미공개"
         elif result["slot_id"]:
@@ -385,6 +410,40 @@ class DoomEscapeEngine(BaseEngine):
         return fields
 
     @staticmethod
+    def _validated_price_fields(fields, people):
+        normalized = {
+            str(name): str(value)
+            for name, value in dict(fields or {}).items()
+            if re.fullmatch(r"price\d*", str(name), re.I)
+            and str(value).isdigit()
+        }
+        selected_name = f"price{people}"
+        if selected_name not in normalized:
+            raise RuntimeError(
+                f"INVALID_PRICE_FIELDS: 선택 인원 {people} 가격값을 확인하지 못했습니다"
+            )
+        normalized["price"] = normalized[selected_name]
+        return normalized
+
+    @staticmethod
+    def _extract_order_id(response_text):
+        text = response_text or ""
+        match = re.search(r"(?<![A-Za-z0-9_])num=(\d+)(?!\d)", text)
+        if match:
+            return match.group(1)
+        soup = BeautifulSoup(text, "html.parser")
+        field = soup.find("input", attrs={"name": "num"})
+        value = str(field.get("value") or "").strip() if field else ""
+        return value if value.isdigit() else ""
+
+    @classmethod
+    def _list_timeout_for_task(cls, task_idx):
+        cadence = max(1, int(cls.SLOW_LIST_EVERY_N_TASKS))
+        if int(task_idx) % cadence == 0:
+            return float(cls.SLOW_LIST_TIMEOUT_SECONDS)
+        return float(cls.LIST_TIMEOUT_SECONDS)
+
+    @staticmethod
     def _prestage_rejection_requires_refresh(status, response_text):
         if int(status or 0) >= 500:
             return False
@@ -396,7 +455,14 @@ class DoomEscapeEngine(BaseEngine):
         if any(marker in message for marker in capacity_markers):
             return False
         form_markers = ("가격", "금액", "인원", "price", "파라미터", "필수", "잘못된")
-        return any(marker.casefold() in message.casefold() for marker in form_markers)
+        if any(marker.casefold() in message.casefold() for marker in form_markers):
+            return True
+        lowered = (response_text or "").casefold()
+        return 200 <= int(status or 0) < 500 and (
+            "theme_time_num" in lowered
+            or 'name="price' in lowered
+            or "name='price" in lowered
+        )
 
     @classmethod
     def _open_anchor_from_wall_clock(cls, value, now=None):
@@ -551,9 +617,10 @@ class DoomEscapeEngine(BaseEngine):
             self._prestage_lock = asyncio.Lock()
         if self._prestage_lock.locked():
             return
-        candidate_time = next(iter(analysis["slot_ids"]), "")
-        source_date = analysis["page_dates"][0] if analysis["page_dates"] else ""
-        slot_id = analysis["slot_ids"].get(candidate_time, "")
+        candidate_time = next(iter(analysis["slot_sources"]), "")
+        source = analysis["slot_sources"].get(candidate_time, {})
+        source_date = str(source.get("rev_days") or "")
+        slot_id = str(source.get("slot_id") or "")
         if not slot_id or not source_date:
             return
         async with self._prestage_lock:
@@ -573,7 +640,7 @@ class DoomEscapeEngine(BaseEngine):
                     "제출 전용", "예약 입력값 사전 준비", "GET", status,
                     time.perf_counter() - started, force=True,
                 )
-                if fields:
+                if status == 200 and fields:
                     self._prestaged_prices = fields
                     self.log(
                         f"[사전준비] {theme_name} 제출 값 확보 완료 · "
@@ -596,7 +663,57 @@ class DoomEscapeEngine(BaseEngine):
             worker_label, "예약 입력 화면 조회", "GET", status,
             time.perf_counter() - started, detail=f"slotId={slot_id}", force=True,
         )
-        return self._extract_price_fields(body.decode("utf-8", errors="ignore"))
+        if status != 200:
+            raise RuntimeError(f"HTTP {status}")
+        fields = self._extract_price_fields(body.decode("utf-8", errors="ignore"))
+        if not fields:
+            raise RuntimeError("INVALID_PRICE_FIELDS: 예약 입력값이 비어 있습니다")
+        return fields
+
+    async def _read_price_fields_hedged_async(
+        self, primary_session, fallback_session, input_url, worker_label, slot_id
+    ):
+        sessions = [primary_session]
+        if fallback_session is not None and fallback_session is not primary_session:
+            sessions.append(fallback_session)
+
+        async def read_with_delay(session, delay):
+            if delay:
+                await asyncio.sleep(delay)
+            fields = await self._read_price_fields_async(
+                session, input_url, worker_label, slot_id
+            )
+            return fields, session
+
+        tasks = {
+            asyncio.create_task(read_with_delay(session, index * 0.15))
+            for index, session in enumerate(sessions)
+        }
+        errors = []
+        try:
+            while tasks:
+                done, tasks = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception as exc:
+                        errors.append(exc)
+                        continue
+                    for pending in tasks:
+                        pending.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    return result
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        if errors:
+            raise errors[0]
+        raise RuntimeError("INVALID_PRICE_FIELDS: 예약 입력값을 확인하지 못했습니다")
 
     @staticmethod
     def _is_transient_site_error(exc):
@@ -1030,8 +1147,9 @@ class DoomEscapeEngine(BaseEngine):
                     if self.stop_event.is_set():
                         break
                     request_started = time.perf_counter()
+                    list_timeout = self._list_timeout_for_task(task_idx)
                     async with session.get(
-                        list_url, timeout=self.LIST_TIMEOUT_SECONDS
+                        list_url, timeout=list_timeout
                     ) as resp:
                         list_status = resp.status
                         if resp.status != 200:
@@ -1106,14 +1224,31 @@ class DoomEscapeEngine(BaseEngine):
                     input_url = f"{self.base_url}/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
                     used_prestage = bool(self._prestaged_prices)
                     price_fields = dict(self._prestaged_prices or {})
+                    if used_prestage:
+                        try:
+                            self._validated_price_fields(price_fields, people)
+                        except RuntimeError:
+                            self.log(
+                                f"[{worker_label}] 사전 준비값에 선택 인원 가격이 없어 "
+                                "대상 회차 입력값을 즉시 확인합니다.",
+                                "warning",
+                            )
+                            price_fields = {}
+                            used_prestage = False
                     if not price_fields:
                         current_stage = "예약 입력 화면 조회"
-                        price_fields = await self._read_price_fields_async(
-                            booking_session, input_url, worker_label, slot_id
+                        price_fields, booking_session = (
+                            await self._read_price_fields_hedged_async(
+                                booking_session,
+                                self._submit_hedge_session,
+                                input_url,
+                                worker_label,
+                                slot_id,
+                            )
                         )
 
                     async def create_order(fields):
-                        base_price = fields.get("price", "126000")
+                        verified_prices = self._validated_price_fields(fields, people)
                         act_data = {
                             "name": name,
                             "mobile1": mobile1,
@@ -1123,16 +1258,10 @@ class DoomEscapeEngine(BaseEngine):
                             "ck_agree": "on",
                             "rev_days": rev_days,
                             "theme_time_num": slot_id,
-                            "price": fields.get(f"price{people}", base_price),
-                            "price1": fields.get("price1", base_price),
-                            "price2": fields.get("price2", base_price),
-                            "price3": fields.get("price3", base_price),
-                            "price4": fields.get("price4", "168000"),
-                            "price5": fields.get("price5", "210000"),
-                            "price6": fields.get("price6", "252000"),
                             "act": "make",
                             "layout_folder": "layout/res",
                         }
+                        act_data.update(verified_prices)
                         encoded_pairs = [
                             (str(key).encode("utf-8"), str(value).encode("utf-8"))
                             for key, value in act_data.items()
@@ -1159,9 +1288,10 @@ class DoomEscapeEngine(BaseEngine):
 
                     current_stage = "예약 주문 생성"
                     act_status, act_text = await create_order(price_fields)
+                    order_id = self._extract_order_id(act_text)
                     if (
                         used_prestage
-                        and not re.search(r"num=(\d+)", act_text)
+                        and not order_id
                         and self._prestage_rejection_requires_refresh(act_status, act_text)
                     ):
                         self.log(
@@ -1169,16 +1299,22 @@ class DoomEscapeEngine(BaseEngine):
                             "warning",
                         )
                         current_stage = "예약 입력 화면 조회"
-                        price_fields = await self._read_price_fields_async(
-                            booking_session, input_url, worker_label, slot_id
+                        price_fields, booking_session = (
+                            await self._read_price_fields_hedged_async(
+                                booking_session,
+                                self._submit_hedge_session,
+                                input_url,
+                                worker_label,
+                                slot_id,
+                            )
                         )
                         current_stage = "예약 주문 생성"
                         act_status, act_text = await create_order(price_fields)
+                        order_id = self._extract_order_id(act_text)
 
                     # Parse response to find num
-                    num_m = re.search(r"num=(\d+)", act_text)
-                    if num_m:
-                        num = num_m.group(1)
+                    if order_id:
+                        num = order_id
                         self.log(
                             f"[{worker_label}] [주문 생성] slotId={slot_id} · orderId={num}",
                             "info",
@@ -1384,10 +1520,10 @@ class DoomEscapeEngine(BaseEngine):
         self.session_pool = []
         self._slot_wait_started_at = time.time()
         self._scan_session_count = max(1, min(int(num_sessions), self.MAX_SCAN_SESSIONS))
-        total_sessions = self._scan_session_count + 1
+        total_sessions = self._scan_session_count + 2
         self.log(
             f"[정보] 설정 작업 {num_sessions}개 · 실제 감시 연결 {self._scan_session_count}개 · "
-            "제출 전용 연결 1개를 준비합니다.",
+            "제출 전용 연결 2개를 준비합니다.",
             "info",
         )
         if self._open_anchor_epoch is not None:
@@ -1421,7 +1557,8 @@ class DoomEscapeEngine(BaseEngine):
 
         results = await asyncio.gather(*(warm_one() for _ in range(total_sessions)))
         self.session_pool = [session for session, _warmed, _status, _rtt, _error in results]
-        self._submit_session = self.session_pool[-1]
+        self._submit_session = self.session_pool[-2]
+        self._submit_hedge_session = self.session_pool[-1]
         warmed_count = sum(
             1 for _session, warmed, _status, _rtt, _error in results if warmed
         )

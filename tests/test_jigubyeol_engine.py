@@ -148,7 +148,7 @@ def test_payment_method_uses_fast_attribute_order_independent_parser():
     assert JigubyeolEngine._payment_method_from_html("<html>no hidden value</html>") == "1"
 
 
-def test_async_reservation_requests_run_concurrently():
+def test_async_time_selection_stays_concurrent_but_final_reservation_is_serialized():
     async def scenario():
         engine = make_engine()
         active_submissions = 0
@@ -182,7 +182,7 @@ def test_async_reservation_requests_run_concurrently():
 
         await engine.run_async_tasks(reservation_data(), 2)
 
-        assert max_active_submissions == 2
+        assert max_active_submissions == 1
 
     asyncio.run(scenario())
 
@@ -256,7 +256,7 @@ def test_error_html_is_parsed_once_while_every_attempt_is_still_logged(monkeypat
     assert len(logs) == 2
 
 
-def test_configured_fifty_workers_can_all_remain_in_flight():
+def test_configured_fifty_workers_can_all_monitor_time_selection_concurrently():
     async def scenario():
         engine = make_engine()
         active = 0
@@ -269,9 +269,6 @@ def test_configured_fifty_workers_can_all_remain_in_flight():
             ]
 
         async def submit_time_selection(_session, _csrf_token, _reservation_data):
-            return AsyncResponse(200, '<input name="payment_method" value="1">')
-
-        async def submit_reservation(_session, _csrf_token, _reservation_data, _payment_method):
             nonlocal active, peak
             active += 1
             peak = max(peak, active)
@@ -284,7 +281,6 @@ def test_configured_fifty_workers_can_all_remain_in_flight():
 
         engine.pre_fetch_sessions_async = prefetch
         engine.submit_time_selection_async = submit_time_selection
-        engine.submit_reservation_async = submit_reservation
 
         await asyncio.wait_for(
             engine.run_async_tasks(reservation_data(), 50),

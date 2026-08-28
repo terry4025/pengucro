@@ -466,8 +466,20 @@ class JigubyeolEngine(BaseEngine):
                     payment_method = self._payment_method_from_html(decoded_html)
 
                     stage = "최종 예약"
-                    started = time.perf_counter()
-                    step2_response = await self.submit_reservation_async(session, csrf_token, reservation_data, payment_method)
+                    # Keep timetable/time-selection observation concurrent, but
+                    # allow exactly one final reservation mutation at a time.
+                    # If another worker succeeds while this one waits, do not
+                    # send a duplicate final POST.
+                    async with self.async_submission_lock:
+                        if self.stop_event.is_set():
+                            break
+                        started = time.perf_counter()
+                        step2_response = await self.submit_reservation_async(
+                            session,
+                            csrf_token,
+                            reservation_data,
+                            payment_method,
+                        )
                     step2_rtt = self._elapsed_ms(started)
                     final_recovery_delay = self.observe_async_response(step2_response, step2_rtt)
                     if step2_response.status in (200, 201):

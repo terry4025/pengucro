@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 from pengucro.models import NAVER_MODE, STANDARD_MODE, TRIPCOM_MODE
@@ -522,6 +523,7 @@ def test_cgv_mode_disables_main_form_date_time_people_controls():
 
 
 def test_cgv_selection_mirrors_authoritatively_into_reservation_data():
+    selected_date = (date.today() + timedelta(days=7)).isoformat()
     form = SimpleNamespace(
         engine_mode_btn=Value(STANDARD_MODE),
         _site_uses_cgv=lambda: True,
@@ -554,7 +556,7 @@ def test_cgv_selection_mirrors_authoritatively_into_reservation_data():
             "movie": "오디세이",
             "auditorium": "IMAX관",
             "format": "IMAX LASER 2D",
-            "date": "2026-08-26",
+            "date": selected_date,
             "people": 2,
             "show_time": "17:30",
             "preferred_times": ["17:30", "14:00"],
@@ -568,7 +570,7 @@ def test_cgv_selection_mirrors_authoritatively_into_reservation_data():
 
     assert error is None
     # Authoritative values originate strictly from cgv_selection
-    assert request.reservation_date == "2026-08-26"
+    assert request.reservation_date == selected_date
     assert request.people == 2
     assert request.reservation_time == "17:30:00"
     assert request.engine_metadata["cgv"]["preferred_times"] == ["17:30", "14:00"]
