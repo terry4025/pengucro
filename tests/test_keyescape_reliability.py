@@ -43,6 +43,25 @@ def test_timing_parameters_only_make_first_read_more_conservative():
     assert hardened[2] <= KeyescapeEngine.SLOT_READ_LEAD_MAX_SECONDS
 
 
+def test_sparse_exact_timing_uses_theme_and_branch_fallback(monkeypatch):
+    engine = make_engine()
+    history = {
+        "18:58:13:40": {"samples": [{"read_rtt_ms": 100.0}]},
+        "18:58:14:40": {"samples": [{"read_rtt_ms": 900.0}]},
+        "18:58:15:40": {"samples": [{"read_rtt_ms": 1000.0}]},
+        "22:65:15:50": {"samples": [{"read_rtt_ms": 50.0}]},
+    }
+    monkeypatch.setattr(runtime, "load_json", lambda *_args, **_kwargs: history)
+
+    key, _hedge, _retry, read_lead, has_timing = engine._load_timing_profile(
+        "18", "58", "13:40"
+    )
+
+    assert key == "18:58:13:40"
+    assert has_timing is True
+    assert read_lead >= 0.45
+
+
 def test_adaptive_shared_wait_keeps_existing_absolute_cap():
     engine = make_engine()
     engine._live_slot_state = {"read_lead": 0.25}

@@ -151,8 +151,12 @@ def test_requestfinished_records_booking_post_resource_timing():
         }
 
     assert "requestfinished" in page.handlers
+    assert "request" in page.handlers
+    page.handlers["request"][-1](Request())
     run(page.handlers["requestfinished"][-1](Request()))
 
+    assert state["request_started"] is True
+    assert state["request_finished"] is True
     metrics = state["network_timing"]
     assert metrics["connect_ms"] == pytest.approx(20.0)
     assert metrics["tls_ms"] == pytest.approx(16.0)
@@ -177,3 +181,23 @@ def test_requestfinished_ignores_non_booking_controller_calls():
 
     run(page.handlers["requestfinished"][-1](Request()))
     assert "network_timing" not in state
+
+
+def test_requestfailed_marks_sent_attempt_for_uncertain_reconciliation():
+    engine, _logs = make_engine()
+    page = HandlerPage()
+    state = engine._new_submission_state()
+    run(engine._prepare_page(page, state))
+
+    class Request:
+        url = "https://www.keyescape.com/controller/run_proc.php"
+        method = "POST"
+        post_data = "t=ins_rev&themeTimeNum=2499"
+        failure = "net::ERR_TIMED_OUT"
+
+    page.handlers["request"][-1](Request())
+    run(page.handlers["requestfailed"][-1](Request()))
+
+    assert state["request_started"] is True
+    assert state["request_failed"] is True
+    assert state["request_failure"] == "net::ERR_TIMED_OUT"

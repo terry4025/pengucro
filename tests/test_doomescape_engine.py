@@ -588,6 +588,123 @@ def test_order_connect_failure_before_send_uses_warmed_fallback_once():
     assert any("연결 즉시 전환" in message for message, _level in logs)
 
 
+def test_second_pre_send_round_can_claim_same_slot_without_duplicate_risk():
+    import aiohttp
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return b"order-num=9002"
+
+    class Primary:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            raise aiohttp.ClientConnectionError("connect failed before send")
+
+    class Fallback:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            if self.post_count == 1:
+                raise aiohttp.ClientConnectionError("connect failed before send")
+            return Response()
+
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    primary = Primary()
+    fallback = Fallback()
+    engine._transport_traced_session_ids.update((id(primary), id(fallback)))
+
+    status, body, used = asyncio.run(
+        engine._post_order_with_safe_connect_retry_async(
+            primary,
+            fallback,
+            "https://doomescape.com/core/res/rev.act.php",
+            b"act=make",
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            "태스크 1",
+            "36",
+        )
+    )
+
+    assert status == 200
+    assert body == "order-num=9002"
+    assert used is fallback
+    assert primary.post_count == 2
+    assert fallback.post_count == 2
+
+
+def test_submit_keepalive_refreshes_both_dedicated_sessions():
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return b"ok"
+
+    class Session:
+        closed = False
+
+        def __init__(self):
+            self.get_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.get_count += 1
+            return Response()
+
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    primary = Session()
+    hedge = Session()
+    engine._submit_session = primary
+    engine._submit_hedge_session = hedge
+
+    warmed = asyncio.run(engine._refresh_submit_connections_once())
+
+    assert warmed == 2
+    assert primary.get_count == 1
+    assert hedge.get_count == 1
+
+
+def test_server_date_records_exact_publish_second_and_transition(monkeypatch):
+    import engines.doomescape_engine as module
+
+    saved = {}
+    monkeypatch.setattr(module, "load_json", lambda *_args, **_kwargs: {"branches": {}})
+    monkeypatch.setattr(module, "save_json", lambda _name, value: saved.update(value))
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    engine._branch_id = "3"
+    engine._server_clock_offset_seconds = 0.0
+    engine._last_unavailable_server_epoch = datetime(
+        2026, 8, 28, 20, 55, 57
+    ).timestamp()
+    engine._server_clock_now = lambda: datetime(
+        2026, 8, 28, 20, 55, 58
+    ).timestamp()
+
+    engine._record_open_time()
+
+    entry = saved["branches"]["3"]
+    assert entry["open_time"] == "20:55:58"
+    assert entry["transition_after"].endswith("20:55:57")
+    assert entry["transition_window_ms"] == 1000.0
+
+
 def test_transport_trace_marks_headers_as_sent():
     engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
     trace_config = engine._build_transport_trace_config()
@@ -679,8 +796,8 @@ def test_two_before_send_failures_remain_safe_to_retry():
             )
         )
 
-    assert primary.post_count == 1
-    assert fallback.post_count == 1
+    assert primary.post_count == 2
+    assert fallback.post_count == 2
 
 
 def test_known_order_recovery_reads_completion_without_resending_confirmation():

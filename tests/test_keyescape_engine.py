@@ -432,6 +432,99 @@ def test_submit_updates_slot_and_clicks_in_one_playwright_call():
     assert "button.click()" in page.calls[0][0]
 
 
+def test_trusted_submit_passes_absolute_browser_fire_time():
+    engine = make_engine()
+    page = RecordingPage(results={
+        "const slotId": {
+            "written": 1,
+            "captchaReady": True,
+            "buttonFound": True,
+            "clicked": True,
+        }
+    })
+    engine._await_completion = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=None
+    )
+    fire_at = time.time() * 1000.0 + 50.0
+
+    result = run(engine._submit(
+        page, {"message": ""}, "2301", "테마",
+        "2026-08-15", "09:50", "22", False,
+        fire_at_client_epoch_ms=fire_at,
+    ))
+
+    assert result == "retry"
+    args = page.calls[0][1][0]
+    assert args["fireAtClientEpochMs"] == pytest.approx(fire_at)
+    assert args["armId"]
+    assert "setTimeout" in page.calls[0][0]
+
+
+def test_sent_post_without_response_stops_as_uncertain_instead_of_retrying():
+    engine = make_engine()
+    page = RecordingPage(results={
+        "const slotId": {
+            "written": 1,
+            "captchaReady": True,
+            "buttonFound": True,
+            "clicked": True,
+        }
+    })
+    state = {"message": ""}
+    calls = []
+
+    async def no_completion(*_args, **_kwargs):
+        calls.append(True)
+        state["request_started"] = True
+        return None
+
+    engine._await_completion = no_completion
+
+    result = run(engine._submit(
+        page, state, "2301", "테마",
+        "2026-08-15", "09:50", "22", False,
+    ))
+
+    assert result == "submission_uncertain"
+    assert len(calls) == 2
+
+
+def test_late_completion_during_reconciliation_is_reported_as_success(monkeypatch):
+    engine = make_engine()
+    page = RecordingPage(results={
+        "const slotId": {
+            "written": 1,
+            "captchaReady": True,
+            "buttonFound": True,
+            "clicked": True,
+        }
+    })
+    state = {"message": ""}
+    calls = []
+
+    async def late_completion(*_args, **_kwargs):
+        calls.append(True)
+        state["request_started"] = True
+        return None if len(calls) == 1 else page
+
+    engine._await_completion = late_completion
+    engine._resolve_booking_number = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result="9001"
+    )
+    engine.notify_success = lambda *_args, **_kwargs: True
+    monkeypatch.setattr(
+        "engines.keyescape_engine.append_history", lambda *_args, **_kwargs: None
+    )
+
+    result = run(engine._submit(
+        page, state, "2301", "테마",
+        "2026-08-15", "09:50", "22", False,
+    ))
+
+    assert result == "success"
+    assert len(calls) == 2
+
+
 def test_manual_captcha_age_uses_safety_ttl():
     engine = make_engine()
     now = time.monotonic()
@@ -745,6 +838,30 @@ def test_prime_trusted_slot_refreshes_all_published_dates_for_local_history(
         "2026-08-28", "2026-08-27", "2026-08-26", "2026-08-25",
         "2026-08-24", "2026-08-23", "2026-08-22",
     ]
+
+
+def test_prime_trusted_slot_skips_network_when_targeted_cache_is_fresh(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    engine = make_engine()
+    engine._remember_slot_template(
+        "2026-08-24", "23", "69", _template_slots(gubun="A")
+    )
+    engine._remember_slot_template(
+        "2026-08-25", "23", "69", _template_slots(gubun="A")
+    )
+
+    async def forbidden_fetch(*_args, **_kwargs):
+        raise AssertionError("신선한 선택 테마 캐시는 다시 조회하지 않아야 합니다")
+
+    engine._fetch_slots = forbidden_fetch
+    slot_id, sources = run(engine._prime_trusted_slot_template(
+        "2026-08-26", "20:45", "23", "69", 8
+    ))
+
+    assert slot_id == "2828"
+    assert sources == ("2026-08-25", "2026-08-24")
 
 
 def test_only_first_standby_page_receives_trusted_fast_slot():

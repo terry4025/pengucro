@@ -32,6 +32,8 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
     TRUSTED_MISMATCH_QUARANTINE_DAYS = 14
     SHARED_WAIT_MIN_SECONDS = 0.65
     SHARED_WAIT_MARGIN_SECONDS = 0.15
+    TIMING_PROFILE_MIN_SAMPLES = 3
+    TIMING_PROFILE_MAX_SAMPLES = 12
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -230,6 +232,44 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
         )
         return hedge_delay, retry_delay, read_lead
 
+    def _load_timing_profile(self, zizum_num, theme_num, target_time):
+        """Fill sparse exact profiles from progressively broader recent history."""
+        key = self._timing_key(zizum_num, theme_num, target_time)
+        history = load_json(self.TIMING_HISTORY_FILE, {})
+        if not isinstance(history, dict):
+            history = {}
+
+        selected = []
+        used_keys = set()
+
+        def extend(profile_keys):
+            for profile_key in profile_keys:
+                if profile_key in used_keys:
+                    continue
+                used_keys.add(profile_key)
+                entry = history.get(profile_key, {})
+                samples = entry.get("samples", []) if isinstance(entry, dict) else []
+                for sample in samples:
+                    if isinstance(sample, dict):
+                        selected.append(sample)
+                if len(selected) >= self.TIMING_PROFILE_MAX_SAMPLES:
+                    return
+
+        extend([key])
+        exact_count = len(selected)
+        if len(selected) < self.TIMING_PROFILE_MIN_SAMPLES:
+            prefix = f"{zizum_num}:{theme_num}:"
+            extend(sorted(candidate for candidate in history if candidate.startswith(prefix)))
+        if len(selected) < self.TIMING_PROFILE_MIN_SAMPLES:
+            prefix = f"{zizum_num}:"
+            extend(sorted(candidate for candidate in history if candidate.startswith(prefix)))
+        if len(selected) < self.TIMING_PROFILE_MIN_SAMPLES:
+            extend(sorted(history))
+
+        selected = selected[-self.TIMING_PROFILE_MAX_SAMPLES:]
+        hedge_delay, retry_delay, read_lead = self._timing_parameters(selected)
+        return key, hedge_delay, retry_delay, read_lead, bool(exact_count or selected)
+
     async def _fetch_live_slots(self, target_date, zizum_num, theme_num, target_time):
         started = time.monotonic()
         started_delta = self._t0_delta_ms()
@@ -253,6 +293,7 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
         sample = state.get("timing_sample")
         if not isinstance(sample, dict):
             return
+        sample.setdefault("observed_at_epoch", round(time.time(), 3))
         current_delta = self._t0_delta_ms()
         if current_delta is not None:
             sample.setdefault("observed_ready_delay_ms", round(max(0.0, current_delta), 1))

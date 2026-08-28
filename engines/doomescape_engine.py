@@ -6,6 +6,7 @@ import os
 import re
 import time
 import urllib.parse
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -106,6 +107,10 @@ class DoomEscapeEngine(BaseEngine):
     SAFE_READ_RETRY_ATTEMPTS = 3
     ORDER_RECOVERY_ATTEMPTS = 6
     ORDER_RECOVERY_DELAY_SECONDS = 0.25
+    ORDER_PRE_SEND_RECONNECT_ROUNDS = 2
+    ORDER_PRE_SEND_RECONNECT_DELAY_SECONDS = 0.05
+    SUBMIT_KEEPALIVE_INTERVAL_SECONDS = 8.0
+    SUBMIT_KEEPALIVE_TIMEOUT_SECONDS = 3.0
     OPEN_ANCHOR_LEAD_SECONDS = 3.0
     OPEN_ANCHOR_HOLD_SECONDS = 1800.0
     DEFAULT_OPEN_TIME = "23:45:00"
@@ -164,8 +169,15 @@ class DoomEscapeEngine(BaseEngine):
         self._scan_session_count = 0
         self._submit_session = None
         self._submit_hedge_session = None
+        self._submit_keepalive_task = None
+        self._submit_keepalive_stop = None
+        self._submit_keepalive_cycles = 0
         self._transport_traced_session_ids = set()
         self._open_anchor_epoch = None
+        self._server_clock_offsets = []
+        self._server_clock_offset_seconds = 0.0
+        self._last_unavailable_server_epoch = None
+        self._last_publish_server_epoch = None
         self._last_slot_reason = None
         self._open_time_recorded = False
         self._branch_id = "3"
@@ -211,6 +223,28 @@ class DoomEscapeEngine(BaseEngine):
         trace_config.on_request_chunk_sent.append(mark_request_sent)
         return trace_config
 
+    def _observe_server_date(self, headers, request_wall_started, response_wall_finished):
+        """Keep a low-cost server-clock estimate from ordinary scan responses."""
+        try:
+            raw = str(headers.get("Date", "") or "")
+            server_dt = parsedate_to_datetime(raw)
+            if server_dt.tzinfo is None:
+                return
+            server_epoch = server_dt.timestamp() + 0.5
+            midpoint = (float(request_wall_started) + float(response_wall_finished)) / 2.0
+            sample = server_epoch - midpoint
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return
+        if abs(sample) > 300.0:
+            return
+        self._server_clock_offsets.append(sample)
+        self._server_clock_offsets = self._server_clock_offsets[-9:]
+        ordered = sorted(self._server_clock_offsets)
+        self._server_clock_offset_seconds = ordered[len(ordered) // 2]
+
+    def _server_clock_now(self):
+        return time.time() + float(self._server_clock_offset_seconds or 0.0)
+
     async def _post_order_with_safe_connect_retry_async(
         self,
         primary_session,
@@ -226,7 +260,8 @@ class DoomEscapeEngine(BaseEngine):
         if fallback_session is not None and fallback_session is not primary_session:
             sessions.append(fallback_session)
 
-        for attempt, candidate_session in enumerate(sessions, start=1):
+        attempts = sessions * max(1, int(self.ORDER_PRE_SEND_RECONNECT_ROUNDS))
+        for attempt, candidate_session in enumerate(attempts, start=1):
             transport_state = {"request_bytes_sent": False}
             started = time.perf_counter()
             try:
@@ -247,11 +282,18 @@ class DoomEscapeEngine(BaseEngine):
                     trace_is_authoritative
                     and not transport_state["request_bytes_sent"]
                 )
-                has_fallback = attempt < len(sessions)
+                has_fallback = attempt < len(attempts)
                 if safe_before_send_failure and has_fallback:
+                    if attempt == len(sessions):
+                        self.log(
+                            f"[{worker_label}] [안전 재연결] 제출 연결 2개가 모두 "
+                            "바이트 전송 전에 끊겨 같은 슬롯을 새 연결로 한 차례 더 시도합니다.",
+                            "warning",
+                        )
+                        await asyncio.sleep(self.ORDER_PRE_SEND_RECONNECT_DELAY_SECONDS)
                     self.log(
                         f"[{worker_label}] [연결 즉시 전환] 예약 주문 바이트 전송 전 "
-                        f"{self._describe_exception(exc)} · 두 번째 예열 연결로 1회 재시도합니다.",
+                        f"{self._describe_exception(exc)} · 안전한 다음 제출 연결로 전환합니다.",
                         "warning",
                     )
                     continue
@@ -607,15 +649,31 @@ class DoomEscapeEngine(BaseEngine):
         if self._open_time_recorded:
             return
         self._open_time_recorded = True
-        observed = datetime.now().replace(second=0, microsecond=0)
+        observed_epoch = self._server_clock_now()
+        self._last_publish_server_epoch = observed_epoch
+        observed = datetime.fromtimestamp(observed_epoch).replace(microsecond=0)
         data = load_json(self.OPEN_TIME_MEMORY_FILE, {})
         if not isinstance(data, dict):
             data = {}
         branches = data.setdefault("branches", {})
-        branches[str(self._branch_id)] = {
+        entry = {
             "open_time": observed.strftime("%H:%M:%S"),
             "observed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "server_observed_at": observed.strftime("%Y-%m-%d %H:%M:%S"),
+            "server_offset_seconds": round(
+                float(self._server_clock_offset_seconds or 0.0), 3
+            ),
         }
+        if self._last_unavailable_server_epoch is not None:
+            unavailable = datetime.fromtimestamp(
+                self._last_unavailable_server_epoch
+            ).replace(microsecond=0)
+            entry["transition_after"] = unavailable.strftime("%Y-%m-%d %H:%M:%S")
+            entry["transition_window_ms"] = round(
+                max(0.0, observed_epoch - self._last_unavailable_server_epoch) * 1000.0,
+                1,
+            )
+        branches[str(self._branch_id)] = entry
         try:
             save_json(self.OPEN_TIME_MEMORY_FILE, data)
         except OSError:
@@ -625,7 +683,7 @@ class DoomEscapeEngine(BaseEngine):
         governor = self.scan_governor
         if governor is None:
             return
-        now = time.time()
+        now = self._server_clock_now()
         active_by_clock = bool(
             self._open_anchor_epoch is not None
             and self._open_anchor_epoch - self.OPEN_ANCHOR_LEAD_SECONDS
@@ -640,6 +698,8 @@ class DoomEscapeEngine(BaseEngine):
             and not self._outage_started_at
         ):
             self._record_open_time()
+        if not published:
+            self._last_unavailable_server_epoch = now
         self._last_slot_reason = reason
         if governor.set_phase(phase):
             self.log(
@@ -725,6 +785,81 @@ class DoomEscapeEngine(BaseEngine):
                 f"{now - started:.1f}초 · 즉시 선점 경로를 재개합니다.",
                 "success",
             )
+
+    async def _refresh_submit_connections_once(self, *, announce=False):
+        """Refresh the two state-changing lanes with a harmless same-origin GET."""
+        sessions = [
+            session for session in (self._submit_session, self._submit_hedge_session)
+            if session is not None and not getattr(session, "closed", False)
+        ]
+        if not sessions:
+            return 0
+        home_url = f"{self.base_url}/layout/res/home.php?go=main&pg_submit_warm={int(time.time())}"
+
+        async def warm(session):
+            try:
+                async with session.get(
+                    home_url,
+                    timeout=self.SUBMIT_KEEPALIVE_TIMEOUT_SECONDS,
+                ) as response:
+                    await response.read()
+                    return response.status < 500
+            except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                return False
+
+        results = await asyncio.gather(*(warm(session) for session in sessions))
+        warmed = sum(bool(result) for result in results)
+        self._submit_keepalive_cycles += 1
+        if announce or warmed != len(sessions):
+            self.log(
+                f"[정보] 제출 전용 연결 재예열 {warmed}/{len(sessions)}개 · "
+                "주문 POST 직전 연결 비용을 제거합니다.",
+                "info" if warmed == len(sessions) else "warning",
+            )
+        return warmed
+
+    async def _submit_connection_keepalive_loop(self):
+        stop = self._submit_keepalive_stop
+        if stop is None:
+            return
+        while not self.stop_event.is_set() and not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(), timeout=self.SUBMIT_KEEPALIVE_INTERVAL_SECONDS
+                )
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self.stop_event.is_set() or stop.is_set():
+                break
+            await self._refresh_submit_connections_once(
+                announce=self._submit_keepalive_cycles == 0
+            )
+
+    def _start_submit_connection_keepalive(self):
+        task = self._submit_keepalive_task
+        if task is not None and not task.done():
+            return task
+        self._submit_keepalive_stop = asyncio.Event()
+        self._submit_keepalive_task = asyncio.create_task(
+            self._submit_connection_keepalive_loop(),
+            name="doom-submit-connection-keepalive",
+        )
+        return self._submit_keepalive_task
+
+    async def _stop_submit_connection_keepalive(self):
+        stop = self._submit_keepalive_stop
+        if stop is not None:
+            stop.set()
+        task = self._submit_keepalive_task
+        self._submit_keepalive_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _close_session_pool(self):
+        await self._stop_submit_connection_keepalive()
+        await super()._close_session_pool()
 
     async def _prestage_prices(self, analysis, theme_name):
         if self._prestaged_prices is not None or self._submit_session is None:
@@ -1291,11 +1426,13 @@ class DoomEscapeEngine(BaseEngine):
                     if self.stop_event.is_set():
                         break
                     request_started = time.perf_counter()
+                    request_wall_started = time.time()
                     list_timeout = self._list_timeout_for_task(task_idx)
                     async with session.get(
                         list_url, timeout=list_timeout
                     ) as resp:
                         list_status = resp.status
+                        response_headers = getattr(resp, "headers", {}) or {}
                         if resp.status != 200:
                             await resp.read()
                             self._log_http_diagnostic(
@@ -1308,8 +1445,12 @@ class DoomEscapeEngine(BaseEngine):
                             )
                             raise RuntimeError(f"HTTP {resp.status}")
                         html_bytes = await resp.read()
+                    response_wall_finished = time.time()
                     request_elapsed = time.perf_counter() - request_started
                 html_text = html_bytes.decode('utf-8', errors='ignore')
+                self._observe_server_date(
+                    response_headers, request_wall_started, response_wall_finished
+                )
 
                 self._log_http_diagnostic(
                     worker_label,
@@ -1366,6 +1507,10 @@ class DoomEscapeEngine(BaseEngine):
                 try:
                     if self.stop_event.is_set():
                         break
+
+                    # Stop harmless keep-alive reads before the winning response
+                    # borrows the two dedicated POST connections.
+                    await self._stop_submit_connection_keepalive()
 
                     booking_session = self._submit_session or session
                     input_url = f"{self.base_url}/layout/res/home.php?go=rev.make.input&rev_days={rev_days}&theme_time_num={slot_id}"
@@ -1713,6 +1858,8 @@ class DoomEscapeEngine(BaseEngine):
             except Exception as e:
                 if self.stop_event.is_set():
                     break
+                if isinstance(e, DoomOrderNotSent):
+                    self._start_submit_connection_keepalive()
                 err_str = self._describe_exception(e)
                 now = time.time()
                 show_log = False
@@ -1763,6 +1910,13 @@ class DoomEscapeEngine(BaseEngine):
         self._inventory_logged = False
         self._unverified_date_warned = False
         self._transport_traced_session_ids.clear()
+        self._server_clock_offsets = []
+        self._server_clock_offset_seconds = 0.0
+        self._last_unavailable_server_epoch = None
+        self._last_publish_server_epoch = None
+        self._submit_keepalive_cycles = 0
+        self._submit_keepalive_stop = asyncio.Event()
+        self._submit_keepalive_task = None
         self._branch_id = str(reservation_data.get("branch", "3") or "3")
         configured_open = ""
         for key in ("openDateTime", "openAt", "reservationOpenAt", "openTime"):
@@ -1818,6 +1972,7 @@ class DoomEscapeEngine(BaseEngine):
         self.session_pool = [session for session, _warmed, _status, _rtt, _error in results]
         self._submit_session = self.session_pool[-2]
         self._submit_hedge_session = self.session_pool[-1]
+        self._start_submit_connection_keepalive()
         warmed_count = sum(
             1 for _session, warmed, _status, _rtt, _error in results if warmed
         )

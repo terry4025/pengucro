@@ -283,9 +283,17 @@ class KeyescapeEngine(_ReliabilityKeyescapeEngine):
         """Keep base success handling and add non-invasive network telemetry."""
         await super()._prepare_page(page, dialog_state)
 
+        def handle_request_started(request):
+            if not self._is_booking_post(request):
+                return
+            dialog_state["request_started"] = True
+            dialog_state["request_started_monotonic"] = time.monotonic()
+            self._trace_timing("예약 POST 브라우저 전송 시작")
+
         async def handle_request_finished(request):
             if not self._is_booking_post(request):
                 return
+            dialog_state["request_finished"] = True
             try:
                 timing = request.timing
                 if callable(timing):
@@ -352,11 +360,14 @@ class KeyescapeEngine(_ReliabilityKeyescapeEngine):
                     failure = failure()
             except Exception:
                 failure = ""
+            dialog_state["request_failed"] = True
+            dialog_state["request_failure"] = str(failure or "")
             self._trace_timing(
                 "예약 POST 네트워크 실패"
                 + (f" · {str(failure)[:120]}" if failure else ""),
                 "warning",
             )
 
+        page.on("request", handle_request_started)
         page.on("requestfinished", handle_request_finished)
         page.on("requestfailed", handle_request_failed)

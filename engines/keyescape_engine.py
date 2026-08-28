@@ -203,6 +203,7 @@ class KeyescapeEngine(BaseEngine):
 
     MAX_STANDBY_PAGES = 3
     SUBMIT_MAX_ATTEMPTS = 5
+    SUBMISSION_RECONCILE_SECONDS = 4.0
     SIBLING_SUCCESS_GRACE_SECONDS = 0.25
     PLACEHOLDER_SLOT_ID = "9999"
     SLOT_OPEN_RETRY_SECONDS = 0.12
@@ -220,6 +221,7 @@ class KeyescapeEngine(BaseEngine):
     SLOT_TEMPLATE_FILE = "keyescape_slot_templates.json"
     TIMING_SAMPLE_LIMIT = 20
     SLOT_TEMPLATE_LIMIT = 40
+    SLOT_TEMPLATE_REFRESH_TTL_SECONDS = 1800.0
     TRUSTED_TEMPLATE_MAX_AGE_DAYS = 21
     TRUSTED_SINGLE_TEMPLATE_MAX_AGE_DAYS = 8
     TRUSTED_FIRE_EXTRA_SECONDS = 0.005
@@ -670,6 +672,28 @@ class KeyescapeEngine(BaseEngine):
 
         return "", ()
 
+    def _trusted_cache_age_seconds(self, zizum_num, theme_num):
+        canonical_site = self.site_url.rstrip("/").lower()
+        for suffix in ("/reservation.php", "/reservation2.php"):
+            if canonical_site.endswith(suffix):
+                canonical_site = canonical_site[:-len(suffix)]
+                break
+        key = f"{canonical_site}|{zizum_num}|{theme_num}"
+        cache = load_json(self.SLOT_TEMPLATE_FILE, {"entries": {}})
+        entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+        rows = entries.get(key, []) if isinstance(entries, dict) else []
+        newest = None
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                observed = datetime.fromisoformat(str(row.get("observed_at", "")))
+                stamp = observed.timestamp()
+            except (TypeError, ValueError, OSError):
+                continue
+            newest = stamp if newest is None else max(newest, stamp)
+        return None if newest is None else max(0.0, time.time() - newest)
+
     async def _prime_trusted_slot_template(
         self, target_date, target_time, zizum_num, theme_num, doing_days
     ) -> tuple[str, tuple[str, ...]]:
@@ -679,6 +703,22 @@ class KeyescapeEngine(BaseEngine):
             server_day = datetime.fromtimestamp(self.clock.now(), KST).date()
         except (TypeError, ValueError, OSError):
             return "", ()
+        cached = self._trusted_slot_from_cache(
+            target_date, target_time, zizum_num, theme_num
+        )
+        cache_age = self._trusted_cache_age_seconds(zizum_num, theme_num)
+        if (
+            cached[0]
+            and cache_age is not None
+            and cache_age <= self.SLOT_TEMPLATE_REFRESH_TTL_SECONDS
+        ):
+            self.log(
+                f"[정보] 선택 테마 시간표 캐시 신선도 확인 · {cache_age:.0f}초 전 갱신 · "
+                "추가 조회 없이 Fast Path를 준비합니다.",
+                "info",
+            )
+            return cached
+
         # Refresh every published date for this theme so each real weekday
         # schedule remains available locally after it leaves the site window.
         candidates = [
@@ -1767,14 +1807,10 @@ class KeyescapeEngine(BaseEngine):
 
     async def _wait_for_trusted_fire(self):
         """Never let the verified-template page cross the server gate early."""
-        if self.open_at is None:
+        target = self._trusted_fire_server_epoch()
+        if target is None:
             return
-        try:
-            precision = float(self.clock.last_precision or 0.06)
-        except (TypeError, ValueError):
-            precision = 0.06
-        safety = min(0.12, max(0.02, precision) + self.TRUSTED_FIRE_EXTRA_SECONDS)
-        target = float(self.open_at) + safety
+
         timer_active = self._begin_high_resolution_timer()
         try:
             while not self.stop_event.is_set():
@@ -1785,6 +1821,22 @@ class KeyescapeEngine(BaseEngine):
         finally:
             if timer_active:
                 self._end_high_resolution_timer()
+
+    def _trusted_fire_server_epoch(self):
+        if self.open_at is None:
+            return None
+        try:
+            precision = float(self.clock.last_precision or 0.06)
+        except (TypeError, ValueError):
+            precision = 0.06
+        safety = min(0.12, max(0.02, precision) + self.TRUSTED_FIRE_EXTRA_SECONDS)
+        return float(self.open_at) + safety
+
+    def _trusted_fire_client_epoch_ms(self):
+        target = self._trusted_fire_server_epoch()
+        if target is None:
+            return 0.0
+        return (time.time() + max(0.0, target - self.clock.now())) * 1000.0
 
     def _live_slot_retry_delay(self):
         state = self._live_slot_state or {}
@@ -1897,6 +1949,10 @@ class KeyescapeEngine(BaseEngine):
             "submission_status": "",
             "booking_number": "",
             "ck_code": "",
+            "request_started": False,
+            "request_finished": False,
+            "request_failed": False,
+            "request_failure": "",
         }
 
     @staticmethod
@@ -2396,10 +2452,13 @@ class KeyescapeEngine(BaseEngine):
         };
     }"""
 
-    FINAL_CLICK_SCRIPT = """(args) => {
+    FINAL_CLICK_SCRIPT = """async (args) => {
         const slotId = String(args.slotId || '');
         const apiToken = String(args.apiToken || '');
         const apiTokenActive = Boolean(args.apiTokenActive);
+        const fireAt = Number(args.fireAtClientEpochMs || 0);
+        const armId = String(args.armId || '');
+        if (armId) { window.__pgFinalArmId = armId; }
         const form = document.querySelector('#form');
         let written = 0;
         if (form) {
@@ -2457,12 +2516,25 @@ class KeyescapeEngine(BaseEngine):
             || Array.from(document.querySelectorAll('button, a'))
                 .find(el => (el.innerText || '').includes('예약하기'));
         const ready = Boolean(form && written > 0 && captchaReady && button);
-        if (ready) { button.click(); }
+        if (ready && fireAt > Date.now()) {
+            // Yield for the long portion, then keep the final 25 ms inside the
+            // browser process. Windows timer wake-ups can otherwise overshoot
+            // the gate by roughly one scheduler quantum.
+            const coarseDelay = Math.max(0, fireAt - Date.now() - 25);
+            if (coarseDelay > 0) {
+                await new Promise(resolve => setTimeout(resolve, coarseDelay));
+            }
+            while (Date.now() < fireAt) {}
+        }
+        const stillArmed = !armId || window.__pgFinalArmId === armId;
+        if (ready && stillArmed) { button.click(); }
         return {
             written,
             captchaReady,
             buttonFound: Boolean(button),
-            clicked: ready,
+            clicked: ready && stillArmed,
+            armed: Boolean(fireAt),
+            firedAtClientEpochMs: Date.now(),
         };
     }"""
 
@@ -3025,9 +3097,6 @@ class KeyescapeEngine(BaseEngine):
                 self._trusted_slot_id and not trusted_attempted
             )
             if use_trusted_slot:
-                await self._wait_for_trusted_fire()
-                if self.stop_event.is_set() or self._page_success_event.is_set():
-                    return
                 live_slot_id = self._trusted_slot_id
                 live_slot_status = "trusted"
                 self._trace_timing(
@@ -3095,6 +3164,9 @@ class KeyescapeEngine(BaseEngine):
                 captcha_age=(
                     time.monotonic() - captcha_since if captcha_since else None
                 ),
+                fire_at_client_epoch_ms=(
+                    self._trusted_fire_client_epoch_ms() if use_trusted_slot else 0.0
+                ),
             )
 
             submitted_api_token = (
@@ -3116,6 +3188,14 @@ class KeyescapeEngine(BaseEngine):
                 )
             if result == "capacity":
                 await self._report_capacity_result()
+                return
+            if result == "submission_uncertain":
+                self.log(
+                    "[중복 방지 정지] 예약 POST가 서버로 전달된 뒤 결과를 확정하지 "
+                    "못했습니다. 같은 페이지에서 다시 제출하지 않고 브라우저의 예약 "
+                    "결과를 확인해주세요.",
+                    "error",
+                )
                 return
 
             message = dialog_state.get("message", "")
@@ -3209,6 +3289,7 @@ class KeyescapeEngine(BaseEngine):
         self, page, dialog_state, slot_id, theme_name,
         target_date, target_time, zizum_num, dev_mode,
         api_token_active=False, captcha_age=None,
+        fire_at_client_epoch_ms=0.0,
     ):
         slot_id = str(slot_id or "").strip()
         if not slot_id or slot_id == self.PLACEHOLDER_SLOT_ID:
@@ -3224,9 +3305,18 @@ class KeyescapeEngine(BaseEngine):
         # possible slot-id spellings, re-stamp/verify an API captcha token when
         # one is active, and click the site's existing AJAX submit handler.
         try:
-            self._trace_timing(f"최종 브라우저 동작 전달 · 슬롯 ID {slot_id}")
-            action = await page.evaluate(
-                self.FINAL_CLICK_SCRIPT,
+            arm_id = (
+                f"{id(page)}-{time.time_ns()}" if fire_at_client_epoch_ms else ""
+            )
+            self._trace_timing(
+                (
+                    f"브라우저 예약 타이머 설치 · 슬롯 ID {slot_id}"
+                    if fire_at_client_epoch_ms else
+                    f"최종 브라우저 동작 전달 · 슬롯 ID {slot_id}"
+                )
+            )
+            action = await self._run_final_click_action(
+                page,
                 {
                     "slotId": slot_id,
                     "apiToken": (
@@ -3235,6 +3325,8 @@ class KeyescapeEngine(BaseEngine):
                         else ""
                     ),
                     "apiTokenActive": bool(api_token_active),
+                    "fireAtClientEpochMs": float(fire_at_client_epoch_ms or 0.0),
+                    "armId": arm_id,
                 },
             )
         except Exception as exc:
@@ -3288,7 +3380,27 @@ class KeyescapeEngine(BaseEngine):
             submission_state=dialog_state,
         )
         if completion is None:
-            return self._classify_failure(dialog_state.get("message", ""))
+            if (
+                dialog_state.get("request_started")
+                and not dialog_state.get("submission_status")
+                and not dialog_state.get("message")
+            ):
+                self.log(
+                    "[정보] 예약 POST 전송을 확인했지만 응답이 늦어 추가 완료 확인을 "
+                    f"{self.SUBMISSION_RECONCILE_SECONDS:.0f}초 진행합니다.",
+                    "warning",
+                )
+                completion = await self._await_completion(
+                    page,
+                    timeout=self.SUBMISSION_RECONCILE_SECONDS,
+                    include_context_pages=(self._page_count <= 1),
+                    finish_inflight=True,
+                    submission_state=dialog_state,
+                )
+                if completion is None:
+                    return "submission_uncertain"
+            else:
+                return self._classify_failure(dialog_state.get("message", ""))
 
         self._page_success_event.set()
         booking_number = await self._resolve_booking_number(
@@ -3320,6 +3432,42 @@ class KeyescapeEngine(BaseEngine):
             )
         )
         return "success"
+
+    async def _run_final_click_action(self, page, args):
+        """Run a pre-armed browser click while keeping stop semantics authoritative."""
+        fire_at = float(args.get("fireAtClientEpochMs") or 0.0)
+        arm_id = str(args.get("armId") or "")
+        if not fire_at:
+            return await page.evaluate(self.FINAL_CLICK_SCRIPT, args)
+        if self.stop_event.is_set() or self._page_success_event.is_set():
+            return {
+                "written": 1,
+                "captchaReady": True,
+                "buttonFound": True,
+                "clicked": False,
+                "cancelled": True,
+            }
+
+        action_task = asyncio.create_task(
+            page.evaluate(self.FINAL_CLICK_SCRIPT, args),
+            name=f"keyescape-final-arm-{getattr(self, '_page_index', 1)}",
+        )
+        while not action_task.done():
+            if self.stop_event.is_set() or self._page_success_event.is_set():
+                try:
+                    await page.evaluate(
+                        """(armId) => {
+                            if (window.__pgFinalArmId === armId) {
+                                window.__pgFinalArmId = '';
+                            }
+                        }""",
+                        arm_id,
+                    )
+                except Exception:
+                    pass
+                return await action_task
+            await asyncio.wait({action_task}, timeout=0.02)
+        return await action_task
 
     @staticmethod
     def _classify_failure(message):
