@@ -547,10 +547,11 @@ def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_pat
     assert store.get("cgv_npay_password") == ""
 
 
-def test_v659_release_contract_is_complete():
-    assert __version__ == "6.59"
-    assert __release_sequence__ == 6590001
-    note = notes_for("6.59")
+def test_v660_release_contract_is_complete():
+    assert __version__ == "6.60"
+    assert __release_sequence__ == 6600001
+    note = notes_for("6.60")
     assert note is not None
-    assert any("네이버" in change for change in note.changes)
     assert any("둠이스케이프" in change for change in note.changes)
+    assert any("연결 오류" in change for change in note.changes)
+    assert any("중복 예약" in change for change in note.changes)

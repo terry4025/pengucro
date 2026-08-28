@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.60",
+        changes=(
+            "둠이스케이프 주문 전송 전 연결 오류 발생 시 즉시 재시도해 선점 복구 강화",
+            "둠이스케이프 주문 전송 여부를 구분해 중복 예약 없이 감시 지속",
+        ),
+    ),
+    PatchNote(
         version="6.59",
         changes=(
             "네이버 통신 지연과 서버 시각 오차를 반영해 오픈 순간 선점 시점 자동 보정",
