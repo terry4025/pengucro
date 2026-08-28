@@ -2,10 +2,16 @@ import asyncio
 import json
 import time
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
-from engines.doomescape_engine import DoomEscapeEngine, DoomScanGovernor
+from engines.doomescape_engine import (
+    DoomEscapeEngine,
+    DoomOrderNotSent,
+    DoomScanGovernor,
+    DoomSubmissionUncertain,
+)
 
 
 def test_empty_timeout_error_has_a_useful_name():
@@ -520,6 +526,161 @@ def test_async_order_timeout_stops_without_duplicate_post(monkeypatch):
     assert submit_session.post_count == 1
     assert engine.stop_event.is_set()
     assert any("중복 방지 정지" in message for message, _level in logs)
+
+
+def test_order_connect_failure_before_send_uses_warmed_fallback_once():
+    import aiohttp
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return b"order-num=9001"
+
+    class PrimarySession:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            raise aiohttp.ClientConnectionError("connect failed before send")
+
+    class FallbackSession:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            return Response()
+
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    primary = PrimarySession()
+    fallback = FallbackSession()
+    engine._transport_traced_session_ids.update((id(primary), id(fallback)))
+
+    status, body, used_session = asyncio.run(
+        engine._post_order_with_safe_connect_retry_async(
+            primary,
+            fallback,
+            "https://doomescape.com/core/res/rev.act.php",
+            b"act=make",
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            "태스크 1",
+            "36",
+        )
+    )
+
+    assert status == 200
+    assert body == "order-num=9001"
+    assert used_session is fallback
+    assert primary.post_count == 1
+    assert fallback.post_count == 1
+    assert any("연결 즉시 전환" in message for message, _level in logs)
+
+
+def test_transport_trace_marks_headers_as_sent():
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    trace_config = engine._build_transport_trace_config()
+    state = {"request_bytes_sent": False}
+    context = SimpleNamespace(
+        trace_request_ctx={"doom_transport_state": state}
+    )
+
+    asyncio.run(trace_config.on_request_headers_sent[0](None, context, None))
+
+    assert state["request_bytes_sent"] is True
+
+
+def test_order_failure_after_headers_sent_never_uses_fallback():
+    class TimeoutResponse:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class SentSession:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **kwargs):
+            self.post_count += 1
+            kwargs["trace_request_ctx"]["doom_transport_state"][
+                "request_bytes_sent"
+            ] = True
+            return TimeoutResponse()
+
+    class ForbiddenFallback:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            raise AssertionError("전송 후에는 두 번째 주문 POST를 보내면 안 됩니다")
+
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    primary = SentSession()
+    fallback = ForbiddenFallback()
+    engine._transport_traced_session_ids.update((id(primary), id(fallback)))
+
+    with pytest.raises(DoomSubmissionUncertain, match="예약 주문 생성"):
+        asyncio.run(
+            engine._post_order_with_safe_connect_retry_async(
+                primary,
+                fallback,
+                "https://doomescape.com/core/res/rev.act.php",
+                b"act=make",
+                {"Content-Type": "application/x-www-form-urlencoded"},
+                "태스크 1",
+                "36",
+            )
+        )
+
+    assert primary.post_count == 1
+    assert fallback.post_count == 0
+
+
+def test_two_before_send_failures_remain_safe_to_retry():
+    import aiohttp
+
+    class FailedSession:
+        def __init__(self):
+            self.post_count = 0
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            raise aiohttp.ClientConnectionError("connect failed before send")
+
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    primary = FailedSession()
+    fallback = FailedSession()
+    engine._transport_traced_session_ids.update((id(primary), id(fallback)))
+
+    with pytest.raises(DoomOrderNotSent, match="안전하게 다시 시도"):
+        asyncio.run(
+            engine._post_order_with_safe_connect_retry_async(
+                primary,
+                fallback,
+                "https://doomescape.com/core/res/rev.act.php",
+                b"act=make",
+                {"Content-Type": "application/x-www-form-urlencoded"},
+                "태스크 1",
+                "36",
+            )
+        )
+
+    assert primary.post_count == 1
+    assert fallback.post_count == 1
 
 
 def test_known_order_recovery_reads_completion_without_resending_confirmation():

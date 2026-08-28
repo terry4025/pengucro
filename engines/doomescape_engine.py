@@ -28,6 +28,10 @@ class DoomSubmissionUncertain(RuntimeError):
         self.order_id = str(order_id or "")
 
 
+class DoomOrderNotSent(ConnectionError):
+    """The order request provably failed before any HTTP bytes were sent."""
+
+
 class DoomScanGovernor:
     """Space aggregate timetable requests independently of worker count."""
 
@@ -160,6 +164,7 @@ class DoomEscapeEngine(BaseEngine):
         self._scan_session_count = 0
         self._submit_session = None
         self._submit_hedge_session = None
+        self._transport_traced_session_ids = set()
         self._open_anchor_epoch = None
         self._last_slot_reason = None
         self._open_time_recorded = False
@@ -182,6 +187,97 @@ class DoomEscapeEngine(BaseEngine):
             r"(?i)(?P<prefix>[?&]ck_code=)[^&#\s]+",
             r"\g<prefix>[redacted]",
             message,
+        )
+
+    def _build_transport_trace_config(self):
+        """Track whether a state-changing request emitted any HTTP bytes.
+
+        A connection failure is safe to retry only while the client can prove
+        that even the request headers were not sent. Once headers or a body
+        chunk leave the client, the server may still complete the order after
+        the local response wait fails.
+        """
+        trace_config = aiohttp.TraceConfig()
+
+        async def mark_request_sent(_session, trace_context, _params):
+            request_context = getattr(trace_context, "trace_request_ctx", None)
+            if not isinstance(request_context, dict):
+                return
+            state = request_context.get("doom_transport_state")
+            if isinstance(state, dict):
+                state["request_bytes_sent"] = True
+
+        trace_config.on_request_headers_sent.append(mark_request_sent)
+        trace_config.on_request_chunk_sent.append(mark_request_sent)
+        return trace_config
+
+    async def _post_order_with_safe_connect_retry_async(
+        self,
+        primary_session,
+        fallback_session,
+        act_url,
+        post_data,
+        post_headers,
+        worker_label,
+        slot_id,
+    ):
+        """Create one order, failing over only before any request bytes leave."""
+        sessions = [primary_session]
+        if fallback_session is not None and fallback_session is not primary_session:
+            sessions.append(fallback_session)
+
+        for attempt, candidate_session in enumerate(sessions, start=1):
+            transport_state = {"request_bytes_sent": False}
+            started = time.perf_counter()
+            try:
+                async with candidate_session.post(
+                    act_url,
+                    data=post_data,
+                    headers=post_headers,
+                    timeout=self.ORDER_POST_TIMEOUT_SECONDS,
+                    trace_request_ctx={"doom_transport_state": transport_state},
+                ) as response:
+                    status = response.status
+                    text = (await response.read()).decode("utf-8", errors="ignore")
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                trace_is_authoritative = id(candidate_session) in (
+                    self._transport_traced_session_ids
+                )
+                safe_before_send_failure = (
+                    trace_is_authoritative
+                    and not transport_state["request_bytes_sent"]
+                )
+                has_fallback = attempt < len(sessions)
+                if safe_before_send_failure and has_fallback:
+                    self.log(
+                        f"[{worker_label}] [연결 즉시 전환] 예약 주문 바이트 전송 전 "
+                        f"{self._describe_exception(exc)} · 두 번째 예열 연결로 1회 재시도합니다.",
+                        "warning",
+                    )
+                    continue
+                if safe_before_send_failure:
+                    raise DoomOrderNotSent(
+                        "예약 주문 바이트를 전송하지 못해 안전하게 다시 시도할 수 있음: "
+                        f"{self._describe_exception(exc)}"
+                    ) from exc
+                raise DoomSubmissionUncertain(
+                    "예약 주문 생성",
+                    self._describe_exception(exc),
+                ) from exc
+
+            self._log_http_diagnostic(
+                worker_label,
+                "예약 주문 생성",
+                "POST",
+                status,
+                time.perf_counter() - started,
+                detail=f"slotId={slot_id} · 연결 {attempt}",
+                force=True,
+            )
+            return status, text, candidate_session
+
+        raise DoomSubmissionUncertain(
+            "예약 주문 생성", "예열된 제출 연결을 사용할 수 없음"
         )
 
     def _next_sync_worker_label(self):
@@ -1324,32 +1420,23 @@ class DoomEscapeEngine(BaseEngine):
                             "Origin": self.base_url,
                             "User-Agent": headers["User-Agent"],
                         }
-                        started = time.perf_counter()
-                        try:
-                            async with booking_session.post(
-                                act_url,
-                                data=post_data,
-                                headers=post_headers,
-                                timeout=self.ORDER_POST_TIMEOUT_SECONDS,
-                            ) as response:
-                                status = response.status
-                                text = (await response.read()).decode(
-                                    "utf-8", errors="ignore"
-                                )
-                        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                            raise DoomSubmissionUncertain(
-                                "예약 주문 생성",
-                                self._describe_exception(exc),
-                            ) from exc
-                        self._log_http_diagnostic(
-                            worker_label, "예약 주문 생성", "POST", status,
-                            time.perf_counter() - started,
-                            detail=f"slotId={slot_id}", force=True,
+                        fallback_session = self._submit_hedge_session
+                        if fallback_session is booking_session:
+                            fallback_session = self._submit_session
+                        return await self._post_order_with_safe_connect_retry_async(
+                            booking_session,
+                            fallback_session,
+                            act_url,
+                            post_data,
+                            post_headers,
+                            worker_label,
+                            slot_id,
                         )
-                        return status, text
 
                     current_stage = "예약 주문 생성"
-                    act_status, act_text = await create_order(price_fields)
+                    act_status, act_text, booking_session = await create_order(
+                        price_fields
+                    )
                     order_id = self._extract_order_id(act_text)
                     if not order_id and int(act_status or 0) >= 500:
                         raise DoomSubmissionUncertain(
@@ -1376,7 +1463,9 @@ class DoomEscapeEngine(BaseEngine):
                             )
                         )
                         current_stage = "예약 주문 생성"
-                        act_status, act_text = await create_order(price_fields)
+                        act_status, act_text, booking_session = await create_order(
+                            price_fields
+                        )
                         order_id = self._extract_order_id(act_text)
                         if not order_id and int(act_status or 0) >= 500:
                             raise DoomSubmissionUncertain(
@@ -1673,6 +1762,7 @@ class DoomEscapeEngine(BaseEngine):
         self._last_scan_failure_at = 0.0
         self._inventory_logged = False
         self._unverified_date_warned = False
+        self._transport_traced_session_ids.clear()
         self._branch_id = str(reservation_data.get("branch", "3") or "3")
         configured_open = ""
         for key in ("openDateTime", "openAt", "reservationOpenAt", "openTime"):
@@ -1703,7 +1793,11 @@ class DoomEscapeEngine(BaseEngine):
         warm_gate = asyncio.Semaphore(self.MAX_WARM_INFLIGHT)
 
         async def warm_one():
-            session = aiohttp.ClientSession(headers=self.REQUEST_HEADERS)
+            session = aiohttp.ClientSession(
+                headers=self.REQUEST_HEADERS,
+                trace_configs=[self._build_transport_trace_config()],
+            )
+            self._transport_traced_session_ids.add(id(session))
             warmed = False
             status = None
             error = ""
