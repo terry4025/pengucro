@@ -387,6 +387,8 @@ class ArmedPage:
                 "response": {"status": 200, "body": {"data": {"submitBooking": {
                     "bookingId": "999888", "url": "/my/bookings/999888",
                 }}}},
+                "armedAt": 800,
+                "dueAt": 995,
                 "startedAt": 1000,
                 "completedAt": 1042,
                 "error": "",
@@ -494,6 +496,8 @@ def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
     assert result.booking_id == "999888"
     assert elapsed_ms == 42
     assert submitter.last_rtt == 0.042
+    assert submitter.last_armed_timing["dueAt"] == 995
+    assert submitter.last_armed_timing["startedAt"] == 1000
     assert page.calls[0]["delayMs"] == 125
     assert page.calls[0]["input"]["slotId"] == "1331382668"
 

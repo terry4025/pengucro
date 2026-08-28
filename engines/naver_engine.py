@@ -464,6 +464,8 @@ class NaverEngine(BaseEngine):
     API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
     API_BROWSER_ARM_STATUS_SECONDS = 0.025
     API_SEND_JITTER_SECONDS = 0.035
+    API_SEND_MIN_LEAD_SECONDS = 0.080
+    API_SEND_MAX_LEAD_SECONDS = 0.300
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -567,6 +569,7 @@ class NaverEngine(BaseEngine):
         self._api_payment_signature: tuple[str, str, bool] | None = None
         self._npay_booking_id = ""
         self._recent_submit_rtt: list[float] = []
+        self._last_api_lead_detail = ""
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1755,22 +1758,55 @@ class NaverEngine(BaseEngine):
             await asyncio.sleep(0.05 if remaining > 0.5 else 0.005)
 
     def _api_one_way_seconds(self) -> float:
-        rtt = (
-            getattr(self._api_submitter, "last_rtt", None)
-            if self._api_submitter is not None
-            else None
-        )
-        if not rtt:
-            rtt = getattr(self.api, "last_rtt", None) if self.api is not None else None
-        try:
-            estimate = float(rtt) / 2 if rtt else 0.05
-        except (TypeError, ValueError):
+        samples = []
+        if self._api_submitter is not None:
+            samples.extend(getattr(self._api_submitter, "safe_rtt_samples", ()) or ())
+            samples.append(getattr(self._api_submitter, "last_rtt", None))
+        if self.api is not None:
+            samples.append(getattr(self.api, "last_rtt", None))
+        normalized = []
+        for value in samples:
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if 0.005 <= candidate <= 3.0:
+                normalized.append(candidate)
+        normalized.sort()
+        if normalized:
+            # A high percentile is deliberate: an early request has a bounded
+            # NOT_OPEN retry, while a late request loses the only seat outright.
+            percentile_index = max(0, (len(normalized) * 3 + 3) // 4 - 1)
+            transport_rtt = normalized[percentile_index]
+            estimate = transport_rtt / 2
+        else:
+            transport_rtt = 0.10
             estimate = 0.05
         if self._recent_submit_rtt:
             # The preflight account query is usually faster than a real booking
             # mutation. Prefer recent observed submission latency when present.
             estimate = max(estimate, max(self._recent_submit_rtt[-3:]) / 2)
-        return min(0.25, max(0.05, estimate + self.API_SEND_JITTER_SECONDS))
+        precision = 0.0
+        if self.clock is not None:
+            try:
+                precision = max(
+                    0.0,
+                    min(0.10, float(getattr(self.clock, "last_precision", 0.0) or 0.0)),
+                )
+            except (TypeError, ValueError):
+                precision = 0.0
+        lead = min(
+            self.API_SEND_MAX_LEAD_SECONDS,
+            max(
+                self.API_SEND_MIN_LEAD_SECONDS,
+                estimate + precision + self.API_SEND_JITTER_SECONDS,
+            ),
+        )
+        self._last_api_lead_detail = (
+            f"안전 RTT {transport_rtt * 1000:.0f}ms · "
+            f"시계 오차 {precision * 1000:.0f}ms"
+        )
+        return lead
 
     async def _wait_for_api_send(self) -> None:
         """Start the fetch early enough for it to reach Naver near the boundary."""
@@ -1888,7 +1924,7 @@ class NaverEngine(BaseEngine):
             )
         self.log(
             f"[정보] 브라우저 내부 API 제출 예약 · 오픈 대비 {-lead:+.3f}초 · "
-            "단일 요청으로 대기합니다.",
+            f"{self._last_api_lead_detail} · 단일 요청으로 대기합니다.",
             "warning",
         )
         due = time.monotonic() + delay
@@ -1910,9 +1946,17 @@ class NaverEngine(BaseEngine):
             )
             if result is not None:
                 self._record_submit_rtt(elapsed_ms)
+                timing = getattr(self._api_submitter, "last_armed_timing", {}) or {}
+                due_at = timing.get("dueAt")
+                started_at = timing.get("startedAt")
+                dispatch_detail = ""
+                if isinstance(due_at, (int, float)) and isinstance(started_at, (int, float)):
+                    lateness_ms = float(started_at) - float(due_at)
+                    dispatch_detail = f" · 실제 발사 오차 {lateness_ms:+.1f}ms"
                 if elapsed_ms is not None:
                     self.log(
-                        f"[정보] 브라우저 내부 API 제출 응답 · {result.outcome} · RTT {elapsed_ms:.0f}ms",
+                        f"[정보] 브라우저 내부 API 제출 응답 · {result.outcome} · "
+                        f"RTT {elapsed_ms:.0f}ms{dispatch_detail}",
                         "success" if result.outcome == SubmitOutcome.SUCCESS else "info",
                     )
                 outcome, detail = await self._handle_api_submit_result(

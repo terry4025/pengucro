@@ -775,6 +775,24 @@ def test_api_send_lead_uses_the_browser_transport_round_trip():
     assert engine._api_one_way_seconds() == pytest.approx(0.235)
 
 
+def test_api_send_lead_uses_safe_percentile_and_server_clock_precision():
+    engine = make_engine()
+    engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
+    engine._api_submitter = type(
+        "BrowserTransport",
+        (),
+        {
+            "last_rtt": 0.10,
+            "safe_rtt_samples": [0.08, 0.12, 0.16, 0.20],
+        },
+    )()
+    engine.clock = type("Clock", (), {"last_precision": 0.04})()
+
+    assert engine._api_one_way_seconds() == pytest.approx(0.155)
+    assert "안전 RTT 160ms" in engine._last_api_lead_detail
+    assert "시계 오차 40ms" in engine._last_api_lead_detail
+
+
 def test_pending_api_strike_refreshes_slot_before_page_reload():
     engine = make_engine()
     engine._open_at_epoch = 1.0

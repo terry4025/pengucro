@@ -571,6 +571,7 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     const state = {
         id: String(request.armId || ""),
         status: "armed",
+        armedAt: performance.now(),
         dueAt: performance.now() + delayMs,
         startedAt: 0,
         completedAt: 0,
@@ -635,6 +636,8 @@ BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
         status: state.status,
         response: state.response,
         error: state.error || "",
+        armedAt: Number(state.armedAt) || 0,
+        dueAt: Number(state.dueAt) || 0,
         startedAt: Number(state.startedAt) || 0,
         completedAt: Number(state.completedAt) || 0,
     };
@@ -742,6 +745,8 @@ class NaverBrowserSubmitter:
         self.page = page
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.last_rtt: float | None = None
+        self.safe_rtt_samples: list[float] = []
+        self.last_armed_timing: dict[str, float] = {}
         # ``False`` distinguishes a failed GraphQL request from a successful
         # response that explicitly says the current browser is logged out.
         self.last_account_fetch_ok = False
@@ -764,7 +769,11 @@ class NaverBrowserSubmitter:
                 timeout=self.timeout_seconds + 0.25,
             )
         finally:
-            self.last_rtt = time.monotonic() - started
+            elapsed = time.monotonic() - started
+            self.last_rtt = elapsed
+            if operation_name != "submitBooking" and 0.005 <= elapsed <= 3.0:
+                self.safe_rtt_samples.append(elapsed)
+                del self.safe_rtt_samples[:-8]
 
     async def fetch_account(self) -> NaverAccount:
         self.last_account_fetch_ok = False
@@ -855,6 +864,12 @@ class NaverBrowserSubmitter:
                 message="브라우저 내부 예약 상태 형식이 올바르지 않습니다.",
             ), None
         status = str(state.get("status") or "error")
+        timing = {}
+        for key in ("armedAt", "dueAt", "startedAt", "completedAt"):
+            value = state.get(key)
+            if isinstance(value, (int, float)):
+                timing[key] = float(value)
+        self.last_armed_timing = timing
         elapsed_ms: float | None = None
         started = state.get("startedAt")
         completed = state.get("completedAt")

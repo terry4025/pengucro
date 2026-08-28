@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.59",
+        changes=(
+            "네이버 통신 지연과 서버 시각 오차를 반영해 오픈 순간 선점 시점 자동 보정",
+            "둠이스케이프 목표 회차 공개 즉시 주문 단계로 전환해 선점 지연 단축",
+            "둠이스케이프 서버 혼잡 중 주문 응답 유실 시 기존 주문 확인과 중복 제출 방지",
+        ),
+    ),
+    PatchNote(
         version="6.58",
         changes=(
             "CGV 좌석 임시선점 후 정확한 4석 화면 동기화와 결제 전환 안정화",

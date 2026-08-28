@@ -411,6 +411,10 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     engine._slot_wait_started_at = time.time()
     engine.session_pool = [scan_session, submit_session]
     engine._submit_session = submit_session
+    async def forbidden_prestage(*_args, **_kwargs):
+        raise AssertionError("공개된 목표 슬롯보다 사전 준비를 먼저 기다리면 안 됩니다")
+
+    engine._prestage_prices = forbidden_prestage
     monkeypatch.setattr(module, "append_history", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: False)
 
@@ -432,6 +436,137 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     assert successes == [True]
     assert any("전체 정지 없이 독립 감시" in message for message, _level in logs)
     assert any("예약 최종 완료" in message for message, _level in logs)
+
+
+def test_async_order_timeout_stops_without_duplicate_post(monkeypatch):
+    class Response:
+        def __init__(self, body, status=200):
+            self.body = body.encode("utf-8")
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self.body
+
+        async def text(self, **_kwargs):
+            return self.body.decode("utf-8")
+
+    class TimeoutResponse:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    target_html = (
+        '<input type="hidden" name="rev_days" value="2026-09-05">'
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?rev_days=2026-09-05&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span>'
+        "</a></div>"
+    )
+
+    class ScanSession:
+        def get(self, *_args, **_kwargs):
+            return Response(target_html)
+
+    class SubmitSession:
+        def __init__(self):
+            self.post_count = 0
+
+        def get(self, url, **_kwargs):
+            assert "go=rev.make.input" in url
+            return Response('<input type="hidden" name="price3" value="126000">')
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            return TimeoutResponse()
+
+    scan_session = ScanSession()
+    submit_session = SubmitSession()
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    engine.scan_governor = DoomScanGovernor(1000, 1000, 1000, 1000)
+    engine.scan_governor.set_phase("active")
+    engine._scan_inflight = asyncio.Semaphore(2)
+    engine._scan_session_count = 1
+    engine._prestage_lock = asyncio.Lock()
+    engine._slot_wait_started_at = time.time()
+    engine.session_pool = [scan_session, submit_session]
+    engine._submit_session = submit_session
+    monkeypatch.setattr(engine, "_write_safe_failure_summary", lambda **_kwargs: None)
+
+    reservation = {
+        "branch": "4",
+        "reservationDate": "2026-09-05",
+        "reservationTime": "19:00",
+        "themePK": "36",
+        "themeLabel": "데이투어",
+        "name": "테스트",
+        "phone": "010-1234-5678",
+        "people": "3",
+    }
+
+    asyncio.run(engine.make_reservation_async_task(reservation, 0))
+
+    assert submit_session.post_count == 1
+    assert engine.stop_event.is_set()
+    assert any("중복 방지 정지" in message for message, _level in logs)
+
+
+def test_known_order_recovery_reads_completion_without_resending_confirmation():
+    class Response:
+        def __init__(self, body, status=200):
+            self.body = body.encode("utf-8")
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self.body
+
+    class TimeoutResponse:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.get_count = 0
+            self.urls = []
+
+        def get(self, url, **_kwargs):
+            self.get_count += 1
+            self.urls.append(url)
+            if self.get_count == 1:
+                return TimeoutResponse()
+            return Response("예약 완료 · rev.make.end")
+
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    engine.ORDER_RECOVERY_DELAY_SECONDS = 0
+    session = Session()
+
+    recovered = asyncio.run(
+        engine._recover_known_order_async(session, "9001", "777", {})
+    )
+
+    assert recovered == (200, "예약 완료 · rev.make.end")
+    assert session.get_count == 2
+    assert all("go=rev.make.end" in url for url in session.urls)
 
 
 def test_ui_payload_reaches_registry_and_base_async_start(monkeypatch):

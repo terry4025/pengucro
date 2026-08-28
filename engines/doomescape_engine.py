@@ -14,6 +14,20 @@ from pengucro.diagnostics import format_exception
 from pengucro.storage import append_history, load_json, save_json
 
 
+class DoomSubmissionUncertain(RuntimeError):
+    """The server may have accepted a state-changing request.
+
+    Retrying the whole flow after this point can create a duplicate reservation,
+    so callers must stop or resume from a known order id instead.
+    """
+
+    def __init__(self, stage, detail, order_id=""):
+        super().__init__(f"{stage}: {detail}")
+        self.stage = str(stage)
+        self.detail = str(detail)
+        self.order_id = str(order_id or "")
+
+
 class DoomScanGovernor:
     """Space aggregate timetable requests independently of worker count."""
 
@@ -82,6 +96,12 @@ class DoomEscapeEngine(BaseEngine):
     MAX_SCAN_INFLIGHT = 32
     MAX_WARM_INFLIGHT = 4
     MAX_SCAN_SESSIONS = 8
+    ORDER_POST_TIMEOUT_SECONDS = 20.0
+    ORDER_FOLLOWUP_TIMEOUT_SECONDS = 12.0
+    ORDER_CONFIRM_TIMEOUT_SECONDS = 20.0
+    SAFE_READ_RETRY_ATTEMPTS = 3
+    ORDER_RECOVERY_ATTEMPTS = 6
+    ORDER_RECOVERY_DELAY_SECONDS = 0.25
     OPEN_ANCHOR_LEAD_SECONDS = 3.0
     OPEN_ANCHOR_HOLD_SECONDS = 1800.0
     DEFAULT_OPEN_TIME = "23:45:00"
@@ -715,6 +735,32 @@ class DoomEscapeEngine(BaseEngine):
             raise errors[0]
         raise RuntimeError("INVALID_PRICE_FIELDS: 예약 입력값을 확인하지 못했습니다")
 
+    async def _recover_known_order_async(self, session, order_id, ck_code, headers):
+        """Read a known order after an ambiguous confirmation without resending it."""
+        completion_url = (
+            f"{self.base_url}/layout/res/home.php?go=rev.make.end"
+            f"&num={order_id}&ck_code={urllib.parse.quote(str(ck_code))}"
+        )
+        for attempt in range(1, self.ORDER_RECOVERY_ATTEMPTS + 1):
+            if attempt > 1:
+                await asyncio.sleep(self.ORDER_RECOVERY_DELAY_SECONDS * min(attempt, 4))
+            try:
+                async with session.get(
+                    completion_url,
+                    headers=headers,
+                    timeout=self.ORDER_FOLLOWUP_TIMEOUT_SECONDS,
+                ) as response:
+                    status = response.status
+                    body = await response.read()
+                text = body.decode("utf-8", errors="ignore")
+                if status < 500 and self._safe_response_markers(text)[
+                    "has_completion_marker"
+                ]:
+                    return status, text
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                continue
+        return None
+
     @staticmethod
     def _is_transient_site_error(exc):
         if isinstance(exc, (asyncio.TimeoutError, aiohttp.ClientError, ConnectionError)):
@@ -1136,6 +1182,8 @@ class DoomEscapeEngine(BaseEngine):
 
         while not self.stop_event.is_set():
             current_stage = "시간표 조회"
+            slot_id = ""
+            order_id = ""
             try:
                 # 1. Fetch reservation page to list slots
                 self._update_scan_phase(self._last_slot_reason or "미오픈")
@@ -1186,9 +1234,12 @@ class DoomEscapeEngine(BaseEngine):
                 self._log_inventory_once(
                     worker_label, rev_days, target_time, analysis
                 )
-                await self._prestage_prices(analysis, theme_name)
                 found_slot = analysis["slot_id"]
                 if not found_slot:
+                    # Prestage only while the target itself is unavailable.  On
+                    # the first open response this GET can take up to three
+                    # seconds, which would throw away the winning response.
+                    await self._prestage_prices(analysis, theme_name)
                     reason = analysis["reason"]
                     self._log_missing_slot(worker_label, target_time, reason)
                     continue
@@ -1274,11 +1325,22 @@ class DoomEscapeEngine(BaseEngine):
                             "User-Agent": headers["User-Agent"],
                         }
                         started = time.perf_counter()
-                        async with booking_session.post(
-                            act_url, data=post_data, headers=post_headers, timeout=8
-                        ) as response:
-                            status = response.status
-                            text = (await response.read()).decode("utf-8", errors="ignore")
+                        try:
+                            async with booking_session.post(
+                                act_url,
+                                data=post_data,
+                                headers=post_headers,
+                                timeout=self.ORDER_POST_TIMEOUT_SECONDS,
+                            ) as response:
+                                status = response.status
+                                text = (await response.read()).decode(
+                                    "utf-8", errors="ignore"
+                                )
+                        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                            raise DoomSubmissionUncertain(
+                                "예약 주문 생성",
+                                self._describe_exception(exc),
+                            ) from exc
                         self._log_http_diagnostic(
                             worker_label, "예약 주문 생성", "POST", status,
                             time.perf_counter() - started,
@@ -1289,6 +1351,11 @@ class DoomEscapeEngine(BaseEngine):
                     current_stage = "예약 주문 생성"
                     act_status, act_text = await create_order(price_fields)
                     order_id = self._extract_order_id(act_text)
+                    if not order_id and int(act_status or 0) >= 500:
+                        raise DoomSubmissionUncertain(
+                            "예약 주문 생성",
+                            f"HTTP {act_status} 응답으로 주문 생성 여부를 확정할 수 없음",
+                        )
                     if (
                         used_prestage
                         and not order_id
@@ -1311,6 +1378,11 @@ class DoomEscapeEngine(BaseEngine):
                         current_stage = "예약 주문 생성"
                         act_status, act_text = await create_order(price_fields)
                         order_id = self._extract_order_id(act_text)
+                        if not order_id and int(act_status or 0) >= 500:
+                            raise DoomSubmissionUncertain(
+                                "예약 주문 생성",
+                                f"HTTP {act_status} 응답으로 주문 생성 여부를 확정할 수 없음",
+                            )
 
                     # Parse response to find num
                     if order_id:
@@ -1323,10 +1395,35 @@ class DoomEscapeEngine(BaseEngine):
                         
                         # 4. Fetch KCP page to extract ck_code
                         current_stage = "결제 준비 화면 조회"
+                        kcp_status = 0
+                        kcp_text = ""
+                        kcp_error = None
                         request_started = time.perf_counter()
-                        async with booking_session.get(kcp_url, headers=headers, timeout=8) as kcp_resp:
-                            kcp_status = kcp_resp.status
-                            kcp_text = await kcp_resp.text(encoding='utf-8', errors='ignore')
+                        for read_attempt in range(1, self.SAFE_READ_RETRY_ATTEMPTS + 1):
+                            try:
+                                async with booking_session.get(
+                                    kcp_url,
+                                    headers=headers,
+                                    timeout=self.ORDER_FOLLOWUP_TIMEOUT_SECONDS,
+                                ) as kcp_resp:
+                                    kcp_status = kcp_resp.status
+                                    kcp_text = await kcp_resp.text(
+                                        encoding='utf-8', errors='ignore'
+                                    )
+                                if kcp_status < 500:
+                                    kcp_error = None
+                                    break
+                                kcp_error = RuntimeError(f"HTTP {kcp_status}")
+                            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                                kcp_error = exc
+                            if read_attempt < self.SAFE_READ_RETRY_ATTEMPTS:
+                                await asyncio.sleep(0.10 * read_attempt)
+                        if kcp_error is not None:
+                            raise DoomSubmissionUncertain(
+                                current_stage,
+                                self._describe_exception(kcp_error),
+                                order_id=num,
+                            ) from kcp_error
                         self._log_http_diagnostic(
                             worker_label,
                             current_stage,
@@ -1339,6 +1436,12 @@ class DoomEscapeEngine(BaseEngine):
                         
                         ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
                         ck_code_val = ck_m.group(1) if ck_m else ""
+                        if not ck_code_val:
+                            raise DoomSubmissionUncertain(
+                                current_stage,
+                                "주문은 생성됐지만 결제 확인 코드를 읽지 못함",
+                                order_id=num,
+                            )
 
                         # 5. Submit mutong.php (using GET or POST - GET is browser default)
                         mutong_url = f"{self.base_url}/core/res/rev.make.mutong.php"
@@ -1354,10 +1457,41 @@ class DoomEscapeEngine(BaseEngine):
 
                         current_stage = "무통장 예약 확정"
                         request_started = time.perf_counter()
-                        async with booking_session.get(mutong_get_url, headers=headers, timeout=8) as mutong_resp:
-                            mutong_status = mutong_resp.status
-                            mutong_bytes = await mutong_resp.read()
-                            mutong_text = mutong_bytes.decode('utf-8', errors='ignore')
+                        mutong_error = None
+                        try:
+                            async with booking_session.get(
+                                mutong_get_url,
+                                headers=headers,
+                                timeout=self.ORDER_CONFIRM_TIMEOUT_SECONDS,
+                            ) as mutong_resp:
+                                mutong_status = mutong_resp.status
+                                mutong_bytes = await mutong_resp.read()
+                                mutong_text = mutong_bytes.decode('utf-8', errors='ignore')
+                        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                            mutong_error = exc
+                            mutong_status = 0
+                            mutong_text = ""
+                        if mutong_error is not None or mutong_status >= 500:
+                            recovered = await self._recover_known_order_async(
+                                booking_session, num, ck_code_val, headers
+                            )
+                            if recovered is None:
+                                detail = (
+                                    self._describe_exception(mutong_error)
+                                    if mutong_error is not None
+                                    else f"HTTP {mutong_status} 응답으로 확정 여부를 알 수 없음"
+                                )
+                                raise DoomSubmissionUncertain(
+                                    current_stage,
+                                    detail,
+                                    order_id=num,
+                                ) from mutong_error
+                            mutong_status, mutong_text = recovered
+                            self.log(
+                                f"[{worker_label}] [복구] orderId={num} · "
+                                "확정 요청은 재전송하지 않고 완료 화면에서 기존 주문을 확인했습니다.",
+                                "success",
+                            )
                         self._log_http_diagnostic(
                             worker_label,
                             current_stage,
@@ -1456,6 +1590,37 @@ class DoomEscapeEngine(BaseEngine):
                         except RuntimeError:
                             pass
 
+            except DoomSubmissionUncertain as e:
+                self._write_safe_failure_summary(
+                    worker=worker_label,
+                    stage=e.stage,
+                    status="UNKNOWN",
+                    response_text=e.detail,
+                    slot_id=slot_id,
+                    order_id=e.order_id,
+                )
+                if e.order_id:
+                    self.log(
+                        f"[{worker_label}] [중복 방지 정지] 주문 선점은 확인됨 · "
+                        f"orderId={e.order_id} · {e.stage} 결과 불명확 · "
+                        "같은 주문을 다시 만들지 않고 기존 주문 확인이 필요합니다.",
+                        "warning",
+                    )
+                    try:
+                        import webbrowser
+                        webbrowser.open(
+                            f"{self.base_url}/layout/res/home.php?go=rev.kcp&num={e.order_id}"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    self.log(
+                        f"[{worker_label}] [중복 방지 정지] {e.stage} · {e.detail} · "
+                        "서버가 요청을 받았을 가능성이 있어 자동 재전송하지 않습니다.",
+                        "error",
+                    )
+                self.stop_event.set()
+                break
             except Exception as e:
                 if self.stop_event.is_set():
                     break
