@@ -45,6 +45,54 @@ def test_three_person_without_metadata_uses_safe_interior_anchor_first():
     assert CgvEngine._adaptive_anchor_candidates(target, [])[0] == "B19"
 
 
+def test_four_person_log_case_uses_inner_f22_before_outward_endpoints():
+    target = ["F21", "F22", "F23", "F24"]
+    candidates = CgvEngine._adaptive_anchor_candidates(target, [])
+
+    assert candidates[:4] == ("F22", "F23", "F21", "F24")
+
+
+def test_four_person_log_case_avoids_outside_auto_pairs(monkeypatch):
+    engine = CgvEngine(lambda _message, _level: None)
+    target = ["F21", "F22", "F23", "F24"]
+    state = {"selected": set(), "clicks": []}
+    paired = {
+        "F21": {"F20", "F21"},
+        "F22": {"F21", "F22"},
+        "F23": {"F23", "F24"},
+        "F24": {"F24", "F25"},
+    }
+
+    def snapshot(_page, target_ids):
+        selected = set(state["selected"])
+        target_set = set(target_ids)
+        complete = selected == target_set
+        return {
+            "selectedIds": sorted(selected),
+            "extras": sorted(selected - target_set),
+            "missing": [seat for seat in target_ids if seat not in selected],
+            "submitReady": complete,
+            "ready": complete,
+        }
+
+    def click(_page, anchor):
+        state["clicks"].append(anchor)
+        pair = paired[anchor]
+        if anchor in state["selected"]:
+            state["selected"] -= pair
+        else:
+            state["selected"] |= pair
+        return True
+
+    monkeypatch.setattr(engine, "_exact_seat_selection_snapshot", snapshot)
+    monkeypatch.setattr(engine, "_click_pair_anchor", click)
+    monkeypatch.setattr(engine, "_pairwise_wait", lambda _page: None)
+
+    assert engine._normalize_active_seat_group(object(), target) is True
+    assert state["selected"] == set(target)
+    assert state["clicks"] == ["F22", "F23"]
+
+
 @pytest.mark.parametrize("partner_direction", ["left", "right"])
 def test_three_person_dynamic_partner_direction_succeeds(monkeypatch, partner_direction):
     engine = CgvEngine(lambda _message, _level: None)
@@ -267,3 +315,7 @@ def test_final_registry_runtime_includes_watchdog_and_adaptive_pair_layer():
     )
     assert isinstance(engine, CgvEngine)
     assert isinstance(engine, WatchdogCgvEngine)
+    assert engine.API_HOLD_UI_SYNC_MAX_ATTEMPTS == 2
+    assert engine.SEAT_SUBMIT_TRANSITION_TIMEOUT_SECONDS == 20.0
+    assert engine.CGV_PAYMENT_PAGE_TIMEOUT_SECONDS == 30.0
+    assert engine.NPAY_PAGE_TIMEOUT_SECONDS == 45.0

@@ -61,10 +61,21 @@ class CgvEngine(GuardedCgvEngine):
 
     # A successful direct hold is more valuable than shaving a second from UI
     # rendering. The previous 40 * 25 ms window could release an already-won
-    # hold because React had not enabled 선택완료 yet. Give that state up to about
-    # three seconds while avoiding repeated seat toggles when the exact group is
-    # already selected and only the submit button is lagging.
-    API_UI_SYNC_ATTEMPTS = 120
+    # hold because React had not enabled 선택완료 yet. Give each local recovery
+    # pass up to about six seconds and retain the already-won API hold across a
+    # second bounded pass. This adds no CGV polling traffic.
+    API_UI_SYNC_ATTEMPTS = 240
+    API_HOLD_UI_SYNC_MAX_ATTEMPTS = 2
+
+    # Successful seat selection is already protected by CGV's temporary hold.
+    # Congested checkout/Naver Pay pages should not be classified as failed just
+    # because they need more than the old 15-20 second UI grace. These are local
+    # observation deadlines and do not add duplicate payment or hold requests.
+    SEAT_SUBMIT_TRANSITION_TIMEOUT_SECONDS = 20.0
+    CGV_PAYMENT_PAGE_TIMEOUT_SECONDS = 30.0
+    NPAY_PAGE_TIMEOUT_SECONDS = 45.0
+    NPAY_CONTROL_TIMEOUT_SECONDS = 30.0
+    NPAY_COMPLETION_TIMEOUT_SECONDS = 120.0
 
     MEMBER_SESSION_EXPIRY_LEEWAY_SECONDS = 60.0
     MEMBER_SESSION_PROBE_INTERVAL_MS = 60_000
@@ -74,6 +85,8 @@ class CgvEngine(GuardedCgvEngine):
         f"searchMblTktTabPrdtypList?coCd={CGV_COMPANY_CODE}&custNo="
     )
     MEMBER_SESSION_AUTH_ERROR_CODES = {"-1001", "-1002", "401"}
+    MEMBER_SESSION_CONFIRM_ATTEMPTS = 3
+    MEMBER_SESSION_CONFIRM_INTERVAL_MS = 250
 
     @staticmethod
     def _context_member_tokens(context) -> dict[str, str]:
@@ -242,11 +255,83 @@ class CgvEngine(GuardedCgvEngine):
         except Exception:
             return {}
 
+    @staticmethod
+    def _clear_invalid_member_tokens(context) -> None:
+        """Remove only CGV member tokens after an authoritative auth failure."""
+
+        clear_cookies = getattr(context, "clear_cookies", None)
+        if not callable(clear_cookies):
+            return
+        try:
+            cookies = list(context.cookies(CGV_HOME_URL))
+        except Exception:
+            cookies = []
+        for cookie in cookies:
+            name = str(cookie.get("name", "") or "")
+            if name not in {"accessToken", "refresh_token"}:
+                continue
+            try:
+                clear_cookies(
+                    name=name,
+                    domain=str(cookie.get("domain", "") or "") or None,
+                    path=str(cookie.get("path", "") or "") or None,
+                )
+            except Exception:
+                pass
+
+    def _confirm_member_session(self, page, context) -> bool | None:
+        """Require a live read-only member API confirmation before scanning."""
+
+        last_result: bool | None = None
+        for attempt in range(max(1, int(self.MEMBER_SESSION_CONFIRM_ATTEMPTS))):
+            access_token = self._context_member_tokens(context)["accessToken"]
+            last_result = self._probe_member_session(page, access_token)
+            if last_result is not None or self.stop_event.is_set():
+                return last_result
+            if attempt + 1 < self.MEMBER_SESSION_CONFIRM_ATTEMPTS:
+                try:
+                    page.wait_for_timeout(self.MEMBER_SESSION_CONFIRM_INTERVAL_MS)
+                except Exception:
+                    if self.stop_event.wait(
+                        self.MEMBER_SESSION_CONFIRM_INTERVAL_MS / 1000.0
+                    ):
+                        break
+        return last_result
+
     def _recover_member_session(self, page, context) -> bool:
         recovered = super()._ensure_member_session(page, context)
-        if recovered:
+        if not recovered:
+            return False
+
+        confirmed = self._confirm_member_session(page, context)
+        if confirmed is True:
+            self.log(
+                "[CGV] 회원 API 인증까지 확인했습니다. 예약 감시를 시작합니다.",
+                "success",
+            )
             self._install_member_session_guard(page)
-        return recovered
+            return True
+
+        if confirmed is False:
+            self._clear_invalid_member_tokens(context)
+            self.log(
+                "[CGV] 로그인 화면 전환은 감지했지만 회원 API 인증이 유효하지 않아 "
+                "예약 시작을 차단했습니다. 다시 로그인한 뒤 예약 시작을 눌러주세요.",
+                "error",
+            )
+            return False
+
+        # The live probe can time out while CGV is congested. The base recovery
+        # just navigated through the official login route and returned only after
+        # CGV redirected away with member cookies, so that route transition is a
+        # safe secondary proof. Keep the periodic guard active for a later 401.
+        self.log(
+            "[CGV] 회원 API 응답은 지연됐지만 공식 로그인 화면의 회원 리다이렉트와 "
+            "세션 쿠키를 확인했습니다. 감시 중 인증 확인을 계속합니다.",
+            "warning",
+        )
+        self._install_member_session_guard(page)
+        return True
 
     def _ensure_member_session(self, page, context) -> bool:
         if not _MEMBER_SESSION_GUARD_ACTIVE.get():
@@ -259,20 +344,30 @@ class CgvEngine(GuardedCgvEngine):
                 "[CGV] 저장된 회원 accessToken이 만료됐거나 없어 공식 로그인/갱신 경로로 전환합니다.",
                 "warning",
             )
+            if access_token:
+                self._clear_invalid_member_tokens(context)
             return self._recover_member_session(page, context)
 
-        if freshness is True or self._probe_member_session(page, access_token) is True:
+        confirmed = self._confirm_member_session(page, context)
+        if confirmed is True:
             self.log(
-                "[CGV] 슬롯 1의 기존 Chrome 로그인 세션 확인 · 현재 CGV 탭을 그대로 재사용합니다.",
+                "[CGV] 슬롯 1의 기존 Chrome 회원 API 인증 확인 · 현재 CGV 탭을 그대로 재사용합니다.",
                 "success",
             )
             self._install_member_session_guard(page)
             return True
 
-        self.log(
-            "[CGV] 저장된 회원 세션의 인증 만료/무효 가능성을 감지해 공식 로그인/갱신 경로로 전환합니다.",
-            "warning",
-        )
+        if confirmed is False:
+            self._clear_invalid_member_tokens(context)
+            self.log(
+                "[CGV] 저장된 회원 세션이 실제 회원 API에서 거부되어 공식 로그인 경로로 전환합니다.",
+                "warning",
+            )
+        else:
+            self.log(
+                "[CGV] 저장된 회원 세션을 실시간으로 확인하지 못해 공식 로그인/확인 경로로 전환합니다.",
+                "warning",
+            )
         return self._recover_member_session(page, context)
 
     def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
@@ -314,6 +409,7 @@ class CgvEngine(GuardedCgvEngine):
     @staticmethod
     def _serialize_structured_seat_groups(value, people: int) -> str:
         groups: list[str] = []
+        seen: set[tuple[str, ...]] = set()
         if not isinstance(value, (list, tuple)):
             return ""
         expected = max(1, int(people))
@@ -324,6 +420,10 @@ class CgvEngine(GuardedCgvEngine):
             seats = [seat for seat in seats if seat]
             if len(seats) != expected:
                 continue
+            key = tuple(seat.replace(" ", "").casefold() for seat in seats)
+            if key in seen:
+                continue
+            seen.add(key)
             groups.append(",".join(seats))
         return " | ".join(groups)
 

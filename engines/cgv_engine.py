@@ -75,7 +75,9 @@ class CgvEngine(BaseEngine):
     SCHEDULE_PROMOTION_REWATCH_INTERVAL = 1.0
     API_UI_SYNC_ATTEMPTS = 40
     API_UI_SYNC_INTERVAL_MS = 25
+    API_HOLD_UI_SYNC_MAX_ATTEMPTS = 1
     CAPTURED_REQUEST_HEADERS = ("authorization", "accept-language")
+    SEAT_SUBMIT_TRANSITION_TIMEOUT_SECONDS = 10.0
     CGV_PAYMENT_PAGE_TIMEOUT_SECONDS = 15.0
     NPAY_PAGE_TIMEOUT_SECONDS = 20.0
     NPAY_CONTROL_TIMEOUT_SECONDS = 15.0
@@ -1442,6 +1444,29 @@ class CgvEngine(BaseEngine):
         del page, schedule, people
         return True
 
+    def _sync_held_seats_for_checkout(self, page, payload, selected) -> bool:
+        """Mirror an already-held seat group without releasing it on first lag.
+
+        The direct API transaction has already won the actual seat race.  A
+        temporary React/DOM mismatch must therefore be retried locally while
+        the server hold remains intact.  The base engine keeps one attempt for
+        backward compatibility; the final runtime raises the bounded limit.
+        """
+
+        attempts = max(1, int(self.API_HOLD_UI_SYNC_MAX_ATTEMPTS))
+        for attempt in range(attempts):
+            if self.stop_event.is_set():
+                return False
+            if self._select_api_seats_in_ui(page, payload, selected):
+                return True
+            if attempt + 1 < attempts:
+                self.log(
+                    "[CGV] API 임시선점은 유지합니다 · 화면 좌석 상태를 재구성한 뒤 "
+                    f"동기화를 다시 시도합니다 ({attempt + 2}/{attempts}).",
+                    "warning",
+                )
+        return False
+
     def _watch_and_hold_api(
         self,
         page,
@@ -1612,10 +1637,14 @@ class CgvEngine(BaseEngine):
                     "warning",
                 )
                 return False, True
-            if not self._select_api_seats_in_ui(page, seat_payload, selected):
+            if not self._sync_held_seats_for_checkout(page, seat_payload, selected):
                 self._cancel_api_hold(page, hold_payload, hold_response)
                 self._last_fast_monitor_exit_reason = "ui-sync-failed"
-                self.log("CGV 화면 동기화에 실패해 확보 좌석을 해제하고 안전 경로로 전환합니다.", "warning")
+                self.log(
+                    "CGV 화면 동기화 복구 한도를 모두 사용해 확보 좌석을 해제하고 "
+                    "안전 경로로 전환합니다.",
+                    "warning",
+                )
                 return False, True
 
             self._install_cached_hold_responses(page, price_response, hold_response)
@@ -2770,7 +2799,11 @@ class CgvEngine(BaseEngine):
                 return False
 
         start_time = time.monotonic()
-        while not self.stop_event.is_set() and time.monotonic() - start_time < 10.0:
+        while (
+            not self.stop_event.is_set()
+            and time.monotonic() - start_time
+            < self.SEAT_SUBMIT_TRANSITION_TIMEOUT_SECONDS
+        ):
             if check_conflict():
                 self._click_visible_by_text(page, ("확인", "닫기", "취소"))
                 return False

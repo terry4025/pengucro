@@ -112,8 +112,8 @@ class CgvEngine(WatchdogCgvEngine):
         1) an explicit CGV two-seat attach group fully inside the missing target;
         2) a previously observed anchor whose whole result stayed in target;
         3) for odd missing runs, an interior seat (both neighbours are targets);
-        4) for even runs, endpoints first so a valid pair partition can be
-           discovered with the fewest probes;
+        4) for even runs of four or more, interior anchors first so CGV cannot
+           auto-attach a seat just outside the already-held block;
         5) remaining missing seats as a last observation-based fallback.
         """
 
@@ -166,15 +166,21 @@ class CgvEngine(WatchdogCgvEngine):
             ):
                 add(run[index])
 
-        # Even runs have to consume their endpoints eventually. Probe endpoints
-        # before interior seats; a wrong outward pair is rolled back immediately.
+        # For four or more held seats, the log-proven failure mode is an endpoint
+        # click auto-attaching an outside neighbour (F21 -> F20+F21 and F24 ->
+        # F24+F25). Probe the seats just inside each edge first: either neighbour
+        # direction then remains inside the exact held block. A two-seat run has
+        # no safe interior and keeps the observation-based endpoint order.
         even_runs = [run for run in runs if len(run) >= 2 and len(run) % 2 == 0]
         even_runs.sort(key=len, reverse=True)
         for run in even_runs:
+            if len(run) >= 4:
+                add(run[1])
+                add(run[-2])
+                for seat_id in run[2:-2]:
+                    add(seat_id)
             add(run[0])
             add(run[-1])
-            for seat_id in run[1:-1]:
-                add(seat_id)
 
         # Remaining odd/eccentric runs, including layouts split by an already
         # selected pair.

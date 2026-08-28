@@ -402,6 +402,48 @@ def test_browser_internal_hold_finishes_before_visible_ui_sync():
     assert actions == ["monitor-with-direct-hold", "prepare", "ui", "cache", "submit"]
 
 
+def test_api_hold_is_retained_across_bounded_ui_sync_recovery():
+    payload = _seat_payload("F21", "F22", "F23", "F24")
+    actions = []
+    sync_results = iter((False, True))
+    engine = CgvEngine(lambda *_args: None)
+    engine.API_HOLD_UI_SYNC_MAX_ATTEMPTS = 2
+    engine._browser_auth_data = lambda _page: {"custNo": "member"}
+    engine._start_fast_seat_monitor = lambda *_args, **_kwargs: True
+    engine._read_fast_seat_monitor = lambda _page: {
+        "running": False,
+        "completed": 1,
+        "hit": {
+            "data": payload,
+            "transaction": {
+                "priceResponse": {"statusCode": 0},
+                "holdResponse": {"statusCode": 0, "data": {"movAtktNo": "hold-4"}},
+                "holdPayload": {"seatPrmpDataList": []},
+            },
+        },
+    }
+    engine._stop_fast_seat_monitor = lambda _page: None
+    engine._select_api_seats_in_ui = (
+        lambda *_args: actions.append("sync") or next(sync_results)
+    )
+    engine._cancel_api_hold = lambda *_args: actions.append("cancel") or True
+    engine._install_cached_hold_responses = lambda *_args: actions.append("cache")
+    engine._submit_seat_selection = lambda *_args: actions.append("submit") or True
+    engine._restore_fetch = lambda *_args: None
+
+    held, fallback = engine._watch_and_hold_api(
+        object(),
+        {"siteNo": "0013", "scnYmd": "20260905", "scnsNo": "018", "scnSseq": "2"},
+        (CgvSeatGroup(("F21", "F22", "F23", "F24")),),
+        4,
+        False,
+        {},
+    )
+
+    assert (held, fallback) == (True, False)
+    assert actions == ["sync", "sync", "cache", "submit"]
+
+
 def test_watch_waits_for_inflight_direct_hold_instead_of_restarting_monitor():
     payload = _seat_payload("H22", "H23")
     starts = []
