@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.63",
+        changes=(
+            "지구별 최종 결과 확인 전 중복 제출 차단과 예약번호 검증 강화",
+            "제로월드 예약 응답 유실 시 완료 상태 재확인으로 중복 제출 방지",
+            "제로월드 선점 승인 후 결제 응답 지연 시 예약 재제출 방지",
+        ),
+    ),
+    PatchNote(
         version="6.62",
         changes=(
             "둠이스케이프 서버 복구 지연이 다음 예약의 집중 감시 시작을 늦추지 않도록 보완",

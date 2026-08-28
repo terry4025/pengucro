@@ -27,6 +27,15 @@ class AsyncResponse:
     async def text(self):
         return self._text
 
+    async def read(self):
+        return self._text.encode("utf-8")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
 
 class AsyncSession:
     def __init__(self):
@@ -146,6 +155,77 @@ def test_payment_method_uses_fast_attribute_order_independent_parser():
         '<input value="2" type="hidden" name="payment_method">'
     ) == "2"
     assert JigubyeolEngine._payment_method_from_html("<html>no hidden value</html>") == "1"
+
+
+def test_completion_requires_a_real_booking_number():
+    assert JigubyeolEngine._completion_evidence("<html>예약이 완료되었습니다</html>") == ""
+    assert JigubyeolEngine._completion_evidence(
+        "<table><tr><th>예약번호</th><td>J-2048</td></tr></table>"
+    ) == "J-2048"
+
+
+def test_final_success_owner_holds_lock_through_done_confirmation():
+    async def scenario():
+        engine = make_engine()
+        final_posts = 0
+
+        class Session(AsyncSession):
+            def get(self, _url):
+                return AsyncResponse(
+                    200,
+                    "<table><tr><th>예약번호</th><td>J-1</td></tr></table>",
+                )
+
+        async def prefetch(num_sessions, _reservation_data):
+            engine.session_pool = [(Session(), f"csrf-{idx}") for idx in range(num_sessions)]
+
+        async def select(*_args):
+            return AsyncResponse(200, '<input name="payment_method" value="1">')
+
+        async def submit(*_args):
+            nonlocal final_posts
+            final_posts += 1
+            await asyncio.sleep(0.02)
+            return AsyncResponse(200, "accepted")
+
+        engine.pre_fetch_sessions_async = prefetch
+        engine.submit_time_selection_async = select
+        engine.submit_reservation_async = submit
+        await engine.run_async_tasks(reservation_data(), 2)
+        assert final_posts == 1
+        assert engine._final_submission_state == "success"
+
+    asyncio.run(scenario())
+
+
+def test_ambiguous_final_timeout_stops_without_second_post():
+    async def scenario():
+        engine = make_engine()
+        final_posts = 0
+
+        class Session(AsyncSession):
+            def get(self, _url):
+                return AsyncResponse(200, "로그인 화면")
+
+        async def prefetch(num_sessions, _reservation_data):
+            engine.session_pool = [(Session(), f"csrf-{idx}") for idx in range(num_sessions)]
+
+        async def select(*_args):
+            return AsyncResponse(200, '<input name="payment_method" value="1">')
+
+        async def submit(*_args):
+            nonlocal final_posts
+            final_posts += 1
+            raise asyncio.TimeoutError()
+
+        engine.pre_fetch_sessions_async = prefetch
+        engine.submit_time_selection_async = select
+        engine.submit_reservation_async = submit
+        await engine.run_async_tasks(reservation_data(), 2)
+        assert final_posts == 1
+        assert engine._final_submission_state == "uncertain"
+
+    asyncio.run(scenario())
 
 
 def test_async_time_selection_stays_concurrent_but_final_reservation_is_serialized():

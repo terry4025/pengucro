@@ -45,6 +45,7 @@ class ZeroWorldShinEngine(BaseEngine):
     USE_ASYNC_HOT_PATH = True
     LOOKUP_TIMEOUT_SECONDS = 8.0
     SUBMIT_TIMEOUT_SECONDS = 12.0
+    SUBMIT_RECONCILE_SECONDS = 3.0
 
     SELECT_URL = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
     ACTION_URL = "https://zeroworldkorea.com/core/res/rev.act.php"
@@ -69,6 +70,7 @@ class ZeroWorldShinEngine(BaseEngine):
         self._last_messages: dict[str, float] = {}
         self._slot_lookup_key: tuple[str, str, str] | None = None
         self._slot_lookup_payload: dict[str, str] = {}
+        self._final_submission_state = "idle"
 
     @staticmethod
     def _elapsed_ms(started: float) -> float:
@@ -171,6 +173,7 @@ class ZeroWorldShinEngine(BaseEngine):
 
         context = self._build_context(reservation_data)
         self.session_pool = []
+        self._final_submission_state = "idle"
         self._shared_connector = create_shared_connector(num_sessions)
         timeout = aiohttp.ClientTimeout(total=self.LOOKUP_TIMEOUT_SECONDS)
         self.log(f"제로월드 연결·예약 단계 예열 시작 · 세션 {num_sessions}개", "info")
@@ -275,7 +278,9 @@ class ZeroWorldShinEngine(BaseEngine):
 
                     stage = "예약 제출"
                     async with self.async_submission_lock:
-                        if self.stop_event.is_set():
+                        if self.stop_event.is_set() or self._final_submission_state in {
+                            "success", "uncertain",
+                        }:
                             return
                         if preselected_slot_id != slot_id:
                             stage = "시간 선택 준비"
@@ -285,11 +290,31 @@ class ZeroWorldShinEngine(BaseEngine):
                                 continue
                             preselected_slot_id = slot_id
                         stage = "예약 제출"
-                        result = await self._submit(session, context, slot_id, worker_name)
+                        self._final_submission_state = "inflight"
+                        try:
+                            result = await self._submit(
+                                session, context, slot_id, worker_name
+                            )
+                        except Exception as exc:
+                            result = await self._reconcile_ambiguous_submit(
+                                session, context, worker_name
+                            )
+                            if result is None:
+                                self._final_submission_state = "uncertain"
+                                self.stop_event.set()
+                                self.log(
+                                    f"[{worker_name}] [중복 방지 정지] 예약 POST 뒤 응답을 "
+                                    "확정하지 못했습니다. 추가 제출 없이 사이트 예약내역을 "
+                                    f"확인해주세요. ({self._format_exception(exc, context)})",
+                                    "error",
+                                )
+                                return
                     if result:
+                        self._final_submission_state = "success"
                         self.log(f"[{worker_name}] 🎉 {result.message}", "success")
                         self.notify_success(result)
                         return
+                    self._final_submission_state = "idle"
                     # A pre-open time selection can be accepted at the HTTP
                     # layer without becoming active server-side.  Refresh it on
                     # the next attempt only when the fast-path submission fails.
@@ -535,14 +560,74 @@ class ZeroWorldShinEngine(BaseEngine):
             "결제/완료 단계로 진행",
             "info",
         )
-        return await self._complete_payment(
-            session,
-            body,
-            final_url,
-            history_urls,
-            context,
-            worker_name,
-        )
+        try:
+            return await self._complete_payment(
+                session,
+                body,
+                final_url,
+                history_urls,
+                context,
+                worker_name,
+            )
+        except Exception as exc:
+            # The mutation was accepted before this follow-up began. A payment or
+            # completion timeout must never turn into a second reservation POST.
+            self.log(
+                f"[{worker_name}] 예약 선점 승인 후 완료 단계 응답 지연 · "
+                "추가 예약 POST 없이 사이트 확인 필요 · "
+                f"{self._format_exception(exc, context)}",
+                "warning",
+            )
+            return BookingResult(
+                True,
+                "예약 선점 성공 · 결제/완료 상태는 사이트에서 확인해주세요.",
+            )
+
+    async def _reconcile_ambiguous_submit(
+        self,
+        session: aiohttp.ClientSession,
+        context: ZeroWorldContext,
+        worker_name: str,
+    ) -> BookingResult | None:
+        """Read session state after an ambiguous mutation without another POST."""
+
+        reconcile_url = f"{self.home_url}?go=rev.kcp"
+        try:
+            async with session.get(
+                reconcile_url,
+                timeout=aiohttp.ClientTimeout(total=self.SUBMIT_RECONCILE_SECONDS),
+            ) as response:
+                body = decode_body(await response.read())
+                status = response.status
+                final_url = str(response.url)
+                history_urls = [str(item.url) for item in response.history]
+            self._log_http(
+                worker_name,
+                "예약 결과 재확인",
+                status,
+                0.0,
+                "추가 예약 POST 없음",
+            )
+            combined = " ".join([body, final_url, *history_urls])
+            reservation_code = self._extract_value(body, "code")
+            check_code = self._extract_value(body, "ck_code")
+            if not reservation_code:
+                match = re.search(r"[?&]code=([A-Za-z0-9_-]+)", combined)
+                reservation_code = match.group(1) if match else ""
+            if not reservation_code and not check_code:
+                return None
+            if not self._submission_accepted(body, final_url, history_urls):
+                return None
+            return await self._complete_payment(
+                session,
+                body,
+                final_url,
+                history_urls,
+                context,
+                worker_name,
+            )
+        except Exception:
+            return None
 
     async def _post_and_discard(
         self,

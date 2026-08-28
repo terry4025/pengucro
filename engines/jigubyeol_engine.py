@@ -26,6 +26,7 @@ class JigubyeolEngine(BaseEngine):
     # locks up permanently.
     LOOKUP_TIMEOUT = 5
     SUBMIT_TIMEOUT = 8
+    FINAL_RECONCILE_TIMEOUT = 3
     USE_ASYNC_HOT_PATH = True
     ERROR_CACHE_SIZE = 64
     _INPUT_TAG_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
@@ -42,6 +43,7 @@ class JigubyeolEngine(BaseEngine):
         super().__init__(log_callback, success_callback)
         self.base_url = site_url if site_url else 'https://www.xn--2e0b040a4xj.com'
         self._async_error_cache: OrderedDict[str, str] = OrderedDict()
+        self._final_submission_state = "idle"
         self._time_selection_headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
             'X-Requested-With': 'XMLHttpRequest',
@@ -158,6 +160,38 @@ class JigubyeolEngine(BaseEngine):
         if booking_id:
             message += f" · 예약번호 {booking_id}"
         return message
+
+    @staticmethod
+    def _completion_evidence(done_text):
+        """Return a booking id only when the done page proves a reservation exists."""
+
+        soup = BeautifulSoup(str(done_text or ""), 'html.parser')
+        for row in soup.select('table tr'):
+            heading = row.find('th')
+            value = row.find('td')
+            if not heading or not value:
+                continue
+            if '예약번호' in heading.get_text(" ", strip=True):
+                booking_id = value.get_text(" ", strip=True)
+                if booking_id:
+                    return booking_id
+        return ""
+
+    async def _reconcile_final_submission(self, session, worker_name):
+        """Read the session's done page without issuing another reservation POST."""
+
+        done_url = f"{self.base_url}/reservation/done"
+        try:
+            async with asyncio.timeout(self.FINAL_RECONCILE_TIMEOUT):
+                async with session.get(done_url) as done_res:
+                    done_text = await done_res.text()
+                    booking_id = self._completion_evidence(done_text)
+                    if booking_id:
+                        self._log_http(worker_name, "예약 결과 재확인", done_res.status, 0.0)
+                        return done_text
+        except Exception:
+            return ""
+        return ""
 
     def _log_http(self, worker_name, stage, status, rtt_ms):
         self.log(
@@ -471,66 +505,91 @@ class JigubyeolEngine(BaseEngine):
                     # If another worker succeeds while this one waits, do not
                     # send a duplicate final POST.
                     async with self.async_submission_lock:
-                        if self.stop_event.is_set():
+                        if self.stop_event.is_set() or self._final_submission_state in {
+                            "success", "uncertain",
+                        }:
                             break
-                        started = time.perf_counter()
-                        step2_response = await self.submit_reservation_async(
-                            session,
-                            csrf_token,
-                            reservation_data,
-                            payment_method,
-                        )
-                    step2_rtt = self._elapsed_ms(started)
-                    final_recovery_delay = self.observe_async_response(step2_response, step2_rtt)
-                    if step2_response.status in (200, 201):
-                        self._log_http(worker_name, stage, step2_response.status, step2_rtt)
-
-                    if step2_response.status == 419:
-                        await drain_response(step2_response)
-                        self.log(
-                            f"[{worker_name}] {target_time} 시도 중... "
-                            f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
-                            "warning",
-                        )
-                        csrf_token = None
-                        continue
-
-                    if step2_response.status in (200, 201):
-                        await drain_response(step2_response)
+                        self._final_submission_state = "inflight"
                         try:
-                            stage = "완료 정보 확인"
-                            done_url = f"{self.base_url}/reservation/done"
                             started = time.perf_counter()
-                            async with session.get(done_url) as done_res:
-                                done_text = await done_res.text()
-                                self._log_http(
-                                    worker_name,
-                                    stage,
-                                    done_res.status,
-                                    self._elapsed_ms(started),
-                                )
+                            step2_response = await self.submit_reservation_async(
+                                session,
+                                csrf_token,
+                                reservation_data,
+                                payment_method,
+                            )
+                        except Exception as exc:
+                            done_text = await self._reconcile_final_submission(
+                                session, worker_name
+                            )
+                            if done_text:
+                                self._final_submission_state = "success"
                                 self.log(
                                     f"[{worker_name}] {self._success_message(done_text)}",
                                     "success",
                                 )
-                        except Exception as e:
+                                self.notify_success()
+                                break
+                            self._final_submission_state = "uncertain"
+                            self.stop_event.set()
                             self.log(
-                                f"[{worker_name}] 예약 성공! (완료 정보 확인 실패 · "
-                                f"{self._format_exception(e, reservation_data)})",
-                                "success",
+                                f"[{worker_name}] [중복 방지 정지] 최종 예약 요청 뒤 응답을 "
+                                f"확정하지 못했습니다. 추가 POST 없이 예약내역을 확인해주세요. "
+                                f"({self._format_exception(exc, reservation_data)})",
+                                "error",
                             )
+                            break
 
+                        step2_rtt = self._elapsed_ms(started)
+                        final_recovery_delay = self.observe_async_response(
+                            step2_response, step2_rtt
+                        )
+                        if step2_response.status == 419:
+                            await drain_response(step2_response)
+                            self._final_submission_state = "idle"
+                            self.log(
+                                f"[{worker_name}] {target_time} 시도 중... "
+                                f"({stage} · HTTP 419 CSRF 만료 · 토큰 갱신 후 재시도)",
+                                "warning",
+                            )
+                            csrf_token = None
+                            continue
+                        if step2_response.status not in (200, 201):
+                            self._final_submission_state = "idle"
+                            await self.handle_error_async(
+                                step2_response,
+                                reservation_data,
+                                stage,
+                                worker_name=worker_name,
+                                rtt_ms=step2_rtt,
+                                recovery_delay=final_recovery_delay,
+                            )
+                            continue
+
+                        self._log_http(
+                            worker_name, stage, step2_response.status, step2_rtt
+                        )
+                        await drain_response(step2_response)
+                        done_text = await self._reconcile_final_submission(
+                            session, worker_name
+                        )
+                        if not done_text:
+                            self._final_submission_state = "uncertain"
+                            self.stop_event.set()
+                            self.log(
+                                f"[{worker_name}] [중복 방지 정지] HTTP "
+                                f"{step2_response.status} 응답 뒤 예약번호를 확인하지 못했습니다. "
+                                "추가 POST 없이 예약내역을 확인해주세요.",
+                                "error",
+                            )
+                            break
+                        self._final_submission_state = "success"
+                        self.log(
+                            f"[{worker_name}] {self._success_message(done_text)}",
+                            "success",
+                        )
                         self.notify_success()
                         break
-                    else:
-                        await self.handle_error_async(
-                            step2_response,
-                            reservation_data,
-                            stage,
-                            worker_name=worker_name,
-                            rtt_ms=step2_rtt,
-                            recovery_delay=final_recovery_delay,
-                        )
                 except Exception as e:
                     if self.stop_event.is_set():
                         break
@@ -647,6 +706,7 @@ class JigubyeolEngine(BaseEngine):
 
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
         self.log(f"지구별 연결 예열 시작 · 세션 {num_sessions}개", "info")
+        self._final_submission_state = "idle"
         
         self.session_pool = []
         self._shared_connector = create_shared_connector(num_sessions)

@@ -79,6 +79,14 @@ class SequenceSession:
         return next(self.responses)
 
 
+class GetSession:
+    def __init__(self, response):
+        self.response = response
+
+    def get(self, _url, **_kwargs):
+        return self.response
+
+
 def test_blank_exception_is_identifiable_and_sensitive_query_values_are_redacted():
     assert ZeroWorldShinEngine._format_exception(asyncio.TimeoutError()) == "TimeoutError"
 
@@ -245,6 +253,131 @@ def test_submit_fast_path_posts_only_final_reservation_action(monkeypatch):
     assert len(session.posts) == 1
     assert session.posts[0][0] == engine.action_url
     assert session.posts[0][1]["act"] == "make"
+
+
+def test_payment_timeout_after_acceptance_never_retries_reservation_post(monkeypatch):
+    engine = make_engine()
+    context = engine._build_context(
+        {
+            "branch": "1",
+            "reservationDate": "2026-08-14",
+            "reservationTime": "11:00:00",
+            "themePK": "28",
+            "name": "테스트",
+            "phone": "01012345678",
+            "people": "2",
+        }
+    )
+    session = SequenceSession(
+        [
+            FakeResponse(
+                body=b'<form action="rev.make.mutong.php"><input name="code" value="x"></form>',
+                url="https://zero.example/rev.make.mutong.php",
+            )
+        ]
+    )
+
+    async def timeout_after_acceptance(*_args, **_kwargs):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(engine, "_complete_payment", timeout_after_acceptance)
+    result = asyncio.run(engine._submit(session, context, "SLOT-17", "작업 1"))
+
+    assert result and result.success
+    assert len(session.posts) == 1
+
+
+def test_ambiguous_reconcile_rejects_bare_payment_route_without_booking_code():
+    engine = make_engine()
+    context = engine._build_context(
+        {
+            "branch": "1",
+            "reservationDate": "2026-08-14",
+            "reservationTime": "11:00:00",
+            "themePK": "28",
+            "name": "테스트",
+            "phone": "01012345678",
+            "people": "2",
+        }
+    )
+    session = GetSession(
+        FakeResponse(
+            body=b"<html>payment page</html>",
+            url="https://zero.example/layout/res/home.php?go=rev.kcp",
+        )
+    )
+
+    result = asyncio.run(
+        engine._reconcile_ambiguous_submit(session, context, "작업 1")
+    )
+
+    assert result is None
+
+
+def test_ambiguous_final_submit_stops_all_workers_after_one_post(monkeypatch):
+    engine = make_engine()
+    final_posts = 0
+
+    class Session:
+        async def close(self):
+            return None
+
+    async def prestage(*_args):
+        return True
+
+    async def find(*_args):
+        return ZeroWorldTimeSlot("11:00", "SLOT-17", True)
+
+    async def prepare(*_args):
+        return True
+
+    async def submit(*_args):
+        nonlocal final_posts
+        final_posts += 1
+        raise asyncio.TimeoutError()
+
+    async def reconcile(*_args):
+        return None
+
+    monkeypatch.setattr(zeroworld_shin.aiohttp, "ClientSession", lambda **_kwargs: Session())
+    monkeypatch.setattr(engine, "_prestage_session", prestage)
+    monkeypatch.setattr(engine, "_find_target_slot", find)
+    monkeypatch.setattr(engine, "_prepare_time_slot", prepare)
+    monkeypatch.setattr(engine, "_submit", submit)
+    monkeypatch.setattr(engine, "_reconcile_ambiguous_submit", reconcile)
+
+    async def scenario():
+        engine.async_submission_lock = asyncio.Lock()
+        await asyncio.gather(
+            engine.make_reservation_async_task(
+                {
+                    "branch": "1",
+                    "reservationDate": "2026-08-14",
+                    "reservationTime": "11:00:00",
+                    "themePK": "28",
+                    "name": "테스트",
+                    "phone": "01012345678",
+                    "people": "2",
+                },
+                0,
+            ),
+            engine.make_reservation_async_task(
+                {
+                    "branch": "1",
+                    "reservationDate": "2026-08-14",
+                    "reservationTime": "11:00:00",
+                    "themePK": "28",
+                    "name": "테스트",
+                    "phone": "01012345678",
+                    "people": "2",
+                },
+                1,
+            ),
+        )
+
+    asyncio.run(scenario())
+    assert final_posts == 1
+    assert engine._final_submission_state == "uncertain"
 
 
 def test_worker_skips_calendar_and_reuses_closed_slot_preselection(monkeypatch):
