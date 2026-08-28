@@ -1,8 +1,9 @@
 import asyncio
 import json
 import time
+from datetime import datetime
 
-from engines.doomescape_engine import DoomEscapeEngine
+from engines.doomescape_engine import DoomEscapeEngine, DoomScanGovernor
 
 
 def test_empty_timeout_error_has_a_useful_name():
@@ -18,7 +19,7 @@ def test_exception_diagnostic_redacts_doom_completion_code():
     assert "ck_code=[redacted]" in described
 
 
-def test_session_prefetch_runs_in_parallel(monkeypatch):
+def test_session_prefetch_caps_scan_connections_and_keeps_submit_session(monkeypatch):
     import aiohttp
 
     class FakeResponse:
@@ -48,38 +49,58 @@ def test_session_prefetch_runs_in_parallel(monkeypatch):
     engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
 
     started = time.perf_counter()
-    asyncio.run(engine.pre_fetch_sessions_async(5, {}))
+    asyncio.run(engine.pre_fetch_sessions_async(50, {}))
     elapsed = time.perf_counter() - started
 
-    assert len(engine.session_pool) == 5
-    assert elapsed < 0.16
+    assert engine._scan_session_count == 8
+    assert len(engine.session_pool) == 9
+    assert engine._submit_session is engine.session_pool[-1]
+    assert elapsed < 0.20
 
 
-def test_outage_uses_one_probe_and_releases_all_workers(monkeypatch):
-    logs = []
-    engine = DoomEscapeEngine(
-        "https://doomescape.com",
-        lambda message, level: logs.append((message, level)),
+def test_active_outage_keeps_a_fast_probe_floor_without_a_global_gate():
+    governor = DoomScanGovernor(2, 12, 1, 6)
+    governor.set_phase("active")
+
+    for _ in range(20):
+        governor.observe_failure()
+
+    assert governor.target_rate == 6
+    assert not hasattr(DoomEscapeEngine, "_wait_for_site_recovery")
+    assert (
+        DoomEscapeEngine.ACTIVE_SCAN_RATE_PER_SECOND
+        * DoomEscapeEngine.LIST_TIMEOUT_SECONDS
+        <= DoomEscapeEngine.MAX_SCAN_INFLIGHT
     )
-    probe_results = iter([False, True])
 
-    async def fake_probe(_url):
-        return next(probe_results)
 
-    monkeypatch.setattr(engine, "_probe_reservation_page", fake_probe)
-    engine.RECOVERY_INITIAL_SECONDS = 0
-    engine.RECOVERY_MAX_SECONDS = 0
+def test_governor_does_not_reserve_idle_dispatches_far_ahead():
+    async def run():
+        governor = DoomScanGovernor(2, 20, 1, 5)
+        started = time.monotonic()
+        tasks = [asyncio.create_task(governor.wait_turn()) for _ in range(3)]
+        await tasks[0]
+        governor.set_phase("active")
+        await asyncio.gather(*tasks[1:])
+        return time.monotonic() - started
 
-    async def run_waiters():
-        engine._reset_async_recovery_state()
-        await asyncio.gather(
-            engine._wait_for_site_recovery("https://doomescape.com/list", 0, asyncio.TimeoutError()),
-            engine._wait_for_site_recovery("https://doomescape.com/list", 1, asyncio.TimeoutError()),
-        )
+    assert asyncio.run(run()) < 0.8
 
-    asyncio.run(run_waiters())
 
-    assert any("서버 응답 복구" in message for message, _level in logs)
+def test_open_anchor_stays_active_across_midnight_and_after_open():
+    before_open = datetime(2026, 8, 28, 23, 44, 50)
+    after_open = datetime(2026, 8, 28, 23, 50, 0)
+    after_midnight = datetime(2026, 8, 29, 0, 5, 0)
+
+    assert datetime.fromtimestamp(
+        DoomEscapeEngine._open_anchor_from_wall_clock("23:45:00", before_open)
+    ) == datetime(2026, 8, 28, 23, 45, 0)
+    assert datetime.fromtimestamp(
+        DoomEscapeEngine._open_anchor_from_wall_clock("23:45:00", after_open)
+    ) == datetime(2026, 8, 28, 23, 45, 0)
+    assert datetime.fromtimestamp(
+        DoomEscapeEngine._open_anchor_from_wall_clock("23:45:00", after_midnight)
+    ) == datetime(2026, 8, 28, 23, 45, 0)
 
 
 def test_failure_diagnostic_persists_metadata_without_raw_html(tmp_path, monkeypatch):
@@ -140,6 +161,20 @@ def test_http_diagnostic_includes_worker_stage_status_and_rtt():
     assert level == "warning"
 
 
+def test_timetable_diagnostics_are_aggregated_across_workers():
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+
+    engine._log_http_diagnostic("태스크 1", "시간표 조회", "GET", 200, 0.1)
+    engine._log_http_diagnostic("태스크 2", "시간표 조회", "GET", 200, 0.1)
+
+    assert len(logs) == 1
+    assert "[전체 감시]" in logs[0][0]
+
+
 def test_missing_slot_is_classified_as_unopened_or_sold_out():
     unopened = "<html><body>오픈 전</body></html>"
     sold_out = (
@@ -153,6 +188,221 @@ def test_missing_slot_is_classified_as_unopened_or_sold_out():
         DoomEscapeEngine._classify_missing_slot(sold_out, "나폴리탄")
         == "오픈됨·해당 시간 없음"
     )
+
+
+def test_timetable_rejects_navigation_date_when_slots_are_for_another_day():
+    html = (
+        '<a href="?go=rev.make&rev_days=2026-09-05">다음 날짜</a>'
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?go=rev.make.input&rev_days=2026-08-29&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span>'
+        "</a></div>"
+    )
+
+    analysis = DoomEscapeEngine.analyze_timetable(
+        html, "데이투어", "2026-09-05", "19:00"
+    )
+
+    assert analysis["page_dates"] == ["2026-08-29"]
+    assert analysis["date_matches"] is False
+    assert analysis["slot_id"] is None
+    assert analysis["reason"] == "날짜 미공개"
+
+
+def test_timetable_accepts_only_exact_time_on_the_target_date():
+    html = (
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?rev_days=2026-09-05&theme_time_num=35">'
+        '<span class="num">9:00</span><span class="txt">예약가능</span></a>'
+        '<a href="?rev_days=2026-09-05&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span></a></div>'
+    )
+
+    morning = DoomEscapeEngine.analyze_timetable(
+        html, "데이투어", "2026-09-05", "09:00"
+    )
+    evening = DoomEscapeEngine.analyze_timetable(
+        html, "데이투어", "2026-09-05", "19:00"
+    )
+
+    assert morning["slot_id"] == "35"
+    assert evening["slot_id"] == "36"
+
+
+def test_price_fields_ignore_attribute_order_and_capacity_rejection_is_not_reposted():
+    html = (
+        '<input value="126000" name="price" type="hidden">'
+        '<input name="price3" type="hidden" value="168000">'
+        '<input type="text" name="price4" value="999999">'
+    )
+
+    assert DoomEscapeEngine._extract_price_fields(html) == {
+        "price": "126000",
+        "price3": "168000",
+    }
+    assert DoomEscapeEngine._prestage_rejection_requires_refresh(
+        200, "<script>alert('선택하신 시간은 이미 예약 마감되었습니다')</script>"
+    ) is False
+    assert DoomEscapeEngine._prestage_rejection_requires_refresh(
+        200, "<script>alert('가격 정보가 잘못되었습니다')</script>"
+    ) is True
+
+
+def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
+    import engines.doomescape_engine as module
+    import webbrowser
+
+    target_html = (
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?rev_days=2026-09-05&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span>'
+        "</a></div>"
+    )
+
+    class Response:
+        def __init__(self, body, status=200):
+            self.body = body.encode("utf-8")
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self.body
+
+        async def text(self, **_kwargs):
+            return self.body.decode("utf-8")
+
+    class TimeoutResponse:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class ScanSession:
+        def __init__(self):
+            self.get_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.get_count += 1
+            if self.get_count == 1:
+                return TimeoutResponse()
+            return Response(target_html)
+
+        async def close(self):
+            return None
+
+    class SubmitSession:
+        def __init__(self):
+            self.post_count = 0
+
+        def get(self, url, **_kwargs):
+            if "go=rev.make.input" in url:
+                return Response('<input type="hidden" name="price3" value="126000">')
+            if "go=rev.kcp" in url:
+                return Response('<input name="ck_code" value="777">')
+            if "rev.make.mutong.php" in url:
+                return Response(
+                    '<meta http-equiv="refresh" content="0;url=rev.make.exe.php?ck_code=888">'
+                )
+            return Response("예약 완료")
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            return Response("<script>location.href='?num=9001'</script>")
+
+        async def close(self):
+            return None
+
+    scan_session = ScanSession()
+    submit_session = SubmitSession()
+    successes = []
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+        lambda: successes.append(True),
+    )
+    engine.scan_governor = DoomScanGovernor(1000, 1000, 1000, 1000)
+    engine.scan_governor.set_phase("active")
+    engine._scan_inflight = asyncio.Semaphore(2)
+    engine._scan_session_count = 1
+    engine._prestage_lock = asyncio.Lock()
+    engine._slot_wait_started_at = time.time()
+    engine.session_pool = [scan_session, submit_session]
+    engine._submit_session = submit_session
+    monkeypatch.setattr(module, "append_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(webbrowser, "open", lambda *_args, **_kwargs: False)
+
+    reservation = {
+        "branch": "4",
+        "reservationDate": "2026-09-05",
+        "reservationTime": "19:00",
+        "themePK": "36",
+        "themeLabel": "데이투어",
+        "name": "테스트",
+        "phone": "010-1234-5678",
+        "people": "3",
+    }
+
+    asyncio.run(engine.make_reservation_async_task(reservation, 0))
+
+    assert scan_session.get_count == 2
+    assert submit_session.post_count == 1
+    assert successes == [True]
+    assert any("전체 정지 없이 독립 감시" in message for message, _level in logs)
+    assert any("예약 최종 완료" in message for message, _level in logs)
+
+
+def test_ui_payload_reaches_registry_and_base_async_start(monkeypatch):
+    from engines.registry import EngineRegistry
+    from pengucro.models import ReservationRequest, STANDARD_MODE
+
+    request = ReservationRequest.from_mapping(
+        "둠이스케이프",
+        {
+            "branch": "4",
+            "reservationDate": "2026-09-05",
+            "reservationTime": "19:00",
+            "themePK": "36",
+            "themeLabel": "데이투어",
+            "name": "테스트",
+            "phone": "010-1234-5678",
+            "people": "3",
+            "site_url": "https://doomescape.com",
+        },
+    )
+    payload = request.to_engine_payload()
+    engine = EngineRegistry.create(
+        site_name="둠이스케이프",
+        mode=STANDARD_MODE,
+        payload=payload,
+        custom_sites={},
+        log_callback=lambda *_args: None,
+        success_callback=lambda: None,
+    )
+    captured = {}
+
+    async def capture_run(data, workers, *_args, **_kwargs):
+        captured.update(payload=data, workers=workers)
+
+    monkeypatch.setattr(engine, "run_async_tasks", capture_run)
+    engine.start_reservation(payload, 50, is_async=True)
+    deadline = time.time() + 2
+    while engine.is_running and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert isinstance(engine, DoomEscapeEngine)
+    assert captured["workers"] == 50
+    assert captured["payload"]["reservationDate"] == "2026-09-05"
+    assert captured["payload"]["reservationTime"] == "19:00:00"
+    assert captured["payload"]["themePK"] == "36"
+    assert captured["payload"]["people"] == "3"
+    assert engine.is_running is False
 
 
 def test_missing_slot_log_throttles_and_reports_wait_time():

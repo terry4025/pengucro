@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.56",
+        changes=(
+            "둠이스케이프 서버 장애 중에도 첫 정상 응답 즉시 선점 재개",
+            "둠이스케이프 오픈 전 제출값 사전 준비로 주문 생성 지연 단축",
+            "둠이스케이프 목표 날짜·회차 검증 강화로 잘못된 제출 방지",
+        ),
+    ),
+    PatchNote(
         version="6.55",
         changes=(
             "둠이스케이프 미오픈과 마감 상태를 구분해 오픈까지 안정적으로 계속 조회",

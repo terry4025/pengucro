@@ -17,23 +17,29 @@ from pengucro.models import BookingEvent, BookingEventType, BookingResult
 logger = logging.getLogger(__name__)
 
 
-class _QuietProactorLoop(asyncio.ProactorEventLoop):
-    """Proactor loop that swallows the noisy WinError 10022 teardown callback.
+def _is_benign_proactor_teardown(context: dict[str, Any]) -> bool:
+    """Recognise only the harmless Windows socket teardown callback."""
 
-    On Windows, closing many pooled connections can make
-    ``_ProactorBasePipeTransport._call_connection_lost`` raise
-    ``OSError(WinError 10022)`` inside an event-loop callback.  The error is
-    harmless (the connection was already closing) but previously flooded the
-    log with hundreds of tracebacks per run.  Dropping only that one
-    known-benign exception keeps every other callback failure visible.
-    """
+    error = context.get("exception")
+    if not isinstance(error, OSError) or getattr(error, "winerror", None) != 10022:
+        return False
+    return "_call_connection_lost" in str(context.get("handle", "")) or (
+        "connection_lost" in str(context.get("message", ""))
+    )
 
-    def _call_connection_lost(self, exc):
-        try:
-            super()._call_connection_lost(exc)
-        except OSError as error:
-            if getattr(error, "winerror", None) != 10022:
-                raise
+
+def _install_quiet_teardown_handler(loop: asyncio.AbstractEventLoop) -> None:
+    previous_handler = loop.get_exception_handler()
+
+    def handler(target_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if _is_benign_proactor_teardown(context):
+            return
+        if previous_handler is not None:
+            previous_handler(target_loop, context)
+        else:
+            target_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
 
 
 LogCallback = Callable[[str, str], None]
@@ -257,9 +263,10 @@ class BaseEngine:
 
     def _run_async_loop(self, reservation_data: dict[str, Any], num_tasks: int) -> None:
         if hasattr(asyncio, "ProactorEventLoop"):
-            loop = _QuietProactorLoop()
+            loop = asyncio.ProactorEventLoop()
         else:
             loop = asyncio.new_event_loop()
+        _install_quiet_teardown_handler(loop)
         self._loop = loop
         asyncio.set_event_loop(loop)
         try:
