@@ -17,6 +17,16 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.58",
+        changes=(
+            "CGV 좌석 임시선점 후 정확한 4석 화면 동기화와 결제 전환 안정화",
+            "CGV 좌석 우선순위 일부가 없으면 다음 완전한 좌석 묶음으로 자동 전환",
+            "CGV 예약 시작 시 CGV·네이버 로그인 세션 확인과 저장 로그인 자동 복구",
+            "네이버페이 재로그인 및 추가 보안 확인 완료 후 결제 흐름 자동 재개",
+            "일부 Windows 환경에서 로그 출력 오류로 예약이 중단되는 문제 수정",
+        ),
+    ),
+    PatchNote(
         version="6.57",
         changes=(
             "둠이스케이프 빠른 조회와 지연 복구 응답을 함께 감시해 선점 재개 강화",
