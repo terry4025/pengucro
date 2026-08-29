@@ -406,7 +406,7 @@ class TestUIComponents(unittest.TestCase):
         std_options = self.app.site_dropdown.cget("values")
         self.assertTrue(len(std_options) >= len(self.app.default_site_names))
         self.assertTrue(any("제로월드" in opt for opt in std_options))
-        self.assertEqual(float(self.app.form.threads_slider.cget("to")), 50.0)
+        self.assertEqual(float(self.app.form.threads_slider.cget("to")), 32.0)
         self.assertEqual(self.app.form.threads_slider.cget("state"), "normal")
         print("[Pass] Standard engine mode restores default site options correctly.")
 
@@ -475,9 +475,9 @@ class TestUIComponents(unittest.TestCase):
 
         # Give standard sites a distinctive value so a Keyescape round-trip
         # proves that the independent memories are not overwriting each other.
-        self.app.form.standard_threads = 47
-        self.app.form.threads_slider.set(47)
-        self.app.form._on_threads_slider_move(47)
+        self.app.form.standard_threads = 31
+        self.app.form.threads_slider.set(31)
+        self.app.form._on_threads_slider_move(31)
         
         # 1. Switch to Keyescape
         self.app.site_var.set("키이스케이프")
@@ -527,11 +527,11 @@ class TestUIComponents(unittest.TestCase):
         self.assertEqual(cb_state_new, "disabled", "Server time checkbox must be disabled for Zero World")
         self.assertFalse(self.app.is_sync_running, "Sync thread should be stopped for Zero World")
         self.assertEqual(
-            float(self.app.form.threads_slider.cget("to")), 50.0,
-            "Standard sites must restore the full 1-50 range after Keyescape",
+            float(self.app.form.threads_slider.cget("to")), 32.0,
+            "ZeroWorld must restore its measured 1-32 range after Keyescape",
         )
         self.assertEqual(self.app.form.threads_slider.cget("state"), "normal")
-        self.assertEqual(int(self.app.form.threads_slider.get()), 47)
+        self.assertEqual(int(self.app.form.threads_slider.get()), 31)
         self.assertEqual(
             self.app.form.yescaptcha_frame.winfo_manager(), "",
             "YesCaptcha controls must be removed outside Keyescape",
@@ -575,12 +575,12 @@ class TestUIComponents(unittest.TestCase):
         self.app.site_var.set("제로월드")
         self.app._on_site_change("제로월드")
         self.app.update()
-        self.assertEqual(float(form.threads_slider.cget("to")), 50.0)
+        self.assertEqual(float(form.threads_slider.cget("to")), 32.0)
         self.assertEqual(form.threads_slider.cget("state"), "normal")
-        self.assertEqual(int(form.threads_slider.get()), 47)
+        self.assertEqual(int(form.threads_slider.get()), 31)
         self.assertEqual(form.yescaptcha_frame.winfo_manager(), "")
         self.assertEqual(form.keyescape_cache_frame.winfo_manager(), "")
-        print("[Pass] Naver=1 locked, Keyescape=1-3, standard=1-50 with separate memory.")
+        print("[Pass] Naver=1 locked, Keyescape=1-3, ZeroWorld=1-32 with separate memory.")
 
     def test_7_dynamic_advanced_layout_and_original_loading_reveal(self):
         print("\n--- Verifying Dynamic Advanced Layout & Original Loading Reveal ---")

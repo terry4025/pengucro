@@ -882,8 +882,9 @@ class NaverServerClock:
 
     Unlike keyescape -- where only a whole-second ``Date`` header is available and
     the second boundary has to be caught by polling -- ``bizItem.currentDateTime``
-    carries milliseconds, so one request is enough. Accuracy is then bounded by
-    half the round trip (measured 71-97 ms, so roughly +/-45 ms).
+    carries milliseconds. Startup uses one sample; the final pre-open refresh
+    can retain the quickest of several samples to reduce queueing noise. Accuracy
+    is bounded by half that selected round trip.
 
     The anchor is monotonic on purpose: an NTP correction part-way through a run
     cannot shift what the engine believes the server time to be.
@@ -913,24 +914,53 @@ class NaverServerClock:
         return target_epoch - self.now()
 
     def sync(self, announce: bool = False) -> bool:
-        before = time.monotonic()
-        try:
-            meta = self.api.fetch_item_meta()
-        except NaverApiError as exc:
+        return self._sync_samples(1, announce=announce)
+
+    def sync_precise(self, sample_count: int = 3, announce: bool = False) -> bool:
+        """Anchor to the lowest-RTT read-only sample near an opening."""
+        return self._sync_samples(
+            max(2, min(int(sample_count or 3), 5)), announce=announce
+        )
+
+    def _sync_samples(self, sample_count: int, *, announce: bool) -> bool:
+        samples: list[tuple[float, float, float]] = []
+        last_error: Exception | None = None
+        missing_server_time = False
+        for _index in range(max(1, int(sample_count))):
+            before = time.monotonic()
+            try:
+                meta = self.api.fetch_item_meta()
+            except NaverApiError as exc:
+                last_error = exc
+                continue
+            after = time.monotonic()
+            if meta.server_time is None:
+                missing_server_time = True
+                continue
+            samples.append(
+                (after - before, (before + after) / 2, meta.server_time.timestamp())
+            )
+
+        if not samples:
             if announce and self.log:
-                self.log(f"[경고] 네이버 서버 시간을 읽지 못했습니다. 로컬 시계로 진행합니다. ({exc})",
-                         "warning")
-            return False
-        after = time.monotonic()
-        if meta.server_time is None:
-            if announce and self.log:
-                self.log("[경고] 서버 시간 필드가 비어 있습니다. 로컬 시계로 진행합니다.", "warning")
+                if missing_server_time:
+                    self.log(
+                        "[경고] 서버 시간 필드가 비어 있습니다. 로컬 시계로 진행합니다.",
+                        "warning",
+                    )
+                else:
+                    suffix = f" ({last_error})" if last_error else ""
+                    self.log(
+                        f"[경고] 네이버 서버 시간을 읽지 못했습니다. "
+                        f"로컬 시계로 진행합니다.{suffix}",
+                        "warning",
+                    )
             return False
 
-        midpoint = (before + after) / 2
-        self._anchor_server = meta.server_time.timestamp()
+        round_trip, midpoint, server_epoch = min(samples, key=lambda row: row[0])
+        self._anchor_server = server_epoch
         self._anchor_monotonic = midpoint
-        self.last_precision = (after - before) / 2
+        self.last_precision = round_trip / 2
         self.last_offset = self._anchor_server - (
             time.time() - (time.monotonic() - midpoint)
         )

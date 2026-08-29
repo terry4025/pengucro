@@ -772,10 +772,10 @@ def test_api_send_lead_uses_the_browser_transport_round_trip():
     engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
     engine._api_submitter = type("BrowserTransport", (), {"last_rtt": 0.4})()
 
-    assert engine._api_one_way_seconds() == pytest.approx(0.235)
+    assert engine._api_one_way_seconds() == pytest.approx(0.150)
 
 
-def test_api_send_lead_uses_safe_percentile_and_server_clock_precision():
+def test_api_send_lead_targets_just_after_open_from_lowest_warm_rtt():
     engine = make_engine()
     engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
     engine._api_submitter = type(
@@ -787,10 +787,112 @@ def test_api_send_lead_uses_safe_percentile_and_server_clock_precision():
         },
     )()
     engine.clock = type("Clock", (), {"last_precision": 0.04})()
+    engine._recent_submit_rtt = [0.8]
 
-    assert engine._api_one_way_seconds() == pytest.approx(0.155)
-    assert "안전 RTT 160ms" in engine._last_api_lead_detail
+    assert engine._api_one_way_seconds() == pytest.approx(0.025)
+    assert "최저 RTT 80ms" in engine._last_api_lead_detail
+    assert "서버 도착 목표 +15ms" in engine._last_api_lead_detail
     assert "시계 오차 40ms" in engine._last_api_lead_detail
+
+
+def test_final_preopen_clock_sync_runs_once_with_three_samples():
+    logs = []
+    calls = []
+
+    class PreciseClock:
+        last_precision = 0.012
+
+        def sync_precise(self, sample_count, announce=False):
+            calls.append((sample_count, announce))
+            return True
+
+    engine = NaverEngine(lambda message, _level: logs.append(message))
+    engine.clock = PreciseClock()
+
+    assert asyncio.run(engine._sync_clock_before_open()) is True
+    assert asyncio.run(engine._sync_clock_before_open()) is False
+    assert calls == [(3, False)]
+    assert any("최저 지연 표본 오차 약 12ms" in message for message in logs)
+
+
+def test_rt47_recheck_only_releases_guard_for_changed_bookable_inventory():
+    logs = []
+    engine = NaverEngine(lambda message, _level: logs.append(message))
+    rejected = make_slot()
+    changed = make_slot(
+        stock=8,
+        bookingCount=7,
+        unitStock=8,
+        unitBookingCount=7,
+    )
+    engine.clock = FakeClock(-0.01)
+    engine.api = FakeApi(changed)
+    engine._api_refused_signature = engine._slot_signature(rejected, None)
+
+    assert asyncio.run(
+        engine._refused_slot_changed("2026-07-31", "13:20")
+    ) is True
+    assert engine._api_refused_signature is None
+    assert engine.api.calls == 1
+    assert any("최신 재고 변화 확인" in message for message in logs)
+
+
+def test_rt47_recheck_keeps_guard_for_identical_inventory():
+    engine = make_engine()
+    slot = make_slot()
+    signature = engine._slot_signature(slot, None)
+    engine.clock = FakeClock(-0.01)
+    engine.api = FakeApi(slot)
+    engine._api_refused_signature = signature
+
+    assert asyncio.run(
+        engine._refused_slot_changed("2026-07-31", "13:20")
+    ) is False
+    assert engine._api_refused_signature == signature
+
+
+def test_ui_payload_reaches_naver_registry_and_single_async_start(monkeypatch):
+    from engines.registry import EngineRegistry
+    from pengucro.models import NAVER_MODE, ReservationRequest
+
+    request = ReservationRequest.from_mapping(
+        "드림이스케이프 건대",
+        {
+            "reservationDate": "2026-09-05",
+            "reservationTime": "14:25",
+            "themePK": "https://booking.naver.com/booking/12/bizes/1498729/items/6282267",
+            "themeLabel": "바야흐로,여름이었다.",
+            "name": "테스트",
+            "phone": "010-1234-5678",
+            "people": "2",
+        },
+    )
+    payload = request.to_engine_payload()
+    engine = EngineRegistry.create(
+        site_name="드림이스케이프 건대",
+        mode=NAVER_MODE,
+        payload=payload,
+        custom_sites={"드림이스케이프 건대": {"style": "naver"}},
+        log_callback=lambda *_args: None,
+        success_callback=lambda: None,
+    )
+    captured = {}
+
+    async def capture_run(data, workers, *_args, **_kwargs):
+        captured.update(payload=data, workers=workers)
+
+    monkeypatch.setattr(engine, "run_async_tasks", capture_run)
+    engine.start_reservation(payload, 50, is_async=True)
+    deadline = time.time() + 2
+    while engine.is_running and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert isinstance(engine, NaverEngine)
+    assert captured["workers"] == 1
+    assert captured["payload"]["reservationDate"] == "2026-09-05"
+    assert captured["payload"]["reservationTime"] == "14:25:00"
+    assert captured["payload"]["people"] == "2"
+    assert engine.is_running is False
 
 
 def test_pending_api_strike_refreshes_slot_before_page_reload():

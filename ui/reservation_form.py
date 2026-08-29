@@ -27,6 +27,10 @@ from pengucro.storage import SecretStore, load_json, save_json
 from datetime import datetime, timedelta
 import calendar
 
+STANDARD_MAX_WORKERS = 50
+ZEROWORLD_JIGUBYEOL_MAX_WORKERS = 32
+DOOMESCAPE_MAX_WORKERS = 10
+
 # Keys stored in config.json that no widget in this form owns. save_config()
 # replaces the whole file, so these must survive the round trip.
 PRESERVED_CONFIG_KEYS = (
@@ -1533,6 +1537,27 @@ class ReservationForm(ctk.CTkFrame):
         site = self.custom_sites.get(site_name) or {}
         return site.get("engine_id") == "cgv"
 
+    def _standard_thread_limit(self, site_name=None) -> int:
+        """Return the measured UI ceiling for the selected standard engine."""
+        selected = getattr(self, "current_site", "") if site_name is None else site_name
+        custom_sites = getattr(self, "custom_sites", {}) or {}
+        site = custom_sites.get(selected) or {}
+        engine_id = str(site.get("engine_id") or "").lower()
+        style = str(site.get("style") or "").lower()
+        if selected == "둠이스케이프" or engine_id == "doomescape":
+            return DOOMESCAPE_MAX_WORKERS
+        if selected in {"제로월드", "지구별방탈출"}:
+            return ZEROWORLD_JIGUBYEOL_MAX_WORKERS
+        if engine_id in {
+            "jigubyeol",
+            "sinbiworld",
+            "zeroworld_laravel",
+            "zeroworld_gu",
+            "zeroworld_shin",
+        } or style in {"jigubyeol", "zeroworld"}:
+            return ZEROWORLD_JIGUBYEOL_MAX_WORKERS
+        return STANDARD_MAX_WORKERS
+
     def _selected_cgv_site_no(self) -> str:
         selected = str(self.cgv_selection.get("site_no", "")).strip()
         if selected:
@@ -1562,7 +1587,8 @@ class ReservationForm(ctk.CTkFrame):
         elif self._site_uses_cgv():
             self.cgv_threads = max(1, min(value, CGV_MAX_WORKERS))
         else:
-            self.standard_threads = max(1, min(value, 50))
+            limit = ReservationForm._standard_thread_limit(self)
+            self.standard_threads = max(1, min(value, limit))
 
     def _apply_thread_policy(self) -> None:
         """Fully reset the shared slider for the active engine family.
@@ -1654,17 +1680,22 @@ class ReservationForm(ctk.CTkFrame):
             )
             return
 
-        self.standard_threads = max(1, min(self.standard_threads, 50))
+        limit = ReservationForm._standard_thread_limit(self)
+        self.standard_threads = max(1, min(self.standard_threads, limit))
         self.threads_slider.configure(
-            from_=1, to=50, number_of_steps=49, state="normal"
+            from_=1, to=limit, number_of_steps=limit - 1, state="normal"
         )
         self.threads_slider.set(self.standard_threads)
         self.threads_value_label.configure(
             text=str(self.standard_threads), text_color=theme.ACCENT_BLUE
         )
-        self.threads_title_label.configure(
-            text="동시 시도 수", text_color=theme.TEXT_MUTE
-        )
+        if limit == DOOMESCAPE_MAX_WORKERS:
+            title = f"동시 감시 세션 (둠이스케이프 실측 최고 {limit})"
+        elif limit == ZEROWORLD_JIGUBYEOL_MAX_WORKERS:
+            title = f"동시 시도 수 (실측 병목 전 최대 {limit})"
+        else:
+            title = "동시 시도 수"
+        self.threads_title_label.configure(text=title, text_color=theme.TEXT_MUTE)
 
     def _on_mode_change(self, mode):
         if not getattr(self, "_is_initializing", False):
@@ -2158,7 +2189,8 @@ class ReservationForm(ctk.CTkFrame):
         elif self._site_uses_cgv():
             self.cgv_threads = max(1, min(val, CGV_MAX_WORKERS))
         else:
-            self.standard_threads = max(1, min(val, 50))
+            limit = ReservationForm._standard_thread_limit(self)
+            self.standard_threads = max(1, min(val, limit))
         self.auto_save()
 
     def _on_cgv_booking_mode_change(self, _value=None):
@@ -2570,7 +2602,8 @@ class ReservationForm(ctk.CTkFrame):
             )
         else:
             slider = getattr(self, "threads_slider", None)
-            threads = max(1, min(int(slider.get() if slider else 50), 50))
+            limit = ReservationForm._standard_thread_limit(self)
+            threads = max(1, min(int(slider.get() if slider else limit), limit))
         return request, None, threads, not (is_naver or is_tripcom)
 
     def _format_phone(self, event=None):
@@ -2952,7 +2985,10 @@ class ReservationForm(ctk.CTkFrame):
                     1, min(int(self.threads_slider.get()), CGV_MAX_WORKERS)
                 )
             else:
-                self.standard_threads = int(self.threads_slider.get())
+                limit = ReservationForm._standard_thread_limit(self)
+                self.standard_threads = max(
+                    1, min(int(self.threads_slider.get()), limit)
+                )
 
             remember_personal = bool(self.remember_personal_var.get())
             if remember_personal:

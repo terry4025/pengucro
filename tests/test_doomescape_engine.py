@@ -60,8 +60,8 @@ def test_session_prefetch_caps_scan_connections_and_keeps_submit_session(monkeyp
     asyncio.run(engine.pre_fetch_sessions_async(50, {}))
     elapsed = time.perf_counter() - started
 
-    assert engine._scan_session_count == 8
-    assert len(engine.session_pool) == 10
+    assert engine._scan_session_count == 10
+    assert len(engine.session_pool) == 12
     assert engine._submit_session is engine.session_pool[-2]
     assert engine._submit_hedge_session is engine.session_pool[-1]
     assert elapsed < 0.20
@@ -404,11 +404,13 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     submit_session = SubmitSession()
     successes = []
     logs = []
+    status_updates = []
     engine = DoomEscapeEngine(
         "https://doomescape.com",
         lambda message, level: logs.append((message, level)),
         lambda: successes.append(True),
     )
+    engine.status_callback = lambda count, reason: status_updates.append((count, reason))
     engine.scan_governor = DoomScanGovernor(1000, 1000, 1000, 1000)
     engine.scan_governor.set_phase("active")
     engine._scan_inflight = asyncio.Semaphore(2)
@@ -438,6 +440,9 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     asyncio.run(engine.make_reservation_async_task(reservation, 0))
 
     assert scan_session.get_count == 2
+    assert engine.attempt_count == 2
+    assert [count for count, _reason in status_updates] == [1, 2]
+    assert all(reason == "둠이스케이프 시간표 조회" for _count, reason in status_updates)
     assert submit_session.post_count == 1
     assert successes == [True]
     assert any("전체 정지 없이 독립 감시" in message for message, _level in logs)

@@ -14,6 +14,14 @@ from engines.zeroworld_catalog import ZeroWorldTimeSlot, parse_time_slots, decod
 from pengucro.storage import load_json, save_json
 
 
+JIGUBYEOL_TIMETABLE_CACHE = "jigubyeol_timetable_cache.json"
+_jigubyeol_cache_lock = threading.Lock()
+_jigubyeol_seed_lock = threading.Lock()
+_jigubyeol_seed_inflight: dict[tuple[str, str, str, str, str, object], threading.Event] = {}
+_jigubyeol_seed_complete: set[tuple[str, str, str, str, str, object]] = set()
+JIGUBYEOL_DISCOVERY_LOOKAHEAD_DAYS = 14
+JIGUBYEOL_DISCOVERY_DAYS = 16
+
 DOOMESCAPE_TIMETABLE_CACHE = "doomescape_timetable_cache.json"
 _doomescape_cache_lock = threading.Lock()
 _doomescape_page_lock = threading.Lock()
@@ -201,82 +209,327 @@ def fetch_keyescape_slots(
     return []
 
 
+def _jigubyeol_cache_key(base_url: str, branch_id: str, theme_id: str) -> str:
+    parsed = urllib.parse.urlparse(base_url)
+    host = (parsed.netloc or parsed.path).lower().rstrip("/")
+    return f"{host}|{branch_id}|{theme_id}"
+
+
+def _remember_jigubyeol_timetable(
+    base_url: str,
+    branch_id: str,
+    theme_id: str,
+    date_str: str,
+    slots: list[ZeroWorldTimeSlot],
+) -> None:
+    times = sorted({slot.time for slot in slots if slot.time})
+    if not times:
+        return
+    try:
+        source_day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return
+
+    snapshot = {
+        "date": source_day.isoformat(),
+        "weekday": source_day.weekday(),
+        "day_type": "weekend" if source_day.weekday() >= 5 else "weekday",
+        "times": times,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    key = _jigubyeol_cache_key(base_url, branch_id, theme_id)
+    with _jigubyeol_cache_lock:
+        cache = load_json(JIGUBYEOL_TIMETABLE_CACHE, {"version": 1, "entries": {}})
+        if not isinstance(cache, dict):
+            cache = {"version": 1, "entries": {}}
+        entries = cache.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+            cache["entries"] = entries
+        history = entries.get(key, [])
+        if not isinstance(history, list):
+            history = []
+        history = [
+            row for row in history
+            if isinstance(row, dict) and row.get("date") != source_day.isoformat()
+        ]
+        history.append(snapshot)
+        entries[key] = sorted(
+            history, key=lambda row: str(row.get("date", ""))
+        )[-24:]
+        save_json(JIGUBYEOL_TIMETABLE_CACHE, cache)
+
+
+def _estimate_jigubyeol_timetable(
+    base_url: str,
+    branch_id: str,
+    theme_id: str,
+    date_str: str,
+) -> list[ZeroWorldTimeSlot]:
+    try:
+        target_day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return []
+
+    key = _jigubyeol_cache_key(base_url, branch_id, theme_id)
+    with _jigubyeol_cache_lock:
+        cache = load_json(JIGUBYEOL_TIMETABLE_CACHE, {"entries": {}})
+    entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+    history = entries.get(key, []) if isinstance(entries, dict) else []
+    candidates = []
+    target_is_weekend = target_day.weekday() >= 5
+    for row in history if isinstance(history, list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("times"), list):
+            continue
+        try:
+            source_day = datetime.strptime(
+                str(row.get("date", "")), "%Y-%m-%d"
+            ).date()
+        except ValueError:
+            continue
+        if (source_day.weekday() >= 5) != target_is_weekend:
+            continue
+        times = sorted({
+            str(value)[:5]
+            for value in row["times"]
+            if re.fullmatch(r"\d{1,2}:\d{2}", str(value))
+        })
+        if not times:
+            continue
+        basis = (
+            "same_weekday"
+            if source_day.weekday() == target_day.weekday()
+            else "same_day_type"
+        )
+        candidates.append((source_day, basis, times))
+
+    if not candidates:
+        return []
+    preceding = [row for row in candidates if row[0] < target_day]
+    source_day, basis, times = max(preceding or candidates, key=lambda row: row[0])
+    return [
+        ZeroWorldTimeSlot(
+            time=value,
+            slot_id="",
+            available=False,
+            estimated=True,
+            source_date=source_day.isoformat(),
+            estimate_basis=basis,
+        )
+        for value in times
+    ]
+
+
+def _parse_jigubyeol_slots(html: str) -> list[ZeroWorldTimeSlot]:
+    slots: list[ZeroWorldTimeSlot] = []
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 실제 Play33/지구별 Laravel 렌더링은 button을 사용한다.
+    for button in soup.find_all("button"):
+        label = button.get_text(" ", strip=True)
+        time_match = re.search(r"\b(\d{2}:\d{2})\b", label)
+        if not time_match:
+            continue
+        time_value = time_match.group(1)
+        if any(slot.time == time_value for slot in slots):
+            continue
+        classes = " ".join(button.get("class", [])).lower()
+        unavailable = (
+            button.has_attr("disabled")
+            or any(word in label.lower() for word in ("마감", "종료", "불가", "매진", "soldout"))
+            or any(word in classes for word in ("disable", "close", "sold-out", "none"))
+        )
+        slots.append(
+            ZeroWorldTimeSlot(
+                time=time_value, slot_id=time_value, available=not unavailable
+            )
+        )
+
+    if not slots:
+        for item in soup.find_all(
+            "input", attrs={"name": "time", "type": "radio"}
+        ):
+            value = item.get("value", "").strip()
+            if not re.fullmatch(r"\d{2}:\d{2}(?::\d{2})?", value):
+                continue
+            parent = item.parent
+            classes = " ".join(
+                list(item.get("class", []))
+                + (list(parent.get("class", [])) if parent else [])
+            ).lower()
+            label = parent.get_text(" ", strip=True) if parent else ""
+            unavailable = (
+                item.has_attr("disabled")
+                or any(word in label for word in ("마감", "종료", "불가"))
+                or any(word in classes for word in ("disable", "close", "sold-out", "none"))
+            )
+            slots.append(
+                ZeroWorldTimeSlot(
+                    time=value[:5], slot_id=value[:5], available=not unavailable
+                )
+            )
+
+    if not slots:
+        for element in soup.find_all(["a", "span", "div"]):
+            classes = " ".join(element.get("class", [])).lower()
+            if "time" not in classes and "slot" not in classes:
+                continue
+            time_match = re.search(
+                r"\b(\d{2}:\d{2})\b", element.get_text(" ", strip=True)
+            )
+            if not time_match:
+                continue
+            time_value = time_match.group(1)
+            if any(slot.time == time_value for slot in slots):
+                continue
+            unavailable = element.has_attr("disabled") or any(
+                word in classes for word in ("disable", "close", "sold-out")
+            )
+            slots.append(
+                ZeroWorldTimeSlot(
+                    time=time_value, slot_id=time_value, available=not unavailable
+                )
+            )
+
+    return sorted(slots, key=lambda slot: slot.time)
+
+
+def _fetch_exact_jigubyeol_slots(
+    base_url: str,
+    branch_id: str,
+    theme_id: str,
+    date_str: str,
+    timeout: float,
+) -> tuple[list[ZeroWorldTimeSlot], bool]:
+    url = urllib.parse.urljoin(base_url, "/reservation")
+    response = requests.get(
+        url,
+        params={
+            "branch": branch_id,
+            "theme": theme_id,
+            "themePK": theme_id,
+            "date": date_str,
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=timeout,
+        allow_redirects=False,
+    )
+    if 300 <= int(response.status_code) < 400:
+        return [], True
+    response.raise_for_status()
+    response_url = str(getattr(response, "url", "") or "")
+    if response_url and urllib.parse.urlparse(response_url).path.rstrip("/") != "/reservation":
+        return [], True
+    slots = _parse_jigubyeol_slots(response.text)
+    return slots, not slots
+
+
+def _jigubyeol_reference_day() -> date:
+    return datetime.now().date()
+
+
+def _seed_jigubyeol_published_timetable(
+    base_url: str,
+    branch_id: str,
+    theme_id: str,
+    target_date: str,
+    timeout: float,
+) -> None:
+    try:
+        target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return
+    reference_day = _jigubyeol_reference_day()
+    start_day = min(
+        target_day - timedelta(days=1),
+        reference_day + timedelta(days=JIGUBYEOL_DISCOVERY_LOOKAHEAD_DAYS),
+    )
+    day_type = "weekend" if target_day.weekday() >= 5 else "weekday"
+    parsed = urllib.parse.urlparse(base_url)
+    host = (parsed.netloc or parsed.path).lower().rstrip("/")
+    seed_key = (
+        host,
+        str(branch_id),
+        str(theme_id),
+        reference_day.isoformat(),
+        day_type,
+        requests.get,
+    )
+
+    while True:
+        with _jigubyeol_seed_lock:
+            if seed_key in _jigubyeol_seed_complete:
+                return
+            inflight = _jigubyeol_seed_inflight.get(seed_key)
+            if inflight is None:
+                inflight = threading.Event()
+                _jigubyeol_seed_inflight[seed_key] = inflight
+                owner = True
+            else:
+                owner = False
+        if owner:
+            break
+        inflight.wait(max(float(timeout), 1.0) * JIGUBYEOL_DISCOVERY_DAYS + 1.0)
+
+    found = False
+    try:
+        for offset in range(JIGUBYEOL_DISCOVERY_DAYS):
+            source_day = start_day - timedelta(days=offset)
+            if (source_day.weekday() >= 5) != (target_day.weekday() >= 5):
+                continue
+            try:
+                slots, _unopened = _fetch_exact_jigubyeol_slots(
+                    base_url,
+                    str(branch_id),
+                    str(theme_id),
+                    source_day.isoformat(),
+                    timeout,
+                )
+            except requests.RequestException:
+                continue
+            if not slots:
+                continue
+            _remember_jigubyeol_timetable(
+                base_url,
+                str(branch_id),
+                str(theme_id),
+                source_day.isoformat(),
+                slots,
+            )
+            found = True
+            break
+    finally:
+        with _jigubyeol_seed_lock:
+            if found:
+                _jigubyeol_seed_complete.add(seed_key)
+            event = _jigubyeol_seed_inflight.pop(seed_key, None)
+            if event is not None:
+                event.set()
+
+
 def fetch_jigubyeol_slots(
     base_url: str,
     branch_id: str,
     theme_id: str,
     date_str: str,
-    timeout: float
+    timeout: float,
 ) -> list[ZeroWorldTimeSlot]:
-    params = {
-        "branch": branch_id,
-        "theme": theme_id,
-        "themePK": theme_id,
-        "date": date_str
-    }
-    url = urllib.parse.urljoin(base_url, "/reservation")
-    response = requests.get(
-        url,
-        params=params,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=timeout
+    slots, unopened = _fetch_exact_jigubyeol_slots(
+        base_url, branch_id, theme_id, date_str, timeout
     )
-    response.raise_for_status()
-    
-    html = response.text
-    slots = []
-    soup = BeautifulSoup(html, "html.parser")
-    
-    # 1. button 요소를 먼저 탐색 (실제 플레이33 및 지구별 라라벨 렌더링 스타일)
-    buttons = soup.find_all("button")
-    for btn in buttons:
-        btn_text = btn.get_text(" ", strip=True)
-        time_match = re.search(r"\b(\d{2}:\d{2})\b", btn_text)
-        if time_match:
-            time_str = time_match.group(1)
-            if any(s.time == time_str for s in slots):
-                continue
-                
-            disabled = btn.has_attr("disabled")
-            classes = set(btn.get("class", []))
-            
-            is_disabled = disabled or any(kw in btn_text for kw in ["마감", "종료", "불가", "매진", "soldout"]) or any(cls in " ".join(classes).lower() for cls in ["disable", "disabled", "close", "sold-out", "none"])
-            
-            slots.append(ZeroWorldTimeSlot(time=time_str, slot_id=time_str, available=not is_disabled))
-
-    # 2. 만약 button으로 아무것도 못 찾았을 경우, input[name="time"][type="radio"] 탐색 (Fallback 1)
-    if not slots:
-        time_inputs = soup.find_all("input", attrs={"name": "time", "type": "radio"})
-        for inp in time_inputs:
-            val = inp.get("value", "").strip()
-            if re.match(r"^\d{2}:\d{2}(:\d{2})?$", val):
-                time_str = val[:5]
-                parent = inp.parent
-                disabled = inp.has_attr("disabled")
-                classes = set(inp.get("class", []))
-                if parent:
-                    classes.update(parent.get("class", []))
-                
-                parent_text = parent.get_text() if parent else ""
-                is_disabled = disabled or any(kw in parent_text for kw in ["마감", "종료", "불가"]) or any(cls in " ".join(classes).lower() for cls in ["disable", "disabled", "close", "sold-out", "none"])
-                
-                slots.append(ZeroWorldTimeSlot(time=time_str, slot_id=time_str, available=not is_disabled))
-                
-    # 3. Fallback 2: 일반 시간 형식의 a, span, div 중 class에 time/slot이 묻어나는 것
-    if not slots:
-        for element in soup.find_all(["a", "span", "div"]):
-            classes = " ".join(element.get("class", [])) if element.get("class") else ""
-            if "time" in classes.lower() or "slot" in classes.lower():
-                label = element.get_text(" ", strip=True)
-                time_match = re.search(r"\b(\d{2}:\d{2})\b", label)
-                if time_match:
-                    time_str = time_match.group(1)
-                    if any(s.time == time_str for s in slots):
-                        continue
-                    disabled = element.has_attr("disabled") or any(cls in classes.lower() for cls in ["disable", "disabled", "close", "sold-out"])
-                    slots.append(ZeroWorldTimeSlot(time=time_str, slot_id=time_str, available=not disabled))
-                    
-    return sorted(slots, key=lambda s: s.time)
+    if slots:
+        _remember_jigubyeol_timetable(
+            base_url, branch_id, theme_id, date_str, slots
+        )
+        return slots
+    if not unopened:
+        return []
+    _seed_jigubyeol_published_timetable(
+        base_url, branch_id, theme_id, date_str, timeout
+    )
+    return _estimate_jigubyeol_timetable(
+        base_url, branch_id, theme_id, date_str
+    )
 
 
 def fetch_naver_slots(
@@ -458,21 +711,12 @@ def _estimate_doomescape_timetable(
     if not candidates:
         return []
 
-    exact_weekday = [row for row in candidates if row[3] == "same_weekday"]
-    if exact_weekday:
-        _distance, _recent, source_day, basis, signature = min(exact_weekday)
-    else:
-        # When the exact weekday is outside the site's short published window,
-        # prefer the timetable signature seen on the most dates.  This prevents
-        # one substitute holiday from overriding the normal weekday schedule.
-        signature_counts: dict[tuple[str, ...], int] = {}
-        for row in candidates:
-            signature_counts[row[4]] = signature_counts.get(row[4], 0) + 1
-        best_count = max(signature_counts.values())
-        dominant = [
-            row for row in candidates if signature_counts[row[4]] == best_count
-        ]
-        _distance, _recent, source_day, basis, signature = min(dominant)
+    # Timetables can change mid-week.  The latest preceding schedule in the
+    # same weekday/weekend class is stronger evidence than an older signature
+    # that merely occurred more often.  Never cross the weekday/weekend class.
+    preceding = [row for row in candidates if row[2] < target_day]
+    pool = preceding or candidates
+    _distance, _recent, source_day, basis, signature = min(pool)
     times = list(signature)
     return [
         ZeroWorldTimeSlot(
@@ -671,7 +915,6 @@ def _seed_doomescape_published_timetables(
         inflight.wait(max(float(timeout), 1.0) * DOOMESCAPE_DISCOVERY_DAYS + 1.0)
 
     found_page = False
-    empty_after_found = 0
     try:
         for offset in range(DOOMESCAPE_DISCOVERY_DAYS):
             candidate = (reference_day + timedelta(days=offset)).isoformat()
@@ -697,11 +940,6 @@ def _seed_doomescape_published_timetables(
             )
             if parsed_by_theme:
                 found_page = True
-                empty_after_found = 0
-            elif found_page:
-                empty_after_found += 1
-                if empty_after_found >= 2:
-                    break
     finally:
         with _doomescape_seed_lock:
             if found_page:
@@ -806,8 +1044,6 @@ def fetch_doomescape_slots(
     cached_estimate = _estimate_doomescape_timetable(
         base_url, str(branch_id), str(theme_id), date_str
     )
-    if cached_estimate and cached_estimate[0].estimate_basis == "same_weekday":
-        return cached_estimate
     _seed_doomescape_published_timetables(
         base_url, str(branch_id), date_str, timeout, theme_map
     )

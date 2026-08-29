@@ -492,6 +492,35 @@ def test_clock_reports_failure_without_raising(monkeypatch):
     assert any("서버 시간" in message for message in messages)
 
 
+def test_precise_clock_sync_keeps_the_lowest_rtt_sample(monkeypatch):
+    import engines.naver_api as module
+
+    server_times = [
+        datetime(2026, 8, 30, 23, 59, 30, 100000, tzinfo=KST),
+        datetime(2026, 8, 30, 23, 59, 31, 200000, tzinfo=KST),
+        datetime(2026, 8, 30, 23, 59, 32, 300000, tzinfo=KST),
+    ]
+
+    class Api:
+        calls = 0
+
+        def fetch_item_meta(self):
+            value = server_times[self.calls]
+            self.calls += 1
+            return type("Meta", (), {"server_time": value})()
+
+    moments = iter((0.0, 0.20, 1.0, 1.04, 2.0, 2.10, 2.10))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(moments))
+    api = Api()
+    clock = NaverServerClock(api)
+
+    assert clock.sync_precise(3) is True
+    assert api.calls == 3
+    assert clock.last_precision == pytest.approx(0.02)
+    assert clock._anchor_monotonic == pytest.approx(1.02)
+    assert clock._anchor_server == pytest.approx(server_times[1].timestamp())
+
+
 # -- direct submit_booking tests ------------------------------------------
 def test_submit_booking_success(monkeypatch):
     from engines.naver_api import SubmitOutcome

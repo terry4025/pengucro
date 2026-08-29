@@ -100,7 +100,9 @@ class DoomEscapeEngine(BaseEngine):
     # the fast lane from launching on schedule.
     MAX_SCAN_INFLIGHT = 32
     MAX_WARM_INFLIGHT = 4
-    MAX_SCAN_SESSIONS = 8
+    # Live burst measurements reached their lowest observed p95 with 10
+    # independent scan sessions; 16+ consistently regressed.
+    MAX_SCAN_SESSIONS = 10
     ORDER_POST_TIMEOUT_SECONDS = 20.0
     ORDER_FOLLOWUP_TIMEOUT_SECONDS = 12.0
     ORDER_CONFIRM_TIMEOUT_SECONDS = 20.0
@@ -1048,6 +1050,7 @@ class DoomEscapeEngine(BaseEngine):
             current_stage = "시간표 조회"
             try:
                 # 1. Fetch reservation page to list slots
+                self._record_attempt("둠이스케이프 시간표 조회")
                 request_started = time.perf_counter()
                 resp = session.get(list_url, timeout=5)
                 request_rtt = time.perf_counter() - request_started
@@ -1061,9 +1064,6 @@ class DoomEscapeEngine(BaseEngine):
                     force=resp.status_code != 200,
                 )
                 if resp.status_code != 200:
-                    self.silent_tick(
-                        f"[{worker_label}] 시간표 조회 실패 · HTTP {resp.status_code} · 100ms 후 재시도"
-                    )
                     time.sleep(0.1)
                     continue
 
@@ -1082,7 +1082,6 @@ class DoomEscapeEngine(BaseEngine):
                         break
                 
                 if not target_box:
-                    self.silent_tick("테마 박스를 찾을 수 없음")
                     time.sleep(0.1)
                     continue
 
@@ -1432,6 +1431,10 @@ class DoomEscapeEngine(BaseEngine):
                         await self.scan_governor.wait_turn(self.stop_event)
                     if self.stop_event.is_set():
                         break
+                    # Count the network dispatch itself, including requests
+                    # that later time out.  The top status badge represents
+                    # total timetable queries, not only error/retry logs.
+                    self._record_attempt("둠이스케이프 시간표 조회")
                     request_started = time.perf_counter()
                     request_wall_started = time.time()
                     list_timeout = self._list_timeout_for_task(task_idx)

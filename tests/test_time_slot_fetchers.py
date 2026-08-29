@@ -172,8 +172,9 @@ def test_fetch_keyescape_slots_uses_same_weekday_template_for_unopened_date(
     ) == ("2219", ("2026-08-08",))
 
 
-def test_fetch_jigubyeol_slots(monkeypatch):
+def test_fetch_jigubyeol_slots(monkeypatch, tmp_path):
     import requests
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
     # 지구별방탈출 가상 HTML 응답 모킹 (실제 play33 버튼 형태)
     mock_html = """
     <html>
@@ -204,6 +205,50 @@ def test_fetch_jigubyeol_slots(monkeypatch):
     assert slots[0].available is True
     assert slots[1].time == "13:00"
     assert slots[1].available is False
+
+
+def test_play33_unopened_redirect_uses_latest_published_day_type(monkeypatch, tmp_path):
+    import requests
+    import engines.time_slot_fetchers as module
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        module, "_jigubyeol_reference_day", lambda: datetime(2026, 8, 30).date()
+    )
+    calls = []
+
+    def fake_get(_url, *, params, allow_redirects, **_kwargs):
+        requested = params["date"]
+        calls.append((requested, allow_redirects))
+        if requested == "2026-09-03":
+            response = MockResponse(302, "")
+            response.url = "https://play33.kr/reservation"
+            return response
+        if requested == "2026-09-02":
+            response = MockResponse(
+                200,
+                """
+                <button><span>11:00</span> 예약가능</button>
+                <button><span>12:30</span> 예약가능</button>
+                """,
+            )
+            response.url = "https://play33.kr/reservation?date=2026-09-02"
+            return response
+        raise AssertionError(f"unexpected probe: {requested}")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    slots = fetch_jigubyeol_slots(
+        "https://play33.kr", "1", "18", "2026-09-03", 5.0
+    )
+
+    assert [slot.time for slot in slots] == ["11:00", "12:30"]
+    assert all(slot.estimated for slot in slots)
+    assert all(slot.available is False for slot in slots)
+    assert all(slot.slot_id == "" for slot in slots)
+    assert all(slot.source_date == "2026-09-02" for slot in slots)
+    assert all(slot.estimate_basis == "same_day_type" for slot in slots)
+    assert calls == [("2026-09-03", False), ("2026-09-02", False)]
 
 
 def test_fetch_naver_slots(monkeypatch):
@@ -489,8 +534,10 @@ def test_fetch_doomescape_slots_reuses_cached_same_weekday(monkeypatch, tmp_path
 
 def test_doomescape_cache_prefers_same_weekday_over_nearer_weekday(monkeypatch, tmp_path):
     import requests
+    import engines.time_slot_fetchers as module
 
     monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(module, "_doomescape_reference_day", lambda: datetime(2026, 8, 8).date())
 
     def html_for(day, time_value):
         return f"""
@@ -505,11 +552,17 @@ def test_doomescape_cache_prefers_same_weekday_over_nearer_weekday(monkeypatch, 
         "2026-08-14": html_for("2026-08-14", "11:00"),  # Friday, but nearer
         "2026-08-15": '<input name="rev_days" value="2026-08-15"><div>예약</div>',
     }
-    monkeypatch.setattr(
-        requests,
-        "get",
-        lambda _url, *, params, **_kwargs: MockResponse(200, pages[params["rev_days"]]),
-    )
+    def fake_get(_url, *, params, **_kwargs):
+        requested = params["rev_days"]
+        return MockResponse(
+            200,
+            pages.get(
+                requested,
+                f'<input name="rev_days" value="{requested}"><div>예약</div>',
+            ),
+        )
+
+    monkeypatch.setattr(requests, "get", fake_get)
     fetch_doomescape_slots("https://doomescape.com", "3", "8", "2026-08-08", 5.0)
     fetch_doomescape_slots("https://doomescape.com", "3", "8", "2026-08-14", 5.0)
 
@@ -690,9 +743,10 @@ def test_doomescape_unopened_date_seeds_all_themes_on_a_cold_install(monkeypatch
         "https://doomescape.com", "4", "35", "2026-08-18", 5.0
     )
 
-    assert [slot.time for slot in scarecrow] == ["11:00"]
-    assert [slot.time for slot in obscura] == ["11:20"]
+    assert [slot.time for slot in scarecrow] == ["12:20"]
+    assert [slot.time for slot in obscura] == ["12:40"]
     assert all(slot.estimated for slot in scarecrow + obscura)
+    assert all(slot.source_date == "2026-08-17" for slot in scarecrow + obscura)
     assert "2026-08-13" in calls and "2026-08-14" in calls
     assert calls.count("2026-08-18") == 1
 

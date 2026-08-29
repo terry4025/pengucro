@@ -2,7 +2,11 @@ from datetime import date, timedelta
 from types import SimpleNamespace
 
 from pengucro.models import NAVER_MODE, STANDARD_MODE, TRIPCOM_MODE
-from ui.reservation_form import ReservationForm
+from ui.reservation_form import (
+    DOOMESCAPE_MAX_WORKERS,
+    ZEROWORLD_JIGUBYEOL_MAX_WORKERS,
+    ReservationForm,
+)
 
 
 class Value:
@@ -150,6 +154,58 @@ def test_dpsnnn_thread_policy_limits_slider_to_four():
     assert slider.value == 4
     assert form.dpsnnn_threads == 4
     assert "최대 4" in title.config["text"]
+
+
+def test_zeroworld_and_jigubyeol_thread_policy_caps_slider_at_32():
+    for site_name in ("제로월드", "지구별방탈출"):
+        slider = Widget(50)
+        title = Widget()
+        form = SimpleNamespace(
+            current_site=site_name,
+            custom_sites={},
+            engine_mode_btn=Value(STANDARD_MODE),
+            standard_threads=50,
+            threads_slider=slider,
+            threads_title_label=title,
+            threads_value_label=Widget(),
+            _site_uses_keyescape=lambda: False,
+            _site_uses_cgv=lambda: False,
+            _site_uses_dpsnnn=lambda: False,
+        )
+
+        ReservationForm._apply_thread_policy(form)
+
+        assert slider.config["to"] == ZEROWORLD_JIGUBYEOL_MAX_WORKERS
+        assert slider.value == 32
+        assert form.standard_threads == 32
+        assert "최대 32" in title.config["text"]
+
+
+def test_doomescape_thread_policy_uses_measured_fastest_count():
+    from engines.doomescape_engine import DoomEscapeEngine
+
+    slider = Widget(50)
+    title = Widget()
+    form = SimpleNamespace(
+        current_site="둠이스케이프",
+        custom_sites={},
+        engine_mode_btn=Value(STANDARD_MODE),
+        standard_threads=50,
+        threads_slider=slider,
+        threads_title_label=title,
+        threads_value_label=Widget(),
+        _site_uses_keyescape=lambda: False,
+        _site_uses_cgv=lambda: False,
+        _site_uses_dpsnnn=lambda: False,
+    )
+
+    ReservationForm._apply_thread_policy(form)
+
+    assert DOOMESCAPE_MAX_WORKERS == DoomEscapeEngine.MAX_SCAN_SESSIONS == 10
+    assert slider.config["to"] == 10
+    assert slider.value == 10
+    assert form.standard_threads == 10
+    assert "실측 최고 10" in title.config["text"]
 
 
 def test_tripcom_thread_policy_is_fixed_to_one():

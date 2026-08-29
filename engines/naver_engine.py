@@ -463,9 +463,15 @@ class NaverEngine(BaseEngine):
     API_BROWSER_ARM_MIN_SECONDS = 0.30
     API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
     API_BROWSER_ARM_STATUS_SECONDS = 0.025
-    API_SEND_JITTER_SECONDS = 0.035
-    API_SEND_MIN_LEAD_SECONDS = 0.080
-    API_SEND_MAX_LEAD_SECONDS = 0.300
+    # Aim for the request to reach Naver just after its accept gate opens.  The
+    # previous formula added clock uncertainty and jitter to the one-way delay,
+    # which made a 127 ms path fire 145 ms early and could arrive before the
+    # mutation was accepted.
+    API_TARGET_ACCEPT_AFTER_OPEN_SECONDS = 0.015
+    API_SEND_MIN_LEAD_SECONDS = 0.0
+    API_SEND_MAX_LEAD_SECONDS = 0.150
+    API_PREOPEN_CLOCK_SAMPLES = 3
+    API_REFUSED_RECHECK_TIMEOUT_SECONDS = 0.30
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -553,6 +559,7 @@ class NaverEngine(BaseEngine):
         self._uses_open_schedule = False
         self._last_open_schedule_refresh = 0.0
         self._final_open_schedule_refresh = False
+        self._final_clock_sync_attempted = False
         self._notready_until = 0.0
         self._last_warm = 0.0
         self._warmed_for_date = False
@@ -688,6 +695,7 @@ class NaverEngine(BaseEngine):
         self._uses_open_schedule = bool(meta.uses_open_schedule)
         self._last_open_schedule_refresh = time.monotonic()
         self._final_open_schedule_refresh = False
+        self._final_clock_sync_attempted = False
         self._open_strike_pending = False
         if meta.uses_open_schedule and target_open_at:
             remaining = self.clock.seconds_until(target_open_at.timestamp())
@@ -1192,6 +1200,8 @@ class NaverEngine(BaseEngine):
                     refreshed = await self._refresh_open_schedule(target_date)
                     if final_due and refreshed is not None:
                         self._final_open_schedule_refresh = True
+                    if final_due:
+                        await self._sync_clock_before_open()
                     until_open = self._seconds_until_open()
             outside_blackout = (
                 until_open is None
@@ -1436,6 +1446,9 @@ class NaverEngine(BaseEngine):
                     f"[정보] 화면에는 아직 예약할 수 없습니다. 계속 확인합니다. {detail}",
                     "info", 10.0,
                 )
+                if await self._refused_slot_changed(target_date, target_time):
+                    await asyncio.sleep(0)
+                    continue
                 # The page just told us the slot is gone, so trust it over the API
                 # reading that sent us here and stop driving the page for a moment.
                 # Retrying at burst speed costs a ~1.4 s page cycle per turn and
@@ -1757,35 +1770,66 @@ class NaverEngine(BaseEngine):
                 return
             await asyncio.sleep(0.05 if remaining > 0.5 else 0.005)
 
+    async def _sync_clock_before_open(self) -> bool:
+        """Refresh the server clock once in the final safe pre-open window."""
+        if self._final_clock_sync_attempted or self.clock is None:
+            return False
+        self._final_clock_sync_attempted = True
+        precise_sync = getattr(self.clock, "sync_precise", None)
+        if not callable(precise_sync):
+            return False
+        synced = await asyncio.to_thread(
+            precise_sync,
+            self.API_PREOPEN_CLOCK_SAMPLES,
+            False,
+        )
+        if not synced:
+            return False
+        precision_ms = float(self.clock.last_precision or 0.0) * 1000
+        self.log(
+            f"[정보] 오픈 직전 서버 시계 정밀 보정 완료 · "
+            f"최저 지연 표본 오차 약 {precision_ms:.0f}ms",
+            "success",
+        )
+        return True
+
     def _api_one_way_seconds(self) -> float:
-        samples = []
+        browser_samples = []
         if self._api_submitter is not None:
-            samples.extend(getattr(self._api_submitter, "safe_rtt_samples", ()) or ())
-            samples.append(getattr(self._api_submitter, "last_rtt", None))
-        if self.api is not None:
-            samples.append(getattr(self.api, "last_rtt", None))
-        normalized = []
-        for value in samples:
-            try:
-                candidate = float(value)
-            except (TypeError, ValueError):
-                continue
-            if 0.005 <= candidate <= 3.0:
-                normalized.append(candidate)
-        normalized.sort()
-        if normalized:
-            # A high percentile is deliberate: an early request has a bounded
-            # NOT_OPEN retry, while a late request loses the only seat outright.
-            percentile_index = max(0, (len(normalized) * 3 + 3) // 4 - 1)
-            transport_rtt = normalized[percentile_index]
-            estimate = transport_rtt / 2
+            browser_samples.extend(
+                getattr(self._api_submitter, "safe_rtt_samples", ()) or ()
+            )
+            browser_samples.append(getattr(self._api_submitter, "last_rtt", None))
+
+        def normalized(values):
+            result = []
+            for value in values:
+                try:
+                    candidate = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0.005 <= candidate <= 3.0:
+                    result.append(candidate)
+            return result
+
+        transport_samples = normalized(browser_samples)
+        if not transport_samples and self.api is not None:
+            transport_samples = normalized((getattr(self.api, "last_rtt", None),))
+        if transport_samples:
+            # The quickest warmed same-origin read best represents network
+            # transit. Higher percentiles and mutation response RTT include
+            # server queue/processing time and caused excessive early sends.
+            transport_rtt = min(transport_samples)
         else:
             transport_rtt = 0.10
-            estimate = 0.05
-        if self._recent_submit_rtt:
-            # The preflight account query is usually faster than a real booking
-            # mutation. Prefer recent observed submission latency when present.
-            estimate = max(estimate, max(self._recent_submit_rtt[-3:]) / 2)
+        one_way = transport_rtt / 2
+        lead = min(
+            self.API_SEND_MAX_LEAD_SECONDS,
+            max(
+                self.API_SEND_MIN_LEAD_SECONDS,
+                one_way - self.API_TARGET_ACCEPT_AFTER_OPEN_SECONDS,
+            ),
+        )
         precision = 0.0
         if self.clock is not None:
             try:
@@ -1795,15 +1839,9 @@ class NaverEngine(BaseEngine):
                 )
             except (TypeError, ValueError):
                 precision = 0.0
-        lead = min(
-            self.API_SEND_MAX_LEAD_SECONDS,
-            max(
-                self.API_SEND_MIN_LEAD_SECONDS,
-                estimate + precision + self.API_SEND_JITTER_SECONDS,
-            ),
-        )
         self._last_api_lead_detail = (
-            f"안전 RTT {transport_rtt * 1000:.0f}ms · "
+            f"최저 RTT {transport_rtt * 1000:.0f}ms · "
+            f"서버 도착 목표 +{self.API_TARGET_ACCEPT_AFTER_OPEN_SECONDS * 1000:.0f}ms · "
             f"시계 오차 {precision * 1000:.0f}ms"
         )
         return lead
@@ -1836,6 +1874,40 @@ class NaverEngine(BaseEngine):
         if 0.005 <= seconds <= 3.0:
             self._recent_submit_rtt.append(seconds)
             del self._recent_submit_rtt[:-5]
+
+    async def _refused_slot_changed(
+        self, target_date: str, target_time: str
+    ) -> bool:
+        """Recheck RT47 with one read before honoring the longer backoff.
+
+        This never sends another reservation mutation.  It only removes the
+        refusal guard when Naver's fresh public inventory has changed to a new,
+        still-bookable state; the normal loop then owns any later submission.
+        """
+        refused_signature = self._api_refused_signature
+        if self.api is None or refused_signature is None:
+            return False
+        try:
+            slot = await asyncio.wait_for(
+                asyncio.to_thread(self.api.find_slot, target_date, target_time),
+                timeout=self.API_REFUSED_RECHECK_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, NaverApiError, OSError):
+            return False
+        if slot is None:
+            return False
+        reason = slot.blocked_reason(self.clock.now_kst() if self.clock else None)
+        fresh_signature = self._slot_signature(slot, reason)
+        if reason is not None or fresh_signature == refused_signature:
+            return False
+        self._api_refused_signature = None
+        self.log(
+            f"[정보] 서버 거절 직후 최신 재고 변화 확인 · "
+            f"slotId={slot.slot_id} 잔여 {slot.remaining}/{slot.stock} · "
+            "긴 대기 없이 감시를 재개합니다.",
+            "success",
+        )
+        return True
 
     async def _handle_api_submit_result(
         self,
