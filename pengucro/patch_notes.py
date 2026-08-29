@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.64",
+        changes=(
+            "CGV 회차 공개 직후 화면 전환을 기다리지 않고 좌석 선점을 시작하도록 개선",
+            "키이스케이프 예약 제출 시점을 실측 네트워크 지연에 맞춰 보정",
+        ),
+    ),
+    PatchNote(
         version="6.63",
         changes=(
             "지구별 최종 결과 확인 전 중복 제출 차단과 예약번호 검증 강화",

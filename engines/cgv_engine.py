@@ -96,6 +96,7 @@ class CgvEngine(BaseEngine):
         self._initial_seat_response: dict[str, Any] | None = None
         self._last_fast_retry_after_seconds = 0.0
         self._developer_hold_cleanup: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self._api_hold_ui_schedule_key: tuple[str, ...] = ()
 
     def start_reservation(
         self, reservation_data: dict[str, Any], num_threads: int, is_async: bool = False
@@ -1436,13 +1437,28 @@ class CgvEngine(BaseEngine):
     ) -> bool:
         """Prepare the browser UI after an API hold and before seat sync.
 
-        Ordinary single-screen bookings are already on the correct seat page.
-        The priority ladder overrides this hook for a fallback screening so the
-        latency-sensitive hold happens before the slower route/visitor UI work.
+        The opening race starts from the authenticated CGV page, so the direct
+        seat read/hold can finish before the slower visitor and seat-modal UI
+        transition.  Once the server hold is ours, prepare that UI while keeping
+        the hold alive, then let the existing synchronization path take over.
         """
 
-        del page, schedule, people
-        return True
+        schedule_key = tuple(
+            str(schedule.get(key, "") or "")
+            for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq")
+        )
+        if schedule_key and schedule_key == self._api_hold_ui_schedule_key:
+            return True
+        self.log(
+            "[CGV] 좌석 API 임시선점 완료 후 관람인원·좌석 화면을 동기화합니다.",
+            "info",
+        )
+        try:
+            return self._prepare_published_schedule(page, schedule, people)
+        finally:
+            # The hold transaction already owns the authoritative seat payload.
+            # Do not let the modal's later capture seed a fallback with stale data.
+            self._initial_seat_response = None
 
     def _sync_held_seats_for_checkout(self, page, payload, selected) -> bool:
         """Mirror an already-held seat group without releasing it on first lag.
@@ -2656,6 +2672,10 @@ class CgvEngine(BaseEngine):
                         page, seat_capture_handler
                     )
             if visitors_ready:
+                self._api_hold_ui_schedule_key = tuple(
+                    str(schedule.get(key, "") or "")
+                    for key in ("siteNo", "scnYmd", "scnsNo", "scnSseq")
+                )
                 return True
 
             # Never leak a response captured from an incomplete render into the
@@ -3473,25 +3493,11 @@ class CgvEngine(BaseEngine):
                                 f"[CGV] 실제 IMAX 회차 감지 · {movie} · {time_label} · {elapsed:.0f}ms · 고속 선점 모드 전환",
                                 "success",
                             )
-                            if self._prepare_published_schedule(
-                                page, schedule, people
-                            ):
-                                break
-                            schedule = None
-                            if self.stop_event.is_set():
-                                break
                             self.log(
-                                "[CGV] 회차는 공개됐지만 인원/좌석 화면이 아직 완성되지 않았습니다. "
-                                "공식 시간표를 다시 확인한 뒤 자동 재진입합니다.",
-                                "warning",
+                                "[CGV] 브라우저 화면 준비를 기다리지 않고 좌석 API 선점을 즉시 시작합니다.",
+                                "info",
                             )
-                            self.stop_event.wait(
-                                max(
-                                    0.0,
-                                    float(self.SCHEDULE_PROMOTION_REWATCH_INTERVAL),
-                                )
-                            )
-                            continue
+                            break
 
                         has_hint = _has_schedule_hint(payload_data, movie, auditorium)
                         if has_hint:

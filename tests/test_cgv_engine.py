@@ -423,6 +423,7 @@ def test_api_hold_is_retained_across_bounded_ui_sync_recovery():
         },
     }
     engine._stop_fast_seat_monitor = lambda _page: None
+    engine._prepare_api_hold_ui = lambda *_args: True
     engine._select_api_seats_in_ui = (
         lambda *_args: actions.append("sync") or next(sync_results)
     )
@@ -488,6 +489,7 @@ def test_watch_waits_for_inflight_direct_hold_instead_of_restarting_monitor():
     )
     engine._read_fast_seat_monitor = lambda _page: next(snapshots)
     engine._stop_fast_seat_monitor = lambda _page: stops.append(1)
+    engine._prepare_api_hold_ui = lambda *_args: True
     engine._select_api_seats_in_ui = lambda *_args: True
     engine._install_cached_hold_responses = lambda *_args: None
     engine._submit_seat_selection = lambda *_args: True
@@ -530,6 +532,7 @@ def test_direct_hold_result_never_reloads_browser_page():
         },
     }
     engine._stop_fast_seat_monitor = lambda _page: None
+    engine._prepare_api_hold_ui = lambda *_args: True
     engine._select_api_seats_in_ui = lambda *_args: True
     engine._install_cached_hold_responses = lambda *_args: None
     engine._submit_seat_selection = lambda *_args: False
@@ -715,7 +718,7 @@ def test_cgv_engine_detects_recoverable_browser_errors():
     ) is False
 
 
-def test_schedule_promotion_retries_then_returns_to_authoritative_watch(monkeypatch):
+def test_schedule_detection_starts_api_hold_before_visitor_ui(monkeypatch):
     import playwright.sync_api as playwright_sync_api
     import engines.cgv_engine as engine_module
     from engines import browser_session
@@ -732,8 +735,6 @@ def test_schedule_promotion_retries_then_returns_to_authoritative_watch(monkeypa
         "cntlYn": "N",
     }
     race_calls = []
-    enter_results = iter((False, True, False, True))
-    visitor_results = iter((False, True))
     enter_calls = []
     visitor_calls = []
     hold_calls = []
@@ -827,12 +828,12 @@ def test_schedule_promotion_retries_then_returns_to_authoritative_watch(monkeypa
         or {"ok": True, "status": 200, "elapsedMs": 1, "data": {"data": [schedule]}}
     )
     engine._enter_visitor_page = (
-        lambda *_args: enter_calls.append("enter") or next(enter_results)
+        lambda *_args: enter_calls.append("enter") or True
     )
     engine._begin_initial_seat_response_capture = lambda _page: object()
     engine._end_initial_seat_response_capture = lambda *_args: None
     engine._select_visitors = (
-        lambda *_args: visitor_calls.append("visitors") or next(visitor_results)
+        lambda *_args: visitor_calls.append("visitors") or True
     )
     engine._watch_and_hold_api = (
         lambda *_args: hold_calls.append("hold") or (False, False)
@@ -857,10 +858,47 @@ def test_schedule_promotion_retries_then_returns_to_authoritative_watch(monkeypa
         }
     )
 
-    assert race_calls == ["race", "race"]
-    assert enter_calls == ["enter", "enter", "enter", "enter"]
-    assert visitor_calls == ["visitors", "visitors"]
+    assert race_calls == ["race"]
+    assert enter_calls == []
+    assert visitor_calls == []
     assert hold_calls == ["hold"]
+
+
+def test_api_hold_prepares_visitor_ui_only_after_server_hold():
+    actions = []
+    engine = CgvEngine(lambda *_args: None)
+    schedule = {
+        "siteNo": "0013",
+        "scnYmd": "20260905",
+        "scnsNo": "018",
+        "scnSseq": "2",
+    }
+    engine._prepare_published_schedule = (
+        lambda *_args: actions.append("prepare-ui-after-hold") or True
+    )
+
+    assert engine._prepare_api_hold_ui(object(), schedule, 4) is True
+    assert actions == ["prepare-ui-after-hold"]
+
+
+def test_api_hold_discards_late_modal_payload_even_when_ui_prepare_fails():
+    engine = CgvEngine(lambda *_args: None)
+    schedule = {
+        "siteNo": "0013",
+        "scnYmd": "20260905",
+        "scnsNo": "018",
+        "scnSseq": "2",
+    }
+    engine._initial_seat_response = {"stale": True}
+
+    def fail_prepare(*_args):
+        raise RuntimeError("visitor UI failed")
+
+    engine._prepare_published_schedule = fail_prepare
+
+    with pytest.raises(RuntimeError, match="visitor UI failed"):
+        engine._prepare_api_hold_ui(object(), schedule, 4)
+    assert engine._initial_seat_response is None
 
 
 def test_developer_mode_retains_then_releases_direct_hold():
@@ -892,6 +930,7 @@ def test_developer_mode_retains_then_releases_direct_hold():
         },
     }
     engine._stop_fast_seat_monitor = lambda _page: None
+    engine._prepare_api_hold_ui = lambda *_args: True
     engine._select_api_seats_in_ui = lambda *_args: True
     engine._install_cached_hold_responses = lambda *_args: None
     engine._submit_seat_selection = lambda *_args: True

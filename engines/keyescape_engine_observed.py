@@ -1,8 +1,8 @@
 """Keyescape runtime additions for clock and browser-network observability.
 
-This layer intentionally leaves the proven booking gate and final submit routine
-untouched.  It only hardens clock re-sync quality, warms the exact booking origin
-from Chrome, and records resource timing for the real booking POST.
+This layer keeps the proven single final-submit routine intact while hardening
+clock re-sync quality, warming the exact booking origin from Chrome, measuring
+that route, and compensating the trusted fire instant for its one-way latency.
 """
 
 from __future__ import annotations
@@ -15,15 +15,44 @@ from engines.keyescape_engine_single_page import (
 
 
 class KeyescapeEngine(_ReliabilityKeyescapeEngine):
-    """Reliability wrapper with conservative clock/network diagnostics."""
+    """Reliability wrapper with measured server-arrival fire timing."""
 
     CLOCK_PRECISE_MAX_AGE_SECONDS = 300.0
     CLOCK_REGRESSION_RATIO = 1.5
     CLOCK_REGRESSION_ABSOLUTE_SECONDS = 0.010
+    FINAL_POST_ONE_WAY_MIN_SECONDS = 0.003
+    FINAL_POST_ONE_WAY_MAX_SECONDS = 0.150
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._browser_prewarm_metrics: dict = {}
+
+    def _final_post_one_way_seconds(self) -> float:
+        """Estimate browser-to-controller transit from the warmed exact route."""
+
+        metrics = self._browser_prewarm_metrics
+        controller = metrics.get("controller") if isinstance(metrics, dict) else None
+        if not isinstance(controller, dict) or not controller.get("reached"):
+            return 0.0
+        try:
+            duration_ms = float(controller.get("duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not 1.0 <= duration_ms <= 3000.0:
+            return 0.0
+        return min(
+            self.FINAL_POST_ONE_WAY_MAX_SECONDS,
+            max(self.FINAL_POST_ONE_WAY_MIN_SECONDS, duration_ms / 2000.0),
+        )
+
+    def _trusted_fire_server_epoch(self):
+        target = super()._trusted_fire_server_epoch()
+        if target is None:
+            return None
+        one_way = self._final_post_one_way_seconds()
+        if one_way <= 0:
+            return target
+        return float(target) - one_way
 
     # ------------------------------------------------------------------
     # Server-clock quality

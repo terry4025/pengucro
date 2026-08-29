@@ -423,6 +423,7 @@ class CgvEngine(VisitorDomCgvEngine):
             if not self._activate_priority_schedule(page, schedule, people):
                 return False
             self._priority_page_schedule_key = candidate_key
+            self._api_hold_ui_schedule_key = candidate_key
         return super()._prepare_api_hold_ui(page, schedule, people)
 
     def _watch_and_hold_api(

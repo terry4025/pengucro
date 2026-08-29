@@ -127,6 +127,28 @@ def test_browser_prewarm_touches_exact_booking_controller():
     assert any("Chrome 예약 endpoint 예열" in message for message, _level in logs)
 
 
+def test_trusted_fire_compensates_for_measured_controller_one_way_latency():
+    engine, _logs = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = 0.020
+    engine._browser_prewarm_metrics = {
+        "controller": {"reached": True, "duration": 80.0},
+    }
+
+    # Base safety is 25 ms after T0. An 80 ms warmed RTT contributes a 40 ms
+    # one-way estimate, so Chrome fires 15 ms before T0 for arrival at T+25 ms.
+    assert engine._trusted_fire_server_epoch() == pytest.approx(999.985)
+
+
+def test_trusted_fire_keeps_original_gate_without_valid_route_measurement():
+    engine, _logs = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = 0.020
+    engine._browser_prewarm_metrics = {}
+
+    assert engine._trusted_fire_server_epoch() == pytest.approx(1000.025)
+
+
 def test_requestfinished_records_booking_post_resource_timing():
     engine, logs = make_engine()
     page = HandlerPage()

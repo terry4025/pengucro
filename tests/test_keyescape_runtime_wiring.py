@@ -68,6 +68,6 @@ def test_runtime_clock_preserves_recent_real_precise_sample(monkeypatch):
     assert engine.clock.last_offset == pytest.approx(before_offset)
 
 
-def test_runtime_does_not_override_final_submit_or_fire_gate():
+def test_runtime_does_not_override_final_submit_or_fire_wait_loop():
     assert "_submit" not in KeyescapeEngine.__dict__
     assert "_wait_for_trusted_fire" not in KeyescapeEngine.__dict__
