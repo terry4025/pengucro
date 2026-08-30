@@ -463,15 +463,16 @@ class NaverEngine(BaseEngine):
     API_BROWSER_ARM_MIN_SECONDS = 0.30
     API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
     API_BROWSER_ARM_STATUS_SECONDS = 0.025
-    # Aim for the request to reach Naver just after its accept gate opens.  The
-    # previous formula added clock uncertainty and jitter to the one-way delay,
-    # which made a 127 ms path fire 145 ms early and could arrive before the
-    # mutation was accepted.
-    API_TARGET_ACCEPT_AFTER_OPEN_SECONDS = 0.015
-    API_SEND_MIN_LEAD_SECONDS = 0.0
-    API_SEND_MAX_LEAD_SECONDS = 0.150
+    # Successful field evidence showed that a request displayed 64 ms before the
+    # boundary could create the exact requested hold even when RT47 was returned.
+    # Target a small pre-open arrival window instead of intentionally arriving
+    # after competitors.  The final request remains exactly one mutation.
+    API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS = 0.060
+    API_SEND_MIN_LEAD_SECONDS = 0.060
+    API_SEND_MAX_LEAD_SECONDS = 0.250
     API_PREOPEN_CLOCK_SAMPLES = 3
     API_REFUSED_RECHECK_TIMEOUT_SECONDS = 0.30
+    API_RECONCILE_ATTEMPTS = 4
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -567,6 +568,7 @@ class NaverEngine(BaseEngine):
         self._api_preparation: NaverSubmitPreparation | None = None
         self._api_submit_enabled = False
         self._api_submit_blocked = False
+        self._api_submit_state = "idle"
         self._api_prepare_pending = False
         self._api_refused_signature: tuple[Any, ...] | None = None
         self._api_account: NaverAccount | None = None
@@ -625,6 +627,7 @@ class NaverEngine(BaseEngine):
         self._api_preparation = None
         self._api_submit_enabled = False
         self._api_submit_blocked = False
+        self._api_submit_state = "idle"
         self._api_prepare_pending = False
         self._api_refused_signature = None
         self._api_account = None
@@ -1827,7 +1830,7 @@ class NaverEngine(BaseEngine):
             self.API_SEND_MAX_LEAD_SECONDS,
             max(
                 self.API_SEND_MIN_LEAD_SECONDS,
-                one_way - self.API_TARGET_ACCEPT_AFTER_OPEN_SECONDS,
+                one_way + self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS,
             ),
         )
         precision = 0.0
@@ -1841,7 +1844,7 @@ class NaverEngine(BaseEngine):
                 precision = 0.0
         self._last_api_lead_detail = (
             f"최저 RTT {transport_rtt * 1000:.0f}ms · "
-            f"서버 도착 목표 +{self.API_TARGET_ACCEPT_AFTER_OPEN_SECONDS * 1000:.0f}ms · "
+            f"서버 도착 목표 -{self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS * 1000:.0f}ms · "
             f"시계 오차 {precision * 1000:.0f}ms"
         )
         return lead
@@ -1909,6 +1912,67 @@ class NaverEngine(BaseEngine):
         )
         return True
 
+    async def _reconcile_ambiguous_api_submit(
+        self,
+        *,
+        reservation_data: dict[str, Any] | None,
+        dev_mode: bool,
+    ) -> tuple[str, str] | None:
+        """Confirm this account's booking without issuing another mutation."""
+        if self._api_submitter is None or self._api_preparation is None:
+            return None
+        reconcile = getattr(self._api_submitter, "reconcile_upcoming_booking", None)
+        if not callable(reconcile):
+            return None
+        data = reservation_data or {}
+        payload = self._api_preparation.payload
+        target_date = str(data.get("reservationDate") or "")
+        target_time = str(data.get("reservationTime") or "")[:5]
+        business_id = str(payload.get("businessId") or "")
+        item_name = str(
+            (self._api_biz_item or {}).get("name")
+            or data.get("themeLabel")
+            or ""
+        )
+        if not target_date or not target_time:
+            return None
+        self.log(
+            "[정보] 제출 응답이 불명확해 추가 POST 없이 본인 네이버 예약내역을 확인합니다.",
+            "warning",
+        )
+        evidence = await reconcile(
+            target_date=target_date,
+            target_time=target_time,
+            business_id=business_id,
+            item_name=item_name,
+            attempts=self.API_RECONCILE_ATTEMPTS,
+        )
+        if not getattr(evidence, "found", False) or not getattr(
+            evidence, "booking_id", ""
+        ):
+            return None
+
+        booking_id = str(evidence.booking_id)
+        landing_url = str(getattr(evidence, "url", "") or "")
+        if landing_url.startswith("/"):
+            landing_url = urllib.parse.urljoin(
+                "https://m.booking.naver.com", landing_url
+            )
+        self._api_submit_state = "success"
+        self.log(
+            f"[정보] 본인 예약내역 대조 성공 · 예약번호 {booking_id} · "
+            "동일 상품·날짜·시간 확인",
+            "success",
+        )
+        if self._api_preparation.requires_checkout:
+            return await self._continue_npay_checkout(
+                booking_id=booking_id,
+                payment_url=landing_url,
+                dev_mode=dev_mode,
+                navigate_immediately=True,
+            )
+        return "success", f"예약번호 {booking_id} · 본인 예약내역에서 확정"
+
     async def _handle_api_submit_result(
         self,
         result,
@@ -1919,6 +1983,7 @@ class NaverEngine(BaseEngine):
     ) -> tuple[str, str]:
         """Handle one known result without issuing any additional mutation."""
         if result.outcome == SubmitOutcome.SUCCESS:
+            self._api_submit_state = "success"
             if self._api_preparation is not None and self._api_preparation.requires_checkout:
                 return await self._continue_npay_checkout(
                     booking_id=result.booking_id,
@@ -1931,21 +1996,38 @@ class NaverEngine(BaseEngine):
                 f"예약번호 {result.booking_id}"
                 + (f" · {result.url}" if result.url else ""),
             )
-        if result.outcome == SubmitOutcome.REFUSED:
+        if result.outcome == SubmitOutcome.NOT_OPEN:
+            self._api_submit_state = "idle"
+            return "notopen", result.detail
+        if result.outcome in {
+            SubmitOutcome.REFUSED,
+            SubmitOutcome.DUPLICATED,
+            SubmitOutcome.UNKNOWN,
+            SubmitOutcome.ERROR,
+        }:
+            # RT47, duplicate, timeout and malformed-response paths can all be
+            # partial/ambiguous after the mutation crossed the network.  Freeze
+            # final submission and reconcile the authenticated account instead
+            # of risking a second reservation.
+            self._api_submit_state = "uncertain"
+            self._api_submit_enabled = False
+            self._api_submit_blocked = True
             self._api_refused_signature = (
                 signature if signature is not None else getattr(self, "_last_signature", None)
             )
-            return "taken", result.detail
-        if result.outcome == SubmitOutcome.DUPLICATED:
-            self._api_submit_enabled = False
-            self._api_submit_blocked = True
-            return "duplicate", result.detail
-        if result.outcome == SubmitOutcome.NOT_OPEN:
-            return "notopen", result.detail
-        if result.outcome == SubmitOutcome.UNKNOWN:
-            self._api_submit_enabled = False
-            self._api_submit_blocked = True
-            return "unknown", result.detail
+            recovered = await self._reconcile_ambiguous_api_submit(
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
+            if recovered is not None:
+                return recovered
+            suffix = " · 본인 예약내역에서 아직 확정되지 않음 · 추가 POST 없음"
+            if result.outcome == SubmitOutcome.REFUSED:
+                return "unknown", result.detail + suffix
+            if result.outcome == SubmitOutcome.DUPLICATED:
+                return "duplicate", result.detail + suffix
+            return "unknown", result.detail + suffix
+        self._api_submit_state = "idle"
         self._disable_api_submit(result.detail)
         return "fallback", result.detail
 
@@ -1957,6 +2039,11 @@ class NaverEngine(BaseEngine):
         dev_mode: bool = False,
     ) -> tuple[str, str]:
         """Arm one browser-internal mutation before the published opening time."""
+        if self._api_submit_state != "idle":
+            return (
+                "unknown",
+                f"API 제출 상태 {self._api_submit_state} · 추가 POST를 보내지 않습니다",
+            )
         if (
             not self._api_submit_enabled
             or self._api_submitter is None
@@ -1994,6 +2081,7 @@ class NaverEngine(BaseEngine):
                 reservation_data=reservation_data,
                 dev_mode=dev_mode,
             )
+        self._api_submit_state = "inflight"
         self.log(
             f"[정보] 브라우저 내부 API 제출 예약 · 오픈 대비 {-lead:+.3f}초 · "
             f"{self._last_api_lead_detail} · 단일 요청으로 대기합니다.",
@@ -2008,6 +2096,7 @@ class NaverEngine(BaseEngine):
             await asyncio.sleep(min(0.10, max(0.01, wait_for)))
         if self.stop_event.is_set():
             await self._api_submitter.cancel_armed_submit(arm_id)
+            self._api_submit_state = "idle"
             return "stopped", "중지됨"
         # Keep CDP traffic out of the final timer window; Chrome owns the exact
         # dispatch and Python reads the result only afterwards.
@@ -2047,9 +2136,11 @@ class NaverEngine(BaseEngine):
                     )
                 return outcome, detail
             if state == "cancelled":
+                self._api_submit_state = "idle"
                 return "stopped", "중지됨"
             await asyncio.sleep(self.API_BROWSER_ARM_STATUS_SECONDS)
         await self._api_submitter.cancel_armed_submit(arm_id)
+        self._api_submit_state = "idle"
         return "stopped", "중지됨"
 
     async def _submit_api_first(
@@ -2060,6 +2151,11 @@ class NaverEngine(BaseEngine):
         dev_mode: bool = False,
     ) -> tuple[str, str]:
         """Send the prepared mutation, retrying only the server's not-open reply."""
+        if self._api_submit_state != "idle":
+            return (
+                "unknown",
+                f"API 제출 상태 {self._api_submit_state} · 추가 POST를 보내지 않습니다",
+            )
         if (
             not self._api_submit_enabled
             or self._api_submitter is None
@@ -2070,6 +2166,7 @@ class NaverEngine(BaseEngine):
 
         deadline = time.monotonic() + self.API_NOT_OPEN_WINDOW_SECONDS
         for attempt in range(1, self.API_SUBMIT_MAX_ATTEMPTS + 1):
+            self._api_submit_state = "inflight"
             sent_at = time.monotonic()
             offset = self._seconds_until_open()
             offset_text = (
@@ -2115,6 +2212,11 @@ class NaverEngine(BaseEngine):
         self, target_date: str, target_time: str, reservation_data, dev_mode: bool
     ) -> tuple[str, str]:
         """Own the opening moment: direct mutation first, browser fallback second."""
+        if self._api_submit_state in {"inflight", "success", "uncertain"}:
+            return (
+                "unknown",
+                f"API 제출 상태 {self._api_submit_state} · 추가 POST를 보내지 않습니다",
+            )
         remaining = self._seconds_until_open()
         if self._api_prepare_pending:
             if remaining is not None and remaining > 0:
@@ -2690,6 +2792,21 @@ class NaverEngine(BaseEngine):
             return False
         return host == "pay.naver.com" or host.endswith(".pay.naver.com")
 
+    @staticmethod
+    def _is_trusted_booking_resume_url(url: str) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower()
+            path = (parsed.path or "").lower()
+        except Exception:
+            return False
+        return (
+            (host == "booking.naver.com" or host.endswith(".booking.naver.com"))
+            and ("booking" in path or "/my/" in path)
+        ) or (
+            host == "m.place.naver.com" and "/my/" in path
+        )
+
     async def _submit_npay(
         self, submit, *, dev_mode: bool
     ) -> tuple[str, str]:
@@ -2843,8 +2960,12 @@ class NaverEngine(BaseEngine):
         )
 
     async def _navigate_to_npay_page(self, payment_url: str):
-        """Use the trusted URL returned by direct submit without a render wait."""
-        if self._page is None or not self._is_npay_url(payment_url):
+        """Resume either a direct Npay URL or a reconciled booking-detail hold."""
+        if self._page is None:
+            return None
+        direct_npay = self._is_npay_url(payment_url)
+        booking_resume = self._is_trusted_booking_resume_url(payment_url)
+        if not direct_npay and not booking_resume:
             return None
         try:
             await self._page.goto(
@@ -2852,7 +2973,51 @@ class NaverEngine(BaseEngine):
             )
         except Exception:
             return None
-        return self._page
+        try:
+            current_url = self._page.url or ""
+        except Exception:
+            current_url = ""
+        if self._is_npay_url(current_url):
+            return self._page
+        if direct_npay:
+            return None
+
+        # MY플레이스 gives an authenticated booking-detail URL rather than the
+        # one-time Npay order URL.  Follow only an explicit payment-resume control
+        # on that confirmed booking; this does not create another reservation.
+        exact_payment = re.compile(
+            r"^\s*(?:네이버페이\s*)?(?:결제하기|결제\s*계속|결제\s*진행)\s*$"
+        )
+        candidates = (
+            self._page.locator("a[href*='pay.naver.com']"),
+            self._page.get_by_role("button", name=exact_payment),
+            self._page.get_by_role("link", name=exact_payment),
+        )
+        for group in candidates:
+            try:
+                count = min(await group.count(), 3)
+            except Exception:
+                continue
+            for index in range(count):
+                control = group.nth(index)
+                try:
+                    if not await control.is_visible():
+                        continue
+                    href = await control.get_attribute("href")
+                    if href:
+                        candidate_url = urllib.parse.urljoin(current_url, href)
+                        if self._is_npay_url(candidate_url):
+                            await self._page.goto(
+                                candidate_url,
+                                wait_until="domcontentloaded",
+                                timeout=10000,
+                            )
+                            return self._page
+                    await control.click(timeout=1500)
+                    return await self._wait_for_npay_page("")
+                except Exception:
+                    continue
+        return None
 
     async def _wait_for_npay_page(self, payment_url: str = ""):
         deadline = time.monotonic() + self.NPAY_PAGE_TIMEOUT_SECONDS

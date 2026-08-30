@@ -414,6 +414,108 @@ def test_browser_submitter_classifies_success():
     assert page.calls[0]["variables"]["input"]["slotId"] == "1331382668"
 
 
+def test_browser_submitter_prefers_partial_booking_id_over_rt47_error():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = FakePage({
+        "data": {"submitBooking": {
+            "bookingId": "999888",
+            "url": {"pc": "https://order.pay.naver.com/orderSheet/test"},
+        }},
+        "errors": [{
+            "message": "RT47",
+            "extensions": {"code": "RT47", "reason": "정원 마감"},
+        }],
+    })
+
+    result = asyncio.run(
+        NaverBrowserSubmitter(page).submit({"slotId": "1331382668"})
+    )
+
+    assert result.outcome == SubmitOutcome.SUCCESS
+    assert result.booking_id == "999888"
+
+
+def test_upcoming_booking_match_requires_business_item_date_and_time():
+    from engines.naver_submit import match_upcoming_booking
+
+    rows = [{
+        "id": "999888",
+        "businessId": "1498729",
+        "bizItemName": "바야흐로, 여름이었다.",
+        "formattedBookingDateText": "2026. 9. 5.(토) 오후 2:25",
+        "bookingStatusCode": "RC02",
+        "landingUrl": "https://m.booking.naver.com/my/bookings/999888",
+    }]
+
+    matched = match_upcoming_booking(
+        rows,
+        target_date="2026-09-05",
+        target_time="14:25",
+        business_id="1498729",
+        item_name="바야흐로,여름이었다.",
+    )
+    wrong_time = match_upcoming_booking(
+        rows,
+        target_date="2026-09-05",
+        target_time="15:25",
+        business_id="1498729",
+        item_name="바야흐로,여름이었다.",
+    )
+
+    assert matched.found is True
+    assert matched.booking_id == "999888"
+    assert wrong_time.found is False
+
+
+def test_browser_reconciliation_reads_account_history_without_mutation():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    class LookupPage:
+        def __init__(self):
+            self.goto_calls = []
+            self.evaluate_calls = []
+            self.closed = False
+
+        async def goto(self, url, **kwargs):
+            self.goto_calls.append((url, kwargs))
+
+        async def evaluate(self, _script, argument):
+            self.evaluate_calls.append(argument)
+            return {"status": 200, "body": {"data": {"me": {
+                "upcomingBookings": {"bookings": [{
+                    "id": "999888",
+                    "businessId": "1498729",
+                    "bizItemName": "바야흐로, 여름이었다.",
+                    "formattedBookingDateText": "2026. 9. 5.(토) 오후 2:25",
+                    "bookingStatusCode": "RC02",
+                    "landingUrl": "https://m.booking.naver.com/my/bookings/999888",
+                }]},
+            }}}}
+
+        async def close(self):
+            self.closed = True
+
+    lookup = LookupPage()
+
+    class Context:
+        async def new_page(self):
+            return lookup
+
+    source = type("SourcePage", (), {"context": Context()})()
+    result = asyncio.run(NaverBrowserSubmitter(source).reconcile_upcoming_booking(
+        target_date="2026-09-05",
+        target_time="14:25",
+        business_id="1498729",
+        item_name="바야흐로,여름이었다.",
+    ))
+
+    assert result.found is True
+    assert result.booking_id == "999888"
+    assert lookup.evaluate_calls[0]["query"].startswith("query UpcomingBookingQuery")
+    assert lookup.closed is True
+
+
 def test_browser_submitter_classifies_not_open_and_rt98():
     from engines.naver_submit import NaverBrowserSubmitter
 

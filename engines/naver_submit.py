@@ -33,6 +33,30 @@ TERMS_VERSION = "20251030"
 PAYMENT_BOOKING = "booking"
 PAYMENT_NPAY_PREPAID = "npay_prepaid"
 PAYMENT_POSTPAID = "postpaid"
+UPCOMING_BOOKINGS_URL = "https://m.place.naver.com/my/timeline?tab=RESERVATION"
+UPCOMING_BOOKINGS_ENDPOINT = "https://porta.place.naver.com/graphql"
+
+
+UPCOMING_BOOKINGS_QUERY = """query UpcomingBookingQuery($page: Int, $limit: Int) {
+  me {
+    ... on MeSucceed {
+      upcomingBookings(page: $page, limit: $limit) {
+        bookings {
+          id
+          formattedBookingDateText
+          bizItemName
+          businessName
+          businessId
+          label
+          bookingStatusCode
+          landingUrl
+          displayOrderTimestamp
+        }
+        pageInfo { page nextPage totalCount hasNextPage }
+      }
+    }
+  }
+}"""
 
 
 @dataclass(frozen=True)
@@ -57,6 +81,119 @@ class NaverSubmitPreparation:
             PAYMENT_NPAY_PREPAID: "네이버페이 선결제형",
             PAYMENT_POSTPAID: "후결제형",
         }.get(self.payment_mode, self.payment_mode or "알 수 없음")
+
+
+@dataclass(frozen=True)
+class NaverBookingReconciliation:
+    """Authoritative same-account evidence after an ambiguous mutation reply."""
+
+    found: bool
+    booking_id: str = ""
+    url: str = ""
+    status: str = ""
+
+
+def _compact_match_text(value: Any) -> str:
+    return re.sub(r"[^0-9a-z가-힣]", "", str(value or "").casefold())
+
+
+def _row_booking_datetime(
+    row: Mapping[str, Any], target_date: str, target_time: str
+) -> bool:
+    """Match the date/time rendered by MY플레이스 without guessing from order."""
+    try:
+        target = datetime.fromisoformat(f"{target_date}T{target_time[:5]}").replace(
+            tzinfo=KST
+        )
+    except ValueError:
+        return False
+
+    raw_timestamp = row.get("displayOrderTimestamp")
+    parsed_timestamp: datetime | None = None
+    if isinstance(raw_timestamp, (int, float)):
+        epoch = float(raw_timestamp)
+        if epoch > 10_000_000_000:
+            epoch /= 1000
+        try:
+            parsed_timestamp = datetime.fromtimestamp(epoch, KST)
+        except (OSError, OverflowError, ValueError):
+            parsed_timestamp = None
+    elif raw_timestamp:
+        parsed_timestamp = _parse_datetime(raw_timestamp)
+        if parsed_timestamp is not None:
+            parsed_timestamp = parsed_timestamp.astimezone(KST)
+    if parsed_timestamp is not None:
+        timestamp_matches = (
+            parsed_timestamp.date() == target.date()
+            and parsed_timestamp.hour == target.hour
+            and parsed_timestamp.minute == target.minute
+        )
+        if timestamp_matches:
+            return True
+
+    rendered = " ".join(
+        str(row.get(key) or "")
+        for key in ("formattedBookingDateText", "label")
+    )
+    date_match = re.search(
+        r"(?:(\d{4})\s*[.년/-]\s*)?(\d{1,2})\s*[.월/-]\s*(\d{1,2})",
+        rendered,
+    )
+    time_match = re.search(r"(오전|오후)?\s*(\d{1,2})\s*:\s*(\d{2})", rendered)
+    if not date_match or not time_match:
+        return False
+    year_text, month_text, day_text = date_match.groups()
+    meridiem, hour_text, minute_text = time_match.groups()
+    hour = int(hour_text)
+    if meridiem == "오후" and hour < 12:
+        hour += 12
+    elif meridiem == "오전" and hour == 12:
+        hour = 0
+    return (
+        (not year_text or int(year_text) == target.year)
+        and int(month_text) == target.month
+        and int(day_text) == target.day
+        and hour == target.hour
+        and int(minute_text) == target.minute
+    )
+
+
+def match_upcoming_booking(
+    rows: Any,
+    *,
+    target_date: str,
+    target_time: str,
+    business_id: str = "",
+    item_name: str = "",
+) -> NaverBookingReconciliation:
+    """Require account booking id plus exact business/item/date/time evidence."""
+    if not isinstance(rows, list):
+        return NaverBookingReconciliation(False)
+    expected_item = _compact_match_text(item_name)
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        booking_id = str(raw.get("id") or "").strip()
+        if not booking_id:
+            continue
+        row_business_id = str(raw.get("businessId") or "").strip()
+        if business_id and row_business_id != str(business_id):
+            continue
+        row_item = _compact_match_text(raw.get("bizItemName"))
+        if expected_item:
+            if not row_item or not (
+                expected_item in row_item or row_item in expected_item
+            ):
+                continue
+        if not _row_booking_datetime(raw, target_date, target_time):
+            continue
+        return NaverBookingReconciliation(
+            True,
+            booking_id=booking_id,
+            url=str(raw.get("landingUrl") or ""),
+            status=str(raw.get("bookingStatusCode") or ""),
+        )
+    return NaverBookingReconciliation(False)
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -523,6 +660,31 @@ BROWSER_GRAPHQL_SCRIPT = r"""async request => {
 }"""
 
 
+BROWSER_UPCOMING_BOOKINGS_SCRIPT = r"""async request => {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+        () => controller.abort(), Math.max(300, Number(request.timeoutMs) || 2000));
+    try {
+        const response = await fetch(request.endpoint, {
+            method: "POST",
+            credentials: "include",
+            signal: controller.signal,
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                operationName: "UpcomingBookingQuery",
+                query: request.query,
+                variables: {limit: 10},
+            }),
+        });
+        let body = null;
+        try { body = await response.json(); } catch (_) {}
+        return {status: response.status, body};
+    } finally {
+        clearTimeout(timeout);
+    }
+}"""
+
+
 # This is intentionally a single, pre-armed request.  It is installed while the
 # page is idle several seconds before the published opening time, then Chrome's
 # own event loop starts the same GraphQL mutation at the calculated moment.  That
@@ -711,6 +873,18 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
             message=f"브라우저 GraphQL 응답을 해석하지 못했습니다 ({detail})",
         )
 
+    # GraphQL may return partial data together with an error.  A concrete
+    # bookingId is stronger evidence than RT47's generic wrapper and must not be
+    # discarded, otherwise a real Npay hold is mistaken for somebody else's win.
+    booking = ((body.get("data") or {}).get("submitBooking")) or {}
+    booking_id = str(booking.get("bookingId") or "")
+    if booking_id:
+        return SubmitResult(
+            SubmitOutcome.SUCCESS,
+            booking_id=booking_id,
+            url=booking.get("url"),
+        )
+
     errors = body.get("errors") or []
     if errors:
         first = errors[0] if isinstance(errors[0], dict) else {}
@@ -725,14 +899,6 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
             message=reason or message,
         )
 
-    booking = ((body.get("data") or {}).get("submitBooking")) or {}
-    booking_id = str(booking.get("bookingId") or "")
-    if booking_id:
-        return SubmitResult(
-            SubmitOutcome.SUCCESS,
-            booking_id=booking_id,
-            url=booking.get("url"),
-        )
     if status >= 400:
         return SubmitResult(SubmitOutcome.ERROR, message=f"HTTP {status}")
     return SubmitResult(SubmitOutcome.ERROR, message="예약번호가 비어 있습니다")
@@ -794,6 +960,67 @@ class NaverBrowserSubmitter:
             user_id=str(account.get("userId") or ""),
             nickname=str(account.get("nickname") or ""),
         )
+
+    async def reconcile_upcoming_booking(
+        self,
+        *,
+        target_date: str,
+        target_time: str,
+        business_id: str = "",
+        item_name: str = "",
+        attempts: int = 4,
+    ) -> NaverBookingReconciliation:
+        """Read the logged-in account's booking list without another mutation."""
+        context = getattr(self.page, "context", None)
+        if context is None or not hasattr(context, "new_page"):
+            return NaverBookingReconciliation(False)
+        lookup_page = None
+        try:
+            lookup_page = await context.new_page()
+            await lookup_page.goto(
+                UPCOMING_BOOKINGS_URL,
+                wait_until="domcontentloaded",
+                timeout=5000,
+            )
+            for attempt in range(max(1, min(int(attempts or 1), 6))):
+                response = await asyncio.wait_for(
+                    lookup_page.evaluate(
+                        BROWSER_UPCOMING_BOOKINGS_SCRIPT,
+                        {
+                            "endpoint": UPCOMING_BOOKINGS_ENDPOINT,
+                            "query": UPCOMING_BOOKINGS_QUERY,
+                            "timeoutMs": 2000,
+                        },
+                    ),
+                    timeout=2.5,
+                )
+                body = response.get("body") if isinstance(response, dict) else None
+                data = body.get("data") if isinstance(body, dict) else None
+                me = data.get("me") if isinstance(data, dict) else None
+                upcoming = (
+                    me.get("upcomingBookings") if isinstance(me, dict) else None
+                )
+                rows = upcoming.get("bookings") if isinstance(upcoming, dict) else []
+                matched = match_upcoming_booking(
+                    rows,
+                    target_date=target_date,
+                    target_time=target_time,
+                    business_id=business_id,
+                    item_name=item_name,
+                )
+                if matched.found:
+                    return matched
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.15)
+        except Exception:
+            return NaverBookingReconciliation(False)
+        finally:
+            if lookup_page is not None:
+                try:
+                    await lookup_page.close()
+                except Exception:
+                    pass
+        return NaverBookingReconciliation(False)
 
     async def submit(self, payload: dict[str, Any]) -> SubmitResult:
         try:

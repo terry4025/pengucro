@@ -14,7 +14,12 @@ from engines.naver_api import (
     SubmitResult,
 )
 from engines.naver_engine import NaverEngine
-from engines.naver_submit import PAYMENT_NPAY_PREPAID, NaverSubmitPreparation
+from engines.naver_submit import (
+    PAYMENT_NPAY_PREPAID,
+    PAYMENT_POSTPAID,
+    NaverBookingReconciliation,
+    NaverSubmitPreparation,
+)
 
 KST = timezone(timedelta(hours=9))
 
@@ -240,6 +245,17 @@ class FakeSubmitter:
         return self.results.pop(0)
 
 
+class ReconcilingSubmitter(FakeSubmitter):
+    def __init__(self, results, evidence):
+        super().__init__(results)
+        self.evidence = evidence
+        self.reconcile_calls = []
+
+    async def reconcile_upcoming_booking(self, **kwargs):
+        self.reconcile_calls.append(kwargs)
+        return self.evidence
+
+
 class ArmedSubmitter(FakeSubmitter):
     def __init__(self, results):
         super().__init__(results)
@@ -258,6 +274,17 @@ class ArmedSubmitter(FakeSubmitter):
     async def cancel_armed_submit(self, arm_id):
         self.cancelled.append(arm_id)
         return True
+
+
+class ArmedReconcilingSubmitter(ArmedSubmitter):
+    def __init__(self, results, evidence):
+        super().__init__(results)
+        self.evidence = evidence
+        self.reconcile_calls = []
+
+    async def reconcile_upcoming_booking(self, **kwargs):
+        self.reconcile_calls.append(kwargs)
+        return self.evidence
 
 
 def arm_direct_submit(engine, results):
@@ -651,6 +678,41 @@ def test_open_strike_arms_browser_internal_submit_before_the_boundary():
     assert engine._recent_submit_rtt == [pytest.approx(0.042)]
 
 
+def test_armed_rt47_reconciles_with_exactly_one_browser_mutation():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(0.10)
+    engine.API_BROWSER_ARM_MIN_SECONDS = 0.01
+    engine.API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.0
+    engine.API_BROWSER_ARM_STATUS_SECONDS = 0.0
+    engine._api_submitter = ArmedReconcilingSubmitter(
+        [SubmitResult(SubmitOutcome.REFUSED, code="RT47", message="정원 마감")],
+        NaverBookingReconciliation(
+            True,
+            booking_id="999888",
+            url="https://m.booking.naver.com/my/bookings/999888",
+        ),
+    )
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={"slotId": "1331382668", "businessId": "1498729"},
+        slot_id="1331382668",
+        payment_mode=PAYMENT_POSTPAID,
+    )
+    engine._api_biz_item = {"name": "바야흐로,여름이었다."}
+    engine._api_submit_enabled = True
+
+    outcome, detail = asyncio.run(engine._strike_at_open(
+        "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+    ))
+
+    assert outcome == "success"
+    assert "999888" in detail
+    assert len(engine._api_submitter.armed) == 1
+    assert engine._api_submitter.calls == 0
+    assert len(engine._api_submitter.reconcile_calls) == 1
+
+
 def test_open_strike_never_waits_for_clock_sync_inside_the_blackout():
     engine = make_engine()
     engine._open_at_epoch = 1.0
@@ -772,10 +834,10 @@ def test_api_send_lead_uses_the_browser_transport_round_trip():
     engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
     engine._api_submitter = type("BrowserTransport", (), {"last_rtt": 0.4})()
 
-    assert engine._api_one_way_seconds() == pytest.approx(0.150)
+    assert engine._api_one_way_seconds() == pytest.approx(0.250)
 
 
-def test_api_send_lead_targets_just_after_open_from_lowest_warm_rtt():
+def test_api_send_lead_targets_preopen_arrival_from_lowest_warm_rtt():
     engine = make_engine()
     engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
     engine._api_submitter = type(
@@ -789,9 +851,9 @@ def test_api_send_lead_targets_just_after_open_from_lowest_warm_rtt():
     engine.clock = type("Clock", (), {"last_precision": 0.04})()
     engine._recent_submit_rtt = [0.8]
 
-    assert engine._api_one_way_seconds() == pytest.approx(0.025)
+    assert engine._api_one_way_seconds() == pytest.approx(0.100)
     assert "최저 RTT 80ms" in engine._last_api_lead_detail
-    assert "서버 도착 목표 +15ms" in engine._last_api_lead_detail
+    assert "서버 도착 목표 -60ms" in engine._last_api_lead_detail
     assert "시계 오차 40ms" in engine._last_api_lead_detail
 
 
@@ -988,7 +1050,7 @@ def test_api_rt98_disables_direct_path_and_falls_back_to_browser():
     assert [entry[0] for entry in calls] == ["goto", "submit"]
 
 
-def test_api_refusal_keeps_watching_without_browser_reload():
+def test_api_refusal_stops_after_reconciliation_without_browser_resubmission():
     engine = make_engine()
     engine._open_at_epoch = 1.0
     engine.clock = FakeClock(-0.01)
@@ -1012,9 +1074,49 @@ def test_api_refusal_keeps_watching_without_browser_reload():
         )
     )
 
-    assert outcome == "taken"
+    assert outcome == "unknown"
     assert "RT47" in detail
-    assert engine._api_submit_enabled is True
+    assert engine._api_submit_enabled is False
+    assert engine._api_submit_state == "uncertain"
+    assert "추가 POST 없음" in detail
+    repeated, _ = asyncio.run(engine._strike_at_open(
+        "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+    ))
+    assert repeated == "unknown"
+    assert engine._api_submitter.calls == 1
+
+
+def test_rt47_reconciles_postpaid_booking_without_second_post():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(-0.01)
+    engine._api_submitter = ReconcilingSubmitter(
+        [SubmitResult(SubmitOutcome.REFUSED, code="RT47", message="정원 마감")],
+        NaverBookingReconciliation(
+            True,
+            booking_id="999888",
+            url="https://m.booking.naver.com/my/bookings/999888",
+            status="RC02",
+        ),
+    )
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={"slotId": "1331382668", "businessId": "1498729"},
+        slot_id="1331382668",
+        payment_mode=PAYMENT_POSTPAID,
+    )
+    engine._api_biz_item = {"name": "바야흐로,여름이었다."}
+    engine._api_submit_enabled = True
+
+    outcome, detail = asyncio.run(engine._strike_at_open(
+        "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+    ))
+
+    assert outcome == "success"
+    assert "999888" in detail
+    assert engine._api_submitter.calls == 1
+    assert len(engine._api_submitter.reconcile_calls) == 1
+    assert engine._api_submit_state == "success"
 
 
 def test_strike_retries_the_reload_and_reports_notready_without_submitting():
@@ -1565,6 +1667,18 @@ def test_npay_response_parser_extracts_booking_before_payment_redirect():
     assert error == ""
 
 
+def test_npay_resume_accepts_only_naver_booking_history_urls():
+    assert NaverEngine._is_trusted_booking_resume_url(
+        "https://m.booking.naver.com/my/bookings/999888"
+    ) is True
+    assert NaverEngine._is_trusted_booking_resume_url(
+        "https://m.place.naver.com/my/timeline?tab=RESERVATION"
+    ) is True
+    assert NaverEngine._is_trusted_booking_resume_url(
+        "https://evil.example/my/bookings/999888"
+    ) is False
+
+
 def test_direct_npay_api_hold_continues_to_checkout_without_page_submission():
     engine = make_engine()
     pay_button = FakeClickButton()
@@ -1593,6 +1707,42 @@ def test_direct_npay_api_hold_continues_to_checkout_without_page_submission():
     assert outcome == "payment"
     assert "결제 요청" in detail
     assert engine._api_submitter.calls == 1
+    assert engine._npay_booking_id == "1310923519"
+    assert pay_button.clicks == 1
+
+
+def test_rt47_reconciles_prepaid_hold_and_resumes_npay_without_second_post():
+    engine = make_engine()
+    pay_button = FakeClickButton()
+    configure_fake_npay_checkout(engine, pay_button)
+    engine._api_submitter = ReconcilingSubmitter(
+        [SubmitResult(SubmitOutcome.REFUSED, code="RT47", message="정원 마감")],
+        NaverBookingReconciliation(
+            True,
+            booking_id="1310923519",
+            url="https://order.pay.naver.com/orderSheet/test",
+            status="RC02",
+        ),
+    )
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={"slotId": "1303986499", "businessId": "1498729"},
+        slot_id="1303986499",
+        payment_mode=PAYMENT_NPAY_PREPAID,
+        payment_source="slotSeat.isPostPayment",
+    )
+    engine._api_biz_item = {"name": "바야흐로,여름이었다."}
+    engine._api_submit_enabled = True
+
+    outcome, detail = asyncio.run(engine._submit_api_first(
+        reservation_data=PREPARATION_RESERVATION,
+        dev_mode=False,
+    ))
+
+    assert outcome == "payment"
+    assert "결제 요청" in detail
+    assert engine._api_submitter.calls == 1
+    assert len(engine._api_submitter.reconcile_calls) == 1
     assert engine._npay_booking_id == "1310923519"
     assert pay_button.clicks == 1
 

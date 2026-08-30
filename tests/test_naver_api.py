@@ -517,7 +517,9 @@ def test_precise_clock_sync_keeps_the_lowest_rtt_sample(monkeypatch):
     assert clock.sync_precise(3) is True
     assert api.calls == 3
     assert clock.last_precision == pytest.approx(0.02)
-    assert clock._anchor_monotonic == pytest.approx(1.02)
+    # currentDateTime is emitted near response completion, so anchoring it to
+    # the request midpoint would make the clock run half an RTT ahead.
+    assert clock._anchor_monotonic == pytest.approx(1.04)
     assert clock._anchor_server == pytest.approx(server_times[1].timestamp())
 
 

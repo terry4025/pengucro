@@ -420,10 +420,9 @@ class SubmitOutcome:
     """How a direct ``submitBooking`` attempt ended.
 
     The engine branches on these rather than on message text: ``NOT_OPEN`` means
-    fire again in a moment, ``REFUSED`` means someone else got there, and
-    ``DUPLICATED`` means Naver believes this account already sent or owns the
-    same reservation, and ``ABUSE``/``PAYLOAD`` mean stop using the API path and
-    let the page do it.
+    fire again in a moment, while ``REFUSED``/``DUPLICATED`` are ambiguous until
+    the authenticated booking list is reconciled. ``ABUSE``/``PAYLOAD`` mean stop
+    using the API path and let the page do it.
     """
 
     SUCCESS = "success"
@@ -882,9 +881,11 @@ class NaverServerClock:
 
     Unlike keyescape -- where only a whole-second ``Date`` header is available and
     the second boundary has to be caught by polling -- ``bizItem.currentDateTime``
-    carries milliseconds. Startup uses one sample; the final pre-open refresh
-    can retain the quickest of several samples to reduce queueing noise. Accuracy
-    is bounded by half that selected round trip.
+    carries milliseconds. Live measurements on 2026-08-30 showed that this field
+    advances with response completion rather than request arrival: anchoring it
+    to the request midpoint therefore made the local server clock run roughly
+    half an RTT ahead. Startup uses one sample; the final pre-open refresh retains
+    the quickest response-completion sample to reduce queueing noise.
 
     The anchor is monotonic on purpose: an NTP correction part-way through a run
     cannot shift what the engine believes the server time to be.
@@ -937,9 +938,7 @@ class NaverServerClock:
             if meta.server_time is None:
                 missing_server_time = True
                 continue
-            samples.append(
-                (after - before, (before + after) / 2, meta.server_time.timestamp())
-            )
+            samples.append((after - before, after, meta.server_time.timestamp()))
 
         if not samples:
             if announce and self.log:
@@ -957,12 +956,15 @@ class NaverServerClock:
                     )
             return False
 
-        round_trip, midpoint, server_epoch = min(samples, key=lambda row: row[0])
+        round_trip, response_end, server_epoch = min(samples, key=lambda row: row[0])
         self._anchor_server = server_epoch
-        self._anchor_monotonic = midpoint
-        self.last_precision = round_trip / 2
+        self._anchor_monotonic = response_end
+        # The server timestamp is produced close to response completion.  Keep a
+        # conservative upper bound for logging instead of reintroducing the old
+        # midpoint bias into the anchor itself.
+        self.last_precision = min(round_trip / 2, 0.025)
         self.last_offset = self._anchor_server - (
-            time.time() - (time.monotonic() - midpoint)
+            time.time() - (time.monotonic() - response_end)
         )
         if announce and self.log:
             self.log(
