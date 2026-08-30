@@ -287,6 +287,17 @@ class ArmedReconcilingSubmitter(ArmedSubmitter):
         return self.evidence
 
 
+class ServerTimedArmedSubmitter(ArmedSubmitter):
+    def __init__(self, results):
+        super().__init__(results)
+        self.server_armed = []
+        self.last_armed_timing = {"delayMs": 1.0}
+
+    async def arm_submit_at_server_time(self, payload, delay_seconds, **kwargs):
+        self.server_armed.append((dict(payload), delay_seconds, kwargs))
+        return "armed-1"
+
+
 def arm_direct_submit(engine, results):
     engine._api_submitter = FakeSubmitter(results)
     engine._api_preparation = NaverSubmitPreparation(
@@ -711,6 +722,46 @@ def test_armed_rt47_reconciles_with_exactly_one_browser_mutation():
     assert len(engine._api_submitter.armed) == 1
     assert engine._api_submitter.calls == 0
     assert len(engine._api_submitter.reconcile_calls) == 1
+    reconcile_call = engine._api_submitter.reconcile_calls[0]
+    assert reconcile_call["attempts"] == 20
+    assert reconcile_call["window_seconds"] == 8.0
+
+
+def test_open_strike_uses_same_browser_server_clock_for_absolute_arm():
+    engine = make_engine()
+    engine._open_at_epoch = 1788102000.0
+    engine.clock = FakeClock(0.10)
+    engine.API_BROWSER_ARM_MIN_SECONDS = 0.01
+    engine.API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.0
+    engine.API_BROWSER_ARM_STATUS_SECONDS = 0.0
+    submitter = ServerTimedArmedSubmitter([
+        SubmitResult(SubmitOutcome.SUCCESS, booking_id="999888"),
+    ])
+    engine._api_submitter = submitter
+    engine._api_preparation = NaverSubmitPreparation(
+        True,
+        payload={
+            "businessId": "1498729",
+            "bizItemId": "7094790",
+            "slotId": "1331382668",
+            "csrfToken": "secret",
+        },
+        slot_id="1331382668",
+    )
+    engine._api_submit_enabled = True
+
+    outcome, detail = asyncio.run(engine._strike_at_open(
+        "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+    ))
+
+    assert outcome == "success"
+    assert "999888" in detail
+    assert len(submitter.server_armed) == 1
+    _payload, _delay, timing = submitter.server_armed[0]
+    assert timing["open_at_epoch"] == 1788102000.0
+    assert timing["lead_seconds"] == pytest.approx(0.11)
+    assert timing["retry_lead_seconds"] == pytest.approx(0.05)
+    assert submitter.armed == []
 
 
 def test_open_strike_never_waits_for_clock_sync_inside_the_blackout():

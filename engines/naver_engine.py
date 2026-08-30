@@ -472,7 +472,8 @@ class NaverEngine(BaseEngine):
     API_SEND_MAX_LEAD_SECONDS = 0.250
     API_PREOPEN_CLOCK_SAMPLES = 3
     API_REFUSED_RECHECK_TIMEOUT_SECONDS = 0.30
-    API_RECONCILE_ATTEMPTS = 4
+    API_RECONCILE_ATTEMPTS = 20
+    API_RECONCILE_WINDOW_SECONDS = 8.0
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -1946,6 +1947,7 @@ class NaverEngine(BaseEngine):
             business_id=business_id,
             item_name=item_name,
             attempts=self.API_RECONCILE_ATTEMPTS,
+            window_seconds=self.API_RECONCILE_WINDOW_SECONDS,
         )
         if not getattr(evidence, "found", False) or not getattr(
             evidence, "booking_id", ""
@@ -2067,9 +2069,24 @@ class NaverEngine(BaseEngine):
         lead = self._api_one_way_seconds()
         delay = max(0.0, remaining - lead)
         try:
-            arm_id = await self._api_submitter.arm_submit_at(
-                self._api_preparation.payload, delay
+            server_time_arm = getattr(
+                self._api_submitter, "arm_submit_at_server_time", None
             )
+            if callable(server_time_arm) and self._open_at_epoch is not None:
+                arm_id = await server_time_arm(
+                    self._api_preparation.payload,
+                    delay,
+                    open_at_epoch=self._open_at_epoch,
+                    lead_seconds=lead,
+                    retry_lead_seconds=max(
+                        0.0,
+                        lead - self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS,
+                    ),
+                )
+            else:
+                arm_id = await self._api_submitter.arm_submit_at(
+                    self._api_preparation.payload, delay
+                )
         except Exception as exc:
             self.log(
                 f"[정보] 브라우저 내부 예약 타이머 준비 실패 ({type(exc).__name__}) · "
@@ -2082,11 +2099,28 @@ class NaverEngine(BaseEngine):
                 dev_mode=dev_mode,
             )
         self._api_submit_state = "inflight"
+        armed_timing = getattr(self._api_submitter, "last_armed_timing", {}) or {}
+        clock_samples = armed_timing.get("clockSampleCount")
+        clock_rtt = armed_timing.get("clockRttMs")
+        clock_detail = ""
+        if (
+            isinstance(clock_samples, (int, float))
+            and clock_samples > 0
+            and isinstance(clock_rtt, (int, float))
+        ):
+            clock_detail = (
+                f" · Chrome 동일 연결 서버 시계 {int(clock_samples)}회 "
+                f"(최저 RTT {float(clock_rtt):.0f}ms)"
+            )
         self.log(
             f"[정보] 브라우저 내부 API 제출 예약 · 오픈 대비 {-lead:+.3f}초 · "
-            f"{self._last_api_lead_detail} · 단일 선점 흐름으로 대기합니다.",
+            f"{self._last_api_lead_detail}{clock_detail} · "
+            "단일 선점 흐름으로 대기합니다.",
             "warning",
         )
+        browser_delay_ms = armed_timing.get("delayMs")
+        if isinstance(browser_delay_ms, (int, float)):
+            delay = max(0.0, float(browser_delay_ms) / 1000)
         due = time.monotonic() + delay
         while (
             not self.stop_event.is_set()
@@ -2110,10 +2144,20 @@ class NaverEngine(BaseEngine):
                 timing = getattr(self._api_submitter, "last_armed_timing", {}) or {}
                 due_at = timing.get("dueAt")
                 started_at = timing.get("startedAt")
+                server_open_at = timing.get("serverOpenAt")
                 dispatch_detail = ""
                 if isinstance(due_at, (int, float)) and isinstance(started_at, (int, float)):
                     lateness_ms = float(started_at) - float(due_at)
-                    dispatch_detail = f" · 실제 발사 오차 {lateness_ms:+.1f}ms"
+                    dispatch_detail = f" · 타이머 발사 오차 {lateness_ms:+.1f}ms"
+                if (
+                    isinstance(server_open_at, (int, float))
+                    and server_open_at > 0
+                    and isinstance(started_at, (int, float))
+                ):
+                    open_offset_ms = float(started_at) - float(server_open_at)
+                    dispatch_detail += (
+                        f" · 네이버 서버 오픈 기준 발사 {open_offset_ms:+.1f}ms"
+                    )
                 attempts = timing.get("attempts")
                 attempt_detail = ""
                 if isinstance(attempts, (int, float)) and attempts > 1:

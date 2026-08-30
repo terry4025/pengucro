@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from engines.naver_api import (
     ACCOUNT_QUERY,
+    BIZ_ITEM_QUERY,
     KST,
     SUBMIT_BOOKING_MUTATION,
     SUBMIT_NOT_OPEN_CODES,
@@ -739,15 +740,71 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     const timeoutMs = Math.max(100, Number(request.timeoutMs) || 3000);
     const maxAttempts = Math.max(1, Math.min(3, Number(request.maxAttempts) || 1));
     const retryDelayMs = Math.max(0, Number(request.retryDelayMs) || 0);
+    const retryLeadMs = Math.max(0, Number(request.retryLeadMs) || 0);
     const retryWindowMs = Math.max(
-        0, Math.min(350, Number(request.retryWindowMs) || 0));
+        0, Math.min(500, Number(request.retryWindowMs) || 0));
     const notOpenCodes = new Set(
         (request.notOpenCodes || []).map(value => String(value || "")));
+
+    // Read Naver's clock over the same warmed browser connection that will send
+    // the mutation. currentDateTime is emitted near response completion, so it
+    // maps directly onto performance.now() without a Python/CDP clock hand-off.
+    let serverOpenAt = 0;
+    let clockRttMs = 0;
+    let clockSampleCount = 0;
+    const requestedOpenEpochMs = Number(request.openAtEpochMs) || 0;
+    const clockSamples = Math.max(0, Math.min(5, Number(request.clockSamples) || 0));
+    if (requestedOpenEpochMs > 0 && clockSamples > 0 && request.clockQuery) {
+        const samples = [];
+        for (let index = 0; index < clockSamples; index += 1) {
+            const clockStartedAt = performance.now();
+            try {
+                const clockResponse = await fetch("/graphql?opName=bizItem", {
+                    method: "POST",
+                    credentials: "include",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        operationName: "bizItem",
+                        query: request.clockQuery,
+                        variables: request.clockVariables || {},
+                    }),
+                });
+                let clockBody = null;
+                try { clockBody = await clockResponse.json(); } catch (_) {}
+                const clockEndedAt = performance.now();
+                const currentDateTime = clockBody && clockBody.data &&
+                    clockBody.data.bizItem && clockBody.data.bizItem.currentDateTime;
+                const serverEpochMs = Date.parse(String(currentDateTime || ""));
+                if (Number.isFinite(serverEpochMs)) {
+                    samples.push({
+                        rtt: clockEndedAt - clockStartedAt,
+                        endedAt: clockEndedAt,
+                        serverEpochMs,
+                    });
+                }
+            } catch (_) {}
+        }
+        if (samples.length) {
+            samples.sort((left, right) => left.rtt - right.rtt);
+            const best = samples[0];
+            serverOpenAt = best.endedAt + (requestedOpenEpochMs - best.serverEpochMs);
+            clockRttMs = best.rtt;
+            clockSampleCount = samples.length;
+        }
+    }
+
+    const armedAt = performance.now();
+    const dueAt = serverOpenAt > 0
+        ? Math.max(armedAt, serverOpenAt - Math.max(0, Number(request.leadMs) || 0))
+        : armedAt + delayMs;
     const state = {
         id: String(request.armId || ""),
         status: "armed",
-        armedAt: performance.now(),
-        dueAt: performance.now() + delayMs,
+        armedAt,
+        dueAt,
+        serverOpenAt,
+        clockRttMs,
+        clockSampleCount,
         startedAt: 0,
         lastStartedAt: 0,
         completedAt: 0,
@@ -772,10 +829,13 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         return [first.message, extensions.code, extensions.reason]
             .some(value => notOpenCodes.has(String(value || "")));
     };
+    const retryExpired = () => state.serverOpenAt > 0
+        ? performance.now() > state.serverOpenAt + retryWindowMs
+        : performance.now() - state.startedAt > retryWindowMs;
     const run = async () => {
         try {
-            // Timer wakeups can be a few milliseconds late.  Keep the final
-            // spin tiny so the booking page remains responsive.
+            // Timer wakeups can be a few milliseconds late. Keep the final spin
+            // tiny so the booking page remains responsive.
             const quietUntil = state.dueAt - 6;
             if (performance.now() < quietUntil) {
                 await pause(quietUntil - performance.now());
@@ -785,8 +845,7 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
             state.status = "submitting";
             state.startedAt = performance.now();
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-                if (attempt > 1 &&
-                        performance.now() - state.startedAt > retryWindowMs) break;
+                if (attempt > 1 && retryExpired()) break;
                 state.attempts = attempt;
                 state.lastStartedAt = performance.now();
                 const controller = new AbortController();
@@ -808,12 +867,20 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
                     try { body = await response.json(); } catch (_) {}
                     state.response = {status: response.status, body};
                     if (!isExplicitNotOpen(body) || attempt >= maxAttempts) break;
-                    if (performance.now() - state.startedAt >= retryWindowMs) break;
+                    if (retryExpired()) break;
                 } finally {
                     clearTimeout(timeout);
                     state.controller = null;
                 }
-                await pause(retryDelayMs);
+                if (state.serverOpenAt > 0) {
+                    // After a deliberate early probe, align the retry with the
+                    // actual gate instead of spending all attempts before open.
+                    const boundarySendAt = state.serverOpenAt - retryLeadMs;
+                    const waitMs = boundarySendAt - performance.now();
+                    if (waitMs > 0) await pause(waitMs);
+                } else {
+                    await pause(retryDelayMs);
+                }
             }
             state.status = "complete";
         } catch (error) {
@@ -823,8 +890,18 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
             state.completedAt = performance.now();
         }
     };
-    state.timer = setTimeout(() => { void run(); }, Math.max(0, delayMs - 8));
-    return {id: state.id, status: state.status, delayMs};
+    state.timer = setTimeout(
+        () => { void run(); }, Math.max(0, state.dueAt - performance.now() - 8));
+    return {
+        id: state.id,
+        status: state.status,
+        delayMs: Math.max(0, state.dueAt - performance.now()),
+        armedAt: state.armedAt,
+        dueAt: state.dueAt,
+        serverOpenAt: state.serverOpenAt,
+        clockRttMs: state.clockRttMs,
+        clockSampleCount: state.clockSampleCount,
+    };
 }"""
 
 
@@ -837,6 +914,9 @@ BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
         error: state.error || "",
         armedAt: Number(state.armedAt) || 0,
         dueAt: Number(state.dueAt) || 0,
+        serverOpenAt: Number(state.serverOpenAt) || 0,
+        clockRttMs: Number(state.clockRttMs) || 0,
+        clockSampleCount: Number(state.clockSampleCount) || 0,
         startedAt: Number(state.startedAt) || 0,
         lastStartedAt: Number(state.lastStartedAt) || 0,
         completedAt: Number(state.completedAt) || 0,
@@ -1018,6 +1098,7 @@ class NaverBrowserSubmitter:
         business_id: str = "",
         item_name: str = "",
         attempts: int = 4,
+        window_seconds: float = 8.0,
     ) -> NaverBookingReconciliation:
         """Read the logged-in account's booking list without another mutation."""
         context = getattr(self.page, "context", None)
@@ -1031,18 +1112,25 @@ class NaverBrowserSubmitter:
                 wait_until="domcontentloaded",
                 timeout=5000,
             )
-            for attempt in range(max(1, min(int(attempts or 1), 6))):
-                response = await asyncio.wait_for(
-                    lookup_page.evaluate(
-                        BROWSER_UPCOMING_BOOKINGS_SCRIPT,
-                        {
-                            "endpoint": UPCOMING_BOOKINGS_ENDPOINT,
-                            "query": UPCOMING_BOOKINGS_QUERY,
-                            "timeoutMs": 2000,
-                        },
-                    ),
-                    timeout=2.5,
-                )
+            attempt_limit = max(1, min(int(attempts or 1), 24))
+            deadline = time.monotonic() + max(
+                0.5, min(float(window_seconds or 0.5), 10.0)
+            )
+            for attempt in range(attempt_limit):
+                try:
+                    response = await asyncio.wait_for(
+                        lookup_page.evaluate(
+                            BROWSER_UPCOMING_BOOKINGS_SCRIPT,
+                            {
+                                "endpoint": UPCOMING_BOOKINGS_ENDPOINT,
+                                "query": UPCOMING_BOOKINGS_QUERY,
+                                "timeoutMs": 2000,
+                            },
+                        ),
+                        timeout=2.5,
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    response = None
                 body = response.get("body") if isinstance(response, dict) else None
                 data = body.get("data") if isinstance(body, dict) else None
                 me = data.get("me") if isinstance(data, dict) else None
@@ -1059,8 +1147,10 @@ class NaverBrowserSubmitter:
                 )
                 if matched.found:
                     return matched
-                if attempt + 1 < attempts:
-                    await asyncio.sleep(0.15)
+                remaining = deadline - time.monotonic()
+                if attempt + 1 >= attempt_limit or remaining <= 0:
+                    break
+                await asyncio.sleep(min(0.35, remaining))
         except Exception:
             return NaverBookingReconciliation(False)
         finally:
@@ -1100,9 +1190,18 @@ class NaverBrowserSubmitter:
             url=result.url,
         )
 
-    async def arm_submit_at(self, payload: dict[str, Any], delay_seconds: float) -> str:
-        """Arm one flow; retry only after an exact server NOT_OPEN response."""
+    async def _arm_submit(
+        self,
+        payload: dict[str, Any],
+        delay_seconds: float,
+        *,
+        open_at_epoch: float | None = None,
+        lead_seconds: float = 0.0,
+        retry_lead_seconds: float = 0.0,
+    ) -> str:
         arm_id = f"naver-{time.monotonic_ns()}"
+        business_id = str(payload.get("businessId") or "")
+        biz_item_id = str(payload.get("bizItemId") or "")
         try:
             response = await asyncio.wait_for(
                 self.page.evaluate(
@@ -1112,10 +1211,24 @@ class NaverBrowserSubmitter:
                         "input": copy.deepcopy(payload),
                         "query": SUBMIT_BOOKING_MUTATION,
                         "delayMs": round(max(0.0, float(delay_seconds)) * 1000),
+                        "openAtEpochMs": round(float(open_at_epoch or 0.0) * 1000),
+                        "leadMs": round(max(0.0, float(lead_seconds)) * 1000),
+                        "retryLeadMs": round(
+                            max(0.0, float(retry_lead_seconds)) * 1000
+                        ),
+                        "clockSamples": 3 if open_at_epoch and business_id and biz_item_id else 0,
+                        "clockQuery": BIZ_ITEM_QUERY,
+                        "clockVariables": {
+                            "input": {
+                                "businessId": business_id,
+                                "bizItemId": biz_item_id,
+                                "lang": "ko",
+                            }
+                        },
                         "timeoutMs": round(self.timeout_seconds * 1000),
                         "maxAttempts": 3,
                         "retryDelayMs": 10,
-                        "retryWindowMs": 350,
+                        "retryWindowMs": 500,
                         "notOpenCodes": sorted(SUBMIT_NOT_OPEN_CODES),
                     },
                 ),
@@ -1125,7 +1238,40 @@ class NaverBrowserSubmitter:
             raise RuntimeError("브라우저 내부 예약 타이머를 준비하지 못했습니다") from exc
         if not isinstance(response, dict) or response.get("id") != arm_id:
             raise RuntimeError("브라우저 내부 예약 타이머 응답이 올바르지 않습니다")
+        for key in (
+            "armedAt",
+            "dueAt",
+            "serverOpenAt",
+            "clockRttMs",
+            "clockSampleCount",
+            "delayMs",
+        ):
+            value = response.get(key)
+            if isinstance(value, (int, float)):
+                self.last_armed_timing[key] = float(value)
         return arm_id
+
+    async def arm_submit_at(self, payload: dict[str, Any], delay_seconds: float) -> str:
+        """Arm one flow using the caller's relative fallback timer."""
+        return await self._arm_submit(payload, delay_seconds)
+
+    async def arm_submit_at_server_time(
+        self,
+        payload: dict[str, Any],
+        delay_seconds: float,
+        *,
+        open_at_epoch: float,
+        lead_seconds: float,
+        retry_lead_seconds: float,
+    ) -> str:
+        """Arm in Chrome's clock domain after same-origin Naver clock samples."""
+        return await self._arm_submit(
+            payload,
+            delay_seconds,
+            open_at_epoch=open_at_epoch,
+            lead_seconds=lead_seconds,
+            retry_lead_seconds=retry_lead_seconds,
+        )
 
     async def read_armed_submit(self, arm_id: str, payload: Mapping[str, Any]) -> tuple[str, SubmitResult | None, float | None]:
         """Read one armed request without sending another booking mutation."""
@@ -1148,6 +1294,9 @@ class NaverBrowserSubmitter:
         for key in (
             "armedAt",
             "dueAt",
+            "serverOpenAt",
+            "clockRttMs",
+            "clockSampleCount",
             "startedAt",
             "lastStartedAt",
             "completedAt",

@@ -632,8 +632,41 @@ def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
     assert page.calls[0]["input"]["slotId"] == "1331382668"
     assert page.calls[0]["maxAttempts"] == 3
     assert page.calls[0]["retryDelayMs"] == 10
-    assert page.calls[0]["retryWindowMs"] == 350
+    assert page.calls[0]["retryWindowMs"] == 500
     assert page.calls[0]["notOpenCodes"] == ["BizItem is not opened."]
+
+
+def test_browser_submitter_arms_against_same_browser_server_clock():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = ArmedPage()
+    submitter = NaverBrowserSubmitter(page)
+    payload = {
+        "businessId": "1498729",
+        "bizItemId": "7094790",
+        "slotId": "1331382668",
+        "csrfToken": "csrf-secret",
+    }
+
+    asyncio.run(submitter.arm_submit_at_server_time(
+        payload,
+        4.75,
+        open_at_epoch=1788102000.0,
+        lead_seconds=0.115,
+        retry_lead_seconds=0.055,
+    ))
+
+    request = page.calls[0]
+    assert request["openAtEpochMs"] == 1788102000000
+    assert request["leadMs"] == 115
+    assert request["retryLeadMs"] == 55
+    assert request["clockSamples"] == 3
+    assert "currentDateTime" in request["clockQuery"]
+    assert request["clockVariables"]["input"] == {
+        "businessId": "1498729",
+        "bizItemId": "7094790",
+        "lang": "ko",
+    }
 
 
 def test_browser_submitter_classifies_the_resolver_reason():

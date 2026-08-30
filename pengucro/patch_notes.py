@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.69",
+        changes=(
+            "네이버 동일 연결 서버 시각 기준으로 오픈 순간 제출 정밀도 개선",
+            "네이버 미오픈 응답 재시도를 실제 오픈 경계에 맞춰 선점 기회 강화",
+            "네이버 제출 결과 불명확 시 예약내역 확인 시간을 늘려 임시 선점 복구 강화",
+        ),
+    ),
+    PatchNote(
         version="6.68",
         changes=(
             "네이버 브라우저 실제 통신 지연 기준으로 선점 제출 시각 정밀 보정",

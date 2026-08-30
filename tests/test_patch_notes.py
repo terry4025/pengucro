@@ -9,6 +9,18 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v669_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.69")
+
+    assert note is not None
+    assert note.changes == (
+        "네이버 동일 연결 서버 시각 기준으로 오픈 순간 제출 정밀도 개선",
+        "네이버 미오픈 응답 재시도를 실제 오픈 경계에 맞춰 선점 기회 강화",
+        "네이버 제출 결과 불명확 시 예약내역 확인 시간을 늘려 임시 선점 복구 강화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v668_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.68")
 
