@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.68",
+        changes=(
+            "네이버 브라우저 실제 통신 지연 기준으로 선점 제출 시각 정밀 보정",
+            "네이버 명시적 미오픈 응답에만 브라우저 내부 즉시 재시도",
+        ),
+    ),
+    PatchNote(
         version="6.67",
         changes=(
             "키이스케이프 전체 공개 시간표 자동 저장으로 빈 캐시 빠른 제출 지원",

@@ -837,7 +837,7 @@ def test_api_send_lead_uses_the_browser_transport_round_trip():
     assert engine._api_one_way_seconds() == pytest.approx(0.250)
 
 
-def test_api_send_lead_targets_preopen_arrival_from_lowest_warm_rtt():
+def test_api_send_lead_targets_aggressive_preopen_arrival():
     engine = make_engine()
     engine.api = type("PollingApi", (), {"last_rtt": 0.04})()
     engine._api_submitter = type(
@@ -853,8 +853,21 @@ def test_api_send_lead_targets_preopen_arrival_from_lowest_warm_rtt():
 
     assert engine._api_one_way_seconds() == pytest.approx(0.100)
     assert "최저 RTT 80ms" in engine._last_api_lead_detail
-    assert "서버 도착 목표 -60ms" in engine._last_api_lead_detail
+    assert "서버 선점 도착 목표 -60ms" in engine._last_api_lead_detail
     assert "시계 오차 40ms" in engine._last_api_lead_detail
+
+
+def test_api_send_lead_uses_live_browser_rtt_for_the_field_timing_case():
+    engine = make_engine()
+    engine._api_submitter = type(
+        "BrowserTransport",
+        (),
+        {"last_rtt": 0.109, "safe_rtt_samples": [0.109]},
+    )()
+    engine.clock = type("Clock", (), {"last_precision": 0.025})()
+
+    assert engine._api_one_way_seconds() == pytest.approx(0.1145)
+    assert "서버 선점 도착 목표 -60ms" in engine._last_api_lead_detail
 
 
 def test_final_preopen_clock_sync_runs_once_with_three_samples():

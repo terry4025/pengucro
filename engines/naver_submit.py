@@ -21,6 +21,7 @@ from engines.naver_api import (
     ACCOUNT_QUERY,
     KST,
     SUBMIT_BOOKING_MUTATION,
+    SUBMIT_NOT_OPEN_CODES,
     NaverAccount,
     SubmitOutcome,
     SubmitResult,
@@ -596,6 +597,7 @@ class NaverSubmitPayloadBuilder:
 
 
 BROWSER_GRAPHQL_SCRIPT = r"""async request => {
+    const startedAt = performance.now();
     const variables = request.variables || {};
     if (request.operationName === "submitBooking" &&
             variables.input && variables.input.userAgentJson) {
@@ -653,7 +655,11 @@ BROWSER_GRAPHQL_SCRIPT = r"""async request => {
         } catch (_) {
             body = null;
         }
-        return {status: response.status, body};
+        return {
+            status: response.status,
+            body,
+            elapsedMs: performance.now() - startedAt,
+        };
     } finally {
         clearTimeout(timeout);
     }
@@ -685,10 +691,11 @@ BROWSER_UPCOMING_BOOKINGS_SCRIPT = r"""async request => {
 }"""
 
 
-# This is intentionally a single, pre-armed request.  It is installed while the
-# page is idle several seconds before the published opening time, then Chrome's
-# own event loop starts the same GraphQL mutation at the calculated moment.  That
-# removes the last Python -> CDP scheduling hop without multiplying requests.
+# This is one pre-armed reservation flow. It is installed while the page is idle
+# several seconds before the published opening time, then Chrome's own event loop
+# starts the GraphQL mutation at the calculated moment. A retry is permitted only
+# after Naver explicitly says the item is not open; every ambiguous or potentially
+# successful response stops the flow immediately.
 BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     const stateKey = "__pengucroNaverArmedSubmit";
     const existing = window[stateKey];
@@ -730,13 +737,21 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     }
     const delayMs = Math.max(0, Number(request.delayMs) || 0);
     const timeoutMs = Math.max(100, Number(request.timeoutMs) || 3000);
+    const maxAttempts = Math.max(1, Math.min(3, Number(request.maxAttempts) || 1));
+    const retryDelayMs = Math.max(0, Number(request.retryDelayMs) || 0);
+    const retryWindowMs = Math.max(
+        0, Math.min(350, Number(request.retryWindowMs) || 0));
+    const notOpenCodes = new Set(
+        (request.notOpenCodes || []).map(value => String(value || "")));
     const state = {
         id: String(request.armId || ""),
         status: "armed",
         armedAt: performance.now(),
         dueAt: performance.now() + delayMs,
         startedAt: 0,
+        lastStartedAt: 0,
         completedAt: 0,
+        attempts: 0,
         response: null,
         error: "",
         timer: 0,
@@ -744,6 +759,19 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     };
     window[stateKey] = state;
     const pause = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+    const isExplicitNotOpen = body => {
+        const booking = body && body.data && body.data.submitBooking;
+        if (booking && booking.bookingId) return false;
+        const errors = body && Array.isArray(body.errors) ? body.errors : [];
+        if (!errors.length || !errors[0] || typeof errors[0] !== "object") {
+            return false;
+        }
+        const first = errors[0];
+        const extensions = first.extensions && typeof first.extensions === "object"
+            ? first.extensions : {};
+        return [first.message, extensions.code, extensions.reason]
+            .some(value => notOpenCodes.has(String(value || "")));
+    };
     const run = async () => {
         try {
             // Timer wakeups can be a few milliseconds late.  Keep the final
@@ -756,27 +784,36 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
             if (state.status !== "armed") return;
             state.status = "submitting";
             state.startedAt = performance.now();
-            const controller = new AbortController();
-            state.controller = controller;
-            const timeout = setTimeout(() => controller.abort(), timeoutMs);
-            try {
-                const response = await fetch("/graphql?opName=submitBooking", {
-                    method: "POST",
-                    credentials: "include",
-                    signal: controller.signal,
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({
-                        operationName: "submitBooking",
-                        query: request.query,
-                        variables: {input},
-                    }),
-                });
-                let body = null;
-                try { body = await response.json(); } catch (_) {}
-                state.response = {status: response.status, body};
-            } finally {
-                clearTimeout(timeout);
-                state.controller = null;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                if (attempt > 1 &&
+                        performance.now() - state.startedAt > retryWindowMs) break;
+                state.attempts = attempt;
+                state.lastStartedAt = performance.now();
+                const controller = new AbortController();
+                state.controller = controller;
+                const timeout = setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                    const response = await fetch("/graphql?opName=submitBooking", {
+                        method: "POST",
+                        credentials: "include",
+                        signal: controller.signal,
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({
+                            operationName: "submitBooking",
+                            query: request.query,
+                            variables: {input},
+                        }),
+                    });
+                    let body = null;
+                    try { body = await response.json(); } catch (_) {}
+                    state.response = {status: response.status, body};
+                    if (!isExplicitNotOpen(body) || attempt >= maxAttempts) break;
+                    if (performance.now() - state.startedAt >= retryWindowMs) break;
+                } finally {
+                    clearTimeout(timeout);
+                    state.controller = null;
+                }
+                await pause(retryDelayMs);
             }
             state.status = "complete";
         } catch (error) {
@@ -801,7 +838,9 @@ BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
         armedAt: Number(state.armedAt) || 0,
         dueAt: Number(state.dueAt) || 0,
         startedAt: Number(state.startedAt) || 0,
+        lastStartedAt: Number(state.lastStartedAt) || 0,
         completedAt: Number(state.completedAt) || 0,
+        attempts: Number(state.attempts) || 0,
     };
 }"""
 
@@ -921,8 +960,9 @@ class NaverBrowserSubmitter:
         self, operation_name: str, query: str, variables: dict[str, Any]
     ) -> Any:
         started = time.monotonic()
+        response: Any = None
         try:
-            return await asyncio.wait_for(
+            response = await asyncio.wait_for(
                 self.page.evaluate(
                     BROWSER_GRAPHQL_SCRIPT,
                     {
@@ -934,11 +974,20 @@ class NaverBrowserSubmitter:
                 ),
                 timeout=self.timeout_seconds + 0.25,
             )
+            return response
         finally:
             elapsed = time.monotonic() - started
-            self.last_rtt = elapsed
-            if operation_name != "submitBooking" and 0.005 <= elapsed <= 3.0:
-                self.safe_rtt_samples.append(elapsed)
+            measured = elapsed
+            if isinstance(response, dict):
+                try:
+                    browser_elapsed = float(response.get("elapsedMs")) / 1000
+                except (TypeError, ValueError):
+                    browser_elapsed = 0.0
+                if 0.005 <= browser_elapsed <= 3.0:
+                    measured = browser_elapsed
+            self.last_rtt = measured
+            if operation_name != "submitBooking" and 0.005 <= measured <= 3.0:
+                self.safe_rtt_samples.append(measured)
                 del self.safe_rtt_samples[:-8]
 
     async def fetch_account(self) -> NaverAccount:
@@ -1052,7 +1101,7 @@ class NaverBrowserSubmitter:
         )
 
     async def arm_submit_at(self, payload: dict[str, Any], delay_seconds: float) -> str:
-        """Arm exactly one browser-internal submit and return its opaque id."""
+        """Arm one flow; retry only after an exact server NOT_OPEN response."""
         arm_id = f"naver-{time.monotonic_ns()}"
         try:
             response = await asyncio.wait_for(
@@ -1064,6 +1113,10 @@ class NaverBrowserSubmitter:
                         "query": SUBMIT_BOOKING_MUTATION,
                         "delayMs": round(max(0.0, float(delay_seconds)) * 1000),
                         "timeoutMs": round(self.timeout_seconds * 1000),
+                        "maxAttempts": 3,
+                        "retryDelayMs": 10,
+                        "retryWindowMs": 350,
+                        "notOpenCodes": sorted(SUBMIT_NOT_OPEN_CODES),
                     },
                 ),
                 timeout=1.5,
@@ -1092,7 +1145,14 @@ class NaverBrowserSubmitter:
             ), None
         status = str(state.get("status") or "error")
         timing = {}
-        for key in ("armedAt", "dueAt", "startedAt", "completedAt"):
+        for key in (
+            "armedAt",
+            "dueAt",
+            "startedAt",
+            "lastStartedAt",
+            "completedAt",
+            "attempts",
+        ):
             value = state.get(key)
             if isinstance(value, (int, float)):
                 timing[key] = float(value)

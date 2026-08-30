@@ -463,10 +463,10 @@ class NaverEngine(BaseEngine):
     API_BROWSER_ARM_MIN_SECONDS = 0.30
     API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
     API_BROWSER_ARM_STATUS_SECONDS = 0.025
-    # Successful field evidence showed that a request displayed 64 ms before the
-    # boundary could create the exact requested hold even when RT47 was returned.
-    # Target a small pre-open arrival window instead of intentionally arriving
-    # after competitors.  The final request remains exactly one mutation.
+    # Field evidence shows that an aggressively early request can create the
+    # requested hold even when the outer GraphQL wrapper later returns RT47.
+    # Keep the estimated arrival ahead of the boundary; the browser-internal
+    # flow handles only an exact NOT_OPEN reply without adding a competing POST.
     API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS = 0.060
     API_SEND_MIN_LEAD_SECONDS = 0.060
     API_SEND_MAX_LEAD_SECONDS = 0.250
@@ -1825,14 +1825,6 @@ class NaverEngine(BaseEngine):
             transport_rtt = min(transport_samples)
         else:
             transport_rtt = 0.10
-        one_way = transport_rtt / 2
-        lead = min(
-            self.API_SEND_MAX_LEAD_SECONDS,
-            max(
-                self.API_SEND_MIN_LEAD_SECONDS,
-                one_way + self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS,
-            ),
-        )
         precision = 0.0
         if self.clock is not None:
             try:
@@ -1842,9 +1834,17 @@ class NaverEngine(BaseEngine):
                 )
             except (TypeError, ValueError):
                 precision = 0.0
+        one_way = transport_rtt / 2
+        lead = min(
+            self.API_SEND_MAX_LEAD_SECONDS,
+            max(
+                self.API_SEND_MIN_LEAD_SECONDS,
+                one_way + self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS,
+            ),
+        )
         self._last_api_lead_detail = (
             f"최저 RTT {transport_rtt * 1000:.0f}ms · "
-            f"서버 도착 목표 -{self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS * 1000:.0f}ms · "
+            f"서버 선점 도착 목표 -{self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS * 1000:.0f}ms · "
             f"시계 오차 {precision * 1000:.0f}ms"
         )
         return lead
@@ -2084,7 +2084,7 @@ class NaverEngine(BaseEngine):
         self._api_submit_state = "inflight"
         self.log(
             f"[정보] 브라우저 내부 API 제출 예약 · 오픈 대비 {-lead:+.3f}초 · "
-            f"{self._last_api_lead_detail} · 단일 요청으로 대기합니다.",
+            f"{self._last_api_lead_detail} · 단일 선점 흐름으로 대기합니다.",
             "warning",
         )
         due = time.monotonic() + delay
@@ -2114,10 +2114,14 @@ class NaverEngine(BaseEngine):
                 if isinstance(due_at, (int, float)) and isinstance(started_at, (int, float)):
                     lateness_ms = float(started_at) - float(due_at)
                     dispatch_detail = f" · 실제 발사 오차 {lateness_ms:+.1f}ms"
+                attempts = timing.get("attempts")
+                attempt_detail = ""
+                if isinstance(attempts, (int, float)) and attempts > 1:
+                    attempt_detail = f" · 명시적 미오픈 재시도 포함 {int(attempts)}회"
                 if elapsed_ms is not None:
                     self.log(
                         f"[정보] 브라우저 내부 API 제출 응답 · {result.outcome} · "
-                        f"RTT {elapsed_ms:.0f}ms{dispatch_detail}",
+                        f"RTT {elapsed_ms:.0f}ms{dispatch_detail}{attempt_detail}",
                         "success" if result.outcome == SubmitOutcome.SUCCESS else "info",
                     )
                 outcome, detail = await self._handle_api_submit_result(

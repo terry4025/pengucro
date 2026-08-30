@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v668_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.68")
+
+    assert note is not None
+    assert note.changes == (
+        "네이버 브라우저 실제 통신 지연 기준으로 선점 제출 시각 정밀 보정",
+        "네이버 명시적 미오픈 응답에만 브라우저 내부 즉시 재시도",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v667_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.67")
 

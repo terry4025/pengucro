@@ -371,6 +371,13 @@ class DelayedPage(FakePage):
         return await super().evaluate(script, argument)
 
 
+class BrowserTimedPage(DelayedPage):
+    async def evaluate(self, script, argument=None):
+        response = await super().evaluate(script, argument)
+        response["elapsedMs"] = 8.0
+        return response
+
+
 class ArmedPage:
     def __init__(self):
         self.calls = []
@@ -390,7 +397,9 @@ class ArmedPage:
                 "armedAt": 800,
                 "dueAt": 995,
                 "startedAt": 1000,
+                "lastStartedAt": 1010,
                 "completedAt": 1042,
+                "attempts": 2,
                 "error": "",
             }
         return True
@@ -581,6 +590,23 @@ def test_browser_submitter_measures_the_actual_browser_round_trip():
     assert submitter.last_rtt >= 0.015
 
 
+def test_browser_submitter_prefers_in_page_rtt_over_cdp_elapsed_time():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = BrowserTimedPage({"data": {"account": {
+        "isLoggedIn": True,
+        "csrfToken": "csrf-secret",
+        "isSmsAlarm": False,
+    }}})
+    submitter = NaverBrowserSubmitter(page)
+
+    account = asyncio.run(submitter.fetch_account())
+
+    assert account.is_logged_in is True
+    assert submitter.last_rtt == 0.008
+    assert submitter.safe_rtt_samples == [0.008]
+
+
 def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
     from engines.naver_submit import NaverBrowserSubmitter
 
@@ -600,8 +626,14 @@ def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
     assert submitter.last_rtt == 0.042
     assert submitter.last_armed_timing["dueAt"] == 995
     assert submitter.last_armed_timing["startedAt"] == 1000
+    assert submitter.last_armed_timing["lastStartedAt"] == 1010
+    assert submitter.last_armed_timing["attempts"] == 2
     assert page.calls[0]["delayMs"] == 125
     assert page.calls[0]["input"]["slotId"] == "1331382668"
+    assert page.calls[0]["maxAttempts"] == 3
+    assert page.calls[0]["retryDelayMs"] == 10
+    assert page.calls[0]["retryWindowMs"] == 350
+    assert page.calls[0]["notOpenCodes"] == ["BizItem is not opened."]
 
 
 def test_browser_submitter_classifies_the_resolver_reason():
