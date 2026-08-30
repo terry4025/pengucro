@@ -42,7 +42,6 @@ import requests
 
 from engines import browser_session
 from engines.base_engine import BaseEngine
-from engines.keyescape_coordination import SharedServerClock, SharedSlotLookup
 from engines.keyescape_schedule_cache import remember_slot_template
 from engines.server_clock import ServerClock
 from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
@@ -268,7 +267,6 @@ class KeyescapeEngine(BaseEngine):
         self.clock = ServerClock(
             f"{self.site_url}/reservation.php", session=self._session, log=self.log
         )
-        self._clock_share = SharedServerClock(self.site_url.lower())
         self._preferred_end_day = 0
         self._last_slot_state = ""
         # Snapshot of the step 2 bootstrap form, used to rebuild the screen if
@@ -323,12 +321,10 @@ class KeyescapeEngine(BaseEngine):
         return session
 
     def _sync_server_clock(self, announce=False):
-        return self._clock_share.sync(
-            self.clock,
-            announce=bool(announce),
-            max_age=5.0,
-            wait_timeout=3.0,
-        )
+        # Each executable owns its clock. Standby pages in this reservation run
+        # share the same ServerClock object in memory, but unrelated programs
+        # never touch a common clock-state file.
+        return self.clock.sync(announce=bool(announce))
 
     @staticmethod
     def _captcha_profile_id(client_key: str) -> str:
@@ -1039,49 +1035,7 @@ class KeyescapeEngine(BaseEngine):
     async def _fetch_coordinated_live_slots(
         self, target_date, zizum_num, theme_num, target_time
     ):
-        """Share one public timetable response across local Pengucro processes."""
-        share = self._slot_share
-        if share is None:
-            return await self._fetch_live_slots(
-                target_date, zizum_num, theme_num, target_time
-            )
-        if share.owner:
-            share.mark_started()
-            slots = await self._fetch_live_slots(
-                target_date, zizum_num, theme_num, target_time
-            )
-            if slots:
-                async def publish_shared_rows():
-                    try:
-                        await asyncio.to_thread(share.publish, slots)
-                    except OSError:
-                        pass
-
-                self._track_slot_background_task(
-                    asyncio.create_task(publish_shared_rows())
-                )
-            return slots
-
-        wait_started = time.monotonic()
-        slots = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: share.wait_for_result(self.SHARED_SLOT_WAIT_SECONDS),
-        )
-        waited = time.monotonic() - wait_started
-        if slots:
-            state = self._live_slot_state or {}
-            state["last_rtt"] = waited
-            self._trace_timing(
-                f"다른 실행의 동일 시간표 응답 수신 · 공유 대기 {waited * 1000.0:.1f}ms"
-            )
-            return slots
-
-        self._trace_timing(
-            "공유 시간표 응답이 없어 이 실행의 독립 조회로 전환",
-            "warning",
-        )
-        # Do not pay the rendezvous timeout again on later retries.
-        self._slot_share = None
+        """Read in this process; only pages in this run share the result state."""
         return await self._fetch_live_slots(
             target_date, zizum_num, theme_num, target_time
         )
@@ -1149,16 +1103,6 @@ class KeyescapeEngine(BaseEngine):
             f"{'완료' if browser_warmed else '실패 · 기존 연결로 계속 진행'}",
             "info" if browser_warmed else "warning",
         )
-        if self._slot_share is not None:
-            self.log(
-                "[정보] 동일 지점·테마·날짜 시간표 "
-                + (
-                    "대표 조회 실행으로 준비했습니다."
-                    if self._slot_share.owner
-                    else "다른 실행의 대표 조회 결과를 공유받습니다."
-                ),
-                "info",
-            )
 
     # NOTE: the endDay flag is sent as the site sends it, but it was measured to
     # make no difference at all -- responses for endDay=0 and endDay=1 were
@@ -1358,7 +1302,6 @@ class KeyescapeEngine(BaseEngine):
         worker.stop_event = self.stop_event
         worker.listener_stop = self.listener_stop
         worker.clock = self.clock
-        worker._clock_share = self._clock_share
         worker.open_at = self.open_at
         worker._page_index = page_index
         worker._page_count = self._page_count
@@ -1571,13 +1514,6 @@ class KeyescapeEngine(BaseEngine):
             "zizum_num": zizum_num,
             "theme_num": theme_num,
         }
-        if self.open_at is not None:
-            share_key = (
-                f"{self.site_url.lower()}|{zizum_num}|{theme_num}|{target_date}"
-            )
-            self._slot_share = SharedSlotLookup(share_key, self.open_at)
-            self._slot_share.prepare()
-
         async with async_playwright() as playwright:
             browser, context, chrome_session, owns_browser = await self._open_browser(playwright)
             if browser is None or context is None:
@@ -2884,9 +2820,22 @@ class KeyescapeEngine(BaseEngine):
                 )
             ):
                 last_resync = time.monotonic()
-                await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: self._sync_server_clock(announce=False)
-                )
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: self._sync_server_clock(announce=False)
+                    )
+                except Exception as exc:
+                    # A final resync is an accuracy refinement. The existing
+                    # server mapping remains usable and a refinement failure
+                    # must never terminate the only prepared reservation page.
+                    self._clock_sync_enabled = False
+                    self._log_throttled(
+                        "clock_resync_error",
+                        "[경고] 최종 서버 시각 재동기화에 실패해 기존 보정값으로 계속합니다: "
+                        f"{type(exc).__name__}",
+                        "warning",
+                        interval=30.0,
+                    )
                 remaining = (
                     self.clock.seconds_until(self.open_at)
                     if self.open_at is not None else 0.0

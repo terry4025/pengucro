@@ -134,7 +134,6 @@ class KeyescapeEngine(_ObservedKeyescapeEngine):
         worker.stop_event = self.stop_event
         worker.listener_stop = self.listener_stop
         worker.clock = self.clock
-        worker._clock_share = self._clock_share
         worker.open_at = self.open_at
         worker._page_index = page_index
         worker._page_count = self._page_count

@@ -13,7 +13,11 @@ from engines.keyescape_engine import (
     KST,
     KeyescapeEngine,
 )
-from engines.keyescape_coordination import SharedServerClock, SharedSlotLookup
+from engines.keyescape_coordination import (
+    SharedServerClock,
+    SharedSlotLookup,
+    _atomic_json,
+)
 from engines.yescaptcha_client import DEFAULT_SOFT_ID
 from pengucro.storage import save_json
 
@@ -1015,22 +1019,53 @@ def test_shared_server_clock_reuses_one_local_measurement(monkeypatch, tmp_path)
     assert second_clock.shared_announced is True
 
 
-def test_coordinated_slot_read_uses_other_process_result_without_network():
+def test_atomic_clock_snapshot_retries_transient_windows_access_denied(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "clock.json"
+    real_replace = __import__("os").replace
+    calls = []
+
+    def flaky_replace(source, destination):
+        calls.append((source, destination))
+        if len(calls) < 3:
+            raise PermissionError(5, "access denied")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("engines.keyescape_coordination.os.replace", flaky_replace)
+    monkeypatch.setattr("engines.keyescape_coordination.time.sleep", lambda _delay: None)
+
+    _atomic_json(target, {"ok": True})
+
+    assert len(calls) == 3
+    assert target.read_text(encoding="utf-8") == '{"ok":true}'
+
+
+def test_engine_server_clock_sync_is_process_local():
+    engine = make_engine()
+    calls = []
+
+    class Clock:
+        def sync(self, announce=False):
+            calls.append(announce)
+            return True
+
+    engine.clock = Clock()
+
+    assert engine._sync_server_clock(announce=True) is True
+    assert calls == [True]
+
+
+def test_live_slot_read_is_isolated_from_other_process_share_state():
     engine = make_engine()
     rows = _template_slots()
     calls = []
 
-    class Share:
-        owner = False
-
-        def wait_for_result(self, _timeout):
-            return rows
-
     async def network(*_args):
         calls.append(True)
-        return []
+        return rows
 
-    engine._slot_share = Share()
+    engine._slot_share = object()
     engine._live_slot_state = {}
     engine._fetch_live_slots = network
 
@@ -1039,7 +1074,7 @@ def test_coordinated_slot_read_uses_other_process_result_without_network():
     ))
 
     assert result == rows
-    assert calls == []
+    assert calls == [True]
 
 
 def test_browser_submission_connection_prewarm_uses_same_origin_head():

@@ -168,6 +168,28 @@ def main() -> int:
     log_path = logging_setup.configure()
     LOGGER.info("Pengucro starting (log file: %s)", log_path)
 
+    # A fresh installation has no timetable history. Import only missing,
+    # integrity-checked public Keyescape rows bundled with this exact build;
+    # the signed update manifest covers the executable containing this seed.
+    try:
+        from engines.keyescape_schedule_cache import merge_bundled_slot_templates
+
+        seed_result = merge_bundled_slot_templates()
+        if seed_result.imported:
+            LOGGER.info(
+                "Bundled Keyescape timetable seed imported (%s rows)",
+                seed_result.imported,
+            )
+        elif seed_result.available and seed_result.rejected:
+            LOGGER.warning("Bundled Keyescape timetable seed was rejected")
+    except Exception as exc:
+        # Seed data only accelerates the guarded fast path. A packaging or
+        # local-cache issue must not prevent the application from starting.
+        LOGGER.warning(
+            "Bundled Keyescape timetable seed could not be imported (%s)",
+            type(exc).__name__,
+        )
+
     import customtkinter as ctk
 
     from ui.main_window import MainWindow

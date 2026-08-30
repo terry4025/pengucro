@@ -2,6 +2,7 @@ from datetime import date
 
 from engines.keyescape_engine import KeyescapeEngine
 from engines.keyescape_timetable_collector import (
+    KeyescapeAutoCollectionLease,
     KeyescapeThemeTarget,
     KeyescapeTimetableCollector,
 )
@@ -76,3 +77,36 @@ def test_collector_reports_unpublished_rows_without_treating_them_as_errors(
     assert result.saved_count == 0
     assert result.unavailable_count == 1
     assert result.failed_count == 0
+
+
+def test_auto_collection_lease_allows_only_one_process_and_records_success(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    first = KeyescapeAutoCollectionLease(interval_seconds=3600)
+    second = KeyescapeAutoCollectionLease(interval_seconds=3600)
+
+    assert first.acquire() is True
+    assert second.acquire() is False
+
+    first.release(success=True)
+    assert second.acquire() is False
+
+
+def test_cancelled_auto_collection_stops_before_public_requests(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    collector = KeyescapeTimetableCollector(max_workers=1)
+    cancelled = __import__("threading").Event()
+    cancelled.set()
+    monkeypatch.setattr(
+        collector,
+        "_discover_catalog",
+        lambda _cancel: (12, []),
+    )
+
+    result = collector.collect(cancel_event=cancelled)
+
+    assert result.cancelled is True
+    assert result.request_count == 0

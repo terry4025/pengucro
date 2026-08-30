@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 import urllib.parse
@@ -12,7 +14,98 @@ from datetime import date, datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 
+from engines.keyescape_coordination import _pid_alive
 from engines.keyescape_schedule_cache import remember_slot_template
+from pengucro.storage import data_path, load_json, save_json
+
+
+AUTO_COLLECTION_STATE_FILE = "keyescape_auto_collection.json"
+AUTO_COLLECTION_CLAIM_FILE = "keyescape_auto_collection.claim"
+AUTO_COLLECTION_INTERVAL_SECONDS = 6 * 60 * 60
+AUTO_COLLECTION_CLAIM_STALE_SECONDS = 15 * 60
+_CANCELLED = object()
+
+
+class KeyescapeAutoCollectionLease:
+    """Allow only one local program to run the low-priority full collector."""
+
+    def __init__(self, interval_seconds: float = AUTO_COLLECTION_INTERVAL_SECONDS):
+        self.interval_seconds = max(60.0, float(interval_seconds))
+        self.claim_path = data_path(AUTO_COLLECTION_CLAIM_FILE)
+        self.acquired = False
+
+    def is_due(self, now: float | None = None) -> bool:
+        state = load_json(AUTO_COLLECTION_STATE_FILE, {})
+        try:
+            last_success = float(state.get("last_success", 0.0))
+        except (AttributeError, TypeError, ValueError):
+            last_success = 0.0
+        return float(time.time() if now is None else now) - last_success >= self.interval_seconds
+
+    def acquire(self) -> bool:
+        if not self.is_due():
+            return False
+        self.claim_path.parent.mkdir(parents=True, exist_ok=True)
+        for _attempt in range(2):
+            try:
+                handle = os.open(
+                    self.claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                )
+            except FileExistsError:
+                try:
+                    claim = json.loads(self.claim_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    claim = {}
+                try:
+                    pid = int(claim.get("pid") or 0)
+                    created = float(claim.get("created") or 0.0)
+                except (AttributeError, TypeError, ValueError):
+                    pid, created = 0, 0.0
+                stale = time.time() - created > AUTO_COLLECTION_CLAIM_STALE_SECONDS
+                if _pid_alive(pid) and not stale:
+                    return False
+                try:
+                    self.claim_path.unlink()
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                return False
+            try:
+                os.write(
+                    handle,
+                    json.dumps(
+                        {"pid": os.getpid(), "created": time.time()},
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                )
+            finally:
+                os.close(handle)
+            self.acquired = True
+            # Another process may have completed between our due check and
+            # claim acquisition. Avoid repeating a full-site read in that case.
+            if not self.is_due():
+                self.release(success=False)
+                return False
+            return True
+        return False
+
+    def release(self, *, success: bool) -> None:
+        if not self.acquired:
+            return
+        if success:
+            try:
+                save_json(
+                    AUTO_COLLECTION_STATE_FILE,
+                    {"last_success": time.time(), "pid": os.getpid()},
+                )
+            except OSError:
+                pass
+        try:
+            self.claim_path.unlink()
+        except OSError:
+            pass
+        self.acquired = False
 
 
 @dataclass(frozen=True)
@@ -46,6 +139,7 @@ class KeyescapeCacheResult:
     unavailable_count: int
     failed_count: int
     coverage: dict[str, int]
+    cancelled: bool = False
 
 
 class KeyescapeTimetableCollector:
@@ -122,7 +216,9 @@ class KeyescapeTimetableCollector:
                     time.sleep(0.5)
         raise RuntimeError(type(last_error).__name__ if last_error else "request failed")
 
-    def _discover_catalog(self) -> tuple[int, list[KeyescapeThemeTarget]]:
+    def _discover_catalog(
+        self, cancel_event: threading.Event | None = None
+    ) -> tuple[int, list[KeyescapeThemeTarget]]:
         session = self._new_session()
         response = session.get(self.reservation_url, timeout=self.timeout)
         response.raise_for_status()
@@ -134,6 +230,8 @@ class KeyescapeTimetableCollector:
         ]
         targets = []
         for branch_name, branch_id in options:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             payload = self._post(session, {
                 "t": "get_theme_info_list",
                 "zizum_num": branch_id,
@@ -188,10 +286,22 @@ class KeyescapeTimetableCollector:
             return None
         return list(payload["data"])
 
-    def collect(self, progress_callback=None) -> KeyescapeCacheResult:
+    def collect(
+        self, progress_callback=None, cancel_event: threading.Event | None = None
+    ) -> KeyescapeCacheResult:
         callback = progress_callback if callable(progress_callback) else lambda _value: None
         callback(KeyescapeCacheProgress(phase="catalog"))
-        branch_count, targets = self._discover_catalog()
+        branch_count, targets = (
+            self._discover_catalog()
+            if cancel_event is None
+            else self._discover_catalog(cancel_event)
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return KeyescapeCacheResult(
+                branch_count, len(targets), 0, 0, 0, 0,
+                {group: 0 for group in ("A", "B", "C", "D")},
+                cancelled=True,
+            )
         if not targets:
             raise RuntimeError("키이스케이프 테마 목록을 찾지 못했습니다.")
         server_day = self._server_day(targets[0])
@@ -211,12 +321,17 @@ class KeyescapeTimetableCollector:
         completed = 0
         covered_themes: set[tuple[str, str, str]] = set()
 
+        def fetch_if_active(target, source_day):
+            if cancel_event is not None and cancel_event.is_set():
+                return _CANCELLED
+            return self._fetch_slots(target, source_day)
+
         with ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix="KeyescapeCache",
         ) as executor:
             futures = {
-                executor.submit(self._fetch_slots, target, source_day):
+                executor.submit(fetch_if_active, target, source_day):
                 (target, source_day)
                 for target, source_day in tasks
             }
@@ -224,7 +339,9 @@ class KeyescapeTimetableCollector:
                 target, source_day = futures[future]
                 try:
                     slots = future.result()
-                    if slots is None:
+                    if slots is _CANCELLED:
+                        stored = False
+                    elif slots is None:
                         stored = False
                         unavailable += 1
                     else:
@@ -264,4 +381,5 @@ class KeyescapeTimetableCollector:
                 group: sum(item[0] == group for item in covered_themes)
                 for group in ("A", "B", "C", "D")
             },
+            cancelled=bool(cancel_event is not None and cancel_event.is_set()),
         )

@@ -3,7 +3,11 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('icon.ico', '.'), ('app_icon.png', '.')],
+    datas=[
+        ('icon.ico', '.'),
+        ('app_icon.png', '.'),
+        ('keyescape_slot_templates_seed.json', '.'),
+    ],
     hiddenimports=[
         # Engines are selected by name at runtime in engines/registry.py, so
         # static analysis cannot see them.
@@ -91,7 +95,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로6.66_yescaptcha',
+    name='방탈출펭크로6.67_yescaptcha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

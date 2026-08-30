@@ -7,7 +7,10 @@ from ui.repaint import install_scroll_repaint_guard
 from ui.scrollable import SafeScrollableFrame
 from ui.update_dialog import UpdateDialog
 from engines.registry import EngineRegistry
-from engines.keyescape_timetable_collector import KeyescapeTimetableCollector
+from engines.keyescape_timetable_collector import (
+    KeyescapeAutoCollectionLease,
+    KeyescapeTimetableCollector,
+)
 from engines.catalog_providers import (
     builtin_site_configs,
     catalog_to_site_config,
@@ -990,6 +993,9 @@ class MainWindow(ctk.CTk):
         self.catalog_service = CatalogService(default_providers())
         self._catalog_refresh_running = False
         self._keyescape_cache_running = False
+        self._keyescape_cache_automatic = False
+        self._keyescape_cache_cancel_event = None
+        self._keyescape_auto_lease = None
         self._tripcom_refresh_after_id = None
         self._tripcom_refresh_failures = 0
         self._catalog_applied_counts = {}
@@ -1179,6 +1185,9 @@ class MainWindow(ctk.CTk):
 
         # Refresh all stale site catalogs after the UI is ready.
         self.after(200, self._start_catalog_auto_refresh)
+        # A fresh install has no historical timetable rows. Run one guarded,
+        # low-priority all-theme collection after normal startup work settles.
+        self.after(3000, self._start_keyescape_auto_cache_refresh)
         self._update_delete_button_state(saved_site)
 
         # Loading splash. Construction of the window is finished at this point,
@@ -1946,6 +1955,9 @@ class MainWindow(ctk.CTk):
     def _on_close(self):
         self._ui_polling = False
         self.is_sync_running = False
+        cancel_event = getattr(self, "_keyescape_cache_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
         self._cancel_clock_timer()
         trip_timer = getattr(self, "_tripcom_refresh_after_id", None)
         if trip_timer is not None:
@@ -2040,12 +2052,21 @@ class MainWindow(ctk.CTk):
             messagebox.showinfo("예약 시작", "사이트 정보 갱신이 끝난 뒤 예약을 시작해주세요.", parent=self)
             return
         if self._keyescape_cache_running:
-            messagebox.showinfo(
-                "예약 시작",
-                "키이스케이프 전체 시간표 저장이 끝난 뒤 예약을 시작해주세요.",
-                parent=self,
-            )
-            return
+            if self._keyescape_cache_automatic:
+                cancel_event = self._keyescape_cache_cancel_event
+                if cancel_event is not None:
+                    cancel_event.set()
+                self.log_panel.append_log(
+                    "[키이스케이프] 예약 실행을 우선해 자동 시간표 저장을 중단합니다.",
+                    "info",
+                )
+            else:
+                messagebox.showinfo(
+                    "예약 시작",
+                    "키이스케이프 전체 시간표 저장이 끝난 뒤 예약을 시작해주세요.",
+                    parent=self,
+                )
+                return
         selected_site = self.site_var.get()
         payload = reservation_data.to_engine_payload()
         # Register PII and API credentials before the first line belonging to
@@ -2238,7 +2259,7 @@ class MainWindow(ctk.CTk):
             elif kind == "keyescape_cache_progress":
                 self._handle_keyescape_cache_progress(event[1])
             elif kind == "keyescape_cache_done":
-                self._handle_keyescape_cache_done(event[1], event[2])
+                self._handle_keyescape_cache_done(*event[1:])
             elif kind == "server_sync":
                 self._apply_server_sync_result(*event[1:])
 
@@ -2306,6 +2327,49 @@ class MainWindow(ctk.CTk):
         self._tripcom_refresh_after_id = self.after(
             interval * 1000, self._start_catalog_auto_refresh
         )
+
+    def _start_keyescape_auto_cache_refresh(self):
+        if self.current_status in {"running", "stopping"} or self._engine_is_active():
+            self.after(5000, self._start_keyescape_auto_cache_refresh)
+            return
+        if self._catalog_refresh_running or self._keyescape_cache_running:
+            self.after(5000, self._start_keyescape_auto_cache_refresh)
+            return
+
+        lease = KeyescapeAutoCollectionLease()
+        if not lease.acquire():
+            return
+        collector = KeyescapeTimetableCollector("https://www.keyescape.com")
+        cancel_event = threading.Event()
+        self._keyescape_auto_lease = lease
+        self._keyescape_cache_cancel_event = cancel_event
+        self._keyescape_cache_automatic = True
+        self._keyescape_cache_running = True
+        self.form.set_keyescape_cache_state("공개 시간표 자동 저장 중...", busy=True)
+        self.log_panel.append_log(
+            "[키이스케이프] 빈 캐시 대비 전체 공개 시간표 자동 저장을 시작합니다.",
+            "info",
+        )
+
+        def progress(value):
+            self.engine_event_queue.put(("keyescape_cache_progress", value))
+
+        def worker():
+            try:
+                result = collector.collect(progress, cancel_event=cancel_event)
+                error = ""
+            except Exception as exc:
+                result = None
+                error = str(exc) or type(exc).__name__
+            self.engine_event_queue.put(
+                ("keyescape_cache_done", result, error, True)
+            )
+
+        threading.Thread(
+            target=worker,
+            name="KeyescapeAutoTimetableCollector",
+            daemon=True,
+        ).start()
 
     def _refresh_current_catalog(self):
         site_name = self.site_var.get()
@@ -2396,6 +2460,8 @@ class MainWindow(ctk.CTk):
         )
         collector = KeyescapeTimetableCollector(base_url)
         self._keyescape_cache_running = True
+        self._keyescape_cache_automatic = False
+        self._keyescape_cache_cancel_event = None
         self.form.set_keyescape_cache_state("지점·테마 확인 중...", busy=True)
         self.cta_btn.configure(state="disabled")
         self.site_dropdown.configure(state="disabled")
@@ -2416,7 +2482,7 @@ class MainWindow(ctk.CTk):
             except Exception as exc:
                 result = None
                 error = str(exc) or type(exc).__name__
-            self.engine_event_queue.put(("keyescape_cache_done", result, error))
+            self.engine_event_queue.put(("keyescape_cache_done", result, error, False))
 
         threading.Thread(
             target=worker,
@@ -2438,7 +2504,18 @@ class MainWindow(ctk.CTk):
             text = "시간표 준비 중..."
         self.form.set_keyescape_cache_state(text, busy=True)
 
-    def _handle_keyescape_cache_done(self, result, error):
+    def _handle_keyescape_cache_done(self, result, error, automatic=False):
+        lease = self._keyescape_auto_lease if automatic else None
+        if lease is not None:
+            lease.release(
+                success=bool(
+                    not error and result is not None and not result.cancelled
+                    and result.saved_count > 0
+                )
+            )
+        self._keyescape_auto_lease = None
+        self._keyescape_cache_cancel_event = None
+        self._keyescape_cache_automatic = False
         self._keyescape_cache_running = False
         if self.current_status not in {"running", "stopping"}:
             self.cta_btn.configure(state="normal")
@@ -2454,12 +2531,23 @@ class MainWindow(ctk.CTk):
         if error or result is None:
             self.form.set_keyescape_cache_state("저장 실패", busy=False)
             self.log_panel.append_log(
-                f"[키이스케이프] 전체 시간표 저장 실패: {error}", "error"
+                f"[키이스케이프] 전체 시간표 저장 실패: {error}",
+                "warning" if automatic else "error",
             )
+            if automatic:
+                return
             messagebox.showwarning(
                 "키이스케이프 시간표 저장",
                 f"전체 시간표를 저장하지 못했습니다.\n\n{error}",
                 parent=self,
+            )
+            return
+
+        if result.cancelled:
+            self.form.set_keyescape_cache_state("자동 저장 중단 · 예약 우선", busy=False)
+            self.log_panel.append_log(
+                "[키이스케이프] 예약 실행을 우선해 자동 시간표 저장을 중단했습니다.",
+                "info",
             )
             return
 
@@ -2477,6 +2565,8 @@ class MainWindow(ctk.CTk):
             f"[키이스케이프] 전체 시간표 저장 완료 · {summary} · {coverage}",
             "success" if result.saved_count else "warning",
         )
+        if automatic:
+            return
         messagebox.showinfo(
             "키이스케이프 시간표 저장",
             f"전체 공개 시간표 저장이 완료되었습니다.\n\n{summary}\n{coverage}",

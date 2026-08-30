@@ -9,6 +9,18 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v667_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.67")
+
+    assert note is not None
+    assert note.changes == (
+        "키이스케이프 전체 공개 시간표 자동 저장으로 빈 캐시 빠른 제출 지원",
+        "검증 시간표를 배포판에 포함해 신규 사용자 슬롯 ID 연동",
+        "여러 키이스케이프 프로그램의 시각·슬롯 조회를 창별로 격리",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v657_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.57")
 

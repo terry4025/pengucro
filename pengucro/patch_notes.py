@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.67",
+        changes=(
+            "키이스케이프 전체 공개 시간표 자동 저장으로 빈 캐시 빠른 제출 지원",
+            "검증 시간표를 배포판에 포함해 신규 사용자 슬롯 ID 연동",
+            "여러 키이스케이프 프로그램의 시각·슬롯 조회를 창별로 격리",
+        ),
+    ),
+    PatchNote(
         version="6.66",
         changes=(
             "네이버 예약 요청이 오픈 직전 서버에 먼저 도착하도록 실측 기준 제출 시각 개선",

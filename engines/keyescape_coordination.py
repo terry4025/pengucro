@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +20,7 @@ SHARE_DIR_NAME = "keyescape-slot-share"
 CLOCK_DIR_NAME = "keyescape-clock-share"
 RESULT_LIFETIME_SECONDS = 12.0
 CLOCK_CLAIM_STALE_SECONDS = 8.0
+ATOMIC_REPLACE_DELAYS = (0.0, 0.004, 0.012, 0.03)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -66,12 +68,34 @@ def _read_json(path: Path) -> dict:
 
 
 def _atomic_json(path: Path, value: dict) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
+    # Windows refuses ReplaceFile/MoveFileEx while another process happens to
+    # have the destination open without delete sharing.  Server-clock readers
+    # are intentionally lock-free, so retry the very small replacement window
+    # instead of letting a non-essential sharing optimisation abort a booking.
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        last_error = None
+        for delay in ATOMIC_REPLACE_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
 
 
 class SharedSlotLookup:
@@ -203,6 +227,8 @@ class SharedServerClock:
                 except OSError:
                     return False
                 continue
+            except OSError:
+                return False
             try:
                 payload = json.dumps(
                     {"pid": os.getpid(), "created": time.time()},
@@ -232,10 +258,15 @@ class SharedServerClock:
                 ok = bool(clock.sync(announce=announce))
                 snapshot = clock.snapshot() if ok else {}
                 if snapshot:
-                    _atomic_json(
-                        self.state_path,
-                        {"pid": os.getpid(), "snapshot": snapshot},
-                    )
+                    try:
+                        _atomic_json(
+                            self.state_path,
+                            {"pid": os.getpid(), "snapshot": snapshot},
+                        )
+                    except OSError:
+                        # The local clock is already synchronised. Sharing its
+                        # snapshot is optional and must never fail the page.
+                        pass
                 return ok
             finally:
                 try:

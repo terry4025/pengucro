@@ -27,6 +27,7 @@ from pengucro.patch_notes import PATCH_NOTES
 MainWindow._start_jigubyeol_theme_fetcher = lambda self: None
 MainWindow._start_zeroworld_theme_fetcher = lambda self: None
 MainWindow._start_catalog_auto_refresh = lambda self: None
+MainWindow._start_keyescape_auto_cache_refresh = lambda self: None
 
 class TestUIComponents(unittest.TestCase):
     @classmethod
