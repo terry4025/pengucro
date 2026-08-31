@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.71",
+        changes=(
+            "둠이스케이프 주문 생성 후 해당 프로그램의 불필요한 시간표 조회 중단",
+            "둠이스케이프 서버 지연 시 생성된 주문의 결제 준비 확인 강화",
+        ),
+    ),
+    PatchNote(
         version="6.70",
         changes=(
             "YesCaptcha API 키를 암호화 저장해 버전 업데이트 후에도 유지",

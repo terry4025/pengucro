@@ -9,6 +9,17 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v671_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.71")
+
+    assert note is not None
+    assert note.changes == (
+        "둠이스케이프 주문 생성 후 해당 프로그램의 불필요한 시간표 조회 중단",
+        "둠이스케이프 서버 지연 시 생성된 주문의 결제 준비 확인 강화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v669_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.69")
 

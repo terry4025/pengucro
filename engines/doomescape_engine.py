@@ -104,7 +104,7 @@ class DoomEscapeEngine(BaseEngine):
     # independent scan sessions; 16+ consistently regressed.
     MAX_SCAN_SESSIONS = 10
     ORDER_POST_TIMEOUT_SECONDS = 20.0
-    ORDER_FOLLOWUP_TIMEOUT_SECONDS = 12.0
+    ORDER_FOLLOWUP_TIMEOUT_SECONDS = 20.0
     ORDER_CONFIRM_TIMEOUT_SECONDS = 20.0
     SAFE_READ_RETRY_ATTEMPTS = 3
     ORDER_RECOVERY_ATTEMPTS = 6
@@ -174,6 +174,7 @@ class DoomEscapeEngine(BaseEngine):
         self._submit_keepalive_task = None
         self._submit_keepalive_stop = None
         self._submit_keepalive_cycles = 0
+        self._scan_stop_event = threading.Event()
         self._transport_traced_session_ids = set()
         self._open_anchor_epoch = None
         self._server_clock_offsets = []
@@ -1417,7 +1418,7 @@ class DoomEscapeEngine(BaseEngine):
         if task_idx == 0:
             self.log("[정보] 둠이스케이프 독립 감시 루프를 시작합니다.", "info")
 
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not self._scan_stop_event.is_set():
             current_stage = "시간표 조회"
             slot_id = ""
             order_id = ""
@@ -1429,7 +1430,7 @@ class DoomEscapeEngine(BaseEngine):
                 async with self._scan_inflight:
                     if self.scan_governor is not None:
                         await self.scan_governor.wait_turn(self.stop_event)
-                    if self.stop_event.is_set():
+                    if self.stop_event.is_set() or self._scan_stop_event.is_set():
                         break
                     # Count the network dispatch itself, including requests
                     # that later time out.  The top status badge represents
@@ -1633,6 +1634,17 @@ class DoomEscapeEngine(BaseEngine):
                         num = order_id
                         self.log(
                             f"[{worker_label}] [주문 생성] slotId={slot_id} · orderId={num}",
+                            "info",
+                        )
+                        # The slot is already represented by a concrete order.
+                        # Continuing the high-rate timetable scan only competes
+                        # with the read-only checkout follow-up on an overloaded
+                        # site.  Stop sibling scan workers without marking the
+                        # winning checkout task itself as cancelled.
+                        self._scan_stop_event.set()
+                        self.log(
+                            f"[{worker_label}] [정보] orderId={num} 확인 · "
+                            "결제 준비 연결을 보호하기 위해 나머지 시간표 감시를 중단합니다.",
                             "info",
                         )
                         kcp_url = f"{self.base_url}/layout/res/home.php?go=rev.kcp&num={num}"
@@ -1925,6 +1937,7 @@ class DoomEscapeEngine(BaseEngine):
         self._last_unavailable_server_epoch = None
         self._last_publish_server_epoch = None
         self._submit_keepalive_cycles = 0
+        self._scan_stop_event.clear()
         self._submit_keepalive_stop = asyncio.Event()
         self._submit_keepalive_task = None
         self._branch_id = str(reservation_data.get("branch", "3") or "3")

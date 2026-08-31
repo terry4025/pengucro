@@ -95,6 +95,17 @@ def test_list_timeout_keeps_fast_lane_and_periodic_slow_recovery_lane():
     assert observed == [4.5, 1.25, 1.25, 1.25, 4.5, 1.25, 1.25, 1.25]
 
 
+def test_order_scan_stop_is_isolated_to_each_engine_instance():
+    first = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    second = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+
+    first._scan_stop_event.set()
+
+    assert first._scan_stop_event.is_set()
+    assert not second._scan_stop_event.is_set()
+    assert not second.stop_event.is_set()
+
+
 def test_governor_does_not_reserve_idle_dispatches_far_ahead():
     async def run():
         governor = DoomScanGovernor(2, 20, 1, 5)
@@ -381,11 +392,13 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     class SubmitSession:
         def __init__(self):
             self.post_count = 0
+            self.engine = None
 
         def get(self, url, **_kwargs):
             if "go=rev.make.input" in url:
                 return Response('<input type="hidden" name="price3" value="126000">')
             if "go=rev.kcp" in url:
+                assert self.engine._scan_stop_event.is_set()
                 return Response('<input name="ck_code" value="777">')
             if "rev.make.mutong.php" in url:
                 return Response(
@@ -419,6 +432,7 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     engine._slot_wait_started_at = time.time()
     engine.session_pool = [scan_session, submit_session]
     engine._submit_session = submit_session
+    submit_session.engine = engine
     async def forbidden_prestage(*_args, **_kwargs):
         raise AssertionError("공개된 목표 슬롯보다 사전 준비를 먼저 기다리면 안 됩니다")
 
@@ -445,6 +459,8 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     assert all(reason == "둠이스케이프 시간표 조회" for _count, reason in status_updates)
     assert submit_session.post_count == 1
     assert successes == [True]
+    assert engine._scan_stop_event.is_set()
+    assert any("나머지 시간표 감시를 중단" in message for message, _level in logs)
     assert any("전체 정지 없이 독립 감시" in message for message, _level in logs)
     assert any("예약 최종 완료" in message for message, _level in logs)
 
@@ -531,6 +547,102 @@ def test_async_order_timeout_stops_without_duplicate_post(monkeypatch):
     assert submit_session.post_count == 1
     assert engine.stop_event.is_set()
     assert any("중복 방지 정지" in message for message, _level in logs)
+
+
+def test_checkout_followup_timeout_stops_scans_without_duplicate_order(monkeypatch):
+    class Response:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body.encode("utf-8")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def read(self):
+            return self.body
+
+        async def text(self, **_kwargs):
+            return self.body.decode("utf-8")
+
+    class TimeoutResponse:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    target_html = (
+        '<input type="hidden" name="rev_days" value="2026-09-05">'
+        '<div class="tm_box"><p class="name">데이투어</p>'
+        '<a href="?rev_days=2026-09-05&theme_time_num=36">'
+        '<span class="num">19:00</span><span class="txt">예약가능</span>'
+        "</a></div>"
+    )
+
+    class ScanSession:
+        def get(self, *_args, **_kwargs):
+            return Response(target_html)
+
+    class SubmitSession:
+        def __init__(self):
+            self.post_count = 0
+            self.kcp_get_count = 0
+
+        def get(self, url, **_kwargs):
+            if "go=rev.make.input" in url:
+                return Response('<input type="hidden" name="price3" value="126000">')
+            if "go=rev.kcp" in url:
+                assert engine._scan_stop_event.is_set()
+                self.kcp_get_count += 1
+                return TimeoutResponse()
+            raise AssertionError(f"예상하지 못한 GET: {url}")
+
+        def post(self, *_args, **_kwargs):
+            self.post_count += 1
+            return Response("<script>location.href='?num=9001'</script>")
+
+    scan_session = ScanSession()
+    submit_session = SubmitSession()
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    engine.scan_governor = DoomScanGovernor(1000, 1000, 1000, 1000)
+    engine.scan_governor.set_phase("active")
+    engine._scan_inflight = asyncio.Semaphore(2)
+    engine._scan_session_count = 1
+    engine._prestage_lock = asyncio.Lock()
+    engine._slot_wait_started_at = time.time()
+    engine.session_pool = [scan_session, submit_session]
+    engine._submit_session = submit_session
+    monkeypatch.setattr(engine, "_write_safe_failure_summary", lambda **_kwargs: None)
+
+    reservation = {
+        "branch": "4",
+        "reservationDate": "2026-09-05",
+        "reservationTime": "19:00",
+        "themePK": "36",
+        "themeLabel": "데이투어",
+        "name": "테스트",
+        "phone": "010-1234-5678",
+        "people": "3",
+    }
+
+    asyncio.run(engine.make_reservation_async_task(reservation, 0))
+
+    assert submit_session.post_count == 1
+    assert submit_session.kcp_get_count == engine.SAFE_READ_RETRY_ATTEMPTS
+    assert engine._scan_stop_event.is_set()
+    assert engine.stop_event.is_set()
+    assert any(
+        "orderId=9001" in message and "결제 준비 화면 조회 결과 불명확" in message
+        for message, _level in logs
+    )
 
 
 def test_order_connect_failure_before_send_uses_warmed_fallback_once():
