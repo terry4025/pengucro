@@ -1,11 +1,17 @@
 from datetime import date, timedelta
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from pengucro.models import NAVER_MODE, STANDARD_MODE, TRIPCOM_MODE
 from ui.reservation_form import (
     DOOMESCAPE_MAX_WORKERS,
     ZEROWORLD_JIGUBYEOL_MAX_WORKERS,
     ReservationForm,
+    _bounded_int,
+    _merge_config_migration,
+    _merge_form_config,
+    _persist_yescaptcha_secret,
+    _remove_matching_yescaptcha_plaintext,
+    _resolve_yescaptcha_secret,
 )
 
 
@@ -48,6 +54,346 @@ class Widget(Value):
 
     def grid_forget(self):
         pass
+
+
+class EntryWidget(Widget):
+    def delete(self, *args, **kwargs):
+        self.value = ""
+
+    def insert(self, _index, value):
+        self.value = value
+
+
+class ToggleWidget(Widget):
+    def select(self):
+        self.value = True
+
+    def deselect(self):
+        self.value = False
+
+
+class FakeSecretStore:
+    def __init__(self, values=None, *, writable=True):
+        self.values = dict(values or {})
+        self.writable = writable
+        self.calls = []
+
+    def get(self, key, default=""):
+        return self.values.get(key, default)
+
+    def set(self, key, value):
+        self.calls.append((key, value))
+        if not self.writable:
+            return False
+        if value:
+            self.values[key] = value
+        else:
+            self.values.pop(key, None)
+        return True
+
+    def get_or_set(self, key, value):
+        if key in self.values:
+            return self.values[key], True
+        if not self.set(key, value):
+            return "", False
+        return value, True
+
+    def compare_and_set(self, key, expected_value, new_value):
+        current = self.values.get(key, "")
+        if not self.writable:
+            return "", False
+        if current != expected_value:
+            return current, True
+        if new_value:
+            self.values[key] = new_value
+        else:
+            self.values.pop(key, None)
+        return new_value, True
+
+
+def test_yescaptcha_plaintext_key_migrates_to_secret_store():
+    store = FakeSecretStore()
+
+    key, secret_backed, remove_plaintext = _resolve_yescaptcha_secret(
+        store, {"yescaptcha_client_key": " legacy-key "}
+    )
+
+    assert key == "legacy-key"
+    assert secret_backed is True
+    assert remove_plaintext == "legacy-key"
+    assert store.values["yescaptcha_api_key"] == "legacy-key"
+
+
+def test_yescaptcha_plaintext_key_survives_when_secret_backend_fails():
+    store = FakeSecretStore(writable=False)
+
+    key, secret_backed, remove_plaintext = _resolve_yescaptcha_secret(
+        store, {"yescaptcha_client_key": "legacy-key"}
+    )
+
+    assert key == "legacy-key"
+    assert secret_backed is False
+    assert remove_plaintext is None
+
+
+def test_existing_yescaptcha_secret_wins_and_requests_plaintext_cleanup():
+    store = FakeSecretStore({"yescaptcha_api_key": "encrypted-key"})
+
+    key, secret_backed, remove_plaintext = _resolve_yescaptcha_secret(
+        store, {"yescaptcha_client_key": "encrypted-key"}
+    )
+
+    assert key == "encrypted-key"
+    assert secret_backed is True
+    assert remove_plaintext == "encrypted-key"
+    assert store.calls == []
+
+
+def test_newer_plaintext_fallback_replaces_older_secret_when_dpapi_recovers():
+    store = FakeSecretStore({"yescaptcha_api_key": "older-secret"})
+
+    key, secret_backed, remove_plaintext = _resolve_yescaptcha_secret(
+        store, {"yescaptcha_client_key": "newer-fallback"}
+    )
+
+    assert key == "newer-fallback"
+    assert secret_backed is True
+    assert remove_plaintext == "newer-fallback"
+    assert store.values["yescaptcha_api_key"] == "newer-fallback"
+
+
+def test_yescaptcha_plaintext_cleanup_preserves_newer_concurrent_fallback():
+    result = _remove_matching_yescaptcha_plaintext(
+        {"yescaptcha_client_key": "newer-key", "people": "2"},
+        "stale-key",
+    )
+
+    assert result == {"yescaptcha_client_key": "newer-key", "people": "2"}
+
+
+def test_yescaptcha_migration_survives_restart_with_real_secret_store(
+    monkeypatch, tmp_path
+):
+    from pengucro.storage import SecretStore, load_json, save_json, update_json
+
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
+    legacy_key = "synthetic-migration-key"
+    save_json("config.json", {"yescaptcha_client_key": legacy_key})
+    store = SecretStore()
+
+    key, secret_backed, stale_plaintext = _resolve_yescaptcha_secret(
+        store, load_json("config.json", {})
+    )
+    update_json(
+        "config.json",
+        lambda current: _remove_matching_yescaptcha_plaintext(
+            current, stale_plaintext or ""
+        ),
+        {},
+    )
+
+    assert key == legacy_key
+    assert secret_backed is True
+    assert "yescaptcha_client_key" not in load_json("config.json", {})
+    restarted_key, restarted_backed, _stale = _resolve_yescaptcha_secret(
+        SecretStore(), load_json("config.json", {})
+    )
+    assert restarted_key == legacy_key
+    assert restarted_backed is True
+
+
+def test_load_config_migrates_and_populates_yescaptcha_key_before_empty_return(
+    monkeypatch,
+):
+    import ui.reservation_form as reservation_form
+
+    store = FakeSecretStore()
+    persisted = {}
+    monkeypatch.setattr(
+        reservation_form,
+        "load_json",
+        lambda *_args, **_kwargs: {"yescaptcha_client_key": "legacy-key"},
+    )
+
+    def fake_update(_filename, updater, default):
+        persisted.update(
+            updater({"yescaptcha_client_key": "legacy-key"} or default)
+        )
+
+    monkeypatch.setattr(reservation_form, "update_json", fake_update)
+    form = SimpleNamespace(
+        secret_store=store,
+        yescaptcha_client_key_entry=EntryWidget(""),
+        yescaptcha_checkbox=ToggleWidget(False),
+        yescaptcha_test_mode_checkbox=ToggleWidget(False),
+        yescaptcha_soft_id_entry=EntryWidget(""),
+        name_entry=EntryWidget(""),
+        phone_entry=EntryWidget(""),
+        cgv_nonmember_birth_entry=EntryWidget(""),
+        cgv_nonmember_phone_entry=EntryWidget(""),
+        cgv_nonmember_password_entry=EntryWidget(""),
+    )
+    form._load_config_values = MethodType(ReservationForm._load_config_values, form)
+
+    ReservationForm.load_config(form)
+
+    assert form.yescaptcha_client_key_entry.get() == "legacy-key"
+    assert store.values["yescaptcha_api_key"] == "legacy-key"
+    assert "yescaptcha_client_key" not in persisted
+    assert form._is_initializing is False
+
+
+def test_stale_form_does_not_revert_newer_shared_yescaptcha_settings():
+    result = _merge_form_config(
+        {
+            "people": "2",
+            "yescaptcha_enabled": True,
+            "yescaptcha_test_mode": True,
+            "yescaptcha_soft_id": "new-soft-id",
+            "yescaptcha_client_key": "legacy-plaintext",
+        },
+        {
+            "people": "4",
+            "yescaptcha_enabled": False,
+            "yescaptcha_test_mode": False,
+            "yescaptcha_soft_id": "old-soft-id",
+        },
+        {
+            "people": "2",
+            "yescaptcha_enabled": False,
+            "yescaptcha_test_mode": False,
+            "yescaptcha_soft_id": "old-soft-id",
+        },
+        remove_plaintext_yescaptcha_key="legacy-plaintext",
+    )
+
+    assert result["people"] == "4"
+    assert result["yescaptcha_enabled"] is True
+    assert result["yescaptcha_test_mode"] is True
+    assert result["yescaptcha_soft_id"] == "new-soft-id"
+    assert "yescaptcha_client_key" not in result
+
+
+def test_explicit_yescaptcha_setting_change_is_merged():
+    result = _merge_form_config(
+        {"yescaptcha_enabled": False, "yescaptcha_soft_id": "old"},
+        {
+            "yescaptcha_enabled": True,
+            "yescaptcha_test_mode": False,
+            "yescaptcha_soft_id": "changed",
+        },
+        {
+            "yescaptcha_enabled": False,
+            "yescaptcha_test_mode": False,
+            "yescaptcha_soft_id": "old",
+        },
+    )
+
+    assert result["yescaptcha_enabled"] is True
+    assert result["yescaptcha_soft_id"] == "changed"
+
+
+def test_blank_stale_window_does_not_delete_later_plaintext_fallback():
+    result = _merge_form_config(
+        {"yescaptcha_client_key": "written-by-another-process"},
+        {
+            "yescaptcha_enabled": False,
+            "yescaptcha_test_mode": False,
+            "yescaptcha_soft_id": "default",
+        },
+        {
+            "yescaptcha_enabled": False,
+            "yescaptcha_test_mode": False,
+            "yescaptcha_soft_id": "default",
+        },
+        remove_plaintext_yescaptcha_key="key-loaded-by-stale-window",
+    )
+
+    assert result["yescaptcha_client_key"] == "written-by-another-process"
+
+
+def test_unchanged_plaintext_fallback_does_not_overwrite_newer_key():
+    result = _merge_form_config(
+        {"yescaptcha_client_key": "newer-key"},
+        {},
+        {},
+        plaintext_yescaptcha_key="old-key",
+        plaintext_yescaptcha_expected="old-key",
+    )
+
+    assert result["yescaptcha_client_key"] == "newer-key"
+
+
+def test_stale_form_only_updates_fields_changed_since_its_own_load():
+    result = _merge_form_config(
+        {"people": "4", "theme": "theme-a", "date": "2026-09-01"},
+        {"people": "2", "theme": "theme-b", "date": "2026-09-01"},
+        {"people": "2", "theme": "theme-a", "date": "2026-09-01"},
+    )
+
+    assert result == {
+        "people": "4",
+        "theme": "theme-b",
+        "date": "2026-09-01",
+    }
+
+
+def test_unchanged_stale_secret_field_does_not_overwrite_newer_value():
+    store = FakeSecretStore({"api": "newer-value"})
+    form = SimpleNamespace(
+        secret_store=store,
+        _secret_baseline={"api": "value-loaded-by-this-window"},
+    )
+
+    result = ReservationForm._persist_secret_if_changed(
+        form, "api", "value-loaded-by-this-window"
+    )
+
+    assert result is True
+    assert store.calls == []
+    assert store.values["api"] == "newer-value"
+
+
+def test_unbacked_stale_yescaptcha_window_adopts_newer_secret():
+    store = FakeSecretStore({"yescaptcha_api_key": "newer-key"})
+
+    winner, secret_backed, failed = _persist_yescaptcha_secret(
+        store, "old-fallback", "old-fallback", False
+    )
+
+    assert winner == "newer-key"
+    assert secret_backed is True
+    assert failed is False
+    assert store.values["yescaptcha_api_key"] == "newer-key"
+
+
+def test_stale_explicit_secret_change_cannot_overwrite_concurrent_winner():
+    store = FakeSecretStore({"yescaptcha_api_key": "concurrent-key"})
+
+    winner, secret_backed, failed = _persist_yescaptcha_secret(
+        store, "edited-key", "loaded-key", True
+    )
+
+    assert winner == "concurrent-key"
+    assert secret_backed is True
+    assert failed is False
+
+
+def test_config_migration_does_not_overwrite_concurrent_change():
+    result = _merge_config_migration(
+        {"site": "newer-site", "name": "newer-name", "untouched": 1},
+        {"site": "legacy-site", "name": "legacy-name", "untouched": 1},
+        {"site": "normalized-site", "untouched": 1},
+    )
+
+    assert result["site"] == "newer-site"
+    assert result["name"] == "newer-name"
+    assert result["untouched"] == 1
+
+
+def test_malformed_thread_count_uses_bounded_fallback():
+    assert _bounded_int("not-a-number", 10, 1, 50) == 10
+    assert _bounded_int("999", 10, 1, 50) == 50
 
 
 def test_keyescape_cache_button_delegates_to_main_window():

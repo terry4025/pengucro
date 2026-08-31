@@ -22,32 +22,136 @@ from pengucro.models import (
     TRIPCOM_MODE,
     ReservationRequest,
     coerce_bool,
+    parse_bool_flag,
 )
-from pengucro.storage import SecretStore, load_json, save_json
+from pengucro.storage import SecretStore, load_json, update_json
 from datetime import datetime, timedelta
 import calendar
 
 STANDARD_MAX_WORKERS = 50
 ZEROWORLD_JIGUBYEOL_MAX_WORKERS = 32
 DOOMESCAPE_MAX_WORKERS = 10
+YESCAPTCHA_SECRET_KEY = "yescaptcha_api_key"
 
-# Keys stored in config.json that no widget in this form owns. save_config()
-# replaces the whole file, so these must survive the round trip.
-PRESERVED_CONFIG_KEYS = (
-    "force_scroll_repaint",
-    "scroll_repaint_strong",
-    "keyescape_use_real_chrome",
-    "keyescape_close_chrome_on_exit",
-    "keyescape_agree_all",
-    "naver_use_real_chrome",
-    "naver_close_chrome_on_exit",
-    "naver_poll_interval",
-    "naver_poll_burst_interval",
-    "naver_poll_relax_after",
-    "yescaptcha_enabled",
-    "yescaptcha_test_mode",
-    "yescaptcha_client_key",
-)
+def _merge_form_config(
+    existing: object,
+    form_values: dict,
+    form_baseline: dict,
+    *,
+    plaintext_yescaptcha_key: str | None = None,
+    plaintext_yescaptcha_expected: str | None = None,
+    remove_plaintext_yescaptcha_key: str | None = None,
+) -> dict:
+    """Merge one form snapshot without reverting newer shared settings."""
+
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    missing = object()
+    for key, value in form_values.items():
+        if key not in merged or value != form_baseline.get(key, missing):
+            merged[key] = value
+    if plaintext_yescaptcha_key is not None:
+        # Kept only when DPAPI is unavailable so an existing key is never lost.
+        current = str(merged.get("yescaptcha_client_key", "") or "").strip()
+        if (
+            plaintext_yescaptcha_expected is None
+            or not current
+            or current == plaintext_yescaptcha_expected
+        ):
+            merged["yescaptcha_client_key"] = plaintext_yescaptcha_key
+    elif remove_plaintext_yescaptcha_key is not None and str(
+        merged.get("yescaptcha_client_key", "") or ""
+    ).strip() == str(remove_plaintext_yescaptcha_key).strip():
+        merged.pop("yescaptcha_client_key", None)
+    return merged
+
+
+def _bounded_int(value, fallback, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(fallback)
+    return max(int(minimum), min(parsed, int(maximum)))
+
+
+def _resolve_yescaptcha_secret(
+    secret_store, config: dict
+) -> tuple[str, bool, str | None]:
+    """Return the winning key, DPAPI state, and stale plaintext to remove."""
+
+    stored_key = secret_store.get(YESCAPTCHA_SECRET_KEY)
+    legacy_key = str(config.get("yescaptcha_client_key", "") or "").strip()
+    if stored_key:
+        if legacy_key and legacy_key != stored_key:
+            winning_key, persisted = secret_store.compare_and_set(
+                YESCAPTCHA_SECRET_KEY, stored_key, legacy_key
+            )
+            if persisted:
+                return winning_key, bool(winning_key), legacy_key
+            return legacy_key, False, None
+        stale_plaintext = legacy_key if "yescaptcha_client_key" in config else None
+        return stored_key, True, stale_plaintext
+    if not legacy_key:
+        return "", False, None
+    winning_key, secret_backed = secret_store.get_or_set(
+        YESCAPTCHA_SECRET_KEY, legacy_key
+    )
+    if secret_backed and winning_key:
+        return winning_key, True, legacy_key
+    return legacy_key, False, None
+
+
+def _remove_matching_yescaptcha_plaintext(
+    existing: object, expected_key: str
+) -> dict:
+    values = dict(existing) if isinstance(existing, dict) else {}
+    current = str(values.get("yescaptcha_client_key", "") or "").strip()
+    if current == expected_key:
+        values.pop("yescaptcha_client_key", None)
+    return values
+
+
+def _persist_yescaptcha_secret(
+    secret_store,
+    entered_key: str,
+    loaded_key: str,
+    secret_backed: bool,
+) -> tuple[str, bool, bool]:
+    """Persist a key without letting an unchanged stale window overwrite it."""
+
+    if entered_key != loaded_key:
+        winning_key, persisted = secret_store.compare_and_set(
+            YESCAPTCHA_SECRET_KEY, loaded_key, entered_key
+        )
+        if persisted:
+            return winning_key, bool(winning_key), False
+        return entered_key, secret_backed, True
+    if entered_key and not secret_backed:
+        winning_key, persisted = secret_store.get_or_set(
+            YESCAPTCHA_SECRET_KEY, entered_key
+        )
+        if persisted and winning_key:
+            return winning_key, True, False
+        return entered_key, False, True
+    return entered_key, secret_backed, False
+
+
+def _merge_config_migration(existing: object, before: dict, after: dict) -> dict:
+    """Apply only migration edits whose source values were not changed elsewhere."""
+
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    missing = object()
+    for key in before.keys() | after.keys():
+        old_value = before.get(key, missing)
+        new_value = after.get(key, missing)
+        if old_value == new_value:
+            continue
+        if merged.get(key, missing) != old_value:
+            continue
+        if new_value is missing:
+            merged.pop(key, None)
+        else:
+            merged[key] = new_value
+    return merged
 
 
 def _create_lucide_eye_icon(size: tuple[int, int] = (15, 15), color: str = "#8E8E93") -> ctk.CTkImage:
@@ -411,6 +515,9 @@ class ReservationForm(ctk.CTkFrame):
         self._is_initializing = True
         self._save_after_id = None
         self.secret_store = SecretStore()
+        self._secret_baseline = {}
+        self._config_baseline = {}
+        self._yescaptcha_secret_backed = False
         self.cgv_selection = {}
         
         # Thread memory states.
@@ -1479,13 +1586,18 @@ class ReservationForm(ctk.CTkFrame):
         self._update_widgets_state()
 
     def _save_secret_settings(self, event=None):
-        # Retained as a no-op hook: the third-party captcha key it used to store
-        # was removed together with the automatic solving path.
-        try:
-            self.secret_store.delete("yescaptcha_api_key")
-        except RuntimeError as exc:
-            if hasattr(self.master, "log_panel"):
-                self.master.log_panel.append_log(str(exc), "error")
+        self.auto_save()
+
+    def _persist_secret_if_changed(self, key, value):
+        value = str(value or "")
+        baseline = getattr(self, "_secret_baseline", {})
+        if value == baseline.get(key, ""):
+            return True
+        if self.secret_store.set(key, value):
+            baseline[key] = value
+            self._secret_baseline = baseline
+            return True
+        return False
 
     def _request_catalog_refresh(self):
         if hasattr(self.master, "_refresh_current_catalog"):
@@ -2697,20 +2809,94 @@ class ReservationForm(ctk.CTkFrame):
         self.time_entry.icursor(new_cursor)
 
     def load_config(self):
-        config = load_json("config.json", {})
+        self._is_initializing = True
+        try:
+            self._load_config_values()
+            try:
+                self._config_baseline = self._current_config_values(
+                    self.current_site
+                )
+            except (AttributeError, RuntimeError, ValueError):
+                self._config_baseline = {}
+        except Exception as exc:
+            try:
+                self._config_baseline = self._current_config_values(
+                    self.current_site
+                )
+            except (AttributeError, RuntimeError, ValueError):
+                self._config_baseline = {}
+            master = getattr(self, "master", None)
+            if master is not None and hasattr(master, "log_panel"):
+                master.log_panel.append_log(
+                    f"저장된 설정 일부를 불러오지 못했습니다: {exc}", "warning"
+                )
+        finally:
+            self._is_initializing = False
+
+    def _load_config_values(self):
+        loaded_config = load_json("config.json", {})
+        config = dict(loaded_config) if isinstance(loaded_config, dict) else {}
         stored_name = self.secret_store.get("reservation_name")
         stored_phone = self.secret_store.get("reservation_phone")
         stored_cgv_birth = self.secret_store.get("cgv_nonmember_birth")
         stored_cgv_phone = self.secret_store.get("cgv_nonmember_phone")
         stored_cgv_password = self.secret_store.get("cgv_nonmember_password")
         stored_cgv_npay_password = self.secret_store.get("cgv_npay_password")
-        # Drop any captcha key left over from an earlier version so the secret
-        # store does not keep a credential nothing uses.
-        try:
-            if self.secret_store.get("yescaptcha_api_key"):
-                self.secret_store.delete("yescaptcha_api_key")
-        except RuntimeError:
-            pass
+        (
+            stored_yescaptcha_key,
+            self._yescaptcha_secret_backed,
+            stale_plaintext_key,
+        ) = _resolve_yescaptcha_secret(self.secret_store, config)
+        if stale_plaintext_key is not None:
+            config.pop("yescaptcha_client_key", None)
+
+            def remove_legacy_key(raw):
+                return _remove_matching_yescaptcha_plaintext(
+                    raw, stale_plaintext_key
+                )
+
+            try:
+                update_json("config.json", remove_legacy_key, {})
+            except (OSError, TimeoutError, ValueError):
+                pass
+        self._secret_baseline = {
+            "reservation_name": stored_name,
+            "reservation_phone": stored_phone,
+            "cgv_nonmember_birth": stored_cgv_birth,
+            "cgv_nonmember_phone": stored_cgv_phone,
+            "cgv_nonmember_password": stored_cgv_password,
+            "cgv_npay_password": stored_cgv_npay_password,
+            YESCAPTCHA_SECRET_KEY: stored_yescaptcha_key,
+        }
+        self.yescaptcha_client_key_entry.delete(0, "end")
+        if stored_yescaptcha_key:
+            self.yescaptcha_client_key_entry.insert(0, stored_yescaptcha_key)
+
+        yescaptcha_enabled = coerce_bool(
+            config.get("yescaptcha_enabled", False)
+        )
+        yescaptcha_test_mode = bool(
+            yescaptcha_enabled
+            and coerce_bool(config.get("yescaptcha_test_mode", False))
+        )
+        yescaptcha_soft_id = str(
+            config.get("yescaptcha_soft_id", DEFAULT_SOFT_ID) or DEFAULT_SOFT_ID
+        ).strip() or DEFAULT_SOFT_ID
+        if yescaptcha_enabled:
+            self.yescaptcha_checkbox.select()
+        else:
+            self.yescaptcha_checkbox.deselect()
+        if yescaptcha_test_mode:
+            self.yescaptcha_test_mode_checkbox.select()
+        else:
+            self.yescaptcha_test_mode_checkbox.deselect()
+        self.yescaptcha_test_mode_checkbox.configure(
+            state="normal" if yescaptcha_enabled else "disabled",
+            text_color=theme.TEXT_MUTE if yescaptcha_enabled else theme.TEXT_DISABLED,
+        )
+        self.yescaptcha_soft_id_entry.delete(0, "end")
+        self.yescaptcha_soft_id_entry.insert(0, yescaptcha_soft_id)
+        migration_baseline = dict(config)
         if not config:
             if stored_name:
                 self.name_entry.insert(0, stored_name)
@@ -2728,7 +2914,9 @@ class ReservationForm(ctk.CTkFrame):
         self._is_initializing = True
         config_migrated = False
         try:
-            remember_personal = bool(config.get("remember_personal_info", True))
+            remember_personal = parse_bool_flag(
+                config.get("remember_personal_info", True), default=True
+            )
             self.remember_personal_var.set(remember_personal)
             saved_site = config.get("site", "제로월드")
             if saved_site in {"제로월드(신)", "제로월드(구)", "제로월드 강남", "제로월드 홍대"}:
@@ -2833,23 +3021,36 @@ class ReservationForm(ctk.CTkFrame):
                 
             name = stored_name or config.get("name", "")
             phone = stored_phone or config.get("phone", "")
+            name_secret_backed = bool(stored_name)
+            phone_secret_backed = bool(stored_phone)
             if remember_personal and name:
                 self.name_entry.delete(0, "end")
                 self.name_entry.insert(0, name)
                 if not stored_name:
-                    self.secret_store.set("reservation_name", name)
+                    if self.secret_store.set("reservation_name", name):
+                        self._secret_baseline["reservation_name"] = name
+                        name_secret_backed = True
 
             if remember_personal and phone:
                 self.phone_entry.delete(0, "end")
                 self.phone_entry.insert(0, phone)
                 if not stored_phone:
-                    self.secret_store.set("reservation_phone", phone)
+                    if self.secret_store.set("reservation_phone", phone):
+                        self._secret_baseline["reservation_phone"] = phone
+                        phone_secret_backed = True
 
-            if "name" in config or "phone" in config:
+            if "name" in config and (
+                not remember_personal or not name or name_secret_backed
+            ):
                 config.pop("name", None)
-                config.pop("phone", None)
-                config["site"] = saved_site
                 config_migrated = True
+            if "phone" in config and (
+                not remember_personal or not phone or phone_secret_backed
+            ):
+                config.pop("phone", None)
+                config_migrated = True
+            if config_migrated:
+                config["site"] = saved_site
                 
             if "people" in config:
                 self.people_entry.delete(0, "end")
@@ -2857,22 +3058,26 @@ class ReservationForm(ctk.CTkFrame):
                 
             # Parse memory threads first
             if "threads" in config:
-                self.standard_threads = max(1, min(int(config["threads"]), 50))
+                self.standard_threads = _bounded_int(
+                    config["threads"], self.standard_threads, 1, 50
+                )
             if "naver_threads" in config:
                 # NaverEngine always owns exactly one browser worker.
                 self.naver_threads = 1
             if "keyescape_threads" in config:
-                self.keyescape_threads = max(
-                    1, min(int(config["keyescape_threads"]), 3)
+                self.keyescape_threads = _bounded_int(
+                    config["keyescape_threads"], self.keyescape_threads, 1, 3
                 )
             if "dpsnnn_threads" in config:
-                self.dpsnnn_threads = max(
+                self.dpsnnn_threads = _bounded_int(
+                    config["dpsnnn_threads"],
+                    self.dpsnnn_threads,
                     1,
-                    min(int(config["dpsnnn_threads"]), DPSNNN_MAX_WORKERS),
+                    DPSNNN_MAX_WORKERS,
                 )
             if "cgv_threads" in config:
-                self.cgv_threads = max(
-                    1, min(int(config["cgv_threads"]), CGV_MAX_WORKERS)
+                self.cgv_threads = _bounded_int(
+                    config["cgv_threads"], self.cgv_threads, 1, CGV_MAX_WORKERS
                 )
 
             if "engine_mode" in config:
@@ -2887,38 +3092,18 @@ class ReservationForm(ctk.CTkFrame):
                 self._on_mode_change(val)
 
             if "show_server_time" in config:
-                if config["show_server_time"]:
+                if coerce_bool(config["show_server_time"]):
                     self.show_server_time_checkbox.select()
                 else:
                     self.show_server_time_checkbox.deselect()
             else:
                 self.show_server_time_checkbox.deselect()
 
-            if "yescaptcha_enabled" in config:
-                if coerce_bool(config["yescaptcha_enabled"]):
-                    self.yescaptcha_checkbox.select()
-                else:
-                    self.yescaptcha_checkbox.deselect()
-            if (
-                coerce_bool(config.get("yescaptcha_enabled", False))
-                and coerce_bool(config.get("yescaptcha_test_mode", False))
-            ):
-                self.yescaptcha_test_mode_checkbox.select()
-            else:
-                self.yescaptcha_test_mode_checkbox.deselect()
-            yescaptcha_on = bool(self.yescaptcha_enabled_var.get())
-            self.yescaptcha_test_mode_checkbox.configure(
-                state="normal" if yescaptcha_on else "disabled",
-                text_color=theme.TEXT_MUTE if yescaptcha_on else theme.TEXT_DISABLED,
+            self.catalog_auto_refresh_var.set(
+                parse_bool_flag(
+                    config.get("catalog_auto_refresh", True), default=True
+                )
             )
-            if "yescaptcha_client_key" in config:
-                self.yescaptcha_client_key_entry.delete(0, "end")
-                self.yescaptcha_client_key_entry.insert(0, config["yescaptcha_client_key"])
-            if "yescaptcha_soft_id" in config:
-                self.yescaptcha_soft_id_entry.delete(0, "end")
-                self.yescaptcha_soft_id_entry.insert(0, config["yescaptcha_soft_id"])
-
-            self.catalog_auto_refresh_var.set(bool(config.get("catalog_auto_refresh", True)))
             cgv_mode = str(config.get("cgv_booking_mode", "회원"))
             self.cgv_booking_mode_var.set(cgv_mode if cgv_mode in {"회원", "비회원"} else "회원")
             cgv_birth = stored_cgv_birth or str(
@@ -2927,6 +3112,8 @@ class ReservationForm(ctk.CTkFrame):
             cgv_phone = stored_cgv_phone or str(
                 config.get("cgv_nonmember_phone", "")
             )
+            cgv_birth_secret_backed = bool(stored_cgv_birth)
+            cgv_phone_secret_backed = bool(stored_cgv_phone)
             self.cgv_nonmember_birth_entry.delete(0, "end")
             self.cgv_nonmember_birth_entry.insert(0, cgv_birth)
             self.cgv_nonmember_phone_entry.delete(0, "end")
@@ -2940,12 +3127,23 @@ class ReservationForm(ctk.CTkFrame):
                 self.cgv_npay_password_entry.insert(0, stored_cgv_npay_password)
             if "cgv_nonmember_birth" in config or "cgv_nonmember_phone" in config:
                 if cgv_birth:
-                    self.secret_store.set("cgv_nonmember_birth", cgv_birth)
+                    if self.secret_store.set("cgv_nonmember_birth", cgv_birth):
+                        self._secret_baseline["cgv_nonmember_birth"] = cgv_birth
+                        cgv_birth_secret_backed = True
                 if cgv_phone:
-                    self.secret_store.set("cgv_nonmember_phone", cgv_phone)
-                config.pop("cgv_nonmember_birth", None)
-                config.pop("cgv_nonmember_phone", None)
-                config_migrated = True
+                    if self.secret_store.set("cgv_nonmember_phone", cgv_phone):
+                        self._secret_baseline["cgv_nonmember_phone"] = cgv_phone
+                        cgv_phone_secret_backed = True
+                if "cgv_nonmember_birth" in config and (
+                    not cgv_birth or cgv_birth_secret_backed
+                ):
+                    config.pop("cgv_nonmember_birth", None)
+                    config_migrated = True
+                if "cgv_nonmember_phone" in config and (
+                    not cgv_phone or cgv_phone_secret_backed
+                ):
+                    config.pop("cgv_nonmember_phone", None)
+                    config_migrated = True
             self._on_cgv_booking_mode_change()
             if saved_site == self.current_site:
                 if not config.get("selected_branch_id"):
@@ -2960,11 +3158,49 @@ class ReservationForm(ctk.CTkFrame):
                         config_migrated = True
             if config_migrated:
                 config["site"] = saved_site
-                save_json("config.json", config)
+                update_json(
+                    "config.json",
+                    lambda current: _merge_config_migration(
+                        current, migration_baseline, config
+                    ),
+                    {},
+                )
         except Exception:
-            pass
+            raise
         finally:
             self._is_initializing = False
+
+    def _current_config_values(self, site_name):
+        return {
+            "site": site_name,
+            "branch": self.branch_var.get(),
+            "day_type": self.day_type_var.get(),
+            "theme": self.theme_var.get(),
+            "custom_theme": bool(self.custom_theme_checkbox.get()),
+            "theme_pk": self.theme_pk_entry.get().strip(),
+            "date": self.date_entry.get().strip(),
+            "time": self.time_entry.get().strip(),
+            "people": self.people_entry.get().strip(),
+            "threads": self.standard_threads,
+            "naver_threads": self.naver_threads,
+            "keyescape_threads": self.keyescape_threads,
+            "dpsnnn_threads": self.dpsnnn_threads,
+            "cgv_threads": self.cgv_threads,
+            "cgv_selection": dict(self.cgv_selection),
+            "cgv_booking_mode": self.cgv_booking_mode_var.get(),
+            "is_async": self.engine_mode_btn.get() == STANDARD_MODE,
+            "engine_mode": self.engine_mode_btn.get(),
+            "show_server_time": bool(self.show_server_time_checkbox.get()),
+            "remember_personal_info": bool(self.remember_personal_var.get()),
+            "catalog_auto_refresh": bool(self.catalog_auto_refresh_var.get()),
+            "selected_branch_id": self._selected_branch_id(),
+            "selected_theme_id": self._selected_theme_id(),
+            "yescaptcha_enabled": bool(self.yescaptcha_enabled_var.get()),
+            "yescaptcha_test_mode": bool(self.yescaptcha_test_mode_var.get()),
+            "yescaptcha_soft_id": (
+                self.yescaptcha_soft_id_entry.get().strip() or DEFAULT_SOFT_ID
+            ),
+        }
 
     def save_config(self, site_name):
         try:
@@ -2991,74 +3227,92 @@ class ReservationForm(ctk.CTkFrame):
                 )
 
             remember_personal = bool(self.remember_personal_var.get())
-            if remember_personal:
-                self.secret_store.set("reservation_name", self.name_entry.get().strip())
-                self.secret_store.set("reservation_phone", self.phone_entry.get().strip())
-            else:
-                self.secret_store.delete("reservation_name")
-                self.secret_store.delete("reservation_phone")
+            self._persist_secret_if_changed(
+                "reservation_name",
+                self.name_entry.get().strip() if remember_personal else "",
+            )
+            self._persist_secret_if_changed(
+                "reservation_phone",
+                self.phone_entry.get().strip() if remember_personal else "",
+            )
             cgv_password = self.cgv_nonmember_password_entry.get()
             cgv_birth = self.cgv_nonmember_birth_entry.get().strip()
             cgv_phone = self.cgv_nonmember_phone_entry.get().strip()
-            if cgv_password:
-                self.secret_store.set("cgv_nonmember_password", cgv_password)
-            else:
-                self.secret_store.delete("cgv_nonmember_password")
-            if cgv_birth:
-                self.secret_store.set("cgv_nonmember_birth", cgv_birth)
-            else:
-                self.secret_store.delete("cgv_nonmember_birth")
-            if cgv_phone:
-                self.secret_store.set("cgv_nonmember_phone", cgv_phone)
-            else:
-                self.secret_store.delete("cgv_nonmember_phone")
+            self._persist_secret_if_changed("cgv_nonmember_password", cgv_password)
+            self._persist_secret_if_changed("cgv_nonmember_birth", cgv_birth)
+            self._persist_secret_if_changed("cgv_nonmember_phone", cgv_phone)
             if hasattr(self, "cgv_npay_password_entry"):
                 cgv_npay_password = self.cgv_npay_password_entry.get().strip()
-                if cgv_npay_password:
-                    self.secret_store.set("cgv_npay_password", cgv_npay_password)
-                else:
-                    self.secret_store.delete("cgv_npay_password")
+                self._persist_secret_if_changed(
+                    "cgv_npay_password", cgv_npay_password
+                )
 
-            config = {
-                "site": site_name,
-                "branch": self.branch_var.get(),
-                "day_type": self.day_type_var.get(),
-                "theme": self.theme_var.get(),
-                "custom_theme": bool(self.custom_theme_checkbox.get()),
-                "theme_pk": self.theme_pk_entry.get().strip(),
-                "date": self.date_entry.get().strip(),
-                "time": self.time_entry.get().strip(),
-                "people": self.people_entry.get().strip(),
-                "threads": self.standard_threads,
-                "naver_threads": self.naver_threads,
-                "keyescape_threads": self.keyescape_threads,
-                "dpsnnn_threads": self.dpsnnn_threads,
-                "cgv_threads": self.cgv_threads,
-                "cgv_selection": dict(self.cgv_selection),
-                "cgv_booking_mode": self.cgv_booking_mode_var.get(),
-                "is_async": self.engine_mode_btn.get() == STANDARD_MODE,
-                "engine_mode": self.engine_mode_btn.get(),
-                "show_server_time": bool(self.show_server_time_checkbox.get()),
-                "remember_personal_info": remember_personal,
-                "catalog_auto_refresh": bool(self.catalog_auto_refresh_var.get()),
-                "selected_branch_id": self._selected_branch_id(),
-                "selected_theme_id": self._selected_theme_id(),
-                "yescaptcha_enabled": bool(self.yescaptcha_enabled_var.get()),
-                "yescaptcha_test_mode": bool(self.yescaptcha_test_mode_var.get()),
-                "yescaptcha_client_key": self.yescaptcha_client_key_entry.get().strip(),
-                "yescaptcha_soft_id": self.yescaptcha_soft_id_entry.get().strip(),
-            }
-            # save_config rewrites config.json wholesale, so settings that are
-            # not surfaced in this form (currently the scroll repaint switch)
-            # have to be carried over or they would be silently reset on the
-            # next auto-save.
-            existing = load_json("config.json", {})
-            if isinstance(existing, dict):
-                for key in PRESERVED_CONFIG_KEYS:
-                    if key in existing and key not in config:
-                        config[key] = existing[key]
-            save_json("config.json", config)
-        except (OSError, RuntimeError, ValueError) as exc:
+            yescaptcha_key = self.yescaptcha_client_key_entry.get().strip()
+            loaded_yescaptcha_key = self._secret_baseline.get(
+                YESCAPTCHA_SECRET_KEY, ""
+            )
+            yescaptcha_key_edited = yescaptcha_key != loaded_yescaptcha_key
+            (
+                winning_yescaptcha_key,
+                self._yescaptcha_secret_backed,
+                yescaptcha_secret_write_failed,
+            ) = _persist_yescaptcha_secret(
+                self.secret_store,
+                yescaptcha_key,
+                loaded_yescaptcha_key,
+                self._yescaptcha_secret_backed,
+            )
+            if not yescaptcha_secret_write_failed:
+                if winning_yescaptcha_key != yescaptcha_key:
+                    self.yescaptcha_client_key_entry.delete(0, "end")
+                    if winning_yescaptcha_key:
+                        self.yescaptcha_client_key_entry.insert(
+                            0, winning_yescaptcha_key
+                        )
+                yescaptcha_key = winning_yescaptcha_key
+                self._secret_baseline[YESCAPTCHA_SECRET_KEY] = yescaptcha_key
+            yescaptcha_plaintext_fallback = (
+                yescaptcha_key
+                if yescaptcha_key
+                and (not self._yescaptcha_secret_backed or yescaptcha_secret_write_failed)
+                else ""
+            )
+            if yescaptcha_plaintext_fallback:
+                yescaptcha_plaintext_directive = yescaptcha_plaintext_fallback
+                yescaptcha_plaintext_expected = (
+                    None
+                    if yescaptcha_key_edited
+                    else loaded_yescaptcha_key
+                )
+                yescaptcha_plaintext_remove = None
+            elif not yescaptcha_secret_write_failed and (
+                self._yescaptcha_secret_backed
+                or yescaptcha_key_edited
+            ):
+                yescaptcha_plaintext_directive = None
+                yescaptcha_plaintext_expected = None
+                yescaptcha_plaintext_remove = loaded_yescaptcha_key or None
+            else:
+                yescaptcha_plaintext_directive = None
+                yescaptcha_plaintext_expected = None
+                yescaptcha_plaintext_remove = None
+
+            config = self._current_config_values(site_name)
+            config_baseline = dict(getattr(self, "_config_baseline", {}))
+
+            def merge(existing):
+                return _merge_form_config(
+                    existing,
+                    config,
+                    config_baseline,
+                    plaintext_yescaptcha_key=yescaptcha_plaintext_directive,
+                    plaintext_yescaptcha_expected=yescaptcha_plaintext_expected,
+                    remove_plaintext_yescaptcha_key=yescaptcha_plaintext_remove,
+                )
+
+            update_json("config.json", merge, {})
+            self._config_baseline = config
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             if hasattr(self.master, "log_panel"):
                 self.master.log_panel.append_log(f"설정을 저장하지 못했습니다: {exc}", "warning")
 

@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.70",
+        changes=(
+            "YesCaptcha API 키를 암호화 저장해 버전 업데이트 후에도 유지",
+            "여러 프로그램 동시 실행 시 설정이 사라지거나 이전 값으로 되돌아가는 문제 수정",
+            "빈 설정과 이전 설정 형식에서도 자동 저장과 안전한 정보 이전 지원",
+        ),
+    ),
+    PatchNote(
         version="6.69",
         changes=(
             "네이버 동일 연결 서버 시각 기준으로 오픈 순간 제출 정밀도 개선",

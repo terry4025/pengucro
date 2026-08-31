@@ -5,11 +5,16 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 
 APP_DIR_NAME = "Pengucro"
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, threading.RLock] = {}
 
 
 def get_data_dir() -> Path:
@@ -29,26 +34,100 @@ def data_path(filename: str) -> Path:
 
 def migrate_legacy_file(filename: str) -> Path:
     destination = data_path(filename)
-    legacy = Path.cwd() / filename
-    if not destination.exists() and legacy.exists() and legacy.resolve() != destination.resolve():
-        try:
-            shutil.copy2(legacy, destination)
-        except OSError:
-            pass
+    with _exclusive_json_lock(destination):
+        _migrate_legacy_file_unlocked(filename, destination)
     return destination
 
 
+def _migrate_legacy_file_unlocked(filename: str, destination: Path) -> None:
+    legacy = Path.cwd() / filename
+    if not destination.exists() and legacy.exists() and legacy.resolve() != destination.resolve():
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".migrate", dir=destination.parent
+        )
+        os.close(handle)
+        try:
+            shutil.copy2(legacy, temporary_name)
+            os.replace(temporary_name, destination)
+        except OSError:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+
+
 def load_json(filename: str, default: Any) -> Any:
-    path = migrate_legacy_file(filename)
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            return json.load(stream)
-    except (OSError, ValueError, TypeError):
-        return default
-
-
-def save_json(filename: str, value: Any) -> Path:
     path = data_path(filename)
+    with _exclusive_json_lock(path):
+        _migrate_legacy_file_unlocked(filename, path)
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                return json.load(stream)
+        except (OSError, ValueError, TypeError):
+            return default
+
+
+def _thread_lock_for(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve(strict=False)))
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def _exclusive_json_lock(path: Path, timeout_seconds: float = 5.0) -> Iterator[None]:
+    """Serialize one JSON read-modify-write across threads and app processes."""
+
+    thread_lock = _thread_lock_for(path)
+    if not thread_lock.acquire(timeout=max(0.1, float(timeout_seconds))):
+        raise TimeoutError(f"설정 파일 잠금 대기 시간 초과: {path.name}")
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    stream = None
+    locked = False
+    try:
+        stream = lock_path.open("a+b")
+        if stream.seek(0, os.SEEK_END) == 0:
+            stream.write(b"\0")
+            stream.flush()
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        while True:
+            try:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except (OSError, BlockingIOError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"설정 파일 잠금 대기 시간 초과: {path.name}")
+                time.sleep(0.01)
+        yield
+    finally:
+        if stream is not None:
+            if locked:
+                try:
+                    stream.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            stream.close()
+        thread_lock.release()
+
+
+def _write_json_unlocked(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -56,13 +135,50 @@ def save_json(filename: str, value: Any) -> Path:
             json.dump(value, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
+        for attempt in range(8):
+            try:
+                os.replace(temporary_name, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                # Windows virus scanners and indexers can briefly hold the old
+                # destination even though app processes share the lock file.
+                time.sleep(0.01 * (attempt + 1))
     except Exception:
         try:
             os.unlink(temporary_name)
         except OSError:
             pass
         raise
+
+
+def save_json(filename: str, value: Any) -> Path:
+    path = data_path(filename)
+    with _exclusive_json_lock(path):
+        _write_json_unlocked(path, value)
+    return path
+
+
+def update_json(
+    filename: str,
+    updater: Callable[[Any], Any],
+    default: Any,
+) -> Path:
+    """Atomically update shared JSON without losing another process's fields."""
+
+    if not callable(updater):
+        raise TypeError("updater must be callable")
+    path = data_path(filename)
+    with _exclusive_json_lock(path):
+        _migrate_legacy_file_unlocked(filename, path)
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                current = json.load(stream)
+        except (OSError, ValueError, TypeError):
+            current = default
+        updated = updater(current)
+        _write_json_unlocked(path, updated)
     return path
 
 
@@ -173,44 +289,121 @@ class SecretStore:
     def _protect(cls, value: bytes) -> bytes:
         try:
             import win32crypt
-
-            protected = win32crypt.CryptProtectData(value, "Pengucro", None, None, None, 0)
-            return protected[1] if isinstance(protected, tuple) else protected
         except ImportError:
             return cls._windows_dpapi(value, protect=True)
+        try:
+            protected = win32crypt.CryptProtectData(value, "Pengucro", None, None, None, 0)
+            return protected[1] if isinstance(protected, tuple) else protected
+        except Exception as exc:
+            try:
+                return cls._windows_dpapi(value, protect=True)
+            except RuntimeError as fallback_exc:
+                raise RuntimeError("보안 정보를 암호화할 수 없습니다.") from fallback_exc
 
     @classmethod
     def _unprotect(cls, value: bytes) -> bytes:
         try:
             import win32crypt
-
-            return win32crypt.CryptUnprotectData(value, None, None, None, 0)[1]
         except ImportError:
             return cls._windows_dpapi(value, protect=False)
-        except OSError as exc:
+        try:
+            return win32crypt.CryptUnprotectData(value, None, None, None, 0)[1]
+        except Exception as exc:
             try:
                 return cls._windows_dpapi(value, protect=False)
-            except RuntimeError:
-                raise RuntimeError("저장된 보안 정보를 복호화할 수 없습니다.") from exc
+            except RuntimeError as fallback_exc:
+                raise RuntimeError("저장된 보안 정보를 복호화할 수 없습니다.") from fallback_exc
 
     def _load(self) -> dict[str, str]:
         raw = load_json(self.filename, {})
         return raw if isinstance(raw, dict) else {}
 
     def set(self, key: str, value: str) -> bool:
-        values = self._load()
         try:
             if value:
                 encrypted = self._protect(value.encode("utf-8"))
-                values[key] = base64.b64encode(encrypted).decode("ascii")
+                encoded = base64.b64encode(encrypted).decode("ascii")
             else:
-                values.pop(key, None)
-            save_json(self.filename, values)
+                encoded = ""
+
+            def update(raw: Any) -> dict[str, str]:
+                values = dict(raw) if isinstance(raw, dict) else {}
+                if encoded:
+                    values[key] = encoded
+                else:
+                    values.pop(key, None)
+                return values
+
+            update_json(self.filename, update, {})
             return True
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, TimeoutError, ValueError):
             # A secret backend problem must not prevent ReservationForm from
             # continuing to save config.json (people, site, threads, etc.).
             return False
+
+    def get_or_set(self, key: str, value: str) -> tuple[str, bool]:
+        """Atomically keep an existing secret or store the supplied fallback."""
+
+        if not value:
+            return self.get(key), False
+        try:
+            encrypted = self._protect(value.encode("utf-8"))
+            candidate = base64.b64encode(encrypted).decode("ascii")
+            winner = {"encoded": "", "inserted": False}
+
+            def update(raw: Any) -> dict[str, str]:
+                values = dict(raw) if isinstance(raw, dict) else {}
+                existing = str(values.get(key, "") or "")
+                if existing:
+                    winner["encoded"] = existing
+                else:
+                    values[key] = candidate
+                    winner["encoded"] = candidate
+                    winner["inserted"] = True
+                return values
+
+            update_json(self.filename, update, {})
+            if winner["inserted"]:
+                return value, True
+            decoded = base64.b64decode(winner["encoded"])
+            return self._unprotect(decoded).decode("utf-8"), True
+        except (OSError, RuntimeError, TimeoutError, UnicodeDecodeError, ValueError):
+            return "", False
+
+    def compare_and_set(
+        self, key: str, expected_value: str, new_value: str
+    ) -> tuple[str, bool]:
+        """Change one secret only when its decrypted value still matches."""
+
+        try:
+            if new_value:
+                encrypted = self._protect(new_value.encode("utf-8"))
+                candidate = base64.b64encode(encrypted).decode("ascii")
+            else:
+                candidate = ""
+            winner = {"value": ""}
+
+            def update(raw: Any) -> dict[str, str]:
+                values = dict(raw) if isinstance(raw, dict) else {}
+                encoded = str(values.get(key, "") or "")
+                if encoded:
+                    current = self._unprotect(base64.b64decode(encoded)).decode("utf-8")
+                else:
+                    current = ""
+                if current != expected_value:
+                    winner["value"] = current
+                    return values
+                if candidate:
+                    values[key] = candidate
+                else:
+                    values.pop(key, None)
+                winner["value"] = new_value
+                return values
+
+            update_json(self.filename, update, {})
+            return winner["value"], True
+        except (OSError, RuntimeError, TimeoutError, UnicodeDecodeError, ValueError):
+            return "", False
 
     def get(self, key: str, default: str = "") -> str:
         encoded = self._load().get(key)
