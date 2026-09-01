@@ -17,6 +17,13 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.74",
+        changes=(
+            "둠이스케이프 주문 생성 후 결제 준비와 예약번호 복구를 최대 8분간 유지",
+            "서버 지연 시 생성된 주문을 새 연결과 완료 응답에서 자동 재확인",
+        ),
+    ),
+    PatchNote(
         version="6.73",
         changes=(
             "네이버 상품·결제 방식별 선점 제출 시점 자동 보정",

@@ -6,13 +6,26 @@ import os
 import re
 import time
 import urllib.parse
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
 from pathlib import Path
 from bs4 import BeautifulSoup
+from yarl import URL
 from engines.base_engine import BaseEngine
 from pengucro.diagnostics import format_exception
 from pengucro.storage import append_history, load_json, save_json
+
+
+@dataclass(frozen=True)
+class DoomCheckoutRecoveryResult:
+    status: int
+    response_text: str
+    checkout_code: str
+    booking_number: str
+    reports_completed: bool
+    attempts: int
+    error: Exception | None
 
 
 class DoomSubmissionUncertain(RuntimeError):
@@ -105,7 +118,7 @@ class DoomEscapeEngine(BaseEngine):
     MAX_SCAN_SESSIONS = 10
     ORDER_POST_TIMEOUT_SECONDS = 20.0
     ORDER_FOLLOWUP_TIMEOUT_SECONDS = 20.0
-    ORDER_FOLLOWUP_RECOVERY_SECONDS = 180.0
+    ORDER_FOLLOWUP_RECOVERY_SECONDS = 480.0
     ORDER_FOLLOWUP_RETRY_DELAY_SECONDS = 1.0
     ORDER_CONFIRM_TIMEOUT_SECONDS = 20.0
     ORDER_RECOVERY_ATTEMPTS = 6
@@ -387,6 +400,10 @@ class DoomEscapeEngine(BaseEngine):
             "has_alert": "alert(" in lowered or "alert (" in lowered,
             "has_meta_refresh": "http-equiv=\"refresh\"" in lowered
             or "http-equiv='refresh'" in lowered,
+            "reports_already_completed": "이미 예약 완료" in lowered,
+            "has_booking_number": bool(
+                DoomEscapeEngine._extract_booking_number(text)
+            ),
         }
 
     def _write_safe_failure_summary(
@@ -1004,21 +1021,121 @@ class DoomEscapeEngine(BaseEngine):
         return None
 
     @staticmethod
-    def _extract_checkout_code(response_text):
-        soup = BeautifulSoup(response_text or "", "html.parser")
-        field = soup.find("input", attrs={"name": "ck_code"})
-        value = str(field.get("value") or "").strip() if field else ""
-        if value:
-            return value
-        match = re.search(
-            r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)",
-            response_text or "",
-            re.I,
+    def _extract_checkout_code(*response_sources):
+        """Extract a checkout code from HTML, redirects, or response URLs."""
+        for source in response_sources:
+            text = str(source or "")
+            if not text:
+                continue
+            soup = BeautifulSoup(text, "html.parser") if "<" in text else None
+            field = (
+                soup.find("input", attrs={"name": re.compile(r"^ck_code$", re.I)})
+                if soup is not None
+                else None
+            )
+            value = str(field.get("value") or "").strip() if field else ""
+            if value:
+                return urllib.parse.unquote(value)
+            match = re.search(
+                r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)",
+                text,
+                re.I,
+            )
+            if match:
+                return urllib.parse.unquote(match.group(1))
+            match = re.search(r"(?i)(?:[?&]|\b)ck_code=([^&#'\"\s>]+)", text)
+            if match:
+                return urllib.parse.unquote(match.group(1))
+        return ""
+
+    @classmethod
+    def _extract_booking_number(cls, *response_sources):
+        code = cls._extract_checkout_code(*response_sources)
+        if code and re.fullmatch(r"\d{4,10}", code):
+            return code
+        for source in response_sources:
+            raw = str(source or "")
+            text = (
+                BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
+                if "<" in raw
+                else raw
+            )
+            match = re.search(r"예약번호\s*[:：]?\s*(\d{4,10})", text)
+            if match:
+                return match.group(1)
+        return ""
+
+    @staticmethod
+    def _checkout_reports_completed(*response_sources):
+        combined = "\n".join(str(source or "") for source in response_sources)
+        return "이미 예약 완료" in combined or "예약이 완료되었습니다" in combined
+
+    @staticmethod
+    def _checkout_response_sources(response, response_text):
+        sources = [response_text]
+        response_url = getattr(response, "url", None)
+        if response_url:
+            sources.append(str(response_url))
+        headers = getattr(response, "headers", None)
+        if headers:
+            location = headers.get("Location") or headers.get("location")
+            if location:
+                sources.append(str(location))
+        for historical in tuple(getattr(response, "history", ()) or ()):
+            historical_url = getattr(historical, "url", None)
+            if historical_url:
+                sources.append(str(historical_url))
+            historical_headers = getattr(historical, "headers", None)
+            if historical_headers:
+                location = historical_headers.get("Location") or historical_headers.get(
+                    "location"
+                )
+                if location:
+                    sources.append(str(location))
+        return sources
+
+    def _new_checkout_recovery_session(self, source_session, headers):
+        """Clone order cookies onto a fresh TCP path for read-only recovery."""
+        if not isinstance(source_session, aiohttp.ClientSession):
+            return None
+        cookie_jar = aiohttp.CookieJar()
+        try:
+            response_url = URL(self.base_url)
+            cookies = source_session.cookie_jar.filter_cookies(response_url)
+            cookie_jar.update_cookies(cookies, response_url=response_url)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        connector = aiohttp.TCPConnector(
+            limit=2,
+            ttl_dns_cache=30,
         )
-        return match.group(1) if match else ""
+        return aiohttp.ClientSession(
+            headers=dict(headers or {}),
+            cookie_jar=cookie_jar,
+            connector=connector,
+        )
+
+    def _refresh_checkout_recovery_cookies(self, source_session, recovery_session):
+        if recovery_session is None:
+            return
+        try:
+            response_url = URL(self.base_url)
+            cookies = source_session.cookie_jar.filter_cookies(response_url)
+            recovery_session.cookie_jar.update_cookies(
+                cookies, response_url=response_url
+            )
+        except (AttributeError, TypeError, ValueError):
+            return
 
     async def _read_checkout_with_recovery_async(
-        self, session, url, headers, worker_label, order_id
+        self,
+        session,
+        url,
+        headers,
+        worker_label,
+        order_id,
+        *,
+        order_response_text="",
     ):
         """Keep reading a known order without ever creating another order."""
         deadline = time.monotonic() + self.ORDER_FOLLOWUP_RECOVERY_SECONDS
@@ -1027,56 +1144,130 @@ class DoomEscapeEngine(BaseEngine):
         last_text = ""
         last_error = None
         announced = False
-
-        while not self.stop_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            attempt += 1
-            request_timeout = min(self.ORDER_FOLLOWUP_TIMEOUT_SECONDS, remaining)
-            try:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    timeout=max(0.001, request_timeout),
-                ) as response:
-                    last_status = response.status
-                    last_text = await response.text(
-                        encoding="utf-8", errors="ignore"
-                    )
-                checkout_code = self._extract_checkout_code(last_text)
-                if last_status < 500 and checkout_code:
-                    if attempt > 1:
-                        self.log(
-                            f"[{worker_label}] [복구] orderId={order_id} · "
-                            f"결제 준비 화면을 {attempt}번째 조회에서 확인했습니다.",
-                            "success",
-                        )
-                    return last_status, last_text, checkout_code, attempt, None
-                last_error = (
-                    RuntimeError(f"HTTP {last_status}")
-                    if last_status >= 500
-                    else RuntimeError("결제 확인 코드 미표시")
-                )
-            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                last_error = exc
-
-            if not announced:
-                announced = True
-                self.log(
-                    f"[{worker_label}] [복구 대기] orderId={order_id} · "
-                    "결제 준비 화면 응답 지연 · 주문을 다시 만들지 않고 "
-                    f"최대 {self.ORDER_FOLLOWUP_RECOVERY_SECONDS:.0f}초 동안 계속 확인합니다.",
-                    "warning",
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(
-                min(self.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS, remaining)
+        completed_announced = False
+        reports_completed = self._checkout_reports_completed(order_response_text)
+        booking_number = self._extract_booking_number(order_response_text)
+        initial_code = self._extract_checkout_code(order_response_text)
+        if initial_code:
+            return DoomCheckoutRecoveryResult(
+                200,
+                order_response_text,
+                initial_code,
+                booking_number,
+                reports_completed,
+                0,
+                None,
             )
 
-        return last_status, last_text, "", attempt, last_error
+        recovery_session = self._new_checkout_recovery_session(session, headers)
+
+        try:
+            while not self.stop_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                attempt += 1
+                request_timeout = min(self.ORDER_FOLLOWUP_TIMEOUT_SECONDS, remaining)
+                request_session = session
+                if attempt > 1 and recovery_session is not None:
+                    if attempt == 2:
+                        self._refresh_checkout_recovery_cookies(
+                            session, recovery_session
+                        )
+                    request_session = recovery_session
+                try:
+                    async with request_session.get(
+                        url,
+                        headers=headers,
+                        timeout=max(0.001, request_timeout),
+                    ) as response:
+                        last_status = response.status
+                        last_text = await response.text(
+                            encoding="utf-8", errors="ignore"
+                        )
+                        sources = self._checkout_response_sources(response, last_text)
+                    checkout_code = self._extract_checkout_code(*sources)
+                    booking_number = self._extract_booking_number(*sources)
+                    reports_completed = reports_completed or self._checkout_reports_completed(
+                        *sources
+                    )
+                    if last_status < 500 and checkout_code:
+                        if attempt > 1:
+                            self.log(
+                                f"[{worker_label}] [복구] orderId={order_id} · "
+                                f"결제 준비 화면을 {attempt}번째 조회에서 확인했습니다.",
+                                "success",
+                            )
+                        return DoomCheckoutRecoveryResult(
+                            last_status,
+                            last_text,
+                            checkout_code,
+                            booking_number,
+                            reports_completed,
+                            attempt,
+                            None,
+                        )
+                    if reports_completed and booking_number:
+                        self.log(
+                            f"[{worker_label}] [복구] orderId={order_id} · "
+                            "이미 완료된 주문에서 예약번호를 회수했습니다.",
+                            "success",
+                        )
+                        return DoomCheckoutRecoveryResult(
+                            last_status,
+                            last_text,
+                            "",
+                            booking_number,
+                            True,
+                            attempt,
+                            None,
+                        )
+                    if reports_completed and not completed_announced:
+                        completed_announced = True
+                        self.log(
+                            f"[{worker_label}] [완료 상태 감지] orderId={order_id} · "
+                            "서버는 이미 예약 완료로 응답했습니다. 예약번호를 계속 회수합니다.",
+                            "warning",
+                        )
+                    last_error = (
+                        RuntimeError(f"HTTP {last_status}")
+                        if last_status >= 500
+                        else RuntimeError(
+                            "예약 완료 번호 미표시"
+                            if reports_completed
+                            else "결제 확인 코드 미표시"
+                        )
+                    )
+                except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                    last_error = exc
+
+                if not announced:
+                    announced = True
+                    self.log(
+                        f"[{worker_label}] [복구 대기] orderId={order_id} · "
+                        "결제 준비 화면 응답 지연 · 주문을 다시 만들지 않고 "
+                        f"최대 {self.ORDER_FOLLOWUP_RECOVERY_SECONDS:.0f}초 동안 계속 확인합니다.",
+                        "warning",
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(
+                    min(self.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS, remaining)
+                )
+        finally:
+            if recovery_session is not None:
+                await recovery_session.close()
+
+        return DoomCheckoutRecoveryResult(
+            last_status,
+            last_text,
+            "",
+            booking_number,
+            reports_completed,
+            attempt,
+            last_error,
+        )
 
     @staticmethod
     def _is_transient_site_error(exc):
@@ -1728,19 +1919,55 @@ class DoomEscapeEngine(BaseEngine):
                         # 4. Fetch KCP page to extract ck_code
                         current_stage = "결제 준비 화면 조회"
                         request_started = time.perf_counter()
-                        (
-                            kcp_status,
-                            kcp_text,
-                            ck_code_val,
-                            read_attempts,
-                            kcp_error,
-                        ) = await self._read_checkout_with_recovery_async(
+                        checkout_result = await self._read_checkout_with_recovery_async(
                             booking_session,
                             kcp_url,
                             headers,
                             worker_label,
                             num,
+                            order_response_text=act_text,
                         )
+                        kcp_status = checkout_result.status
+                        kcp_text = checkout_result.response_text
+                        ck_code_val = checkout_result.checkout_code
+                        recovered_booking_number = checkout_result.booking_number
+                        read_attempts = checkout_result.attempts
+                        kcp_error = checkout_result.error
+                        if (
+                            checkout_result.reports_completed
+                            and recovered_booking_number
+                            and not ck_code_val
+                        ):
+                            final_msg = (
+                                f"[{worker_label}] 예약 최종 완료! 예약번호: "
+                                f"{recovered_booking_number}"
+                            )
+                            try:
+                                import webbrowser
+
+                                webbrowser.open(
+                                    f"{self.base_url}/layout/res/home.php?go=rev.make.end"
+                                    f"&num={num}&ck_code={urllib.parse.quote(recovered_booking_number)}"
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                append_history(
+                                    {
+                                        "timestamp": time.strftime(
+                                            "%Y-%m-%d %H:%M:%S", time.localtime()
+                                        ),
+                                        "site": "둠이스케이프",
+                                        "date": rev_days,
+                                        "time": target_time,
+                                        "booking_number": recovered_booking_number,
+                                    }
+                                )
+                            except Exception:
+                                pass
+                            self.log(f"🎉 {final_msg}", "success")
+                            self.notify_success()
+                            break
                         if not ck_code_val:
                             detail = (
                                 self._describe_exception(kcp_error)
@@ -1748,7 +1975,11 @@ class DoomEscapeEngine(BaseEngine):
                                 else "결제 확인 코드를 읽지 못함"
                             )
                             raise DoomSubmissionUncertain(
-                                current_stage,
+                                (
+                                    "예약 완료 번호 회수"
+                                    if checkout_result.reports_completed
+                                    else current_stage
+                                ),
                                 detail,
                                 order_id=num,
                             ) from kcp_error

@@ -100,7 +100,7 @@ def test_checkout_recovery_does_not_change_pre_order_speed_contract():
     assert DoomEscapeEngine.MAX_SCAN_SESSIONS == 10
     assert DoomEscapeEngine.ORDER_POST_TIMEOUT_SECONDS == 20.0
     assert DoomEscapeEngine.ORDER_FOLLOWUP_TIMEOUT_SECONDS == 20.0
-    assert DoomEscapeEngine.ORDER_FOLLOWUP_RECOVERY_SECONDS == 180.0
+    assert DoomEscapeEngine.ORDER_FOLLOWUP_RECOVERY_SECONDS == 480.0
 
 
 def test_order_scan_stop_is_isolated_to_each_engine_instance():
@@ -689,7 +689,7 @@ def test_checkout_followup_recovers_late_without_duplicate_order():
     engine.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS = 0
     session = Session()
 
-    status, _text, code, attempts, error = asyncio.run(
+    result = asyncio.run(
         engine._read_checkout_with_recovery_async(
             session,
             "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001",
@@ -699,12 +699,164 @@ def test_checkout_followup_recovers_late_without_duplicate_order():
         )
     )
 
-    assert status == 200
-    assert code == "CODE-777"
-    assert attempts == 6
-    assert error is None
-    assert any("최대 180초 동안 계속 확인" in message for message, _level in logs)
+    assert result.status == 200
+    assert result.checkout_code == "CODE-777"
+    assert result.attempts == 6
+    assert result.error is None
+    assert any("최대 480초 동안 계속 확인" in message for message, _level in logs)
     assert any("6번째 조회에서 확인" in message for message, _level in logs)
+
+
+def test_checkout_followup_recovers_code_from_effective_redirect_url():
+    class Response:
+        status = 200
+        url = "https://doomescape.com/layout/res/home.php?go=rev.make.end&ck_code=76205"
+        headers = {}
+        history = ()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self, **_kwargs):
+            return "예약 페이지 이동"
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+    result = asyncio.run(
+        engine._read_checkout_with_recovery_async(
+            Session(),
+            "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001",
+            {},
+            "태스크 1",
+            "9001",
+        )
+    )
+
+    assert result.checkout_code == "76205"
+    assert result.booking_number == "76205"
+    assert result.attempts == 1
+
+
+def test_checkout_followup_recovers_number_from_completed_page():
+    class Response:
+        status = 200
+        url = "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001"
+        headers = {}
+        history = ()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self, **_kwargs):
+            return "<script>alert('이미 예약 완료되었습니다.')</script> 예약번호 75028"
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    result = asyncio.run(
+        engine._read_checkout_with_recovery_async(
+            Session(),
+            "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001",
+            {},
+            "태스크 1",
+            "9001",
+        )
+    )
+
+    assert result.reports_completed
+    assert result.booking_number == "75028"
+    assert result.checkout_code == ""
+    assert any("예약번호를 회수" in message for message, _level in logs)
+
+
+def test_checkout_completed_without_number_remains_uncertain_until_deadline():
+    class Response:
+        status = 200
+        url = "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001"
+        headers = {}
+        history = ()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self, **_kwargs):
+            return "<script>alert('이미 예약 완료되었습니다.')</script>"
+
+    class Session:
+        def __init__(self):
+            self.get_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.get_count += 1
+            return Response()
+
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    engine.ORDER_FOLLOWUP_RECOVERY_SECONDS = 0.04
+    engine.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS = 0.001
+    session = Session()
+    result = asyncio.run(
+        engine._read_checkout_with_recovery_async(
+            session,
+            "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001",
+            {},
+            "태스크 1",
+            "9001",
+        )
+    )
+
+    assert result.reports_completed
+    assert result.booking_number == ""
+    assert result.checkout_code == ""
+    assert result.attempts > 2
+    assert "예약 완료 번호 미표시" in str(result.error)
+    assert any("완료 상태 감지" in message for message, _level in logs)
+
+
+def test_checkout_recovery_uses_a_distinct_session_with_order_cookies():
+    import aiohttp
+    from yarl import URL
+
+    async def exercise():
+        engine = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
+        source_jar = aiohttp.CookieJar()
+        source_jar.update_cookies(
+            {"PHPSESSID": "order-session"},
+            response_url=URL("https://doomescape.com"),
+        )
+        async with aiohttp.ClientSession(cookie_jar=source_jar) as source:
+            recovery = engine._new_checkout_recovery_session(source, {})
+            try:
+                assert recovery is not source
+                cookies = recovery.cookie_jar.filter_cookies(
+                    URL("https://doomescape.com")
+                )
+                assert cookies["PHPSESSID"].value == "order-session"
+            finally:
+                await recovery.close()
+
+    asyncio.run(exercise())
 
 
 def test_order_connect_failure_before_send_uses_warmed_fallback_once():
