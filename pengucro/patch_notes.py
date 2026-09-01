@@ -17,6 +17,14 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.75",
+        changes=(
+            "네이버 선결제 상품의 오픈 경계 제출 시점을 안정적으로 조정",
+            "네이버 실제 오픈 지연 시 예약 화면이 열릴 때까지 감시 후 자동 재개",
+            "네이버 불명확 응답의 예약내역 확인 시간을 늘리고 잘못된 조기 보정 방지",
+        ),
+    ),
+    PatchNote(
         version="6.74",
         changes=(
             "둠이스케이프 주문 생성 후 결제 준비와 예약번호 복구를 최대 8분간 유지",

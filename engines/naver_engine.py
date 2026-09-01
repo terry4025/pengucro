@@ -469,16 +469,25 @@ class NaverEngine(BaseEngine):
     API_BROWSER_ARM_MIN_SECONDS = 0.30
     API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
     API_BROWSER_ARM_STATUS_SECONDS = 0.025
-    # Start from a 60 ms server-arrival target, then learn a small bounded offset
-    # per business/item/payment mode. The browser-internal flow retries only an
-    # explicit NOT_OPEN response and never treats RT47 as permission to repost.
+    # Postpaid starts at 60 ms before open; prepaid uses a safer 20 ms product
+    # profile because its gate can lag the published boundary. The browser flow
+    # retries only an explicit NOT_OPEN response and never treats RT47 as
+    # permission to repost.
     API_SEND_MIN_LEAD_SECONDS = 0.020
     API_SEND_MAX_LEAD_SECONDS = 0.250
     API_PREOPEN_CLOCK_SAMPLES = 5
     API_REFUSED_RECHECK_TIMEOUT_SECONDS = 0.30
-    API_RECONCILE_ATTEMPTS = 40
-    API_RECONCILE_WINDOW_SECONDS = 20.0
+    API_RECONCILE_ATTEMPTS = 120
+    API_RECONCILE_WINDOW_SECONDS = 60.0
     API_POST_SUBMIT_INVENTORY_OFFSETS = (0.0, 0.10, 0.30, 1.00)
+    # Naver documents that a configured opening can be applied minutes late.
+    # After an explicit NOT_OPEN response, watch the rendered timetable without
+    # another mutation. Keep an intensive five-minute watch, then continue at a
+    # low rate instead of abandoning a genuinely delayed opening.
+    API_DELAYED_OPEN_ACTIVE_WINDOW_SECONDS = 300.0
+    API_DELAYED_OPEN_ACTIVE_POLL_SECONDS = 0.25
+    API_DELAYED_OPEN_SLOW_POLL_SECONDS = 5.0
+    API_DELAYED_OPEN_PAGE_TIMEOUT_MS = 4000
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -577,6 +586,8 @@ class NaverEngine(BaseEngine):
         self._api_submit_state = "idle"
         self._api_prepare_pending = False
         self._api_refused_signature: tuple[Any, ...] | None = None
+        self._api_delayed_open_started = 0.0
+        self._api_delayed_open_slow_logged = False
         self._api_account: NaverAccount | None = None
         self._api_business: dict[str, Any] | None = None
         self._api_biz_item: dict[str, Any] | None = None
@@ -641,6 +652,8 @@ class NaverEngine(BaseEngine):
         self._api_submit_state = "idle"
         self._api_prepare_pending = False
         self._api_refused_signature = None
+        self._api_delayed_open_started = 0.0
+        self._api_delayed_open_slow_logged = False
         self._api_account = None
         self._api_business = None
         self._api_biz_item = None
@@ -1412,6 +1425,13 @@ class NaverEngine(BaseEngine):
                             reservation_data=reservation_data,
                             dev_mode=dev_mode,
                         )
+                        if outcome == "delayed_open":
+                            outcome, detail = await self._wait_for_delayed_api_open(
+                                target_date,
+                                target_time,
+                                reservation_data,
+                                dev_mode,
+                            )
                         if outcome == "fallback":
                             outcome, detail = await self._submit(
                                 target_date,
@@ -2231,6 +2251,8 @@ class NaverEngine(BaseEngine):
         """Handle one known result without issuing any additional mutation."""
         if result.outcome == SubmitOutcome.SUCCESS:
             self._api_submit_state = "success"
+            self._api_delayed_open_started = 0.0
+            self._api_delayed_open_slow_logged = False
             self._record_api_timing_result(
                 outcome=SubmitOutcome.SUCCESS,
                 response_code=result.code,
@@ -2262,6 +2284,8 @@ class NaverEngine(BaseEngine):
             # final submission and reconcile the authenticated account instead
             # of risking a second reservation.
             self._api_submit_state = "uncertain"
+            self._api_delayed_open_started = 0.0
+            self._api_delayed_open_slow_logged = False
             self._api_submit_enabled = False
             self._api_submit_blocked = True
             self._api_refused_signature = (
@@ -2290,6 +2314,8 @@ class NaverEngine(BaseEngine):
                 return "duplicate", result.detail + suffix
             return "unknown", result.detail + suffix
         self._api_submit_state = "idle"
+        self._api_delayed_open_started = 0.0
+        self._api_delayed_open_slow_logged = False
         self._disable_api_submit(result.detail)
         return "fallback", result.detail
 
@@ -2578,10 +2604,93 @@ class NaverEngine(BaseEngine):
                     response_code=result.code,
                     booking_confirmed=False,
                 )
-                return "fallback", detail
+                if self._api_delayed_open_started <= 0:
+                    self._api_delayed_open_started = time.monotonic()
+                    self._api_delayed_open_slow_logged = False
+                return "delayed_open", detail
             return outcome, detail
 
         return "fallback", "API 직접 제출 제한 시간 초과"
+
+    async def _wait_for_delayed_api_open(
+        self,
+        target_date: str,
+        target_time: str,
+        reservation_data: dict[str, Any],
+        dev_mode: bool,
+    ) -> tuple[str, str]:
+        """Wait for a real page transition after an explicit NOT_OPEN reply.
+
+        The slot API can advertise inventory before the booking gate accepts a
+        mutation.  Page/timetable reads are safe evidence of that later
+        transition; RT47 and other ambiguous replies never enter this path.
+        """
+        if self._api_delayed_open_started <= 0:
+            self._api_delayed_open_started = time.monotonic()
+        self.log(
+            "[정보] 네이버가 아직 미오픈으로 확인했습니다 · 추가 제출 없이 "
+            "실제 예약 화면 오픈을 최대 5분 집중 감시합니다.",
+            "warning",
+        )
+
+        while not self.stop_event.is_set():
+            elapsed = time.monotonic() - self._api_delayed_open_started
+            intensive = elapsed < self.API_DELAYED_OPEN_ACTIVE_WINDOW_SECONDS
+            if not intensive and not self._api_delayed_open_slow_logged:
+                self._api_delayed_open_slow_logged = True
+                self.log(
+                    "[정보] 지연 오픈 집중 감시 5분 경과 · 예약을 포기하지 않고 "
+                    "5초 간격의 읽기 전용 확인을 계속합니다.",
+                    "info",
+                )
+
+            try:
+                rendered = await self._goto_item(
+                    target_date,
+                    timeout_ms=self.API_DELAYED_OPEN_PAGE_TIMEOUT_MS,
+                )
+            except Exception as exc:
+                rendered = False
+                self._log_throttled(
+                    "delayed_open_page_error",
+                    f"[정보] 지연 오픈 화면 확인이 늦어지고 있습니다 "
+                    f"({type(exc).__name__}) · 계속 확인합니다.",
+                    "info",
+                    15.0,
+                )
+
+            self._last_warm = time.monotonic()
+            self._warmed_for_date = bool(rendered)
+            if rendered:
+                self.log(
+                    f"[정보] 실제 예약 화면 오픈 확인 · {target_date} {target_time} · "
+                    "최신 세션과 슬롯으로 단일 선점 흐름을 재개합니다.",
+                    "success",
+                )
+                await self._refresh_api_submit(reservation_data)
+                outcome, detail = await self._submit_api_first(
+                    getattr(self, "_last_signature", None),
+                    reservation_data=reservation_data,
+                    dev_mode=dev_mode,
+                )
+                if outcome != "delayed_open":
+                    return outcome, detail
+
+            delay = (
+                self.API_DELAYED_OPEN_ACTIVE_POLL_SECONDS
+                if intensive
+                else self.API_DELAYED_OPEN_SLOW_POLL_SECONDS
+            )
+            self._log_throttled(
+                "delayed_open_wait",
+                f"[정보] 설정 시각 이후 실제 예약 화면 대기 중 · "
+                f"{elapsed:.0f}초 경과 · 읽기 전용 확인을 계속합니다.",
+                "info",
+                10.0,
+            )
+            await asyncio.sleep(delay)
+
+        return "stopped", "중지됨"
 
     async def _strike_at_open(
         self, target_date: str, target_time: str, reservation_data, dev_mode: bool
@@ -2626,6 +2735,13 @@ class NaverEngine(BaseEngine):
                 reservation_data=reservation_data,
                 dev_mode=dev_mode,
             )
+            if outcome == "delayed_open":
+                return await self._wait_for_delayed_api_open(
+                    target_date,
+                    target_time,
+                    reservation_data,
+                    dev_mode,
+                )
             if outcome != "fallback":
                 return outcome, detail
             remaining = self._seconds_until_open()

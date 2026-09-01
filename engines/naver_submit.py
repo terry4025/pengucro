@@ -1191,9 +1191,9 @@ class NaverBrowserSubmitter:
                 wait_until="domcontentloaded",
                 timeout=5000,
             )
-            attempt_limit = max(1, min(int(attempts or 1), 48))
+            attempt_limit = max(1, min(int(attempts or 1), 128))
             deadline = time.monotonic() + max(
-                0.5, min(float(window_seconds or 0.5), 25.0)
+                0.5, min(float(window_seconds or 0.5), 90.0)
             )
             for attempt in range(attempt_limit):
                 try:
@@ -1235,7 +1235,7 @@ class NaverBrowserSubmitter:
                 remaining = deadline - time.monotonic()
                 if attempt + 1 >= attempt_limit or remaining <= 0:
                     break
-                await asyncio.sleep(min(0.35, remaining))
+                await asyncio.sleep(min(0.50, remaining))
         except Exception:
             return NaverBookingReconciliation(False)
         finally:

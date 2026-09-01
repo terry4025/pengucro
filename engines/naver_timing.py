@@ -4,8 +4,8 @@ The public booking API does not expose the server's request-arrival timestamp.
 We therefore learn only from outcomes that have a useful interpretation:
 
 * an explicit NOT_OPEN reply means the request reached the booking gate early;
-* a refusal followed by exhausted public inventory and no booking evidence means
-  the next run may benefit from a slightly earlier arrival target;
+* a refusal followed by exhausted public inventory is still ambiguous because
+  it cannot distinguish an early gate rejection from a competing reservation;
 * a confirmed booking keeps the successful target unchanged.
 
 The adjustment is intentionally small and bounded.  One noisy opening must not
@@ -23,8 +23,10 @@ from pengucro.storage import load_json, update_json
 
 
 TIMING_HISTORY_FILE = "naver_timing_history.json"
+TIMING_HISTORY_VERSION = 2
 DEFAULT_TARGET_BEFORE_OPEN_SECONDS = 0.060
-MIN_TARGET_BEFORE_OPEN_SECONDS = 0.020
+PREPAID_TARGET_BEFORE_OPEN_SECONDS = 0.020
+MIN_TARGET_BEFORE_OPEN_SECONDS = 0.010
 MAX_TARGET_BEFORE_OPEN_SECONDS = 0.120
 ADJUSTMENT_STEP_SECONDS = 0.010
 MAX_OBSERVATIONS = 24
@@ -44,11 +46,19 @@ class NaverTimingUpdate:
     adjustment_seconds: float
 
 
-def _bounded_target(value: Any) -> float:
+def _default_target(payment_mode: str = "") -> float:
+    return (
+        PREPAID_TARGET_BEFORE_OPEN_SECONDS
+        if str(payment_mode or "").strip() == "npay_prepaid"
+        else DEFAULT_TARGET_BEFORE_OPEN_SECONDS
+    )
+
+
+def _bounded_target(value: Any, payment_mode: str = "") -> float:
     try:
         candidate = float(value)
     except (TypeError, ValueError):
-        candidate = DEFAULT_TARGET_BEFORE_OPEN_SECONDS
+        candidate = _default_target(payment_mode)
     return min(
         MAX_TARGET_BEFORE_OPEN_SECONDS,
         max(MIN_TARGET_BEFORE_OPEN_SECONDS, candidate),
@@ -77,18 +87,27 @@ def load_timing_profile(
 ) -> NaverTimingProfile:
     key = timing_profile_key(business_id, biz_item_id, payment_mode)
     if not key:
-        return NaverTimingProfile("", DEFAULT_TARGET_BEFORE_OPEN_SECONDS, 0)
-    payload = load_json(TIMING_HISTORY_FILE, {"version": 1, "entries": {}})
+        return NaverTimingProfile("", _default_target(payment_mode), 0)
+    payload = load_json(
+        TIMING_HISTORY_FILE,
+        {"version": TIMING_HISTORY_VERSION, "entries": {}},
+    )
     entries = payload.get("entries", {}) if isinstance(payload, dict) else {}
     row = entries.get(key, {}) if isinstance(entries, dict) else {}
     observations = row.get("observations", []) if isinstance(row, dict) else []
+    # v1 could move a profile earlier after one RT47 + sold-out observation.
+    # That evidence is ambiguous, so do not carry the learned lead into v2.
+    if isinstance(row, dict) and payload.get("version") == TIMING_HISTORY_VERSION:
+        stored_target = row.get("target_before_open_seconds")
+    elif isinstance(row, dict) and payment_mode != "npay_prepaid":
+        # v1 postpaid learning came from explicit gate evidence and is safe to
+        # preserve. Only prepaid's ambiguous early-send learning is reset.
+        stored_target = row.get("target_before_open_seconds")
+    else:
+        stored_target = _default_target(payment_mode)
     return NaverTimingProfile(
         key,
-        _bounded_target(
-            row.get("target_before_open_seconds")
-            if isinstance(row, dict)
-            else DEFAULT_TARGET_BEFORE_OPEN_SECONDS
-        ),
+        _bounded_target(stored_target, payment_mode),
         len(observations) if isinstance(observations, list) else 0,
     )
 
@@ -106,7 +125,7 @@ def record_timing_observation(
 ) -> NaverTimingUpdate:
     key = timing_profile_key(business_id, biz_item_id, payment_mode)
     if not key:
-        profile = NaverTimingProfile("", DEFAULT_TARGET_BEFORE_OPEN_SECONDS, 0)
+        profile = NaverTimingProfile("", _default_target(payment_mode), 0)
         return NaverTimingUpdate(profile, profile.target_before_open_seconds, 0.0)
 
     clean_outcome = str(outcome or "unknown")[:40]
@@ -119,7 +138,12 @@ def record_timing_observation(
         entries = dict(entries) if isinstance(entries, dict) else {}
         row = entries.get(key)
         row = dict(row) if isinstance(row, dict) else {}
-        previous = _bounded_target(row.get("target_before_open_seconds"))
+        version = payload.get("version")
+        if version == TIMING_HISTORY_VERSION or payment_mode != "npay_prepaid":
+            stored_previous = row.get("target_before_open_seconds")
+        else:
+            stored_previous = _default_target(payment_mode)
+        previous = _bounded_target(stored_previous, payment_mode)
 
         adjustment = 0.0
         if clean_outcome in {"success_after_notopen", "refused_after_notopen"}:
@@ -132,13 +156,11 @@ def record_timing_observation(
                 # The booking resolver explicitly confirmed that the gate had not
                 # opened. Move the next target closer to/after the boundary.
                 adjustment = -ADJUSTMENT_STEP_SECONDS
-            elif clean_outcome == "refused" and inventory_remaining == 0:
-                # No own booking appeared and inventory was already exhausted.
-                # This is the only refusal state that supports a small earlier
-                # adjustment; available/unknown inventory remains ambiguous.
-                adjustment = ADJUSTMENT_STEP_SECONDS
+            # A refusal plus exhausted inventory cannot tell whether this request
+            # reached the gate early or another customer won the one-seat race.
+            # Preserve the target instead of amplifying one noisy observation.
 
-        updated_target = _bounded_target(previous + adjustment)
+        updated_target = _bounded_target(previous + adjustment, payment_mode)
         observations = row.get("observations")
         observations = list(observations) if isinstance(observations, list) else []
         raw_timing = timing if isinstance(timing, dict) else {}
@@ -181,7 +203,7 @@ def record_timing_observation(
             "target_before_open_seconds": round(updated_target, 3),
             "observations": observations,
         }
-        payload["version"] = 1
+        payload["version"] = TIMING_HISTORY_VERSION
         payload["entries"] = entries
         result.update(
             previous=previous,
@@ -194,7 +216,7 @@ def record_timing_observation(
     update_json(
         TIMING_HISTORY_FILE,
         updater,
-        {"version": 1, "entries": {}},
+        {"version": TIMING_HISTORY_VERSION, "entries": {}},
     )
     profile = NaverTimingProfile(key, result["target"], result["count"])
     return NaverTimingUpdate(profile, result["previous"], result["adjustment"])

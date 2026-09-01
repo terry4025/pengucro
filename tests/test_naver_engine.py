@@ -729,8 +729,8 @@ def test_armed_rt47_reconciles_with_exactly_one_browser_mutation():
     assert engine._api_submitter.calls == 0
     assert len(engine._api_submitter.reconcile_calls) == 1
     reconcile_call = engine._api_submitter.reconcile_calls[0]
-    assert reconcile_call["attempts"] == 40
-    assert reconcile_call["window_seconds"] == 20.0
+    assert reconcile_call["attempts"] == 120
+    assert reconcile_call["window_seconds"] == 60.0
 
 
 def test_open_strike_uses_same_browser_server_clock_for_absolute_arm():
@@ -959,10 +959,10 @@ def test_post_submit_inventory_observation_records_the_target_slot_state():
     assert engine._last_post_submit_inventory == samples
 
 
-def test_exhausted_rt47_observation_updates_only_the_matching_product_profile():
+def test_exhausted_rt47_observation_keeps_matching_product_profile_unchanged():
     engine = make_engine()
     engine._timing_profile = NaverTimingProfile(
-        "1498729|7094790|npay_prepaid", 0.060, 0
+        "1498729|7094790|npay_prepaid", 0.020, 0
     )
     engine._last_post_submit_inventory = [{"remaining": 0, "stock": 1}]
 
@@ -973,7 +973,7 @@ def test_exhausted_rt47_observation_updates_only_the_matching_product_profile():
     )
 
     profile = load_timing_profile("1498729", "7094790", "npay_prepaid")
-    assert profile.target_before_open_seconds == pytest.approx(0.070)
+    assert profile.target_before_open_seconds == pytest.approx(0.020)
     assert load_timing_profile(
         "1498729", "7094790", "postpaid"
     ).target_before_open_seconds == pytest.approx(0.060)
@@ -1135,6 +1135,48 @@ def test_api_not_open_retries_until_success_without_reloading():
 
     assert outcome == "success"
     assert engine._api_submitter.calls == 2
+
+
+def test_delayed_not_open_waits_for_page_transition_before_next_submit():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(-0.01)
+    engine.API_NOT_OPEN_WINDOW_SECONDS = 1.0
+    engine.API_NOT_OPEN_RETRY_SECONDS = 0.0
+    engine.API_DELAYED_OPEN_ACTIVE_POLL_SECONDS = 0.0
+    arm_direct_submit(engine, [
+        SubmitResult(SubmitOutcome.NOT_OPEN, message="아직 오픈 전"),
+        SubmitResult(SubmitOutcome.NOT_OPEN, message="아직 오픈 전"),
+        SubmitResult(SubmitOutcome.NOT_OPEN, message="아직 오픈 전"),
+        SubmitResult(SubmitOutcome.SUCCESS, booking_id="999888"),
+    ])
+    page_states = iter([False, True])
+    page_calls = []
+
+    async def fake_goto(date, timeout_ms=None):
+        page_calls.append((date, timeout_ms))
+        return next(page_states)
+
+    async def fake_refresh(_reservation):
+        return True
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("delayed open must remain on the API path")
+
+    engine._goto_item = fake_goto
+    engine._refresh_api_submit = fake_refresh
+    engine._submit = forbidden
+
+    outcome, detail = asyncio.run(
+        engine._strike_at_open(
+            "2026-08-08", "14:30", PREPARATION_RESERVATION, False
+        )
+    )
+
+    assert outcome == "success"
+    assert "999888" in detail
+    assert engine._api_submitter.calls == 4
+    assert len(page_calls) == 2
 
 
 def test_api_rt98_disables_direct_path_and_falls_back_to_browser():

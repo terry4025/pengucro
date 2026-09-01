@@ -5,6 +5,7 @@ from engines.naver_timing import (
     load_timing_profile,
     record_timing_observation,
 )
+from pengucro.storage import update_json
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +23,7 @@ def test_timing_profiles_are_separate_for_prepaid_and_postpaid():
         inventory_remaining=0,
     )
 
-    assert prepaid.profile.target_before_open_seconds == pytest.approx(0.070)
+    assert prepaid.profile.target_before_open_seconds == pytest.approx(0.020)
     assert load_timing_profile(
         "1498729", "7094790", "postpaid"
     ).target_before_open_seconds == pytest.approx(
@@ -30,7 +31,7 @@ def test_timing_profiles_are_separate_for_prepaid_and_postpaid():
     )
 
 
-def test_exhausted_refusal_moves_next_arrival_target_earlier_by_ten_ms():
+def test_exhausted_refusal_keeps_ambiguous_arrival_target_unchanged():
     update = record_timing_observation(
         "1498729",
         "7094790",
@@ -41,9 +42,9 @@ def test_exhausted_refusal_moves_next_arrival_target_earlier_by_ten_ms():
         timing={"estimated_arrival_offset_ms": -60, "attempts": 1},
     )
 
-    assert update.previous_target_seconds == pytest.approx(0.060)
-    assert update.adjustment_seconds == pytest.approx(0.010)
-    assert update.profile.target_before_open_seconds == pytest.approx(0.070)
+    assert update.previous_target_seconds == pytest.approx(0.020)
+    assert update.adjustment_seconds == pytest.approx(0.0)
+    assert update.profile.target_before_open_seconds == pytest.approx(0.020)
 
 
 def test_explicit_not_open_moves_next_arrival_target_later_by_ten_ms():
@@ -76,9 +77,9 @@ def test_confirmed_booking_keeps_the_successful_target():
         inventory_remaining=0,
     )
 
-    assert first.profile.target_before_open_seconds == pytest.approx(0.070)
+    assert first.profile.target_before_open_seconds == pytest.approx(0.020)
     assert success.adjustment_seconds == pytest.approx(0.0)
-    assert success.profile.target_before_open_seconds == pytest.approx(0.070)
+    assert success.profile.target_before_open_seconds == pytest.approx(0.020)
     assert success.profile.observation_count == 2
 
 
@@ -93,7 +94,7 @@ def test_success_after_explicit_not_open_moves_initial_probe_toward_boundary():
     )
 
     assert update.adjustment_seconds == pytest.approx(-0.010)
-    assert update.profile.target_before_open_seconds == pytest.approx(0.050)
+    assert update.profile.target_before_open_seconds == pytest.approx(0.010)
 
 
 def test_available_inventory_after_rt47_does_not_guess_or_risk_oscillation():
@@ -107,4 +108,47 @@ def test_available_inventory_after_rt47_does_not_guess_or_risk_oscillation():
     )
 
     assert update.adjustment_seconds == pytest.approx(0.0)
-    assert update.profile.target_before_open_seconds == pytest.approx(0.060)
+    assert update.profile.target_before_open_seconds == pytest.approx(0.020)
+
+
+def test_v1_ambiguous_early_learning_is_reset_to_safe_prepaid_default():
+    key = "1498729|7094790|npay_prepaid"
+    update_json(
+        "naver_timing_history.json",
+        lambda _current: {
+            "version": 1,
+            "entries": {
+                key: {
+                    "target_before_open_seconds": 0.070,
+                    "observations": [{"outcome": "refused"}],
+                }
+            },
+        },
+        {},
+    )
+
+    profile = load_timing_profile("1498729", "7094790", "npay_prepaid")
+
+    assert profile.target_before_open_seconds == pytest.approx(0.020)
+    assert profile.observation_count == 1
+
+
+def test_v1_postpaid_explicit_gate_learning_is_preserved():
+    key = "1498729|7094790|postpaid"
+    update_json(
+        "naver_timing_history.json",
+        lambda _current: {
+            "version": 1,
+            "entries": {
+                key: {
+                    "target_before_open_seconds": 0.050,
+                    "observations": [{"outcome": "notopen"}],
+                }
+            },
+        },
+        {},
+    )
+
+    profile = load_timing_profile("1498729", "7094790", "postpaid")
+
+    assert profile.target_before_open_seconds == pytest.approx(0.050)
