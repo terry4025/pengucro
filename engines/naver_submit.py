@@ -680,7 +680,10 @@ BROWSER_UPCOMING_BOOKINGS_SCRIPT = r"""async request => {
             body: JSON.stringify({
                 operationName: "UpcomingBookingQuery",
                 query: request.query,
-                variables: {limit: 10},
+                variables: {
+                    page: Math.max(1, Number(request.page) || 1),
+                    limit: Math.max(10, Math.min(30, Number(request.limit) || 20)),
+                },
             }),
         });
         let body = null;
@@ -736,6 +739,13 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
             device,
         };
     }
+    // Serialize while the page is idle. JSON.stringify and object traversal do
+    // not belong in the final millisecond before a one-seat opening.
+    const requestBody = JSON.stringify({
+        operationName: "submitBooking",
+        query: request.query,
+        variables: {input},
+    });
     const delayMs = Math.max(0, Number(request.delayMs) || 0);
     const timeoutMs = Math.max(100, Number(request.timeoutMs) || 3000);
     const maxAttempts = Math.max(1, Math.min(3, Number(request.maxAttempts) || 1));
@@ -752,6 +762,9 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     let serverOpenAt = 0;
     let clockRttMs = 0;
     let clockSampleCount = 0;
+    let clockUncertaintyMs = 0;
+    let clockSpreadMs = 0;
+    let estimatedOutboundMs = 0;
     const requestedOpenEpochMs = Number(request.openAtEpochMs) || 0;
     const clockSamples = Math.max(0, Math.min(5, Number(request.clockSamples) || 0));
     if (requestedOpenEpochMs > 0 && clockSamples > 0 && request.clockQuery) {
@@ -778,6 +791,7 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
                 if (Number.isFinite(serverEpochMs)) {
                     samples.push({
                         rtt: clockEndedAt - clockStartedAt,
+                        startedAt: clockStartedAt,
                         endedAt: clockEndedAt,
                         serverEpochMs,
                     });
@@ -787,15 +801,35 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         if (samples.length) {
             samples.sort((left, right) => left.rtt - right.rtt);
             const best = samples[0];
-            serverOpenAt = best.endedAt + (requestedOpenEpochMs - best.serverEpochMs);
+            // Live measurements show currentDateTime advances near response
+            // completion, not the request midpoint. Preserve that anchor (the
+            // Python server clock uses the same rule), then subtract estimated
+            // outbound transit separately so the configured target describes
+            // server arrival rather than browser dispatch.
+            const selected = samples.slice(0, Math.min(3, samples.length));
+            const openEstimates = selected.map(sample =>
+                sample.endedAt + (requestedOpenEpochMs - sample.serverEpochMs));
+            openEstimates.sort((left, right) => left - right);
+            serverOpenAt = openEstimates[Math.floor(openEstimates.length / 2)];
             clockRttMs = best.rtt;
             clockSampleCount = samples.length;
+            estimatedOutboundMs = best.rtt / 2;
+            clockSpreadMs = openEstimates.length > 1
+                ? openEstimates[openEstimates.length - 1] - openEstimates[0]
+                : 0;
+            clockUncertaintyMs = Math.max(best.rtt / 2, clockSpreadMs / 2);
         }
     }
 
     const armedAt = performance.now();
+    const targetArrivalBeforeOpenMs = Math.max(
+        -20, Math.min(120, Number(request.targetArrivalBeforeOpenMs) || 0));
+    const fallbackLeadMs = Math.max(0, Number(request.leadMs) || 0);
+    const appliedLeadMs = serverOpenAt > 0
+        ? Math.max(0, estimatedOutboundMs + targetArrivalBeforeOpenMs)
+        : fallbackLeadMs;
     const dueAt = serverOpenAt > 0
-        ? Math.max(armedAt, serverOpenAt - Math.max(0, Number(request.leadMs) || 0))
+        ? Math.max(armedAt, serverOpenAt - appliedLeadMs)
         : armedAt + delayMs;
     const state = {
         id: String(request.armId || ""),
@@ -805,10 +839,18 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         serverOpenAt,
         clockRttMs,
         clockSampleCount,
+        clockUncertaintyMs,
+        clockSpreadMs,
+        estimatedOutboundMs,
+        targetArrivalBeforeOpenMs,
+        appliedLeadMs,
         startedAt: 0,
         lastStartedAt: 0,
+        headersAt: 0,
+        responseBodyAt: 0,
         completedAt: 0,
         attempts: 0,
+        notOpenAttempts: 0,
         response: null,
         error: "",
         timer: 0,
@@ -820,14 +862,13 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         const booking = body && body.data && body.data.submitBooking;
         if (booking && booking.bookingId) return false;
         const errors = body && Array.isArray(body.errors) ? body.errors : [];
-        if (!errors.length || !errors[0] || typeof errors[0] !== "object") {
-            return false;
-        }
-        const first = errors[0];
-        const extensions = first.extensions && typeof first.extensions === "object"
-            ? first.extensions : {};
-        return [first.message, extensions.code, extensions.reason]
-            .some(value => notOpenCodes.has(String(value || "")));
+        return errors.some(error => {
+            if (!error || typeof error !== "object") return false;
+            const extensions = error.extensions && typeof error.extensions === "object"
+                ? error.extensions : {};
+            return [error.message, extensions.code, extensions.reason]
+                .some(value => notOpenCodes.has(String(value || "")));
+        });
     };
     const retryExpired = () => state.serverOpenAt > 0
         ? performance.now() > state.serverOpenAt + retryWindowMs
@@ -857,16 +898,16 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
                         credentials: "include",
                         signal: controller.signal,
                         headers: {"Content-Type": "application/json"},
-                        body: JSON.stringify({
-                            operationName: "submitBooking",
-                            query: request.query,
-                            variables: {input},
-                        }),
+                        body: requestBody,
                     });
+                    state.headersAt = performance.now();
                     let body = null;
                     try { body = await response.json(); } catch (_) {}
+                    state.responseBodyAt = performance.now();
                     state.response = {status: response.status, body};
-                    if (!isExplicitNotOpen(body) || attempt >= maxAttempts) break;
+                    const explicitNotOpen = isExplicitNotOpen(body);
+                    if (explicitNotOpen) state.notOpenAttempts += 1;
+                    if (!explicitNotOpen || attempt >= maxAttempts) break;
                     if (retryExpired()) break;
                 } finally {
                     clearTimeout(timeout);
@@ -875,7 +916,10 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
                 if (state.serverOpenAt > 0) {
                     // After a deliberate early probe, align the retry with the
                     // actual gate instead of spending all attempts before open.
-                    const boundarySendAt = state.serverOpenAt - retryLeadMs;
+                    const boundarySendAt = state.serverOpenAt - (
+                        state.estimatedOutboundMs > 0
+                            ? state.estimatedOutboundMs
+                            : retryLeadMs);
                     const waitMs = boundarySendAt - performance.now();
                     if (waitMs > 0) await pause(waitMs);
                 } else {
@@ -901,6 +945,11 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         serverOpenAt: state.serverOpenAt,
         clockRttMs: state.clockRttMs,
         clockSampleCount: state.clockSampleCount,
+        clockUncertaintyMs: state.clockUncertaintyMs,
+        clockSpreadMs: state.clockSpreadMs,
+        estimatedOutboundMs: state.estimatedOutboundMs,
+        targetArrivalBeforeOpenMs: state.targetArrivalBeforeOpenMs,
+        appliedLeadMs: state.appliedLeadMs,
     };
 }"""
 
@@ -917,10 +966,18 @@ BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
         serverOpenAt: Number(state.serverOpenAt) || 0,
         clockRttMs: Number(state.clockRttMs) || 0,
         clockSampleCount: Number(state.clockSampleCount) || 0,
+        clockUncertaintyMs: Number(state.clockUncertaintyMs) || 0,
+        clockSpreadMs: Number(state.clockSpreadMs) || 0,
+        estimatedOutboundMs: Number(state.estimatedOutboundMs) || 0,
+        targetArrivalBeforeOpenMs: Number(state.targetArrivalBeforeOpenMs) || 0,
+        appliedLeadMs: Number(state.appliedLeadMs) || 0,
         startedAt: Number(state.startedAt) || 0,
         lastStartedAt: Number(state.lastStartedAt) || 0,
+        headersAt: Number(state.headersAt) || 0,
+        responseBodyAt: Number(state.responseBodyAt) || 0,
         completedAt: Number(state.completedAt) || 0,
         attempts: Number(state.attempts) || 0,
+        notOpenAttempts: Number(state.notOpenAttempts) || 0,
     };
 }"""
 
@@ -996,12 +1053,33 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
     # bookingId is stronger evidence than RT47's generic wrapper and must not be
     # discarded, otherwise a real Npay hold is mistaken for somebody else's win.
     booking = ((body.get("data") or {}).get("submitBooking")) or {}
-    booking_id = str(booking.get("bookingId") or "")
+    booking_url = booking.get("url") if isinstance(booking, dict) else None
+    if isinstance(booking_url, dict):
+        booking_url_text = str(
+            booking_url.get("pc")
+            or booking_url.get("mobile")
+            or booking_url.get("m")
+            or ""
+        )
+    else:
+        booking_url_text = str(booking_url or "")
+    booking_id = str(booking.get("bookingId") or "") if isinstance(booking, dict) else ""
+    if not booking_id and booking_url_text:
+        # Some partial GraphQL responses retain a trusted booking-detail URL but
+        # omit the sibling bookingId field. Recover only an explicit numeric id;
+        # an order-sheet URL without an id remains ambiguous and is reconciled.
+        identifier = re.search(
+            r"(?:/my/bookings/|[?&](?:bookingId|booking_id|bookingNo)=)(\d+)",
+            booking_url_text,
+            re.IGNORECASE,
+        )
+        if identifier:
+            booking_id = identifier.group(1)
     if booking_id:
         return SubmitResult(
             SubmitOutcome.SUCCESS,
             booking_id=booking_id,
-            url=booking.get("url"),
+            url=booking_url,
         )
 
     errors = body.get("errors") or []
@@ -1032,6 +1110,7 @@ class NaverBrowserSubmitter:
         self.last_rtt: float | None = None
         self.safe_rtt_samples: list[float] = []
         self.last_armed_timing: dict[str, float] = {}
+        self.last_armed_diagnostics: dict[str, float] = {}
         # ``False`` distinguishes a failed GraphQL request from a successful
         # response that explicitly says the current browser is logged out.
         self.last_account_fetch_ok = False
@@ -1097,8 +1176,8 @@ class NaverBrowserSubmitter:
         target_time: str,
         business_id: str = "",
         item_name: str = "",
-        attempts: int = 4,
-        window_seconds: float = 8.0,
+        attempts: int = 40,
+        window_seconds: float = 20.0,
     ) -> NaverBookingReconciliation:
         """Read the logged-in account's booking list without another mutation."""
         context = getattr(self.page, "context", None)
@@ -1112,9 +1191,9 @@ class NaverBrowserSubmitter:
                 wait_until="domcontentloaded",
                 timeout=5000,
             )
-            attempt_limit = max(1, min(int(attempts or 1), 24))
+            attempt_limit = max(1, min(int(attempts or 1), 48))
             deadline = time.monotonic() + max(
-                0.5, min(float(window_seconds or 0.5), 10.0)
+                0.5, min(float(window_seconds or 0.5), 25.0)
             )
             for attempt in range(attempt_limit):
                 try:
@@ -1125,6 +1204,12 @@ class NaverBrowserSubmitter:
                                 "endpoint": UPCOMING_BOOKINGS_ENDPOINT,
                                 "query": UPCOMING_BOOKINGS_QUERY,
                                 "timeoutMs": 2000,
+                                # The newest reservation should be on page 1.
+                                # Periodically checking page 2 also covers a
+                                # delayed ordering/index update without doubling
+                                # every reconciliation request.
+                                "page": 2 if attempt > 0 and attempt % 5 == 0 else 1,
+                                "limit": 20,
                             },
                         ),
                         timeout=2.5,
@@ -1198,6 +1283,7 @@ class NaverBrowserSubmitter:
         open_at_epoch: float | None = None,
         lead_seconds: float = 0.0,
         retry_lead_seconds: float = 0.0,
+        target_arrival_before_open_seconds: float = 0.0,
     ) -> str:
         arm_id = f"naver-{time.monotonic_ns()}"
         business_id = str(payload.get("businessId") or "")
@@ -1216,7 +1302,10 @@ class NaverBrowserSubmitter:
                         "retryLeadMs": round(
                             max(0.0, float(retry_lead_seconds)) * 1000
                         ),
-                        "clockSamples": 3 if open_at_epoch and business_id and biz_item_id else 0,
+                        "targetArrivalBeforeOpenMs": round(
+                            float(target_arrival_before_open_seconds) * 1000
+                        ),
+                        "clockSamples": 5 if open_at_epoch and business_id and biz_item_id else 0,
                         "clockQuery": BIZ_ITEM_QUERY,
                         "clockVariables": {
                             "input": {
@@ -1244,6 +1333,11 @@ class NaverBrowserSubmitter:
             "serverOpenAt",
             "clockRttMs",
             "clockSampleCount",
+            "clockUncertaintyMs",
+            "clockSpreadMs",
+            "estimatedOutboundMs",
+            "targetArrivalBeforeOpenMs",
+            "appliedLeadMs",
             "delayMs",
         ):
             value = response.get(key)
@@ -1263,6 +1357,7 @@ class NaverBrowserSubmitter:
         open_at_epoch: float,
         lead_seconds: float,
         retry_lead_seconds: float,
+        target_arrival_before_open_seconds: float = 0.0,
     ) -> str:
         """Arm in Chrome's clock domain after same-origin Naver clock samples."""
         return await self._arm_submit(
@@ -1271,6 +1366,7 @@ class NaverBrowserSubmitter:
             open_at_epoch=open_at_epoch,
             lead_seconds=lead_seconds,
             retry_lead_seconds=retry_lead_seconds,
+            target_arrival_before_open_seconds=target_arrival_before_open_seconds,
         )
 
     async def read_armed_submit(self, arm_id: str, payload: Mapping[str, Any]) -> tuple[str, SubmitResult | None, float | None]:
@@ -1297,15 +1393,49 @@ class NaverBrowserSubmitter:
             "serverOpenAt",
             "clockRttMs",
             "clockSampleCount",
+            "clockUncertaintyMs",
+            "clockSpreadMs",
+            "estimatedOutboundMs",
+            "targetArrivalBeforeOpenMs",
+            "appliedLeadMs",
             "startedAt",
             "lastStartedAt",
+            "headersAt",
+            "responseBodyAt",
             "completedAt",
             "attempts",
+            "notOpenAttempts",
         ):
             value = state.get(key)
             if isinstance(value, (int, float)):
                 timing[key] = float(value)
         self.last_armed_timing = timing
+        started_at = timing.get("startedAt", 0.0)
+        last_started_at = timing.get("lastStartedAt", started_at)
+        headers_at = timing.get("headersAt", 0.0)
+        body_at = timing.get("responseBodyAt", 0.0)
+        response = state.get("response")
+        self.last_armed_diagnostics = {
+            "attempts": float(timing.get("attempts", 0.0) or 0.0),
+            "notOpenAttempts": float(
+                timing.get("notOpenAttempts", 0.0) or 0.0
+            ),
+            "httpStatus": float(
+                response.get("status", 0)
+                if isinstance(response, dict)
+                else 0
+            ),
+            "ttfbMs": (
+                float(headers_at - last_started_at)
+                if headers_at >= last_started_at > 0
+                else 0.0
+            ),
+            "responseMs": (
+                float(body_at - last_started_at)
+                if body_at >= last_started_at > 0
+                else 0.0
+            ),
+        }
         elapsed_ms: float | None = None
         started = state.get("startedAt")
         completed = state.get("completedAt")

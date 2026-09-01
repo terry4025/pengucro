@@ -396,10 +396,21 @@ class ArmedPage:
                 }}}},
                 "armedAt": 800,
                 "dueAt": 995,
+                "serverOpenAt": 1060,
+                "clockRttMs": 60,
+                "clockSampleCount": 5,
+                "clockUncertaintyMs": 30,
+                "clockSpreadMs": 4,
+                "estimatedOutboundMs": 30,
+                "targetArrivalBeforeOpenMs": 60,
+                "appliedLeadMs": 90,
                 "startedAt": 1000,
                 "lastStartedAt": 1010,
+                "headersAt": 1020,
+                "responseBodyAt": 1040,
                 "completedAt": 1042,
                 "attempts": 2,
+                "notOpenAttempts": 1,
                 "error": "",
             }
         return True
@@ -430,6 +441,28 @@ def test_browser_submitter_prefers_partial_booking_id_over_rt47_error():
         "data": {"submitBooking": {
             "bookingId": "999888",
             "url": {"pc": "https://order.pay.naver.com/orderSheet/test"},
+        }},
+        "errors": [{
+            "message": "RT47",
+            "extensions": {"code": "RT47", "reason": "정원 마감"},
+        }],
+    })
+
+    result = asyncio.run(
+        NaverBrowserSubmitter(page).submit({"slotId": "1331382668"})
+    )
+
+    assert result.outcome == SubmitOutcome.SUCCESS
+    assert result.booking_id == "999888"
+
+
+def test_browser_submitter_recovers_booking_id_from_partial_booking_url():
+    from engines.naver_submit import NaverBrowserSubmitter
+
+    page = FakePage({
+        "data": {"submitBooking": {
+            "bookingId": None,
+            "url": "/my/bookings/999888",
         }},
         "errors": [{
             "message": "RT47",
@@ -628,6 +661,14 @@ def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
     assert submitter.last_armed_timing["startedAt"] == 1000
     assert submitter.last_armed_timing["lastStartedAt"] == 1010
     assert submitter.last_armed_timing["attempts"] == 2
+    assert submitter.last_armed_timing["estimatedOutboundMs"] == 30
+    assert submitter.last_armed_diagnostics == {
+        "attempts": 2.0,
+        "notOpenAttempts": 1.0,
+        "httpStatus": 200.0,
+        "ttfbMs": 10.0,
+        "responseMs": 30.0,
+    }
     assert page.calls[0]["delayMs"] == 125
     assert page.calls[0]["input"]["slotId"] == "1331382668"
     assert page.calls[0]["maxAttempts"] == 3
@@ -654,19 +695,29 @@ def test_browser_submitter_arms_against_same_browser_server_clock():
         open_at_epoch=1788102000.0,
         lead_seconds=0.115,
         retry_lead_seconds=0.055,
+        target_arrival_before_open_seconds=0.060,
     ))
 
     request = page.calls[0]
     assert request["openAtEpochMs"] == 1788102000000
     assert request["leadMs"] == 115
     assert request["retryLeadMs"] == 55
-    assert request["clockSamples"] == 3
+    assert request["clockSamples"] == 5
+    assert request["targetArrivalBeforeOpenMs"] == 60
     assert "currentDateTime" in request["clockQuery"]
     assert request["clockVariables"]["input"] == {
         "businessId": "1498729",
         "bizItemId": "7094790",
         "lang": "ko",
     }
+
+
+def test_browser_clock_uses_response_completion_and_outbound_transit_for_arrival_target():
+    from engines.naver_submit import BROWSER_ARMED_SUBMIT_SCRIPT
+
+    assert "sample.endedAt + (requestedOpenEpochMs - sample.serverEpochMs)" in BROWSER_ARMED_SUBMIT_SCRIPT
+    assert "estimatedOutboundMs + targetArrivalBeforeOpenMs" in BROWSER_ARMED_SUBMIT_SCRIPT
+    assert "serverOpenAt - appliedLeadMs" in BROWSER_ARMED_SUBMIT_SCRIPT
 
 
 def test_browser_submitter_classifies_the_resolver_reason():

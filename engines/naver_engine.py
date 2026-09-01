@@ -80,6 +80,12 @@ from engines.naver_submit import (
     PAYMENT_POSTPAID,
     resolve_booking_quantity,
 )
+from engines.naver_timing import (
+    DEFAULT_TARGET_BEFORE_OPEN_SECONDS,
+    NaverTimingProfile,
+    load_timing_profile,
+    record_timing_observation,
+)
 from pengucro.diagnostics import format_exception, write_redacted_debug_text
 from pengucro.models import parse_bool_flag
 from pengucro.storage import SecretStore, data_path, load_json
@@ -463,17 +469,16 @@ class NaverEngine(BaseEngine):
     API_BROWSER_ARM_MIN_SECONDS = 0.30
     API_BROWSER_ARM_FINAL_QUIET_SECONDS = 0.10
     API_BROWSER_ARM_STATUS_SECONDS = 0.025
-    # Field evidence shows that an aggressively early request can create the
-    # requested hold even when the outer GraphQL wrapper later returns RT47.
-    # Keep the estimated arrival ahead of the boundary; the browser-internal
-    # flow handles only an exact NOT_OPEN reply without adding a competing POST.
-    API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS = 0.060
-    API_SEND_MIN_LEAD_SECONDS = 0.060
+    # Start from a 60 ms server-arrival target, then learn a small bounded offset
+    # per business/item/payment mode. The browser-internal flow retries only an
+    # explicit NOT_OPEN response and never treats RT47 as permission to repost.
+    API_SEND_MIN_LEAD_SECONDS = 0.020
     API_SEND_MAX_LEAD_SECONDS = 0.250
-    API_PREOPEN_CLOCK_SAMPLES = 3
+    API_PREOPEN_CLOCK_SAMPLES = 5
     API_REFUSED_RECHECK_TIMEOUT_SECONDS = 0.30
-    API_RECONCILE_ATTEMPTS = 20
-    API_RECONCILE_WINDOW_SECONDS = 8.0
+    API_RECONCILE_ATTEMPTS = 40
+    API_RECONCILE_WINDOW_SECONDS = 20.0
+    API_POST_SUBMIT_INVENTORY_OFFSETS = (0.0, 0.10, 0.30, 1.00)
     # After the page reports it has nothing to click, wait this long before
     # driving it again. API polling is unaffected.
     NOTREADY_BACKOFF_SECONDS = 1.5
@@ -580,6 +585,11 @@ class NaverEngine(BaseEngine):
         self._npay_booking_id = ""
         self._recent_submit_rtt: list[float] = []
         self._last_api_lead_detail = ""
+        self._timing_profile = NaverTimingProfile(
+            "", DEFAULT_TARGET_BEFORE_OPEN_SECONDS, 0
+        )
+        self._timing_profile_log_signature: tuple[str, float, int] | None = None
+        self._last_post_submit_inventory: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -637,6 +647,11 @@ class NaverEngine(BaseEngine):
         self._slot_post_payment = {}
         self._api_payment_signature = None
         self._npay_booking_id = ""
+        self._timing_profile = NaverTimingProfile(
+            "", DEFAULT_TARGET_BEFORE_OPEN_SECONDS, 0
+        )
+        self._timing_profile_log_signature = None
+        self._last_post_submit_inventory = []
         booking_url = self._resolve_url(reservation_data)
         if not booking_url:
             raise NaverApiError(
@@ -924,6 +939,30 @@ class NaverEngine(BaseEngine):
             return False
         return not dev_mode or self._api_preparation.requires_checkout
 
+    def _adopt_timing_profile(self, preparation: NaverSubmitPreparation) -> None:
+        payload = preparation.payload if isinstance(preparation.payload, dict) else {}
+        profile = load_timing_profile(
+            str(payload.get("businessId") or ""),
+            str(payload.get("bizItemId") or ""),
+            preparation.payment_mode,
+        )
+        self._timing_profile = profile
+        signature = (
+            profile.key,
+            profile.target_before_open_seconds,
+            profile.observation_count,
+        )
+        if not profile.key or profile.observation_count <= 0:
+            return
+        if signature == self._timing_profile_log_signature:
+            return
+        self._timing_profile_log_signature = signature
+        self.log(
+            f"[정보] 상품별 선점 타이밍 학습 적용 · 실측 {profile.observation_count}회 · "
+            f"서버 도착 목표 -{profile.target_before_open_seconds * 1000:.0f}ms",
+            "success",
+        )
+
     async def _prepare_api_submit(self, reservation_data, dev_mode: bool) -> None:
         """Prepare the supported direct mutation without exposing its secrets."""
         if self._api_submit_blocked:
@@ -1042,6 +1081,7 @@ class NaverEngine(BaseEngine):
                 "info",
             )
             return
+        self._adopt_timing_profile(preparation)
         self._log_payment_preparation(preparation)
         if preparation.quantity_mode:
             self.log(
@@ -1152,6 +1192,7 @@ class NaverEngine(BaseEngine):
         )
         self._adopt_browser_account(account, invalidate_preparation=False)
         self._api_preparation = preparation
+        self._adopt_timing_profile(preparation)
         self._log_payment_preparation(preparation)
         if changed:
             self.log(
@@ -1836,16 +1877,20 @@ class NaverEngine(BaseEngine):
             except (TypeError, ValueError):
                 precision = 0.0
         one_way = transport_rtt / 2
+        target_before_open = float(
+            getattr(self._timing_profile, "target_before_open_seconds", 0.0)
+            or DEFAULT_TARGET_BEFORE_OPEN_SECONDS
+        )
         lead = min(
             self.API_SEND_MAX_LEAD_SECONDS,
             max(
                 self.API_SEND_MIN_LEAD_SECONDS,
-                one_way + self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS,
+                one_way + target_before_open,
             ),
         )
         self._last_api_lead_detail = (
             f"최저 RTT {transport_rtt * 1000:.0f}ms · "
-            f"서버 선점 도착 목표 -{self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS * 1000:.0f}ms · "
+            f"서버 선점 도착 목표 -{target_before_open * 1000:.0f}ms · "
             f"시계 오차 {precision * 1000:.0f}ms"
         )
         return lead
@@ -1878,6 +1923,190 @@ class NaverEngine(BaseEngine):
         if 0.005 <= seconds <= 3.0:
             self._recent_submit_rtt.append(seconds)
             del self._recent_submit_rtt[:-5]
+
+    def _timing_observation_payload(self) -> dict[str, Any]:
+        timing = (
+            getattr(self._api_submitter, "last_armed_timing", {})
+            if self._api_submitter is not None
+            else {}
+        ) or {}
+        diagnostics = (
+            getattr(self._api_submitter, "last_armed_diagnostics", {})
+            if self._api_submitter is not None
+            else {}
+        ) or {}
+        server_open_at = timing.get("serverOpenAt")
+        started_at = timing.get("startedAt")
+        last_started_at = timing.get("lastStartedAt")
+        outbound_ms = timing.get("estimatedOutboundMs")
+        dispatch_offset_ms = None
+        arrival_offset_ms = None
+        last_dispatch_offset_ms = None
+        last_arrival_offset_ms = None
+        if (
+            isinstance(server_open_at, (int, float))
+            and server_open_at > 0
+            and isinstance(started_at, (int, float))
+        ):
+            dispatch_offset_ms = float(started_at) - float(server_open_at)
+            if isinstance(outbound_ms, (int, float)):
+                arrival_offset_ms = dispatch_offset_ms + float(outbound_ms)
+        if (
+            isinstance(server_open_at, (int, float))
+            and server_open_at > 0
+            and isinstance(last_started_at, (int, float))
+            and last_started_at > 0
+        ):
+            last_dispatch_offset_ms = float(last_started_at) - float(server_open_at)
+            if isinstance(outbound_ms, (int, float)):
+                last_arrival_offset_ms = (
+                    last_dispatch_offset_ms + float(outbound_ms)
+                )
+        payload = {
+            "dispatch_offset_ms": dispatch_offset_ms,
+            "estimated_arrival_offset_ms": arrival_offset_ms,
+            "last_dispatch_offset_ms": last_dispatch_offset_ms,
+            "last_estimated_arrival_offset_ms": last_arrival_offset_ms,
+            "transport_rtt_ms": (
+                float(outbound_ms) * 2
+                if isinstance(outbound_ms, (int, float))
+                else None
+            ),
+            "submit_rtt_ms": (
+                float(self._recent_submit_rtt[-1]) * 1000
+                if self._recent_submit_rtt
+                else None
+            ),
+            "clock_rtt_ms": timing.get("clockRttMs"),
+            "clock_uncertainty_ms": timing.get("clockUncertaintyMs"),
+            "clock_spread_ms": timing.get("clockSpreadMs"),
+            "ttfb_ms": diagnostics.get("ttfbMs"),
+            "response_ms": diagnostics.get("responseMs"),
+            "attempts": timing.get("attempts"),
+            "not_open_attempts": timing.get("notOpenAttempts"),
+            "http_status": diagnostics.get("httpStatus"),
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _record_api_timing_result(
+        self,
+        *,
+        outcome: str,
+        response_code: str = "",
+        booking_confirmed: bool = False,
+    ) -> None:
+        if not self._timing_profile.key:
+            return
+        remaining = None
+        for sample in reversed(self._last_post_submit_inventory):
+            candidate = sample.get("remaining") if isinstance(sample, dict) else None
+            if isinstance(candidate, (int, float)):
+                remaining = int(candidate)
+                break
+        timing_payload = self._timing_observation_payload()
+        try:
+            not_open_attempts = int(
+                timing_payload.get("not_open_attempts", 0) or 0
+            )
+        except (TypeError, ValueError):
+            not_open_attempts = 0
+        learned_outcome = outcome
+        if not_open_attempts > 0:
+            learned_outcome = (
+                "success_after_notopen"
+                if booking_confirmed
+                else "refused_after_notopen"
+            )
+        business_id, biz_item_id, payment_mode = self._timing_profile.key.split("|", 2)
+        try:
+            update = record_timing_observation(
+                business_id,
+                biz_item_id,
+                payment_mode,
+                outcome=learned_outcome,
+                response_code=response_code,
+                booking_confirmed=booking_confirmed,
+                inventory_remaining=remaining,
+                timing=timing_payload,
+            )
+        except Exception as exc:
+            self._log_throttled(
+                "timing_history_write",
+                f"[정보] 네이버 선점 타이밍 기록을 저장하지 못했습니다 "
+                f"({type(exc).__name__}).",
+                "info",
+                30.0,
+            )
+            return
+        self._timing_profile = update.profile
+        if abs(update.adjustment_seconds) >= 0.0005:
+            direction = "앞당김" if update.adjustment_seconds > 0 else "늦춤"
+            self.log(
+                f"[정보] 상품별 선점 타이밍 학습 갱신 · 다음 서버 도착 목표 "
+                f"-{update.profile.target_before_open_seconds * 1000:.0f}ms · "
+                f"{abs(update.adjustment_seconds) * 1000:.0f}ms {direction}",
+                "success",
+            )
+
+    async def _observe_post_submit_inventory(
+        self,
+        reservation_data: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Capture read-only inventory evidence after one ambiguous mutation."""
+        if self.api is None:
+            return []
+        data = reservation_data or {}
+        target_date = str(data.get("reservationDate") or "")
+        target_time = str(data.get("reservationTime") or "")[:5]
+        if not target_date or not target_time:
+            return []
+        started = time.monotonic()
+        samples: list[dict[str, Any]] = []
+        for offset in self.API_POST_SUBMIT_INVENTORY_OFFSETS:
+            wait_for = started + float(offset) - time.monotonic()
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            try:
+                slot = await asyncio.wait_for(
+                    asyncio.to_thread(self.api.find_slot, target_date, target_time),
+                    timeout=1.0,
+                )
+            except (asyncio.TimeoutError, NaverApiError, OSError):
+                samples.append({
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                    "status": "조회 실패",
+                })
+                continue
+            if slot is None:
+                samples.append({
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                    "status": "미공개",
+                })
+                continue
+            reason = slot.blocked_reason(self.clock.now_kst() if self.clock else None)
+            samples.append({
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "slot_id": slot.slot_id,
+                "stock": slot.stock,
+                "remaining": slot.remaining,
+                "status": reason or "예약 가능",
+            })
+        self._last_post_submit_inventory = samples
+        readable = []
+        for sample in samples:
+            elapsed = sample.get("elapsed_ms", 0)
+            if "remaining" in sample:
+                readable.append(
+                    f"+{float(elapsed):.0f}ms {sample['remaining']}/{sample.get('stock', '?')}"
+                )
+            else:
+                readable.append(f"+{float(elapsed):.0f}ms {sample.get('status', '알 수 없음')}")
+        if readable:
+            self.log(
+                "[정보] 제출 후 재고 관측(읽기 전용) · " + " · ".join(readable),
+                "info",
+            )
+        return samples
 
     async def _refused_slot_changed(
         self, target_date: str, target_time: str
@@ -1937,22 +2166,38 @@ class NaverEngine(BaseEngine):
         )
         if not target_date or not target_time:
             return None
+        self._last_post_submit_inventory = []
+        inventory_task = asyncio.create_task(
+            self._observe_post_submit_inventory(reservation_data)
+        )
         self.log(
             "[정보] 제출 응답이 불명확해 추가 POST 없이 본인 네이버 예약내역을 확인합니다.",
             "warning",
         )
-        evidence = await reconcile(
-            target_date=target_date,
-            target_time=target_time,
-            business_id=business_id,
-            item_name=item_name,
-            attempts=self.API_RECONCILE_ATTEMPTS,
-            window_seconds=self.API_RECONCILE_WINDOW_SECONDS,
-        )
+        try:
+            evidence = await reconcile(
+                target_date=target_date,
+                target_time=target_time,
+                business_id=business_id,
+                item_name=item_name,
+                attempts=self.API_RECONCILE_ATTEMPTS,
+                window_seconds=self.API_RECONCILE_WINDOW_SECONDS,
+            )
+        except Exception:
+            await inventory_task
+            return None
         if not getattr(evidence, "found", False) or not getattr(
             evidence, "booking_id", ""
         ):
+            await inventory_task
             return None
+
+        if not inventory_task.done():
+            inventory_task.cancel()
+            try:
+                await inventory_task
+            except asyncio.CancelledError:
+                pass
 
         booking_id = str(evidence.booking_id)
         landing_url = str(getattr(evidence, "url", "") or "")
@@ -1986,6 +2231,11 @@ class NaverEngine(BaseEngine):
         """Handle one known result without issuing any additional mutation."""
         if result.outcome == SubmitOutcome.SUCCESS:
             self._api_submit_state = "success"
+            self._record_api_timing_result(
+                outcome=SubmitOutcome.SUCCESS,
+                response_code=result.code,
+                booking_confirmed=True,
+            )
             if self._api_preparation is not None and self._api_preparation.requires_checkout:
                 return await self._continue_npay_checkout(
                     booking_id=result.booking_id,
@@ -2022,7 +2272,17 @@ class NaverEngine(BaseEngine):
                 dev_mode=dev_mode,
             )
             if recovered is not None:
+                self._record_api_timing_result(
+                    outcome=SubmitOutcome.SUCCESS,
+                    response_code=result.code,
+                    booking_confirmed=True,
+                )
                 return recovered
+            self._record_api_timing_result(
+                outcome=result.outcome,
+                response_code=result.code,
+                booking_confirmed=False,
+            )
             suffix = " · 본인 예약내역에서 아직 확정되지 않음 · 추가 POST 없음"
             if result.outcome == SubmitOutcome.REFUSED:
                 return "unknown", result.detail + suffix
@@ -2067,6 +2327,10 @@ class NaverEngine(BaseEngine):
                 dev_mode=dev_mode,
             )
         lead = self._api_one_way_seconds()
+        target_before_open = float(
+            getattr(self._timing_profile, "target_before_open_seconds", 0.0)
+            or DEFAULT_TARGET_BEFORE_OPEN_SECONDS
+        )
         delay = max(0.0, remaining - lead)
         try:
             server_time_arm = getattr(
@@ -2080,8 +2344,9 @@ class NaverEngine(BaseEngine):
                     lead_seconds=lead,
                     retry_lead_seconds=max(
                         0.0,
-                        lead - self.API_TARGET_ARRIVAL_BEFORE_OPEN_SECONDS,
+                        lead - target_before_open,
                     ),
+                    target_arrival_before_open_seconds=target_before_open,
                 )
             else:
                 arm_id = await self._api_submitter.arm_submit_at(
@@ -2112,8 +2377,17 @@ class NaverEngine(BaseEngine):
                 f" · Chrome 동일 연결 서버 시계 {int(clock_samples)}회 "
                 f"(최저 RTT {float(clock_rtt):.0f}ms)"
             )
+        applied_lead_ms = armed_timing.get("appliedLeadMs")
+        logged_lead = (
+            float(applied_lead_ms) / 1000
+            if isinstance(applied_lead_ms, (int, float)) and applied_lead_ms > 0
+            else lead
+        )
+        uncertainty_ms = armed_timing.get("clockUncertaintyMs")
+        if isinstance(uncertainty_ms, (int, float)) and uncertainty_ms > 0:
+            clock_detail += f" · 경계 추정 오차 ±{float(uncertainty_ms):.0f}ms 이내"
         self.log(
-            f"[정보] 브라우저 내부 API 제출 예약 · 오픈 대비 {-lead:+.3f}초 · "
+            f"[정보] 브라우저 내부 API 제출 예약 · 추정 오픈 대비 {-logged_lead:+.3f}초 · "
             f"{self._last_api_lead_detail}{clock_detail} · "
             "단일 선점 흐름으로 대기합니다.",
             "warning",
@@ -2156,16 +2430,63 @@ class NaverEngine(BaseEngine):
                 ):
                     open_offset_ms = float(started_at) - float(server_open_at)
                     dispatch_detail += (
-                        f" · 네이버 서버 오픈 기준 발사 {open_offset_ms:+.1f}ms"
+                        f" · 추정 네이버 오픈 기준 발사 {open_offset_ms:+.1f}ms"
                     )
                 attempts = timing.get("attempts")
-                attempt_detail = ""
-                if isinstance(attempts, (int, float)) and attempts > 1:
-                    attempt_detail = f" · 명시적 미오픈 재시도 포함 {int(attempts)}회"
+                attempt_detail = (
+                    f" · POST {int(attempts)}회"
+                    if isinstance(attempts, (int, float)) and attempts > 0
+                    else " · POST 횟수 확인 불가"
+                )
+                outbound_ms = timing.get("estimatedOutboundMs")
+                if (
+                    isinstance(outbound_ms, (int, float))
+                    and isinstance(server_open_at, (int, float))
+                    and server_open_at > 0
+                    and isinstance(started_at, (int, float))
+                ):
+                    arrival_offset_ms = (
+                        float(started_at) + float(outbound_ms) - float(server_open_at)
+                    )
+                    dispatch_detail += f" · 추정 서버 도착 {arrival_offset_ms:+.1f}ms"
+                last_started_at = timing.get("lastStartedAt")
+                if (
+                    isinstance(attempts, (int, float))
+                    and attempts > 1
+                    and isinstance(server_open_at, (int, float))
+                    and server_open_at > 0
+                    and isinstance(last_started_at, (int, float))
+                    and last_started_at > 0
+                ):
+                    retry_dispatch_ms = (
+                        float(last_started_at) - float(server_open_at)
+                    )
+                    dispatch_detail += (
+                        f" · 마지막 재시도 발사 {retry_dispatch_ms:+.1f}ms"
+                    )
+                    if isinstance(outbound_ms, (int, float)):
+                        retry_arrival_ms = retry_dispatch_ms + float(outbound_ms)
+                        dispatch_detail += (
+                            f"/도착 {retry_arrival_ms:+.1f}ms"
+                        )
+                diagnostics = getattr(
+                    self._api_submitter, "last_armed_diagnostics", {}
+                ) or {}
+                http_status = diagnostics.get("httpStatus")
+                ttfb_ms = diagnostics.get("ttfbMs")
+                response_ms = diagnostics.get("responseMs")
+                network_detail = ""
+                if isinstance(http_status, (int, float)) and http_status > 0:
+                    network_detail += f" · HTTP {int(http_status)}"
+                if isinstance(ttfb_ms, (int, float)) and ttfb_ms > 0:
+                    network_detail += f" · TTFB {float(ttfb_ms):.0f}ms"
+                if isinstance(response_ms, (int, float)) and response_ms > 0:
+                    network_detail += f" · 본문 {float(response_ms):.0f}ms"
                 if elapsed_ms is not None:
                     self.log(
                         f"[정보] 브라우저 내부 API 제출 응답 · {result.outcome} · "
-                        f"RTT {elapsed_ms:.0f}ms{dispatch_detail}{attempt_detail}",
+                        f"RTT {elapsed_ms:.0f}ms{dispatch_detail}{attempt_detail}"
+                        f"{network_detail} · 코드 {result.code or '-'}",
                         "success" if result.outcome == SubmitOutcome.SUCCESS else "info",
                     )
                 outcome, detail = await self._handle_api_submit_result(
@@ -2251,6 +2572,12 @@ class NaverEngine(BaseEngine):
                 ):
                     await asyncio.sleep(self.API_NOT_OPEN_RETRY_SECONDS)
                     continue
+                self._last_post_submit_inventory = []
+                self._record_api_timing_result(
+                    outcome=SubmitOutcome.NOT_OPEN,
+                    response_code=result.code,
+                    booking_confirmed=False,
+                )
                 return "fallback", detail
             return outcome, detail
 

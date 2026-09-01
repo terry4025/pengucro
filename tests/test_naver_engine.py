@@ -20,8 +20,14 @@ from engines.naver_submit import (
     NaverBookingReconciliation,
     NaverSubmitPreparation,
 )
+from engines.naver_timing import NaverTimingProfile, load_timing_profile
 
 KST = timezone(timedelta(hours=9))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_naver_data_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("PENGUCRO_DATA_DIR", str(tmp_path))
 
 
 def make_engine():
@@ -723,8 +729,8 @@ def test_armed_rt47_reconciles_with_exactly_one_browser_mutation():
     assert engine._api_submitter.calls == 0
     assert len(engine._api_submitter.reconcile_calls) == 1
     reconcile_call = engine._api_submitter.reconcile_calls[0]
-    assert reconcile_call["attempts"] == 20
-    assert reconcile_call["window_seconds"] == 8.0
+    assert reconcile_call["attempts"] == 40
+    assert reconcile_call["window_seconds"] == 20.0
 
 
 def test_open_strike_uses_same_browser_server_clock_for_absolute_arm():
@@ -761,6 +767,7 @@ def test_open_strike_uses_same_browser_server_clock_for_absolute_arm():
     assert timing["open_at_epoch"] == 1788102000.0
     assert timing["lead_seconds"] == pytest.approx(0.11)
     assert timing["retry_lead_seconds"] == pytest.approx(0.05)
+    assert timing["target_arrival_before_open_seconds"] == pytest.approx(0.06)
     assert submitter.armed == []
 
 
@@ -921,7 +928,58 @@ def test_api_send_lead_uses_live_browser_rtt_for_the_field_timing_case():
     assert "서버 선점 도착 목표 -60ms" in engine._last_api_lead_detail
 
 
-def test_final_preopen_clock_sync_runs_once_with_three_samples():
+def test_product_timing_profile_changes_the_arrival_lead_without_global_offset():
+    engine = make_engine()
+    engine._api_submitter = type(
+        "BrowserTransport",
+        (),
+        {"last_rtt": 0.100, "safe_rtt_samples": [0.100]},
+    )()
+    engine._timing_profile = NaverTimingProfile(
+        "1498729|7094790|npay_prepaid", 0.080, 3
+    )
+
+    assert engine._api_one_way_seconds() == pytest.approx(0.130)
+    assert "서버 선점 도착 목표 -80ms" in engine._last_api_lead_detail
+
+
+def test_post_submit_inventory_observation_records_the_target_slot_state():
+    engine = make_engine()
+    engine.API_POST_SUBMIT_INVENTORY_OFFSETS = (0.0, 0.0)
+    engine.api = FakeApi(make_slot(stock=1, bookingCount=1))
+    engine.clock = FakeClock(-0.01)
+
+    samples = asyncio.run(engine._observe_post_submit_inventory({
+        "reservationDate": "2026-07-31",
+        "reservationTime": "13:20",
+    }))
+
+    assert len(samples) == 2
+    assert all(sample["remaining"] == 0 for sample in samples)
+    assert engine._last_post_submit_inventory == samples
+
+
+def test_exhausted_rt47_observation_updates_only_the_matching_product_profile():
+    engine = make_engine()
+    engine._timing_profile = NaverTimingProfile(
+        "1498729|7094790|npay_prepaid", 0.060, 0
+    )
+    engine._last_post_submit_inventory = [{"remaining": 0, "stock": 1}]
+
+    engine._record_api_timing_result(
+        outcome=SubmitOutcome.REFUSED,
+        response_code="RT47",
+        booking_confirmed=False,
+    )
+
+    profile = load_timing_profile("1498729", "7094790", "npay_prepaid")
+    assert profile.target_before_open_seconds == pytest.approx(0.070)
+    assert load_timing_profile(
+        "1498729", "7094790", "postpaid"
+    ).target_before_open_seconds == pytest.approx(0.060)
+
+
+def test_final_preopen_clock_sync_runs_once_with_five_samples():
     logs = []
     calls = []
 
@@ -937,7 +995,7 @@ def test_final_preopen_clock_sync_runs_once_with_three_samples():
 
     assert asyncio.run(engine._sync_clock_before_open()) is True
     assert asyncio.run(engine._sync_clock_before_open()) is False
-    assert calls == [(3, False)]
+    assert calls == [(5, False)]
     assert any("최저 지연 표본 오차 약 12ms" in message for message in logs)
 
 

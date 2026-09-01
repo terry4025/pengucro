@@ -9,6 +9,18 @@ def test_current_build_has_newest_patch_note():
     assert all(not str(note.version).strip().lower().startswith("v") for note in PATCH_NOTES)
 
 
+def test_v673_patch_notes_are_short_and_user_friendly():
+    note = notes_for("6.73")
+
+    assert note is not None
+    assert note.changes == (
+        "네이버 상품·결제 방식별 선점 제출 시점 자동 보정",
+        "네이버 오픈 경계의 서버 도착 시점과 재시도 정밀화",
+        "네이버 불명확 응답의 예약내역 대조와 예약번호 복구 강화",
+    )
+    assert all(len(change) <= 45 for change in note.changes)
+
+
 def test_v672_patch_notes_are_short_and_user_friendly():
     note = notes_for("6.72")
 
