@@ -95,6 +95,14 @@ def test_list_timeout_keeps_fast_lane_and_periodic_slow_recovery_lane():
     assert observed == [4.5, 1.25, 1.25, 1.25, 4.5, 1.25, 1.25, 1.25]
 
 
+def test_checkout_recovery_does_not_change_pre_order_speed_contract():
+    assert DoomEscapeEngine.ACTIVE_SCAN_RATE_PER_SECOND == 12.0
+    assert DoomEscapeEngine.MAX_SCAN_SESSIONS == 10
+    assert DoomEscapeEngine.ORDER_POST_TIMEOUT_SECONDS == 20.0
+    assert DoomEscapeEngine.ORDER_FOLLOWUP_TIMEOUT_SECONDS == 20.0
+    assert DoomEscapeEngine.ORDER_FOLLOWUP_RECOVERY_SECONDS == 180.0
+
+
 def test_order_scan_stop_is_isolated_to_each_engine_instance():
     first = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
     second = DoomEscapeEngine("https://doomescape.com", lambda *_args: None)
@@ -620,6 +628,8 @@ def test_checkout_followup_timeout_stops_scans_without_duplicate_order(monkeypat
     engine._slot_wait_started_at = time.time()
     engine.session_pool = [scan_session, submit_session]
     engine._submit_session = submit_session
+    engine.ORDER_FOLLOWUP_RECOVERY_SECONDS = 0.08
+    engine.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS = 0.001
     monkeypatch.setattr(engine, "_write_safe_failure_summary", lambda **_kwargs: None)
 
     reservation = {
@@ -636,13 +646,65 @@ def test_checkout_followup_timeout_stops_scans_without_duplicate_order(monkeypat
     asyncio.run(engine.make_reservation_async_task(reservation, 0))
 
     assert submit_session.post_count == 1
-    assert submit_session.kcp_get_count == engine.SAFE_READ_RETRY_ATTEMPTS
+    assert submit_session.kcp_get_count > 3
     assert engine._scan_stop_event.is_set()
     assert engine.stop_event.is_set()
     assert any(
         "orderId=9001" in message and "결제 준비 화면 조회 결과 불명확" in message
         for message, _level in logs
     )
+
+
+def test_checkout_followup_recovers_late_without_duplicate_order():
+    class Response:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def text(self, **_kwargs):
+            return self.body
+
+    class Session:
+        def __init__(self):
+            self.get_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.get_count += 1
+            if self.get_count < 6:
+                return Response("<html>주문 준비 중</html>")
+            return Response('<input value="CODE-777" name="ck_code">')
+
+    logs = []
+    engine = DoomEscapeEngine(
+        "https://doomescape.com",
+        lambda message, level: logs.append((message, level)),
+    )
+    engine.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS = 0
+    session = Session()
+
+    status, _text, code, attempts, error = asyncio.run(
+        engine._read_checkout_with_recovery_async(
+            session,
+            "https://doomescape.com/layout/res/home.php?go=rev.kcp&num=9001",
+            {},
+            "태스크 1",
+            "9001",
+        )
+    )
+
+    assert status == 200
+    assert code == "CODE-777"
+    assert attempts == 6
+    assert error is None
+    assert any("최대 180초 동안 계속 확인" in message for message, _level in logs)
+    assert any("6번째 조회에서 확인" in message for message, _level in logs)
 
 
 def test_order_connect_failure_before_send_uses_warmed_fallback_once():

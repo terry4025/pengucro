@@ -17,6 +17,12 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.72",
+        changes=(
+            "둠이스케이프 주문 생성 후 결제 준비 화면을 최대 3분간 자동 재확인",
+        ),
+    ),
+    PatchNote(
         version="6.71",
         changes=(
             "둠이스케이프 주문 생성 후 해당 프로그램의 불필요한 시간표 조회 중단",

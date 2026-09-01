@@ -105,8 +105,9 @@ class DoomEscapeEngine(BaseEngine):
     MAX_SCAN_SESSIONS = 10
     ORDER_POST_TIMEOUT_SECONDS = 20.0
     ORDER_FOLLOWUP_TIMEOUT_SECONDS = 20.0
+    ORDER_FOLLOWUP_RECOVERY_SECONDS = 180.0
+    ORDER_FOLLOWUP_RETRY_DELAY_SECONDS = 1.0
     ORDER_CONFIRM_TIMEOUT_SECONDS = 20.0
-    SAFE_READ_RETRY_ATTEMPTS = 3
     ORDER_RECOVERY_ATTEMPTS = 6
     ORDER_RECOVERY_DELAY_SECONDS = 0.25
     ORDER_PRE_SEND_RECONNECT_ROUNDS = 2
@@ -1003,6 +1004,81 @@ class DoomEscapeEngine(BaseEngine):
         return None
 
     @staticmethod
+    def _extract_checkout_code(response_text):
+        soup = BeautifulSoup(response_text or "", "html.parser")
+        field = soup.find("input", attrs={"name": "ck_code"})
+        value = str(field.get("value") or "").strip() if field else ""
+        if value:
+            return value
+        match = re.search(
+            r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)",
+            response_text or "",
+            re.I,
+        )
+        return match.group(1) if match else ""
+
+    async def _read_checkout_with_recovery_async(
+        self, session, url, headers, worker_label, order_id
+    ):
+        """Keep reading a known order without ever creating another order."""
+        deadline = time.monotonic() + self.ORDER_FOLLOWUP_RECOVERY_SECONDS
+        attempt = 0
+        last_status = 0
+        last_text = ""
+        last_error = None
+        announced = False
+
+        while not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt += 1
+            request_timeout = min(self.ORDER_FOLLOWUP_TIMEOUT_SECONDS, remaining)
+            try:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=max(0.001, request_timeout),
+                ) as response:
+                    last_status = response.status
+                    last_text = await response.text(
+                        encoding="utf-8", errors="ignore"
+                    )
+                checkout_code = self._extract_checkout_code(last_text)
+                if last_status < 500 and checkout_code:
+                    if attempt > 1:
+                        self.log(
+                            f"[{worker_label}] [복구] orderId={order_id} · "
+                            f"결제 준비 화면을 {attempt}번째 조회에서 확인했습니다.",
+                            "success",
+                        )
+                    return last_status, last_text, checkout_code, attempt, None
+                last_error = (
+                    RuntimeError(f"HTTP {last_status}")
+                    if last_status >= 500
+                    else RuntimeError("결제 확인 코드 미표시")
+                )
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                last_error = exc
+
+            if not announced:
+                announced = True
+                self.log(
+                    f"[{worker_label}] [복구 대기] orderId={order_id} · "
+                    "결제 준비 화면 응답 지연 · 주문을 다시 만들지 않고 "
+                    f"최대 {self.ORDER_FOLLOWUP_RECOVERY_SECONDS:.0f}초 동안 계속 확인합니다.",
+                    "warning",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(
+                min(self.ORDER_FOLLOWUP_RETRY_DELAY_SECONDS, remaining)
+            )
+
+        return last_status, last_text, "", attempt, last_error
+
+    @staticmethod
     def _is_transient_site_error(exc):
         if isinstance(exc, (asyncio.TimeoutError, aiohttp.ClientError, ConnectionError)):
             return True
@@ -1651,33 +1727,29 @@ class DoomEscapeEngine(BaseEngine):
                         
                         # 4. Fetch KCP page to extract ck_code
                         current_stage = "결제 준비 화면 조회"
-                        kcp_status = 0
-                        kcp_text = ""
-                        kcp_error = None
                         request_started = time.perf_counter()
-                        for read_attempt in range(1, self.SAFE_READ_RETRY_ATTEMPTS + 1):
-                            try:
-                                async with booking_session.get(
-                                    kcp_url,
-                                    headers=headers,
-                                    timeout=self.ORDER_FOLLOWUP_TIMEOUT_SECONDS,
-                                ) as kcp_resp:
-                                    kcp_status = kcp_resp.status
-                                    kcp_text = await kcp_resp.text(
-                                        encoding='utf-8', errors='ignore'
-                                    )
-                                if kcp_status < 500:
-                                    kcp_error = None
-                                    break
-                                kcp_error = RuntimeError(f"HTTP {kcp_status}")
-                            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
-                                kcp_error = exc
-                            if read_attempt < self.SAFE_READ_RETRY_ATTEMPTS:
-                                await asyncio.sleep(0.10 * read_attempt)
-                        if kcp_error is not None:
+                        (
+                            kcp_status,
+                            kcp_text,
+                            ck_code_val,
+                            read_attempts,
+                            kcp_error,
+                        ) = await self._read_checkout_with_recovery_async(
+                            booking_session,
+                            kcp_url,
+                            headers,
+                            worker_label,
+                            num,
+                        )
+                        if not ck_code_val:
+                            detail = (
+                                self._describe_exception(kcp_error)
+                                if kcp_error is not None
+                                else "결제 확인 코드를 읽지 못함"
+                            )
                             raise DoomSubmissionUncertain(
                                 current_stage,
-                                self._describe_exception(kcp_error),
+                                detail,
                                 order_id=num,
                             ) from kcp_error
                         self._log_http_diagnostic(
@@ -1686,18 +1758,9 @@ class DoomEscapeEngine(BaseEngine):
                             "GET",
                             kcp_status,
                             time.perf_counter() - request_started,
-                            detail=f"orderId={num}",
+                            detail=f"orderId={num} · 조회 {read_attempts}회",
                             force=True,
                         )
-                        
-                        ck_m = re.search(r"name=['\"]?ck_code['\"]?\s*value=['\"]?([^'\"'>\s]+)", kcp_text)
-                        ck_code_val = ck_m.group(1) if ck_m else ""
-                        if not ck_code_val:
-                            raise DoomSubmissionUncertain(
-                                current_stage,
-                                "주문은 생성됐지만 결제 확인 코드를 읽지 못함",
-                                order_id=num,
-                            )
 
                         # 5. Submit mutong.php (using GET or POST - GET is browser default)
                         mutong_url = f"{self.base_url}/core/res/rev.make.mutong.php"
