@@ -320,6 +320,7 @@ def test_engine_clamps_parallel_workers_to_measured_limit(monkeypatch):
             "themePK": "문장",
             "reservationDate": "2026-08-15",
             "reservationTime": "22:30:00",
+            "devMode": True,
         },
         50,
         is_async=True,

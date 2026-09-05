@@ -11,6 +11,7 @@ naver_cookies.json
 success_reservations.txt
 reservation_history.jsonl
 secrets.json
+dpsnnn-plan*.json
 *.tmp
 scratch/
 archive/

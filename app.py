@@ -168,6 +168,13 @@ def main() -> int:
     log_path = logging_setup.configure()
     LOGGER.info("Pengucro starting (log file: %s)", log_path)
 
+    if "--dpsnnn-plan" in sys.argv:
+        index = sys.argv.index("--dpsnnn-plan")
+        if index + 1 >= len(sys.argv):
+            return 2
+        from ui.dpsnnn_batch import run_plan_window
+        return run_plan_window(sys.argv[index + 1])
+
     # A fresh installation has no timetable history. Import only missing,
     # integrity-checked public Keyescape rows bundled with this exact build;
     # the signed update manifest covers the executable containing this seed.

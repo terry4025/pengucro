@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.76",
+        changes=(
+            "단편선 미오픈 날짜 감시와 새 달력의 예약 가능 슬롯 감지 보강",
+            "단편선 결제 브라우저 사전 준비와 무통장 예약 접수 확인 강화",
+            "단편선 응답 유실·재시작 시 중복 주문 방지",
+            "단편선 예약 목록 최대 4건 동시 감시 화면 추가",
+        ),
+    ),
+    PatchNote(
         version="6.75",
         changes=(
             "네이버 선결제 상품의 오픈 경계 제출 시점을 안정적으로 조정",

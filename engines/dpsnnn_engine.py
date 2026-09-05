@@ -16,6 +16,8 @@ from engines.base_engine import BaseEngine
 from engines.zeroworld_catalog import ZeroWorldTimeSlot
 from pengucro.diagnostics import format_exception
 from pengucro.models import BookingResult, parse_bool_flag
+from engines.dpsnnn_runtime import DpsnnnSession, KST, WarmCheckout
+from engines.dpsnnn_orders import OrderJournal
 
 
 USER_AGENT = (
@@ -45,6 +47,7 @@ DPSNNN_SUBMIT_SELECTORS = (
     f"{DPSNNN_PAYMENT_FORM_SELECTOR} ._btn_start_payment",
     f'{DPSNNN_PAYMENT_FORM_SELECTOR} [role="button"]',
     f'{DPSNNN_PAYMENT_FORM_SELECTOR} button',
+    f'{DPSNNN_PAYMENT_FORM_SELECTOR} input[type="submit"]',
 )
 
 DPSNNN_BRANCHES: dict[str, dict[str, Any]] = {
@@ -99,7 +102,7 @@ def calculate_dpsnnn_open_datetime(date_str: str) -> datetime:
 
 
 def create_dpsnnn_session() -> requests.Session:
-    session = requests.Session()
+    session = DpsnnnSession()
     session.headers.update(
         {
             "User-Agent": USER_AGENT,
@@ -147,7 +150,7 @@ def parse_dpsnnn_calendar(
         badge = anchor.select_one(".booking_badge, .badge")
         badge_text = badge.get_text(" ", strip=True) if badge else ""
         unavailable = bool(classes.intersection({"waiting", "closed", "disable", "disabled"}))
-        unavailable = unavailable or "return false" in onclick or badge_text in {"완", "마감"}
+        unavailable = unavailable or "return false" in onclick or badge_text not in {"가", "예약가능"}
         slots.append(ZeroWorldTimeSlot(slot_time, slot_id, not unavailable))
     return sorted(slots, key=lambda item: (item.time, item.slot_id))
 
@@ -274,6 +277,9 @@ class DpsnnnEngine(BaseEngine):
         self._next_worker_index = 0
         self._diagnostic_log_lock = threading.Lock()
         self._diagnostic_log_state: dict[tuple[str, ...], dict[str, float | int]] = {}
+        self._warm_checkout = None
+        self._journal = None
+        self._start_lock = threading.Lock()
 
     @staticmethod
     def _describe_exception(exc: BaseException) -> str:
@@ -317,7 +323,16 @@ class DpsnnnEngine(BaseEngine):
         )
 
     def start_reservation(self, reservation_data, num_threads, is_async=False) -> None:
+        with self._start_lock:
+            if self.is_running or (self._warm_checkout is not None and not self._warm_checkout.finished.is_set()):
+                self.log("예약 엔진이 이미 실행 중입니다.", "warning")
+                return
+            self._start_reservation(reservation_data, num_threads, is_async)
+
+    def _start_reservation(self, reservation_data, num_threads, is_async=False) -> None:
         workers = max(1, min(int(num_threads), DPSNNN_MAX_WORKERS))
+        self._warm_checkout = None
+        self._journal = None
         self._order_claimed.clear()
         with self._worker_index_lock:
             self._next_worker_index = 0
@@ -350,10 +365,30 @@ class DpsnnnEngine(BaseEngine):
             "주문 생성은 먼저 통과한 1개 세션만 실행합니다.",
             "info",
         )
+        if not parse_bool_flag(reservation_data.get("devMode", False)):
+            branch = resolve_dpsnnn_branch(str(reservation_data.get("branch", "")), self.engine_options)
+            if not str(reservation_data.get("name", "")).strip() or len(re.sub(r"\D", "", str(reservation_data.get("phone", "")))) not in (10, 11):
+                raise ValueError("예약자 이름과 연락처를 확인해주세요.")
+            self._journal = OrderJournal(reservation_data)
+            if self._journal.read() is not None:
+                self._order_claimed.set()
+                self.log("이 예약의 기존 주문 기록이 있습니다. 중복 제출을 막았습니다. 기존 예약번호·결제 화면·알림톡을 먼저 확인해주세요.", "warning")
+                return
+            self.stop_event.clear()
+            self._warm_checkout = WarmCheckout(branch, reservation_data, self.log, self.stop_event)
+            self._warm_checkout.start()
         super().start_reservation(reservation_data, workers, is_async=False)
 
     def get_csrf_token(self, session, url=None) -> str:
         return ""
+
+    def _remember_order(self, state, order_code="", booking_number=""):
+        if self._journal is not None:
+            try:
+                self._journal.update(state, order_code, booking_number)
+            except OSError:
+                # The durable pre-submit claim still prevents another order.
+                self.log("주문 상태 추가 저장 실패 · 기존 중복방지 기록을 유지합니다.", "warning")
 
     def _theme_alias(self, branch: dict[str, Any], reservation_data: dict[str, Any]) -> str:
         raw = str(reservation_data.get("themePK", "")).strip()
@@ -415,6 +450,9 @@ class DpsnnnEngine(BaseEngine):
         if not required.issubset(values):
             missing = ", ".join(sorted(required.difference(values)))
             raise ValueError(f"예약 주문 필드가 부족합니다: {missing}")
+        if not self._prepared_payload_usable(values, slot_id, 0.0,
+                                              date_str=date_str, now_monotonic=0.0):
+            raise ValueError("예약 상세의 날짜·상품·시간 필드가 목표와 일치하지 않습니다.")
         return values
 
     @classmethod
@@ -424,7 +462,9 @@ class DpsnnnEngine(BaseEngine):
         *,
         now: datetime | None = None,
     ) -> bool:
-        current = now or datetime.now()
+        current = now or datetime.now(KST).replace(tzinfo=None)
+        if current.tzinfo is not None:
+            current = current.astimezone(KST).replace(tzinfo=None)
         seconds_until_open = (
             calculate_dpsnnn_open_datetime(date_str) - current
         ).total_seconds()
@@ -459,7 +499,14 @@ class DpsnnnEngine(BaseEngine):
         if date_str:
             target_day = date_str.replace("-", "")
             start_day = str(payload["start_day"]).replace("-", "")
-            if start_day != target_day:
+            end_day = str(payload["end_day"]).replace("-", "")
+            if start_day != target_day or end_day != target_day:
+                return False
+            try:
+                if any(datetime.fromtimestamp(stamp, KST).strftime("%Y%m%d") != target_day
+                       for stamp in (start_timestamp, end_timestamp)):
+                    return False
+            except (OverflowError, OSError, ValueError):
                 return False
         current = time.monotonic() if now_monotonic is None else now_monotonic
         age = current - prepared_at
@@ -494,11 +541,15 @@ class DpsnnnEngine(BaseEngine):
         )
         response.raise_for_status()
         data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("주문 응답 형식이 불명확합니다.")
         message = str(data.get("msg", ""))
         order_code = str(data.get("order_code", ""))
         if message.upper() == "SUCCESS" and order_code:
             return order_code, message
-        return "", message or "예약 주문 생성에 실패했습니다."
+        if not message or message.upper() == "SUCCESS":
+            raise ValueError("주문 생성 여부를 확인할 수 없습니다.")
+        return "", message
 
     @staticmethod
     def _fill_first(page, selectors: list[str], value: str) -> bool:
@@ -509,7 +560,12 @@ class DpsnnnEngine(BaseEngine):
                 for index in range(count):
                     field = locator.nth(index)
                     if field.is_visible() and field.is_enabled():
-                        field.fill(value)
+                        if field.evaluate("element => element.tagName") == "SELECT":
+                            field.select_option(value)
+                        else:
+                            field.fill(value)
+                        if field.input_value().strip() != value.strip():
+                            continue
                         return True
             except Exception:
                 continue
@@ -724,10 +780,14 @@ class DpsnnnEngine(BaseEngine):
             try:
                 for index in range(min(candidates.count(), 12)):
                     candidate = candidates.nth(index)
-                    label = candidate.inner_text().strip()
+                    label = (candidate.inner_text().strip() or
+                             candidate.get_attribute("value") or
+                             candidate.get_attribute("aria-label") or "")
                     if (
                         candidate.is_visible()
-                        and re.fullmatch(r"\s*결제하기\s*", label)
+                        and candidate.is_enabled()
+                        and re.search(r"(?:결제|예약)\s*하기", label)
+                        and not re.search(r"취소|돌아가기", label)
                     ):
                         return candidate
             except Exception:
@@ -736,13 +796,17 @@ class DpsnnnEngine(BaseEngine):
 
     @staticmethod
     def _checkout_success(body: str, current_url: str, payment_url: str) -> bool:
-        del body
         current_path = urllib.parse.urlparse(current_url).path.rstrip("/").casefold()
         payment_path = urllib.parse.urlparse(payment_url).path.rstrip("/").casefold()
+        if urllib.parse.urlparse(current_url).netloc != urllib.parse.urlparse(payment_url).netloc:
+            return False
+        if re.search(r"(?:예약|주문|결제)\s*(?:실패|불가)|오류가\s*발생", body):
+            return False
         return bool(
             current_path
             and current_path != payment_path
-            and "shop_payment_complete" in current_path
+            and current_path == "/shop_payment_complete"
+            and re.search(r"(?:예약|주문)(?:이|이\s*정상적으로|이\s*성공적으로)?\s*(?:완료|접수)", body)
         )
 
     @staticmethod
@@ -788,236 +852,195 @@ class DpsnnnEngine(BaseEngine):
             daemon=True,
         ).start()
 
-    def _complete_checkout(
-        self,
-        session: requests.Session,
-        branch: dict[str, Any],
-        order_code: str,
-        reservation_data: dict[str, Any],
-        worker_label: str = "주문 작업",
-    ) -> tuple[bool, str]:
-        from playwright.sync_api import sync_playwright
+    def _complete_checkout(self, session, branch, order_code, reservation_data,
+                           worker_label="주문 작업") -> tuple[bool, str]:
+        if self._warm_checkout is None:
+            self._warm_checkout = WarmCheckout(branch, reservation_data, self.log, self.stop_event)
+            self._warm_checkout.start()
+        return self._warm_checkout.submit(
+            lambda context, page: self._checkout_on_page(
+                page, context, session, branch, order_code, reservation_data, worker_label))
 
-        chrome_started = time.perf_counter()
-        chrome = browser_session.start_isolated(log=self.log)
-        if chrome is None:
-            return False, "결제 화면을 열 Chrome 슬롯이 없습니다."
-        self.log(
-            f"[{worker_label}] [브라우저] 결제 세션 연결 완료 · "
-            f"{(time.perf_counter() - chrome_started) * 1000:.0f}ms · orderId={order_code}",
-            "info",
-        )
+    def _checkout_on_page(self, page, context, session, branch, order_code,
+                          reservation_data, worker_label) -> tuple[bool, str]:
         payment_url = urllib.parse.urljoin(
-            branch["base_url"] + "/", f"shop_payment/?order_code={urllib.parse.quote(order_code)}"
-        )
-        keep_open = False
+            branch["base_url"] + "/", f"shop_payment/?order_code={urllib.parse.quote(order_code)}")
+        cookies = [{"name": cookie.name, "value": cookie.value,
+                    "domain": cookie.domain or urllib.parse.urlparse(branch["base_url"]).hostname,
+                    "path": cookie.path or "/"} for cookie in session.cookies]
+        if cookies:
+            context.add_cookies(cookies)
         try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
-                cookies = []
-                for cookie in session.cookies:
-                    cookies.append(
-                        {
-                            "name": cookie.name,
-                            "value": cookie.value,
-                            "domain": cookie.domain or urllib.parse.urlparse(branch["base_url"]).hostname,
-                            "path": cookie.path or "/",
-                        }
-                    )
-                if cookies:
-                    context.add_cookies(cookies)
-                page = context.new_page()
-                page_started = time.perf_counter()
-                navigation = page.goto(
-                    payment_url, wait_until="domcontentloaded", timeout=30000
-                )
-                self._log_http_diagnostic(
-                    worker_label,
-                    "결제 화면 조회",
-                    "GET",
-                    getattr(navigation, "status", None),
-                    time.perf_counter() - page_started,
-                    f"orderId={order_code}",
-                    force=True,
-                )
-                page.wait_for_selector(
-                    DPSNNN_PAYMENT_FORM_SELECTOR,
-                    state="attached",
-                    timeout=15000,
-                )
+            page_started = time.perf_counter()
+            navigation = page.goto(
+                payment_url, wait_until="domcontentloaded", timeout=30000
+            )
+            self._log_http_diagnostic(
+                worker_label,
+                "결제 화면 조회",
+                "GET",
+                getattr(navigation, "status", None),
+                time.perf_counter() - page_started,
+                f"orderId={order_code}",
+                force=True,
+            )
+            page.wait_for_selector(
+                DPSNNN_PAYMENT_FORM_SELECTOR,
+                state="attached",
+                timeout=15000,
+            )
 
-                name = str(reservation_data.get("name", ""))
-                phone = str(reservation_data.get("phone", ""))
-                people = str(reservation_data.get("people", ""))
-                self._fill_first(page, [
-                    'input[name*="people" i]', 'select[name*="people" i]',
-                    'input[placeholder*="인원"]',
-                ], people)
+            name = str(reservation_data.get("name", ""))
+            phone = str(reservation_data.get("phone", ""))
+            people = str(reservation_data.get("people", ""))
+            people_selectors = [
+                'input[name*="people" i]', 'select[name*="people" i]',
+                'input[placeholder*="인원"]',
+            ]
+            if any(page.locator(selector).count() for selector in people_selectors):
+                if not self._fill_first(page, people_selectors, people):
+                    return False, "인원 입력을 확인하지 못했습니다. 열린 화면을 확인해주세요."
 
-                orderer_prepared, orderer_error = self._prepare_orderer_checkout(
-                    page,
-                    name,
-                    phone,
-                )
-                if not orderer_prepared:
-                    keep_open = True
-                    return False, orderer_error
+            orderer_prepared, orderer_error = self._prepare_orderer_checkout(
+                page,
+                name,
+                phone,
+            )
+            if not orderer_prepared:
+                return False, orderer_error
 
-                prepared, prepare_error = self._prepare_cash_checkout(page, name)
-                if not prepared:
-                    keep_open = True
-                    return False, prepare_error
+            prepared, prepare_error = self._prepare_cash_checkout(page, name)
+            if not prepared:
+                return False, prepare_error
 
+            self.log(
+                f"[{worker_label}] [결제 준비] 예약자 이름·연락처 · 무통장입금 · 입금자명 · "
+                "취소·환불 및 결제 필수 약관 확인 완료",
+                "info",
+            )
+
+            if parse_bool_flag(reservation_data.get("devMode", False)):
                 self.log(
-                    f"[{worker_label}] [결제 준비] 예약자 이름·연락처 · 무통장입금 · 입금자명 · "
-                    "취소·환불 및 결제 필수 약관 확인 완료",
-                    "info",
+                    f"[개발자 모드] 결제 전 임시 주문 생성 완료 · 내부 orderId {order_code} · "
+                    "최종 결제 클릭 전 정지합니다.",
+                    "success",
                 )
+                return False, "개발자 모드로 결제 직전에 정지했습니다."
 
-                if parse_bool_flag(reservation_data.get("devMode", False)):
-                    self.log(
-                        f"[개발자 모드] 결제 전 임시 주문 생성 완료 · 내부 orderId {order_code} · "
-                        "최종 결제 클릭 전 정지합니다.",
-                        "success",
-                    )
-                    keep_open = True
-                    return False, "개발자 모드로 결제 직전에 정지했습니다."
-
+            submit = self._find_checkout_submit(page)
+            submit_ready_deadline = time.monotonic() + 2.0
+            while submit is None and time.monotonic() < submit_ready_deadline:
+                page.wait_for_timeout(50)
                 submit = self._find_checkout_submit(page)
-                if submit is None:
-                    keep_open = True
-                    return False, (
-                        "결제 전 임시 주문은 생성했지만 최종 결제 버튼을 찾지 못했습니다. "
-                        "열린 화면에서 완료해주세요."
-                    )
-
-                validation_dialogs: list[str] = []
-
-                def record_dialog(dialog) -> None:
-                    validation_dialogs.append(str(dialog.message))
-                    dialog.dismiss()
-
-                page.on("dialog", record_dialog)
-                final_responses = []
-
-                def record_final_response(response) -> None:
-                    if "/backpg/payment/booking/index.cm" in response.url:
-                        final_responses.append(response)
-
-                page.on("response", record_final_response)
-                check_response = None
-                submit_started = time.perf_counter()
-                try:
-                    with page.expect_response(
-                        lambda response: "/shop/check_payment.cm" in response.url,
-                        timeout=12000,
-                    ) as response_info:
-                        submit.click()
-                    check_response = response_info.value
-                except Exception as exc:
-                    if validation_dialogs:
-                        keep_open = True
-                        return False, f"최종 결제 검증 실패: {validation_dialogs[-1]}"
-                    keep_open = True
-                    return False, (
-                        "결제하기 클릭 후 서버 확인 요청을 받지 못했습니다: "
-                        f"{self._describe_exception(exc)}"
-                    )
-
-                check_status = getattr(check_response, "status", None)
-                self.log(
-                    f"[{worker_label}] [HTTP] 최종 결제 사전 확인 · POST · "
-                    f"status={check_status if check_status is not None else '없음'} · "
-                    f"orderId={order_code}",
-                    "info" if check_status is not None and check_status < 400 else "warning",
-                )
-                try:
-                    check_payload = check_response.json()
-                except Exception:
-                    check_payload = {}
-                check_message = str(check_payload.get("msg", ""))
-                if check_message and check_message.upper() != "SUCCESS":
-                    keep_open = True
-                    return False, f"최종 결제 서버 확인 실패: {check_message}"
-
-                self.log(
-                    f"[{worker_label}] [최종 제출] 결제 사전 확인 완료 · "
-                    f"orderId={order_code} · 실제 예약 접수 응답 대기",
-                    "info",
-                )
-
-                final_deadline = time.monotonic() + 20.0
-                while not final_responses and time.monotonic() < final_deadline:
-                    if validation_dialogs:
-                        keep_open = True
-                        return False, f"최종 결제 검증 실패: {validation_dialogs[-1]}"
-                    page.wait_for_timeout(50)
-                if not final_responses:
-                    keep_open = True
-                    return False, (
-                        "결제 사전 확인은 통과했지만 실제 예약 접수 요청을 확인하지 못했습니다. "
-                        "열린 화면을 확인해주세요."
-                    )
-
-                final_response = final_responses[-1]
-                final_status = getattr(final_response, "status", None)
-                self.log(
-                    f"[{worker_label}] [HTTP] 실제 예약 접수 · POST · "
-                    f"status={final_status if final_status is not None else '없음'} · "
-                    f"RTT {(time.perf_counter() - submit_started) * 1000:.0f}ms",
-                    "info" if final_status is not None and final_status < 400 else "warning",
-                )
-                if final_status is None or final_status >= 400:
-                    keep_open = True
-                    return False, f"실제 예약 접수 응답 오류 · status={final_status or '없음'}"
-                try:
-                    final_response_body = final_response.text()
-                except Exception:
-                    final_response_body = ""
-
-                deadline = time.monotonic() + 20.0
-                completion_seen_at = 0.0
-                body = ""
-                while time.monotonic() < deadline:
-                    try:
-                        body = page.locator("body").inner_text(timeout=2500)
-                        if self._checkout_success(body, page.url, payment_url):
-                            if not completion_seen_at:
-                                completion_seen_at = time.monotonic()
-                            booking_number = self._checkout_number(
-                                body,
-                                order_code,
-                                page.url,
-                                final_response_body,
-                            )
-                            if booking_number:
-                                keep_open = True
-                                return True, booking_number
-                            if time.monotonic() - completion_seen_at >= 5.0:
-                                keep_open = True
-                                return True, ""
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(250)
-                keep_open = True
+            if submit is None:
                 return False, (
-                    "결제하기는 전송했지만 예약 완료 화면이나 예약번호를 확인하지 못했습니다. "
+                    "결제 전 임시 주문은 생성했지만 최종 결제 버튼을 찾지 못했습니다. "
+                    "열린 화면에서 완료해주세요."
+                )
+
+            validation_dialogs: list[str] = []
+
+            def record_dialog(dialog) -> None:
+                validation_dialogs.append(str(dialog.message))
+                dialog.dismiss()
+
+            page.on("dialog", record_dialog)
+            final_responses = []
+
+            def record_final_response(response) -> None:
+                if "/backpg/payment/booking/index.cm" in response.url:
+                    final_responses.append(response)
+
+            page.on("response", record_final_response)
+            check_response = None
+            submit_started = time.perf_counter()
+            if self.stop_event.is_set():
+                return False, "중지 요청으로 최종 제출 전 정지했습니다. 생성된 주문 화면을 확인해주세요."
+            try:
+                with page.expect_response(
+                    lambda response: "/shop/check_payment.cm" in response.url,
+                    timeout=12000,
+                ) as response_info:
+                    submit.click()
+                check_response = response_info.value
+            except Exception as exc:
+                if validation_dialogs:
+                    return False, f"최종 결제 검증 실패: {validation_dialogs[-1]}"
+                return False, (
+                    "결제하기 클릭 후 서버 확인 요청을 받지 못했습니다: "
+                    f"{self._describe_exception(exc)}"
+                )
+
+            check_status = getattr(check_response, "status", None)
+            self.log(
+                f"[{worker_label}] [HTTP] 최종 결제 사전 확인 · POST · "
+                f"status={check_status if check_status is not None else '없음'} · "
+                f"orderId={order_code}",
+                "info" if check_status is not None and check_status < 400 else "warning",
+            )
+            try:
+                check_payload = check_response.json()
+            except Exception:
+                check_payload = {}
+            check_message = str(check_payload.get("msg", ""))
+            if check_status is None or not 200 <= check_status < 300 or check_message.upper() != "SUCCESS":
+                return False, "최종 결제 서버 확인 실패 또는 응답 불명확 · 열린 화면을 확인해주세요."
+
+            self.log(
+                f"[{worker_label}] [최종 제출] 결제 사전 확인 완료 · "
+                f"orderId={order_code} · 실제 예약 접수 응답 대기",
+                "info",
+            )
+
+            final_deadline = time.monotonic() + 20.0
+            while not final_responses and time.monotonic() < final_deadline:
+                if validation_dialogs:
+                    return False, f"최종 결제 검증 실패: {validation_dialogs[-1]}"
+                page.wait_for_timeout(50)
+            if not final_responses:
+                return False, (
+                    "결제 사전 확인은 통과했지만 실제 예약 접수 요청을 확인하지 못했습니다. "
                     "열린 화면을 확인해주세요."
                 )
-        except Exception as exc:
-            keep_open = True
-            return (
-                False,
-                "결제 전 임시 주문은 생성했지만 결제 화면 자동화에 실패했습니다: "
-                f"{self._describe_exception(exc)}",
+
+            final_response = final_responses[-1]
+            final_status = getattr(final_response, "status", None)
+            self.log(
+                f"[{worker_label}] [HTTP] 실제 예약 접수 · POST · "
+                f"status={final_status if final_status is not None else '없음'} · "
+                f"RTT {(time.perf_counter() - submit_started) * 1000:.0f}ms",
+                "info" if final_status is not None and final_status < 400 else "warning",
             )
-        finally:
-            if keep_open:
-                self._release_browser_lease_when_closed(chrome)
-            else:
-                chrome.close_if_launched()
-                chrome.release()
+            if final_status is None or not 200 <= final_status < 400:
+                return False, f"실제 예약 접수 응답 오류 · status={final_status or '없음'}"
+            try:
+                final_response_body = final_response.text()
+            except Exception:
+                final_response_body = ""
+
+            deadline = time.monotonic() + 20.0
+            body = ""
+            while time.monotonic() < deadline:
+                try:
+                    body = page.locator("body").inner_text(timeout=2500)
+                    if self._checkout_success(body, page.url, payment_url):
+                        booking_number = self._checkout_number(
+                            body,
+                            order_code,
+                            page.url,
+                            final_response_body,
+                        )
+                        if booking_number:
+                            return True, booking_number
+                except Exception:
+                    pass
+                page.wait_for_timeout(250)
+            return False, (
+                "결제하기는 전송했지만 예약 완료 화면이나 예약번호를 확인하지 못했습니다. "
+                "열린 화면을 확인해주세요."
+            )
+        except Exception as exc:
+            return False, f"생성된 주문의 결제 처리 확인 필요: {self._describe_exception(exc)} · 열린 화면을 확인해주세요."
 
     def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         with self._worker_index_lock:
@@ -1029,6 +1052,7 @@ class DpsnnnEngine(BaseEngine):
         date_str = str(reservation_data.get("reservationDate", ""))
         target_time = str(reservation_data.get("reservationTime", ""))[:5]
         session = create_dpsnnn_session()
+        session.stop_event = self.stop_event
         reserve_url = urllib.parse.urljoin(branch["base_url"] + "/", branch["reserve_path"].lstrip("/"))
         prepared_payload: dict[str, str] | None = None
         prepared_slot_id = ""
@@ -1037,8 +1061,19 @@ class DpsnnnEngine(BaseEngine):
         prestage_completed_slot_id = ""
         current_stage = "예약 홈 예열"
         try:
-            started = time.perf_counter()
-            reserve_response = session.get(reserve_url, timeout=self.REQUEST_TIMEOUT)
+            while not self.stop_event.is_set():
+                try:
+                    started = time.perf_counter()
+                    reserve_response = session.get(reserve_url, timeout=self.REQUEST_TIMEOUT)
+                    reserve_response.raise_for_status()
+                    break
+                except requests.RequestException as exc:
+                    self._log_http_diagnostic(worker_label, current_stage, "GET", None,
+                                              time.perf_counter() - started, type(exc).__name__)
+                    if self.stop_event.wait(0.5):
+                        return
+            else:
+                return
             self._log_http_diagnostic(
                 worker_label,
                 current_stage,
@@ -1060,7 +1095,13 @@ class DpsnnnEngine(BaseEngine):
                 "info",
             )
             last_message = ""
-            while not self.stop_event.is_set() and not self._order_claimed.is_set():
+            while not self.stop_event.is_set():
+                if self._order_claimed.is_set():
+                    if self.submission_lock.acquire(blocking=False):
+                        self.submission_lock.release()
+                        break
+                    self.stop_event.wait(0.01)
+                    continue
                 current_stage = "시간표 조회"
                 try:
                     def poll_diagnostics(stage, method, status, elapsed, detail):
@@ -1081,15 +1122,20 @@ class DpsnnnEngine(BaseEngine):
                             force=False,
                         )
 
-                    slots = fetch_exact_dpsnnn_slots(
-                        session,
-                        branch,
-                        alias,
-                        date_str,
-                        self.REQUEST_TIMEOUT,
-                        diagnostics=poll_diagnostics,
-                    )
-                    target = next((item for item in slots if item.time == target_time), None)
+                    warm = self._warm_checkout
+                    if warm is not None and warm.ready.is_set() and warm.error:
+                        self.log(warm.error, "error")
+                        self.stop_event.set()
+                        return
+                    if warm is not None and warm.native_slot:
+                        slots = [ZeroWorldTimeSlot(target_time, warm.native_slot, True)]
+                    else:
+                        slots = fetch_exact_dpsnnn_slots(
+                            session, branch, alias, date_str, self.REQUEST_TIMEOUT,
+                            diagnostics=poll_diagnostics)
+                    matching = [item for item in slots if item.time == target_time and item.slot_id]
+                    target = next((item for item in matching if item.available),
+                                  matching[0] if matching else None)
                     if (
                         prepared_slot_id
                         and target is not None
@@ -1168,6 +1214,9 @@ class DpsnnnEngine(BaseEngine):
                         self.stop_event.wait(self.POLL_INTERVAL)
                         continue
 
+                    if warm is not None and not warm.ready.is_set():
+                        self.stop_event.wait(0.025)
+                        continue
                     if not self.submission_lock.acquire(blocking=False):
                         self.stop_event.wait(0.01)
                         continue
@@ -1214,22 +1263,41 @@ class DpsnnnEngine(BaseEngine):
                                 worker_label,
                             )
                         current_stage = "예약 주문 생성"
+                        if self.stop_event.is_set() or (warm is not None and warm.error):
+                            return
+                        if self._journal is not None and not self._journal.claim():
+                            self._order_claimed.set()
+                            self.stop_event.set()
+                            self.log("동일 예약의 기존 주문 기록 확인 · 중복 주문 차단", "warning")
+                            return
+                        # Claim BEFORE sending. A timeout cannot prove that the
+                        # server did not accept this write.
+                        self._order_claimed.set()
                         try:
                             order_code, message = self._add_order(
                                 session, branch, payload, worker_label
                             )
-                        except Exception:
-                            prepared_payload = None
-                            prepared_slot_id = ""
-                            payload_prepared_at = 0.0
-                            prestage_completed_slot_id = ""
-                            raise
+                        except Exception as exc:
+                            self._remember_order("unknown")
+                            self.log(f"주문 응답 불명확 ({type(exc).__name__}) · 중복 방지를 위해 재전송을 중단했습니다. 예약 조회·알림톡을 확인해주세요.", "warning")
+                            self.stop_event.set()
+                            return
                         if order_code:
                             # This event is set while holding submission_lock. Any
                             # worker that already observed the same slot must pass
                             # the same lock and will exit before creating an order.
                             self._order_claimed.set()
+                            self._remember_order("created", order_code)
                         else:
+                            if not message or str(message).upper() == "SUCCESS":
+                                self.stop_event.set()
+                                self.log("주문 생성 여부 불명확 · 재주문 차단", "warning")
+                                return
+                            if self._journal is not None:
+                                self._journal.rejected()
+                            self._order_claimed.clear()
+                            if warm is not None:
+                                warm.native_slot = ""
                             prepared_payload = None
                             prepared_slot_id = ""
                             payload_prepared_at = 0.0
@@ -1261,9 +1329,10 @@ class DpsnnnEngine(BaseEngine):
                     )
                     if completed:
                         booking_number = detail.strip()
+                        self._remember_order("received", order_code, booking_number)
                         if booking_number:
                             self.log(
-                                f"단편선 예약 완료 · 예약번호 {booking_number}",
+                                f"단편선 예약 접수 완료 · 입금 대기 · 예약번호 {booking_number}",
                                 "success",
                             )
                         else:
@@ -1277,9 +1346,10 @@ class DpsnnnEngine(BaseEngine):
                             "info",
                         )
                         self.notify_success(
-                            BookingResult(True, "단편선 예약이 완료되었습니다.", booking_number)
+                            BookingResult(True, "단편선 예약 접수 완료 · 알림톡 확인 후 입금해주세요.", booking_number)
                         )
                     else:
+                        self._remember_order("checkout_unknown", order_code)
                         self.log(detail, "warning")
                         self.stop_event.set()
                     break
@@ -1305,6 +1375,11 @@ class DpsnnnEngine(BaseEngine):
             raise
         finally:
             session.close()
+
+    def stop_reservation(self) -> None:
+        super().stop_reservation()
+        if self._warm_checkout is not None:
+            self._warm_checkout.close()
 
     async def make_reservation_async_task(self, reservation_data, task_idx) -> None:
         await asyncio.to_thread(self.make_reservation_thread, reservation_data)

@@ -548,10 +548,10 @@ def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_pat
 
 
 def test_current_release_contract_is_complete():
-    assert __version__ == "6.75"
-    assert __release_sequence__ == 6750001
-    note = notes_for("6.75")
+    assert __version__ == "6.76"
+    assert __release_sequence__ == 6760001
+    note = notes_for("6.76")
     assert note is not None
-    assert any("선결제" in change and "제출 시점" in change for change in note.changes)
-    assert any("실제 오픈 지연" in change and "자동 재개" in change for change in note.changes)
-    assert any("예약내역 확인" in change and "조기 보정" in change for change in note.changes)
+    assert any("미오픈 날짜" in change for change in note.changes)
+    assert any("중복 주문 방지" in change for change in note.changes)
+    assert any("4건 동시 감시" in change for change in note.changes)
