@@ -326,7 +326,7 @@ def test_engine_clamps_parallel_workers_to_measured_limit(monkeypatch):
         is_async=True,
     )
 
-    assert captured == {"workers": 4, "is_async": False}
+    assert captured == {"workers": module.DPSNNN_MAX_WORKERS, "is_async": False}
     assert any("2026-08-09 00:00" in message for message, _level in logs)
 
 

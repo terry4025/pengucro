@@ -83,7 +83,8 @@ def test_batch_window_renders_without_starting_reservations(monkeypatch, tmp_pat
     checked = []
     def mainloop(app):
         app.update()
-        assert "6.76" in app.title()
+        from pengucro import __version__
+        assert __version__ in app.title()
         def descendants(widget):
             for child in widget.winfo_children():
                 yield child
