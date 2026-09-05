@@ -349,7 +349,8 @@ def test_price_validation_never_falls_back_to_hardcoded_amounts():
     ) == {"price": "66000", "price2": "46000", "price3": "66000"}
 
 
-def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
+@pytest.mark.parametrize("receipt_state", ["신청", "환불", "취소", "미확인"])
+def test_async_worker_claims_on_first_recovered_timetable(monkeypatch, receipt_state):
     import engines.doomescape_engine as module
     import webbrowser
 
@@ -412,7 +413,8 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
                 return Response(
                     '<meta http-equiv="refresh" content="0;url=rev.make.exe.php?ck_code=888">'
                 )
-            return Response("예약 완료")
+            return Response(f"예약번호: 8888 예약자: 테스트 ({receipt_state}) "
+                            "예약일시: 2026-09-05 19:00 테마: 데이투어")
 
         def post(self, *_args, **_kwargs):
             self.post_count += 1
@@ -466,11 +468,12 @@ def test_async_worker_claims_on_first_recovered_timetable(monkeypatch):
     assert [count for count, _reason in status_updates] == [1, 2]
     assert all(reason == "둠이스케이프 시간표 조회" for _count, reason in status_updates)
     assert submit_session.post_count == 1
-    assert successes == [True]
+    assert successes == ([True] if receipt_state == "신청" else [])
     assert engine._scan_stop_event.is_set()
     assert any("나머지 시간표 감시를 중단" in message for message, _level in logs)
     assert any("전체 정지 없이 독립 감시" in message for message, _level in logs)
-    assert any("예약 최종 완료" in message for message, _level in logs)
+    assert any("예약 최종 완료" in message for message, _level in logs) is (receipt_state == "신청")
+    assert engine.stop_event.is_set()
 
 
 def test_async_order_timeout_stops_without_duplicate_post(monkeypatch):

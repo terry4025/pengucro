@@ -1070,6 +1070,99 @@ class DoomEscapeEngine(BaseEngine):
         combined = "\n".join(str(source or "") for source in response_sources)
         return "이미 예약 완료" in combined or "예약이 완료되었습니다" in combined
 
+    @classmethod
+    def _receipt_evidence(cls, body, reservation_data):
+        """Only visible, labelled receipt data is authoritative, never ck_code."""
+        soup = BeautifulSoup(body or "", "html.parser")
+        for element in soup(["script", "style", "noscript"]):
+            element.decompose()
+        text = soup.get_text(" ", strip=True)
+        # Bound status to the reservation's status/customer field. Refund policy
+        # paragraphs elsewhere on a valid receipt must not reject the booking.
+        statuses = re.findall(
+            r"(?:예약\s*상태|접수\s*상태|처리\s*상태)\s*[:：]?\s*"
+            r"(환불(?:완료|대기|신청)?|취소(?:완료|대기|신청)?|신청|접수|입금대기|입금완료|예약완료|확정)(?=\s|$|[()])", text)
+        statuses += re.findall(
+            r"예약자(?:명)?\s*[:：]?\s*[^()]{1,50}\(\s*"
+            r"(환불(?:완료|대기|신청)?|취소(?:완료|대기|신청)?|신청|접수|입금대기|입금완료|예약완료|확정)\s*\)", text)
+        state = next((s for s in statuses if s.startswith(("환불", "취소"))),
+                     statuses[0] if statuses else "미확인")
+        number = re.search(r"예약\s*번호\s*[:：]?\s*(\d{4,10})(?!\d)", text)
+        date = str(reservation_data.get("reservationDate", ""))[:10]
+        dates = ["-".join((y, m.zfill(2), d.zfill(2))) for y, m, d in
+                 re.findall(r"(?:예약\s*(?:일시|일자|날짜|일)|이용일)\s*[:：]?\s*"
+                            r"(20\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})", text)]
+        theme = str(reservation_data.get("themeLabel") or
+                    cls.THEME_ID_TO_NAME.get(str(reservation_data.get("themePK", "")), ""))
+        target_time = str(reservation_data.get("reservationTime", ""))[:5]
+        time_fields = re.findall(
+            r"(?:예약\s*(?:일시|일자|날짜|일|시간)|이용시간)\s*[:：]?\s*"
+            r"([0-9년월일:./()\-\s화수목금토요]{1,60})", text)
+        times = re.findall(r"(?<!\d)(\d{1,2}):([0-5]\d)(?!\d)", " ".join(time_fields))
+        theme_matches = bool(theme and re.search(
+            r"(?:예약\s*테마|테마명|테마)\s*[:：]?\s*" + re.escape(theme) + r"(?=\s|$)", text))
+        identity = bool(date and date in dates and theme_matches and
+                        target_time in [h.zfill(2)+":"+m for h, m in times])
+        return dict(state=state, booking_number=number.group(1) if number else "",
+                    identity_matches=identity,
+                    valid=bool(number and identity and state in
+                               {"신청", "접수", "입금대기", "입금완료", "예약완료", "확정"}))
+
+    def _require_receipt(self, body, status, reservation_data, order_id):
+        evidence = self._receipt_evidence(body, reservation_data)
+        self.log(f"[예약 상태 검증] 상태={evidence['state']} · "
+                 f"목표 일치={evidence['identity_matches']} · "
+                 f"예약번호 표시={bool(evidence['booking_number'])} · HTTP={status}", "info")
+        if not (200 <= int(status) < 300 and evidence["valid"]):
+            self.stop_event.set()
+            raise DoomSubmissionUncertain(
+                "예약 상태 검증", f"상태={evidence['state']} · 유효한 접수 증거 부족", order_id)
+        return evidence["booking_number"]
+
+    def _receipt_url(self, order_id, code):
+        return self.base_url + "/layout/res/home.php?" + urllib.parse.urlencode(
+            {"go": "rev.make.end", "num": order_id, "ck_code": code})
+
+    async def _verify_receipt_async(self, session, order_id, code, reservation_data, headers):
+        # Read-only verification of this order, after submission. Never restart
+        # an order or replay confirmation when the result is uncertain.
+        url = self._receipt_url(order_id, code)
+        last_evidence = None
+        for attempt in range(3):
+            if self.stop_event.is_set():
+                break
+            try:
+                async with session.get(url, headers=headers, allow_redirects=False,
+                                       timeout=self.ORDER_FOLLOWUP_TIMEOUT_SECONDS) as response:
+                    body = (await response.read()).decode("utf-8", errors="ignore")
+                    status = response.status
+                evidence = self._receipt_evidence(body, reservation_data)
+                last_evidence = evidence
+                if evidence["state"].startswith(("환불", "취소")):
+                    return self._require_receipt(body, status, reservation_data, order_id)
+                if evidence["valid"] and 200 <= status < 300:
+                    return self._require_receipt(body, status, reservation_data, order_id)
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                pass
+            if attempt < 2:
+                await asyncio.sleep(.25 * (attempt + 1))
+        if last_evidence is not None:
+            self.log(f"[예약 상태 검증] 상태={last_evidence['state']} · "
+                     f"목표 일치={last_evidence['identity_matches']} · "
+                     f"예약번호 표시={bool(last_evidence['booking_number'])}", "warning")
+        raise DoomSubmissionUncertain("예약 상태 검증", "최종 접수 상태 확인 필요 · 재주문하지 않음", order_id)
+
+    def _verify_receipt_sync(self, session, order_id, code, reservation_data):
+        try:
+            response = session.get(self._receipt_url(order_id, code),
+                                   timeout=self.ORDER_FOLLOWUP_TIMEOUT_SECONDS,
+                                   allow_redirects=False)
+        except requests.RequestException as exc:
+            self.stop_event.set()
+            raise DoomSubmissionUncertain("예약 상태 검증", "조회 실패 · 재주문하지 않음", order_id) from exc
+        return self._require_receipt(response.content.decode("utf-8", errors="ignore"),
+                                     response.status_code, reservation_data, order_id)
+
     @staticmethod
     def _checkout_response_sources(response, response_text):
         sources = [response_text]
@@ -1564,12 +1657,13 @@ class DoomEscapeEngine(BaseEngine):
                                     "warning",
                                 )
 
-                        # Extract final booking number (ck_code)
-                        bnum_m = re.search(r"ck_code=(\d+)", mutong_text)
-                        booking_number = bnum_m.group(1) if bnum_m else ""
-                        completion_code = booking_number or ck_code_val
+                        # The transition response is not a receipt. Query this
+                        # known order and validate its actual status and identity.
+                        booking_number = self._verify_receipt_sync(
+                            session, num, ck_code_val, reservation_data)
+                        completion_code = ck_code_val
 
-                        if "rev.make.exe.php" in mutong_text or "rev.make.end" in mutong_text or "완료" in mutong_text or "성공" in mutong_text:
+                        if booking_number:
                             final_msg = (
                                 f"예약 최종 완료! 예약번호: {booking_number}"
                                 if booking_number
@@ -1591,20 +1685,8 @@ class DoomEscapeEngine(BaseEngine):
                             except Exception:
                                 pass
                         else:
-                            self._write_safe_failure_summary(
-                                worker=worker_label,
-                                stage="무통장 예약 결과 판정",
-                                status=mutong_status,
-                                response_text=mutong_text,
-                                slot_id=slot_id,
-                                order_id=num,
-                            )
-                            final_msg = (
-                                f"예약 선점 성공! 예약번호: {booking_number} / 임시번호: {num} "
-                                "(결제확인 응답 재확인 필요)"
-                                if booking_number
-                                else f"예약 선점 성공! 임시번호: {num} (결제확인 응답 재확인 필요)"
-                            )
+                            raise DoomSubmissionUncertain(
+                                "예약 상태 검증", "예약번호 또는 유효한 접수 증거 없음", num)
                     else:
                         err_msg = "선점 실패"
                         alert_match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", act_text)
@@ -1623,6 +1705,11 @@ class DoomEscapeEngine(BaseEngine):
                         except RuntimeError:
                             pass
 
+            except DoomSubmissionUncertain as e:
+                self.stop_event.set()
+                self.log(f"[{worker_label}] [중복 방지 정지] {e.stage} · {e.detail} · "
+                         "예약 상태를 확인해주세요. 자동 재전송하지 않습니다.", "warning")
+                break
             except Exception as e:
                 err_str = self._describe_exception(e)
                 now = time.time()
@@ -1760,6 +1847,7 @@ class DoomEscapeEngine(BaseEngine):
                     continue
 
                 slot_id = found_slot
+                slot_found_at = time.perf_counter()
                 show_found = False
                 with self._log_lock:
                     if not self._notified_found:
@@ -1857,6 +1945,9 @@ class DoomEscapeEngine(BaseEngine):
                         )
 
                     current_stage = "예약 주문 생성"
+                    self.log(
+                        f"[{worker_label}] [주문 준비] 사전 준비값={'사용' if used_prestage else '미사용'} · "
+                        f"슬롯 확인→POST 준비 {(time.perf_counter()-slot_found_at)*1000:.0f}ms", "info")
                     act_status, act_text, booking_session = await create_order(
                         price_fields
                     )
@@ -1938,6 +2029,8 @@ class DoomEscapeEngine(BaseEngine):
                             and recovered_booking_number
                             and not ck_code_val
                         ):
+                            recovered_booking_number = await self._verify_receipt_async(
+                                booking_session, num, recovered_booking_number, reservation_data, headers)
                             final_msg = (
                                 f"[{worker_label}] 예약 최종 완료! 예약번호: "
                                 f"{recovered_booking_number}"
@@ -2081,12 +2174,13 @@ class DoomEscapeEngine(BaseEngine):
                                     "warning",
                                 )
 
-                        # Extract final booking number (ck_code)
-                        bnum_m = re.search(r"ck_code=(\d+)", mutong_text)
-                        booking_number = bnum_m.group(1) if bnum_m else ""
-                        completion_code = booking_number or ck_code_val
+                        # The transition response is not a receipt. Query this
+                        # known order and validate its actual status and identity.
+                        booking_number = await self._verify_receipt_async(
+                            booking_session, num, ck_code_val, reservation_data, headers)
+                        completion_code = ck_code_val
 
-                        if "rev.make.exe.php" in mutong_text or "rev.make.end" in mutong_text or "완료" in mutong_text or "성공" in mutong_text:
+                        if booking_number:
                             final_msg = (
                                 f"[{worker_label}] 예약 최종 완료! 예약번호: {booking_number}"
                                 if booking_number
@@ -2108,20 +2202,8 @@ class DoomEscapeEngine(BaseEngine):
                             except Exception:
                                 pass
                         else:
-                            self._write_safe_failure_summary(
-                                worker=worker_label,
-                                stage="무통장 예약 결과 판정",
-                                status=mutong_status,
-                                response_text=mutong_text,
-                                slot_id=slot_id,
-                                order_id=num,
-                            )
-                            final_msg = (
-                                f"[{worker_label}] 예약 선점 성공! 예약번호: {booking_number} / 임시번호: {num} "
-                                "(결제확인 응답 재확인 필요)"
-                                if booking_number
-                                else f"[{worker_label}] 예약 선점 성공! 임시번호: {num} (결제확인 응답 재확인 필요)"
-                            )
+                            raise DoomSubmissionUncertain(
+                                "예약 상태 검증", "예약번호 또는 유효한 접수 증거 없음", num)
                     else:
                         err_msg = "선점 실패"
                         alert_match = re.search(r"alert\s*\(\s*['\"](.*?)['\"]\s*\)", act_text)
@@ -2151,14 +2233,17 @@ class DoomEscapeEngine(BaseEngine):
                 )
                 if e.order_id:
                     self.log(
-                        f"[{worker_label}] [중복 방지 정지] 주문 선점은 확인됨 · "
+                        f"[{worker_label}] [중복 방지 정지] 주문번호 발급됨 · "
                         f"orderId={e.order_id} · {e.stage} 결과 불명확 · "
+                        f"{e.detail} · "
                         "같은 주문을 다시 만들지 않고 기존 주문 확인이 필요합니다.",
                         "warning",
                     )
                     try:
                         import webbrowser
                         webbrowser.open(
+                            f"{self.base_url}/layout/res/home.php?go=rev.login"
+                            if e.stage == "예약 상태 검증" else
                             f"{self.base_url}/layout/res/home.php?go=rev.kcp&num={e.order_id}"
                         )
                     except Exception:
