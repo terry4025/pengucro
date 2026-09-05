@@ -60,7 +60,8 @@ def _bounded_target(value: Any, payment_mode: str = "") -> float:
     except (TypeError, ValueError):
         candidate = _default_target(payment_mode)
     return min(
-        MAX_TARGET_BEFORE_OPEN_SECONDS,
+        (PREPAID_TARGET_BEFORE_OPEN_SECONDS
+         if payment_mode == "npay_prepaid" else MAX_TARGET_BEFORE_OPEN_SECONDS),
         max(MIN_TARGET_BEFORE_OPEN_SECONDS, candidate),
     )
 
@@ -136,6 +137,16 @@ def record_timing_observation(
         payload = dict(current) if isinstance(current, dict) else {}
         entries = payload.get("entries")
         entries = dict(entries) if isinstance(entries, dict) else {}
+        # Migrate every prepaid row before changing the shared schema version.
+        # Otherwise recording product A labels untouched v1 rows B/C as v2 and
+        # revives the unsafe early targets on their next load.
+        if payload.get("version") != TIMING_HISTORY_VERSION:
+            for entry_key, entry in list(entries.items()):
+                if str(entry_key).endswith("|npay_prepaid") and isinstance(entry, dict):
+                    entries[entry_key] = {
+                        **entry,
+                        "target_before_open_seconds": PREPAID_TARGET_BEFORE_OPEN_SECONDS,
+                    }
         row = entries.get(key)
         row = dict(row) if isinstance(row, dict) else {}
         version = payload.get("version")
@@ -173,6 +184,7 @@ def record_timing_observation(
             "transport_rtt_ms",
             "submit_rtt_ms",
             "clock_rtt_ms",
+            "clock_bridge_rtt_ms",
             "clock_uncertainty_ms",
             "clock_spread_ms",
             "ttfb_ms",
