@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.79",
+        changes=(
+            "CGV 미오픈 날짜와 상영일 공개 후 회차 감시 간격 단축",
+            "CGV 좌석 경합 후 최신 좌석표로 다음 우선순위 재탐색",
+            "CGV 자동 추천 탐색을 시간대별로 나눠 다음 희망 시간 확인 개선",
+            "CGV 가격 오류·좌석 경합·선점 결과 유실 구분 및 재시도 보강",
+        ),
+    ),
+    PatchNote(
         version="6.78",
         changes=(
             "네이버 서버 시각 기준을 유지해 오픈 직전 제출 시각 변경 방지",

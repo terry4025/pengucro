@@ -16,7 +16,7 @@ class CgvEngine(RuntimeCgvEngine):
     continuously.
 
     Policy:
-    * quiet unpublished dates use one request wave every 2.5 seconds;
+    * quiet unpublished dates use one request wave every second;
     * target-movie hints or a real schedule-list change enable a short 0.5-second
       burst and at most two hedged requests;
     * one schedule race has a hard six-second deadline so a broken fetch cannot
@@ -26,7 +26,7 @@ class CgvEngine(RuntimeCgvEngine):
       than terminating the reservation task.
     """
 
-    SCHEDULE_LONG_IDLE_INTERVAL = 2.5
+    SCHEDULE_LONG_IDLE_INTERVAL = 1.0
     SCHEDULE_BURST_INTERVAL = 0.5
     PREOPEN_IDLE_INTERVAL = SCHEDULE_LONG_IDLE_INTERVAL
     SCHEDULE_HINT_INTERVAL = SCHEDULE_BURST_INTERVAL
