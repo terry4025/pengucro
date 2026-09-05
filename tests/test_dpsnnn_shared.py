@@ -1,66 +1,128 @@
 import multiprocessing
-import os
 import time
 from types import SimpleNamespace
-from threading import Event
-
+from threading import Event, Thread
 import pytest
 import requests
-from engines.dpsnnn_shared import SharedReadGovernor
+from engines.dpsnnn_shared import SharedReadGovernor, ReservationCancelled
 
 
-def _budget_worker(root, start):
-    os.environ['PENGUCRO_DATA_DIR'] = root
+def _budget_worker(start, ready, output):
     governor = SharedReadGovernor('test.example')
-    governor.LIMIT = 2
-    governor.INTERVAL = .005
-    while time.time() < start:
-        time.sleep(.01)
-    periods = []
-    for _ in range(2):
-        governor.acquire()
-        begin = time.monotonic()
-        time.sleep(.08)
-        end = time.monotonic()
-        governor.release(SimpleNamespace(status_code=200))
-        periods.append((begin, end))
-    return periods
+    governor.INTERVAL = 0
+    token = governor.acquire()
+    ready.put(True)
+    start.wait(10)
+    governor.release(permit=token)
+    output.put(governor.inflight)
 
 
-def test_four_processes_share_one_budget_and_all_progress(tmp_path):
+def test_four_spawn_processes_are_independent():
     ctx = multiprocessing.get_context('spawn')
-    with ctx.Pool(4) as pool:
-        periods = pool.starmap(_budget_worker, [(str(tmp_path), time.time()+1)]*4)
-    events = sorted((stamp, change) for worker in periods for begin,end in worker
-                    for stamp,change in ((begin,1),(end,-1)))
-    active = peak = 0
-    for _, change in events:
-        active += change
-        peak = max(peak, active)
-    assert peak == 2
-    assert all(len(worker)==2 for worker in periods)
+    start, ready, output = ctx.Event(), ctx.Queue(), ctx.Queue()
+    processes = [ctx.Process(target=_budget_worker, args=(start, ready, output)) for _ in range(4)]
+    for process in processes:
+        process.start()
+    try:
+        assert all(ready.get(timeout=15) for _ in processes)
+        start.set()
+        assert [output.get(timeout=10) for _ in processes] == [0]*4
+    finally:
+        start.set()
+        for process in processes:
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join()
 
 
-def test_backoff_shared_and_cancel_removes_waiter(tmp_path, monkeypatch):
-    monkeypatch.setenv('PENGUCRO_DATA_DIR', str(tmp_path))
-    first = SharedReadGovernor('test.example')
-    second = SharedReadGovernor('test.example')
-    first.acquire()
-    first.release(SimpleNamespace(status_code=429, headers={'Retry-After':'7'}))
-    with second._db() as db:
-        assert db.execute('SELECT blocked FROM budget').fetchone()[0] > time.time()+6
-    stop = Event(); stop.set()
-    with pytest.raises(requests.RequestException):
-        second.acquire(stop_event=stop)
-    with second._db() as db:
-        assert db.execute('SELECT COUNT(*) FROM tickets').fetchone()[0] == 0
-
-
-def test_dead_process_releases_budget(tmp_path, monkeypatch):
-    monkeypatch.setenv('PENGUCRO_DATA_DIR', str(tmp_path))
-    governor = SharedReadGovernor('test.example')
-    governor.LIMIT = 1
-    with governor._db() as db:
-        db.execute('INSERT INTO tickets VALUES (?,?,?,?,1)', ('dead',99999999,0,0))
+@pytest.mark.parametrize('status', [429, 503])
+def test_retry_after_and_cancel(status):
+    governor = SharedReadGovernor()
     governor.acquire()
-    governor.release(SimpleNamespace(status_code=200))
+    governor.release(SimpleNamespace(status_code=status, headers={'Retry-After':'7'}))
+    assert governor.blocked_until > time.monotonic()+6
+    stop = Event()
+    finished = Event()
+    def waiter():
+        with pytest.raises(ReservationCancelled):
+            governor.acquire(stop_event=stop)
+        finished.set()
+    thread = Thread(target=waiter)
+    thread.start()
+    stop.set()
+    governor.wake()
+    assert finished.wait(.3)
+    thread.join()
+    assert governor.snapshot()['waiting'] == 0
+
+
+def test_capacity_dead_owner_and_idempotent_release():
+    governor = SharedReadGovernor()
+    governor.LIMIT = 1
+    governor.INTERVAL = 0
+    thread = Thread(target=governor.acquire)
+    thread.start()
+    thread.join()
+    token = governor.acquire()
+    assert governor.reclaimed == 1
+    governor.release(permit=token)
+    governor.release(permit=token)
+    assert governor.inflight == 0
+
+
+def test_actual_session_no_sqlite_and_cleanup_preserves_order(monkeypatch):
+    import sqlite3
+    from engines import dpsnnn_runtime as runtime
+    governor = SharedReadGovernor()
+    monkeypatch.setitem(runtime._governors, 'mock.example', governor)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('no DB in HTTP path')
+    monkeypatch.setattr(sqlite3, 'connect', forbidden)
+    response = SimpleNamespace(status_code=200, json=lambda: {'order_code':'LOCAL'})
+    monkeypatch.setattr(requests.Session, 'request', lambda *a, **k: response)
+    monkeypatch.setattr(governor, 'release', forbidden)
+    session = runtime.DpsnnnSession()
+    assert session.post('https://mock.example/add_order.cm') is response
+    assert governor.inflight == 0
+    assert session.last_timing['http_ms'] >= 0
+
+
+def test_network_timeout_returned_once_with_backoff(monkeypatch):
+    from engines import dpsnnn_runtime as runtime
+    governor = SharedReadGovernor()
+    monkeypatch.setitem(runtime._governors, 'timeout.example', governor)
+    calls = []
+    def fail(*a, **k):
+        calls.append(1)
+        raise requests.Timeout('mock')
+    monkeypatch.setattr(requests.Session, 'request', fail)
+    with pytest.raises(requests.Timeout):
+        runtime.DpsnnnSession().post('https://timeout.example/add_order.cm')
+    assert calls == [1]
+    assert governor.inflight == 0
+    assert governor.blocked_until > time.monotonic()
+
+
+def test_priority_is_bounded_and_normal_not_starved():
+    governor = SharedReadGovernor()
+    governor.LIMIT = 1
+    governor.INTERVAL = 0
+    held = governor.acquire()
+    order = []
+    def run(priority, label):
+        token = governor.acquire(priority)
+        order.append(label)
+        governor.release(permit=token)
+    threads = [Thread(target=run, args=(False, 'normal'))]
+    threads += [Thread(target=run, args=(True, 'priority')) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic()+2
+    while governor.snapshot()['waiting'] < 6 and time.monotonic() < deadline:
+        time.sleep(.005)
+    governor.release(permit=held)
+    for thread in threads:
+        thread.join(2)
+    assert order[:4] == ['priority']*3+['normal']
+    assert governor.inflight == 0

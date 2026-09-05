@@ -1,99 +1,129 @@
-"""Host request budget shared by independent programs, never their cookies."""
-from contextlib import contextmanager
-import hashlib
-import os
-import sqlite3
+"""Process-local HTTP scheduling; the legacy class name remains compatible.
+
+No shared database, filesystem tickets, or PID probes. OrderJournal is separate.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
+import math
 import threading
 import time
-import uuid
-from email.utils import parsedate_to_datetime
-
 import requests
-from engines.browser_session import _pid_alive
-from pengucro.storage import get_data_dir
+
+
+class ReservationCancelled(requests.RequestException):
+    """Normal cancellation, not a network failure."""
+
+
+@dataclass(eq=False)
+class Permit:
+    priority: bool
+    owner: threading.Thread = field(default_factory=threading.current_thread)
+    queued_at: float = field(default_factory=time.monotonic)
 
 
 class SharedReadGovernor:
+    """One host budget per process, with bounded priority bursts."""
     LIMIT = 32
     INTERVAL = 1 / 32
 
-    def __init__(self, host):
-        root = get_data_dir() / 'dpsnnn-budget'
-        root.mkdir(parents=True, exist_ok=True)
-        self.path = root / (hashlib.sha256(host.encode()).hexdigest() + '.sqlite3')
+    def __init__(self, host=""):
+        self.host = host
+        self.condition = threading.Condition()
         self.local = threading.local()
-        self.db_lock = threading.Lock()
-        with self._db() as db:
-            db.execute('PRAGMA journal_mode=WAL')
-            db.execute('CREATE TABLE IF NOT EXISTS budget (id INTEGER PRIMARY KEY, next REAL, blocked REAL, failures INTEGER)')
-            db.execute('INSERT OR IGNORE INTO budget VALUES (1,0,0,0)')
-            db.execute('CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, pid INTEGER, priority INTEGER, created REAL, active INTEGER)')
+        self._waiting = []
+        self._active = set()
+        self._priority_streak = 0
+        self.next_read = 0.0
+        self.blocked_until = 0.0
+        self.failures = 0
+        self.reclaimed = 0
 
-    @contextmanager
-    def _db(self):
-        # This is transient scheduling state, not the durable order journal.
-        # WAL/NORMAL avoid an fsync for every polling ticket on the hot path.
-        with self.db_lock:
-            db = sqlite3.connect(self.path, timeout=2)
-            try:
-                db.execute('PRAGMA synchronous=NORMAL')
-                with db:
-                    yield db
-            finally:
-                db.close()
+    @property
+    def inflight(self):
+        with self.condition:
+            return len(self._active)
+
+    @property
+    def priority_waiters(self):
+        with self.condition:
+            return sum(p.priority for p in self._waiting)
+
+    def snapshot(self):
+        with self.condition:
+            return dict(active=len(self._active), waiting=len(self._waiting),
+                        limit=self.LIMIT, reclaimed=self.reclaimed)
+
+    def wake(self):
+        with self.condition:
+            self.condition.notify_all()
+
+    def _head(self):
+        ordinary = next((p for p in self._waiting if not p.priority), None)
+        priority = next((p for p in self._waiting if p.priority), None)
+        if priority is not None and (ordinary is None or self._priority_streak < 3):
+            return priority
+        return ordinary
 
     def acquire(self, priority=False, stop_event=None):
-        ticket = uuid.uuid4().hex
-        with self._db() as db:
-            db.execute('INSERT INTO tickets VALUES (?,?,?,?,0)',
-                       (ticket, os.getpid(), int(priority), time.time()))
-        try:
-            while True:
-                if stop_event is not None and stop_event.is_set():
-                    raise requests.RequestException('reservation stopped')
-                with self._db() as db:
-                    db.execute('BEGIN IMMEDIATE')
-                    for (pid,) in db.execute('SELECT DISTINCT pid FROM tickets').fetchall():
-                        if not _pid_alive(pid):
-                            db.execute('DELETE FROM tickets WHERE pid=?', (pid,))
-                    next_at, blocked = db.execute('SELECT next,blocked FROM budget WHERE id=1').fetchone()
-                    count = db.execute('SELECT COUNT(*) FROM tickets WHERE active=1').fetchone()[0]
-                    first = db.execute('SELECT id FROM tickets WHERE active=0 ORDER BY priority DESC,created,id LIMIT 1').fetchone()
-                    now = time.time()
-                    if first and first[0] == ticket and count < self.LIMIT and now >= max(blocked, 0 if priority else next_at):
-                        db.execute('UPDATE tickets SET active=1 WHERE id=?', (ticket,))
-                        if not priority:
-                            db.execute('UPDATE budget SET next=? WHERE id=1', (now+self.INTERVAL,))
-                        self.local.ticket = ticket
-                        return
-                if stop_event is not None:
-                    stop_event.wait(.02)
-                else:
-                    time.sleep(.02)
-        except BaseException:
-            with self._db() as db:
-                db.execute('DELETE FROM tickets WHERE id=?', (ticket,))
-            raise
+        permit = Permit(bool(priority))
+        with self.condition:
+            self._waiting.append(permit)
+            try:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        raise ReservationCancelled("reservation stopped")
+                    # Slow live HTTP threads retain their capacity without a TTL.
+                    dead = {p for p in self._active if not p.owner.is_alive()}
+                    self._active.difference_update(dead)
+                    self.reclaimed += len(dead)
+                    now = time.monotonic()
+                    delay = max(self.next_read, self.blocked_until) - now
+                    if self._head() is permit and len(self._active) < self.LIMIT and delay <= 0:
+                        self._waiting.remove(permit)
+                        self._active.add(permit)
+                        self.next_read = now + self.INTERVAL
+                        self._priority_streak = self._priority_streak + 1 if priority else 0
+                        self.local.permit = permit
+                        self.condition.notify_all()
+                        return permit
+                    self.condition.wait(max(.001, min(.05, delay)) if delay > 0 else .05)
+            finally:
+                if permit in self._waiting:
+                    self._waiting.remove(permit)
+                self.condition.notify_all()
 
-    def release(self, response=None, failed=False):
-        ticket = self.local.ticket
-        with self._db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            db.execute('DELETE FROM tickets WHERE id=?', (ticket,))
-            blocked, failures = db.execute('SELECT blocked,failures FROM budget WHERE id=1').fetchone()
-            status = getattr(response, 'status_code', 0)
-            if failed or status == 429 or status >= 500:
-                failures = min(failures+1, 6)
-                delay = min(8, .25 * 2 ** (failures-1))
-                retry = getattr(response, 'headers', {}).get('Retry-After', '')
-                try:
-                    delay = max(delay, float(retry))
-                except (TypeError, ValueError):
+    def abandon(self, permit=None):
+        """Idempotent capacity return, independent of response bookkeeping."""
+        permit = permit or getattr(self.local, 'permit', None)
+        with self.condition:
+            self._active.discard(permit)
+            if getattr(self.local, 'permit', None) is permit:
+                self.local.permit = None
+            self.condition.notify_all()
+
+    def release(self, response=None, failed=False, *, permit=None):
+        permit = permit or getattr(self.local, 'permit', None)
+        with self.condition:
+            if permit not in self._active:
+                return
+            try:
+                status = getattr(response, 'status_code', 0)
+                if failed or status == 429 or status >= 500:
+                    self.failures = min(self.failures + 1, 6)
+                    delay = min(8.0, .25 * 2 ** (self.failures - 1))
+                    retry = getattr(response, 'headers', {}).get('Retry-After', '')
                     try:
-                        delay = max(delay, parsedate_to_datetime(retry).timestamp()-time.time())
-                    except (TypeError, ValueError, OverflowError):
-                        pass
-                blocked = max(blocked, time.time()+delay)
-            elif 200 <= status < 300:
-                failures = 0
-            db.execute('UPDATE budget SET blocked=?,failures=? WHERE id=1', (blocked, failures))
+                        seconds = float(retry)
+                    except (ValueError, TypeError):
+                        try:
+                            seconds = parsedate_to_datetime(retry).timestamp() - time.time()
+                        except (ValueError, TypeError, OverflowError):
+                            seconds = 0.0
+                    if math.isfinite(seconds):
+                        delay = max(delay, seconds)
+                    self.blocked_until = max(self.blocked_until, time.monotonic() + delay)
+                elif 200 <= status < 300:
+                    self.failures = 0
+            finally:
+                self.abandon(permit)

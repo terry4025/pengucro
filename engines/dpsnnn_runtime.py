@@ -6,6 +6,7 @@ Playwright objects never cross threads; HTTP workers exchange plain values only.
 """
 from __future__ import annotations
 
+import logging
 import queue
 import re
 import threading
@@ -17,63 +18,14 @@ from email.utils import parsedate_to_datetime
 import requests
 
 from engines import browser_session
-from engines.dpsnnn_shared import SharedReadGovernor
-from pengucro.storage import get_data_dir
+from engines.dpsnnn_shared import SharedReadGovernor, ReservationCancelled
 
 KST = timezone(timedelta(hours=9))
 
 
-class ReadGovernor:
-    def __init__(self):
-        self.condition = threading.Condition()
-        self.inflight = 0
-        self.next_read = 0.0
-        self.blocked_until = 0.0
-        self.failures = 0
-        self.priority_waiters = 0
-
-    def acquire(self, priority=False, stop_event=None):
-        with self.condition:
-            if priority:
-                self.priority_waiters += 1
-            try:
-                while True:
-                    if stop_event is not None and stop_event.is_set():
-                        raise requests.RequestException("reservation stopped")
-                    now = time.monotonic()
-                    delay = max(self.blocked_until, 0 if priority else self.next_read) - now
-                    if self.inflight < 4 and delay <= 0 and (priority or not self.priority_waiters):
-                        self.inflight += 1
-                        if not priority:
-                            self.next_read = now + 0.05
-                        return
-                    self.condition.wait(max(0.01, min(0.1, delay)) if delay > 0 else 0.05)
-            finally:
-                if priority:
-                    self.priority_waiters -= 1
-                    self.condition.notify_all()
-
-    def release(self, response=None, failed=False):
-        status = getattr(response, "status_code", 0)
-        with self.condition:
-            self.inflight -= 1
-            if failed or status == 429 or status >= 500:
-                self.failures = min(self.failures + 1, 6)
-                delay = min(8.0, 0.25 * 2 ** (self.failures - 1))
-                retry = getattr(response, "headers", {}).get("Retry-After", "")
-                try:
-                    delay = max(delay, float(retry))
-                except (TypeError, ValueError):
-                    try:
-                        delay = max(delay, parsedate_to_datetime(retry).timestamp() - time.time())
-                    except (TypeError, ValueError, OverflowError):
-                        pass
-                self.blocked_until = max(self.blocked_until, time.monotonic() + delay)
-            elif 200 <= status < 300:
-                self.failures = 0
-            self.condition.notify_all()
-
-
+# Compatibility alias: there is now only one scheduler implementation.
+ReadGovernor = SharedReadGovernor
+LOGGER = logging.getLogger(__name__)
 _governors = {}
 _governor_lock = threading.Lock()
 
@@ -82,7 +34,7 @@ class DpsnnnSession(requests.Session):
     """Bound all Imweb traffic, including preparation, without replaying writes."""
     def request(self, method, url, **kwargs):
         parsed = urllib.parse.urlparse(url)
-        key = (str(get_data_dir()), parsed.netloc)
+        key = parsed.netloc
         with _governor_lock:
             governor = _governors.get(key)
             if governor is None:
@@ -91,14 +43,61 @@ class DpsnnnSession(requests.Session):
                     or parsed.path.endswith("/load_booking_detail_detail_calendar.cm")
                     or (parsed.path in {"/reserve_g", "/reserve_ss"}
                         and ("idx=" in parsed.query or "idx" in (kwargs.get("params") or {}))))
-        governor.acquire(priority=priority,
-                         stop_event=getattr(self, "stop_event", None))
+        begin = time.perf_counter()
+        permit = None
         response = None
+        sent = False
+        acquired = begin
+        http_end = begin
         try:
-            response = super().request(method, url, **kwargs)
-            return response
+            permit = governor.acquire(priority=priority,
+                                      stop_event=getattr(self, "stop_event", None))
+            acquired = time.perf_counter()
+            if getattr(self, "stop_event", None) is not None and self.stop_event.is_set():
+                raise ReservationCancelled("reservation stopped")
+            try:
+                sent = True
+                response = super().request(method, url, **kwargs)
+                return response
+            finally:
+                http_end = time.perf_counter()
         finally:
-            governor.release(response, failed=response is None)
+            if permit is not None:
+                try:
+                    governor.release(response, failed=sent and response is None, permit=permit)
+                except Exception as exc:
+                    # A local cleanup error must never replace a received order
+                    # response or the original network exception.
+                    try:
+                        governor.abandon(permit)
+                    except Exception:
+                        pass
+                    LOGGER.warning("DPSNNN request cleanup failed: %s", type(exc).__name__)
+            ended = time.perf_counter()
+            if permit is None:
+                acquired = ended
+                http_end = ended
+            self.last_timing = {
+                "wait_ms": (acquired-begin)*1000,
+                "http_ms": max(0, http_end-acquired)*1000,
+                "total_ms": (ended-begin)*1000,
+            }
+            callback = getattr(self, "timing_callback", None)
+            if callback is not None and not (
+                    getattr(self, "stop_event", None) is not None and self.stop_event.is_set()):
+                try:
+                    callback(dict(self.last_timing), governor.snapshot(),
+                             parsed.path.endswith("/html_list.cm"), response is not None)
+                except Exception:
+                    pass
+
+
+def wake_governors():
+    with _governor_lock:
+        governors = list(_governors.values())
+    for governor in governors:
+        governor.wake()
+
 
 
 def detail_slot(url, base_url, reserve_path, date_str):

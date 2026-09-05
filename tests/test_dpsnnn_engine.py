@@ -428,7 +428,7 @@ def test_dpsnnn_http_log_identifies_worker_stage_status_and_rtt():
     assert "[작업 4]" in message
     assert "예약 주문 생성" in message
     assert "status=429" in message
-    assert "RTT 87ms" in message
+    assert "전체 87ms" in message
     assert level == "warning"
 
 

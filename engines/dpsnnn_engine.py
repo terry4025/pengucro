@@ -16,7 +16,7 @@ from engines.base_engine import BaseEngine
 from engines.zeroworld_catalog import ZeroWorldTimeSlot
 from pengucro.diagnostics import format_exception
 from pengucro.models import BookingResult, parse_bool_flag
-from engines.dpsnnn_runtime import DpsnnnSession, KST, WarmCheckout
+from engines.dpsnnn_runtime import DpsnnnSession, KST, WarmCheckout, wake_governors
 from engines.dpsnnn_orders import OrderJournal
 
 
@@ -280,6 +280,31 @@ class DpsnnnEngine(BaseEngine):
         self._warm_checkout = None
         self._journal = None
         self._start_lock = threading.Lock()
+        self._last_timing_log = 0.0
+        self._last_target_poll = 0.0
+        self._max_poll_gap = 0.0
+
+    def _record_request_timing(self, timings, budget, is_poll, received):
+        now = time.monotonic()
+        with self._diagnostic_log_lock:
+            if is_poll and received:
+                if self._last_target_poll:
+                    self._max_poll_gap = max(self._max_poll_gap, now-self._last_target_poll)
+                self._last_target_poll = now
+            if self._last_timing_log and now-self._last_timing_log < 5:
+                return
+            self._last_timing_log = now
+            gap = self._max_poll_gap
+            self._max_poll_gap = 0.0
+            since = now-self._last_target_poll if self._last_target_poll else None
+        alive = sum(t.is_alive() for t in self.threads)
+        age = f"{since:.2f}초" if since is not None else "아직 없음"
+        self.log(
+            f"[요청 진단] 내부 허가 대기 {timings['wait_ms']:.0f}ms · "
+            f"HTTP 호출 {timings['http_ms']:.0f}ms · 전체 {timings['total_ms']:.0f}ms · "
+            f"작업 생존 {alive}/{len(self.threads)} · 프로세스 HTTP 진행 {budget['active']}/"
+            f"{budget['limit']} · 대기 {budget['waiting']} · 최근 목표 조회 {age} 전 · "
+            f"최근 최대 감시 공백 {gap:.2f}초", "info")
 
     @staticmethod
     def _describe_exception(exc: BaseException) -> str:
@@ -318,7 +343,7 @@ class DpsnnnEngine(BaseEngine):
         level = "info" if status_text.startswith("2") else "warning"
         self.log(
             f"[{worker}] [HTTP] {stage} · {method} · status={status_text} · "
-            f"RTT {max(0.0, elapsed_seconds) * 1000:.0f}ms{repeat}{suffix}",
+            f"전체 {max(0.0, elapsed_seconds) * 1000:.0f}ms{repeat}{suffix}",
             level,
         )
 
@@ -333,6 +358,7 @@ class DpsnnnEngine(BaseEngine):
         workers = max(1, min(int(num_threads), DPSNNN_MAX_WORKERS))
         self._warm_checkout = None
         self._journal = None
+        self._last_target_poll = self._last_timing_log = self._max_poll_gap = 0.0
         self._order_claimed.clear()
         with self._worker_index_lock:
             self._next_worker_index = 0
@@ -1053,6 +1079,7 @@ class DpsnnnEngine(BaseEngine):
         target_time = str(reservation_data.get("reservationTime", ""))[:5]
         session = create_dpsnnn_session()
         session.stop_event = self.stop_event
+        session.timing_callback = self._record_request_timing
         reserve_url = urllib.parse.urljoin(branch["base_url"] + "/", branch["reserve_path"].lstrip("/"))
         prepared_payload: dict[str, str] | None = None
         prepared_slot_id = ""
@@ -1068,6 +1095,8 @@ class DpsnnnEngine(BaseEngine):
                     reserve_response.raise_for_status()
                     break
                 except requests.RequestException as exc:
+                    if self.stop_event.is_set():
+                        return
                     self._log_http_diagnostic(worker_label, current_stage, "GET", None,
                                               time.perf_counter() - started, type(exc).__name__)
                     if self.stop_event.wait(0.5):
@@ -1083,12 +1112,8 @@ class DpsnnnEngine(BaseEngine):
                 force=True,
             )
             reserve_response.raise_for_status()
-            # Four sessions were the measured saturation point. Spreading their
-            # request phases prevents all four from receiving the same pre-open
-            # snapshot and then going idle together for a full round trip.
-            initial_delay = worker_index * self.WORKER_STAGGER
-            if initial_delay and self.stop_event.wait(initial_delay):
-                return
+            # The host governor already spaces starts. Do not additionally delay
+            # worker 32 by 31 * WORKER_STAGGER (6.2 seconds).
             self.log(
                 f"[{worker_label}] 단편선 슬롯 감시 시작 · 지점={branch['id']} · "
                 f"날짜={date_str} · 시간={target_time}",
@@ -1105,6 +1130,8 @@ class DpsnnnEngine(BaseEngine):
                 current_stage = "시간표 조회"
                 try:
                     def poll_diagnostics(stage, method, status, elapsed, detail):
+                        if self.stop_event.is_set():
+                            return
                         retry_detail = detail
                         if status is None or (status is not None and not 200 <= status < 300):
                             retry_detail = (
@@ -1354,6 +1381,8 @@ class DpsnnnEngine(BaseEngine):
                         self.stop_event.set()
                     break
                 except (requests.RequestException, ValueError, KeyError) as exc:
+                    if self.stop_event.is_set():
+                        return
                     self._log_http_diagnostic(
                         worker_label,
                         current_stage,
@@ -1368,18 +1397,29 @@ class DpsnnnEngine(BaseEngine):
                     )
                     self.stop_event.wait(self.POLL_INTERVAL)
         except Exception as exc:
+            if self.stop_event.is_set():
+                return
             self.log(
                 f"[{worker_label}] [오류] {current_stage} · {self._describe_exception(exc)}",
                 "error",
             )
-            raise
+            self.stop_event.set()
+            wake_governors()
         finally:
             session.close()
 
     def stop_reservation(self) -> None:
         super().stop_reservation()
+        wake_governors()
         if self._warm_checkout is not None:
             self._warm_checkout.close()
+
+    def _monitor_threads(self):
+        super()._monitor_threads()
+        if not self._success_fired and self._warm_checkout is not None:
+            self._warm_checkout.close()
+        self.log("[작업 상태] 감시 작업 종료 · 생존 "
+                 f"{sum(t.is_alive() for t in self.threads)}/{len(self.threads)}", "info")
 
     async def make_reservation_async_task(self, reservation_data, task_idx) -> None:
         await asyncio.to_thread(self.make_reservation_thread, reservation_data)

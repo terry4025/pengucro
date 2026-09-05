@@ -500,7 +500,7 @@ def test_dpsnnn_thread_policy_uses_measured_limit():
     assert slider.config["number_of_steps"] == DPSNNN_MAX_WORKERS - 1
     assert slider.value == DPSNNN_MAX_WORKERS
     assert form.dpsnnn_threads == DPSNNN_MAX_WORKERS
-    assert f"실측 상한 {DPSNNN_MAX_WORKERS}" in title.config["text"]
+    assert f"프로그램당 최대 {DPSNNN_MAX_WORKERS}" in title.config["text"]
 
 
 def test_zeroworld_and_jigubyeol_thread_policy_caps_slider_at_32():
