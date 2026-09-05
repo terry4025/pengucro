@@ -17,6 +17,8 @@ from email.utils import parsedate_to_datetime
 import requests
 
 from engines import browser_session
+from engines.dpsnnn_shared import SharedReadGovernor
+from pengucro.storage import get_data_dir
 
 KST = timezone(timedelta(hours=9))
 
@@ -80,8 +82,11 @@ class DpsnnnSession(requests.Session):
     """Bound all Imweb traffic, including preparation, without replaying writes."""
     def request(self, method, url, **kwargs):
         parsed = urllib.parse.urlparse(url)
+        key = (str(get_data_dir()), parsed.netloc)
         with _governor_lock:
-            governor = _governors.setdefault(parsed.netloc, ReadGovernor())
+            governor = _governors.get(key)
+            if governor is None:
+                governor = _governors[key] = SharedReadGovernor(parsed.netloc)
         priority = (parsed.path.endswith("/add_order.cm")
                     or parsed.path.endswith("/load_booking_detail_detail_calendar.cm")
                     or (parsed.path in {"/reserve_g", "/reserve_ss"}
@@ -142,7 +147,7 @@ class WarmCheckout:
         while not done.wait(0.1):
             if self.finished.is_set() or time.monotonic() >= deadline:
                 # The order may have been submitted. Never create a replacement.
-                return False, "결제 응답 확인 중단 · 재주문하지 말고 열린 화면을 확인해주세요."
+                return False, "결제 응답 확인 중단 · 재주문하지 말고 예약 조회·알림톡을 확인해주세요."
         return result[0]
 
     def _observe_calendar(self, page):
@@ -199,15 +204,15 @@ class WarmCheckout:
         return "soldout"
 
     def _run(self):
-        chrome = None
-        keep_open = False
+        browser = None
+        visible_browser = None
         try:
             from playwright.sync_api import sync_playwright
-            chrome = browser_session.start_isolated(log=self.log)
-            if chrome is None:
-                raise RuntimeError("독립 Chrome 슬롯을 확보하지 못했습니다. 기존 예약 창을 확인해주세요.")
+            executable = browser_session.find_chrome()
+            if executable is None:
+                raise RuntimeError("Chrome 실행 파일을 찾지 못했습니다.")
             with sync_playwright() as playwright:
-                browser = playwright.chromium.connect_over_cdp(chrome.endpoint)
+                browser = playwright.chromium.launch(executable_path=str(executable), headless=True)
                 # A separate cookie jar guarantees non-member checkout even if
                 # the persistent Chrome profile has a previous member login.
                 context = browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul")
@@ -219,7 +224,7 @@ class WarmCheckout:
                 last_navigation = 0.0
                 calendar_state = "loading"
                 self.ready.set()
-                self.log("[사전 준비] 비회원 결제 브라우저 연결 완료", "info")
+                self.log("[사전 준비] 비회원 결제 브라우저 연결 완료 · 백그라운드", "info")
                 while not self._closing.is_set():
                     try:
                         callback, done, result = self.jobs.get(timeout=0.05)
@@ -246,31 +251,37 @@ class WarmCheckout:
                         except Exception:
                             pass  # HTTP observers remain independent of DOM changes.
                         continue
-                    keep_open = True
                     try:
                         result.append(callback(context, page))
                     except Exception as exc:
-                        result.append((False, f"결제 자동화 오류: {type(exc).__name__} · 열린 화면 확인 필요"))
+                        result.append((False, f"결제 자동화 오류: {type(exc).__name__} · 예약 조회·알림톡 확인 필요"))
                     finally:
                         done.set()
-                    # Own the incognito context until its page is closed. Merely
-                    # disconnecting its Playwright owner can dispose that context.
-                    while browser.is_connected() and not page.is_closed():
-                        page.wait_for_timeout(250)
+                    if result[0][0]:
+                        # Display the confirmed receipt only; never replay writes.
+                        try:
+                            visible_browser = playwright.chromium.launch(
+                                executable_path=str(executable), headless=False)
+                            visible_context = visible_browser.new_context(
+                                storage_state=context.storage_state(), locale="ko-KR", timezone_id="Asia/Seoul")
+                            receipt = visible_context.new_page()
+                            receipt.goto(page.url, wait_until="domcontentloaded", timeout=20000)
+                            browser.close()
+                            browser = None
+                            while visible_browser.is_connected() and not receipt.is_closed():
+                                receipt.wait_for_timeout(250)
+                        except Exception as exc:
+                            self.log(f"접수 완료 화면 표시 종료/실패 ({type(exc).__name__}) · 로그의 예약번호로 조회해주세요.", "warning")
+                    else:
+                        self.log("예약 결과 확인 필요 · 재주문하지 말고 예약 조회·알림톡을 확인해주세요.", "warning")
                     break
+                if browser is not None:
+                    browser.close()
+                if visible_browser is not None and visible_browser.is_connected():
+                    visible_browser.close()
         except Exception as exc:
             self.error = str(exc) if isinstance(exc, RuntimeError) else f"결제 브라우저 준비 실패: {type(exc).__name__}"
             self.log(self.error, "error")
         finally:
             self.ready.set()
             self.finished.set()
-            if chrome is not None:
-                if keep_open:
-                    def release_after_close():
-                        while browser_session.cdp_descriptor(chrome.port):
-                            time.sleep(0.5)
-                        chrome.release()
-                    threading.Thread(target=release_after_close, daemon=True).start()
-                else:
-                    chrome.close_if_launched()
-                    chrome.release()

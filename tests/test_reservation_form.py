@@ -476,7 +476,8 @@ def test_naver_time_picker_uses_selected_item_without_requiring_branch(monkeypat
     assert date_str == "2026-08-09"
 
 
-def test_dpsnnn_thread_policy_limits_slider_to_four():
+def test_dpsnnn_thread_policy_uses_measured_limit():
+    from engines.dpsnnn_engine import DPSNNN_MAX_WORKERS
     slider = Widget(50)
     title = Widget()
     value_label = Widget()
@@ -495,11 +496,11 @@ def test_dpsnnn_thread_policy_limits_slider_to_four():
     ReservationForm._apply_thread_policy(form)
 
     assert slider.config["from_"] == 1
-    assert slider.config["to"] == 4
-    assert slider.config["number_of_steps"] == 3
-    assert slider.value == 4
-    assert form.dpsnnn_threads == 4
-    assert "최대 4" in title.config["text"]
+    assert slider.config["to"] == DPSNNN_MAX_WORKERS
+    assert slider.config["number_of_steps"] == DPSNNN_MAX_WORKERS - 1
+    assert slider.value == DPSNNN_MAX_WORKERS
+    assert form.dpsnnn_threads == DPSNNN_MAX_WORKERS
+    assert f"실측 상한 {DPSNNN_MAX_WORKERS}" in title.config["text"]
 
 
 def test_zeroworld_and_jigubyeol_thread_policy_caps_slider_at_32():

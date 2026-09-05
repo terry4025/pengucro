@@ -24,8 +24,8 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-DPSNNN_MAX_WORKERS = 4
-DPSNNN_DEFAULT_WORKERS = 4
+DPSNNN_MAX_WORKERS = 32
+DPSNNN_DEFAULT_WORKERS = 32
 DPSNNN_PAYMENT_FORM_SELECTOR = "form#order_payment"
 DPSNNN_PAYMENT_READY_SELECTOR = f'{DPSNNN_PAYMENT_FORM_SELECTOR}[data-init="Y"]'
 DPSNNN_ORDERER_NAME_SELECTOR = (
@@ -899,7 +899,7 @@ class DpsnnnEngine(BaseEngine):
             ]
             if any(page.locator(selector).count() for selector in people_selectors):
                 if not self._fill_first(page, people_selectors, people):
-                    return False, "인원 입력을 확인하지 못했습니다. 열린 화면을 확인해주세요."
+                    return False, "인원 입력을 확인하지 못했습니다. 예약 조회·알림톡을 확인해주세요."
 
             orderer_prepared, orderer_error = self._prepare_orderer_checkout(
                 page,
@@ -935,7 +935,7 @@ class DpsnnnEngine(BaseEngine):
             if submit is None:
                 return False, (
                     "결제 전 임시 주문은 생성했지만 최종 결제 버튼을 찾지 못했습니다. "
-                    "열린 화면에서 완료해주세요."
+                    "예약 조회·알림톡을 확인해주세요."
                 )
 
             validation_dialogs: list[str] = []
@@ -984,7 +984,7 @@ class DpsnnnEngine(BaseEngine):
                 check_payload = {}
             check_message = str(check_payload.get("msg", ""))
             if check_status is None or not 200 <= check_status < 300 or check_message.upper() != "SUCCESS":
-                return False, "최종 결제 서버 확인 실패 또는 응답 불명확 · 열린 화면을 확인해주세요."
+                return False, "최종 결제 서버 확인 실패 또는 응답 불명확 · 예약 조회·알림톡을 확인해주세요."
 
             self.log(
                 f"[{worker_label}] [최종 제출] 결제 사전 확인 완료 · "
@@ -1000,7 +1000,7 @@ class DpsnnnEngine(BaseEngine):
             if not final_responses:
                 return False, (
                     "결제 사전 확인은 통과했지만 실제 예약 접수 요청을 확인하지 못했습니다. "
-                    "열린 화면을 확인해주세요."
+                    "예약 조회·알림톡을 확인해주세요."
                 )
 
             final_response = final_responses[-1]
@@ -1037,10 +1037,10 @@ class DpsnnnEngine(BaseEngine):
                 page.wait_for_timeout(250)
             return False, (
                 "결제하기는 전송했지만 예약 완료 화면이나 예약번호를 확인하지 못했습니다. "
-                "열린 화면을 확인해주세요."
+                "예약 조회·알림톡을 확인해주세요."
             )
         except Exception as exc:
-            return False, f"생성된 주문의 결제 처리 확인 필요: {self._describe_exception(exc)} · 열린 화면을 확인해주세요."
+            return False, f"생성된 주문의 결제 처리 확인 필요: {self._describe_exception(exc)} · 예약 조회·알림톡을 확인해주세요."
 
     def make_reservation_thread(self, reservation_data: dict[str, Any]) -> None:
         with self._worker_index_lock:
