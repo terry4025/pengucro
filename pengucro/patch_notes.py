@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.77",
+        changes=(
+            "네이버 서버 시각 기준을 유지해 오픈 직전 제출 시각 변경 방지",
+            "네이버 제출 준비 응답 유실 시 중복 제출 방지 강화",
+            "네이버 선결제의 과도한 조기 제출 학습값 복원 오류 수정",
+            "네이버 미오픈 대기 중 반복 조회 감소 및 시각 진단 개선",
+        ),
+    ),
+    PatchNote(
         version="6.76",
         changes=(
             "단편선 미오픈 날짜 감시와 새 달력의 예약 가능 슬롯 감지 보강",
