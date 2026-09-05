@@ -1,6 +1,7 @@
 """Direct-submit payload and browser transport contracts for Naver Booking."""
 
 import asyncio
+import pytest
 from copy import deepcopy
 
 from engines.naver_api import NaverAccount, SubmitOutcome
@@ -351,6 +352,8 @@ class FakePage:
         self.calls = []
 
     async def evaluate(self, _script, argument=None):
+        if argument is None:
+            return {"now": 1000, "origin": 1000000}
         self.calls.append(argument)
         return {"status": self.status, "body": self.body}
 
@@ -384,6 +387,8 @@ class ArmedPage:
         self.arm_id = ""
 
     async def evaluate(self, _script, argument=None):
+        if argument is None:
+            return {"now": 1000, "origin": 1000000}
         self.calls.append(argument)
         if "delayMs" in argument:
             self.arm_id = argument["armId"]
@@ -677,7 +682,7 @@ def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
     assert page.calls[0]["notOpenCodes"] == ["BizItem is not opened."]
 
 
-def test_browser_submitter_arms_against_same_browser_server_clock():
+def test_browser_submitter_transfers_synced_server_deadline():
     from engines.naver_submit import NaverBrowserSubmitter
 
     page = ArmedPage()
@@ -702,22 +707,10 @@ def test_browser_submitter_arms_against_same_browser_server_clock():
     assert request["openAtEpochMs"] == 1788102000000
     assert request["leadMs"] == 115
     assert request["retryLeadMs"] == 55
-    assert request["clockSamples"] == 5
+    assert "clockSamples" not in request
     assert request["targetArrivalBeforeOpenMs"] == 60
-    assert "currentDateTime" in request["clockQuery"]
-    assert request["clockVariables"]["input"] == {
-        "businessId": "1498729",
-        "bizItemId": "7094790",
-        "lang": "ko",
-    }
-
-
-def test_browser_clock_uses_response_completion_and_outbound_transit_for_arrival_target():
-    from engines.naver_submit import BROWSER_ARMED_SUBMIT_SCRIPT
-
-    assert "sample.endedAt + (requestedOpenEpochMs - sample.serverEpochMs)" in BROWSER_ARMED_SUBMIT_SCRIPT
-    assert "estimatedOutboundMs + targetArrivalBeforeOpenMs" in BROWSER_ARMED_SUBMIT_SCRIPT
-    assert "serverOpenAt - appliedLeadMs" in BROWSER_ARMED_SUBMIT_SCRIPT
+    assert request["serverOpenAtPerfMs"] - request["dueAtPerfMs"] == pytest.approx(115)
+    assert request["clockOrigin"] == 1000000
 
 
 def test_browser_submitter_classifies_the_resolver_reason():

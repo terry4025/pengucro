@@ -912,7 +912,7 @@ def test_api_send_lead_targets_aggressive_preopen_arrival():
     assert engine._api_one_way_seconds() == pytest.approx(0.100)
     assert "최저 RTT 80ms" in engine._last_api_lead_detail
     assert "서버 선점 도착 목표 -60ms" in engine._last_api_lead_detail
-    assert "시계 오차 40ms" in engine._last_api_lead_detail
+    assert "시계 표본 불확실성 40ms" in engine._last_api_lead_detail
 
 
 def test_api_send_lead_uses_live_browser_rtt_for_the_field_timing_case():
@@ -996,7 +996,7 @@ def test_final_preopen_clock_sync_runs_once_with_five_samples():
     assert asyncio.run(engine._sync_clock_before_open()) is True
     assert asyncio.run(engine._sync_clock_before_open()) is False
     assert calls == [(5, False)]
-    assert any("최저 지연 표본 오차 약 12ms" in message for message in logs)
+    assert any("표본 기준 불확실성 약 12ms" in message for message in logs)
 
 
 def test_rt47_recheck_only_releases_guard_for_changed_bookable_inventory():
@@ -2132,3 +2132,56 @@ def test_browser_fallback_reports_when_requested_tickets_exceed_visible_limit():
     assert ok is False
     assert "요청 수량 4매" in detail
     assert page.current == 2
+
+
+def test_uncertain_timer_arm_never_falls_back_to_second_submit():
+    from engines.naver_submit import NaverArmUncertainError
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(4)
+    arm_browser_submit(engine, [])
+    async def uncertain(*args, **kwargs):
+        raise NaverArmUncertainError("lost reply")
+    engine._api_submitter.arm_submit_at = uncertain
+    outcome, _ = asyncio.run(engine._submit_api_armed())
+    assert outcome == "unknown"
+    assert engine._api_submitter.calls == 0
+    assert engine._api_submit_blocked
+
+
+def test_safe_arm_failure_waits_until_send_boundary_before_direct_fallback():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(4)
+    arm_browser_submit(engine, [])
+    events = []
+    async def failed(*args, **kwargs):
+        raise RuntimeError("bridge failed before arming")
+    async def wait():
+        events.append("wait")
+    async def send(*args, **kwargs):
+        events.append("send")
+        return "success", "test"
+    engine._api_submitter.arm_submit_at = failed
+    engine._wait_for_api_send = wait
+    engine._submit_api_first = send
+    assert asyncio.run(engine._submit_api_armed())[0] == "success"
+    assert events == ["wait", "send"]
+
+
+def test_late_arm_preparation_still_waits_for_remaining_send_boundary():
+    engine = make_engine()
+    engine._open_at_epoch = 1.0
+    engine.clock = FakeClock(0.20)
+    arm_browser_submit(engine, [])
+    events = []
+    async def wait():
+        events.append("wait")
+    async def send(*args, **kwargs):
+        events.append("send")
+        return "success", "test"
+    engine._wait_for_api_send = wait
+    engine._submit_api_first = send
+    assert asyncio.run(engine._submit_api_armed())[0] == "success"
+    assert events == ["wait", "send"]
+    assert engine._api_submitter.armed == []
