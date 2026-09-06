@@ -213,6 +213,7 @@ def test_hold_conflict_tries_next_seat_group_in_same_time(monkeypatch):
     first_group = CgvSeatGroup(("C8", "C9"))
     second_group = CgvSeatGroup(("B8", "B9"))
     payload = _seat_payload("C8", "C9", "B8", "B9")
+    engine._fetch_priority_seat_payload = lambda *_args: {"ok": True, "status": 200, "data": payload}
     engine._priority_movie = "오디세이"
     engine._priority_auditorium = "IMAX관"
     engine._priority_format = "IMAX LASER 2D"
@@ -258,6 +259,7 @@ def test_all_seat_groups_lost_moves_to_next_time(monkeypatch):
     first_group = CgvSeatGroup(("C8", "C9"))
     second_group = CgvSeatGroup(("B8", "B9"))
     payload = _seat_payload("C8", "C9", "B8", "B9")
+    engine._fetch_priority_seat_payload = lambda *_args: {"ok": True, "status": 200, "data": payload}
     engine._priority_movie = "오디세이"
     engine._priority_auditorium = "IMAX관"
     engine._priority_format = "IMAX LASER 2D"

@@ -547,9 +547,7 @@ def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_pat
     assert store.get("cgv_npay_password") == ""
 
 
-def test_current_release_contract_is_complete():
-    assert __version__ == "6.77"
-    assert __release_sequence__ == 6770001
+def test_v677_release_history_is_preserved():
     note = notes_for("6.77")
     assert note is not None
     assert any("백그라운드" in change for change in note.changes)
