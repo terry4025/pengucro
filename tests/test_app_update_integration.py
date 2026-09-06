@@ -56,6 +56,16 @@ def test_malformed_helper_invocation_exits_without_opening_gui():
     assert result.stderr == ""
 
 
+def test_packaged_ocr_diagnostic_dispatches_without_ui_or_reservations(monkeypatch):
+    from tools import verify_zeroworld_ocr
+    seen = []
+    monkeypatch.setattr(sys, "argv", ["app.exe", "--verify-zeroworld-ocr", "local-corpus", "--output", "report.json"])
+    monkeypatch.setattr(verify_zeroworld_ocr, "main", lambda args: seen.append(args) or 0)
+    monkeypatch.setattr(app, "configure_windows_app_identity", lambda: (_ for _ in ()).throw(AssertionError("No UI")))
+    assert app.main() == 0
+    assert seen == [["local-corpus", "--output", "report.json"]]
+
+
 def test_update_busy_covers_booking_engine_and_catalog_refresh():
     assert app._update_busy(SimpleNamespace(current_status="running"))
     assert app._update_busy(

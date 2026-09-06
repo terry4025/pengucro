@@ -12,6 +12,15 @@ def make_engine():
     return ZeroWorldShinEngine("", lambda *_args: None)
 
 
+@pytest.fixture(autouse=True)
+def mock_captcha_preparation(monkeypatch):
+    # These tests exercise reservation transport; OCR has its own test module.
+    async def prepared(*_args):
+        return "12345"
+    monkeypatch.setattr(ZeroWorldShinEngine, "_prepare_captcha", prepared)
+    monkeypatch.setattr(ZeroWorldShinEngine, "_wait_for_date", prepared)
+
+
 @pytest.mark.parametrize(
     ("branch", "subject"),
     [("1", "A"), ("2", "B"), ("4", "A"), ("5", "A")],
@@ -283,7 +292,8 @@ def test_payment_timeout_after_acceptance_never_retries_reservation_post(monkeyp
     monkeypatch.setattr(engine, "_complete_payment", timeout_after_acceptance)
     result = asyncio.run(engine._submit(session, context, "SLOT-17", "작업 1"))
 
-    assert result and result.success
+    assert result and not result.success
+    assert result.details["outcome"] == "uncertain"
     assert len(session.posts) == 1
 
 
@@ -412,7 +422,7 @@ def test_worker_skips_calendar_and_reuses_closed_slot_preselection(monkeypatch):
         return BookingResult(True, "완료")
 
     async def fail_date_poll(*_args, **_kwargs):
-        raise AssertionError("날짜 캘린더를 조회하면 안 됩니다.")
+        return True  # The calendar must now prove the target date is open.
 
     monkeypatch.setattr(zeroworld_shin.aiohttp, "ClientSession", lambda **_kwargs: Session())
     monkeypatch.setattr(engine, "_prestage_session", fake_prestage)

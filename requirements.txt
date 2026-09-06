@@ -11,3 +11,5 @@ pywin32>=306; platform_system == "Windows"
 # It was imported at runtime but never declared, so the Phobia Dungeon engine
 # failed immediately on a clean install.
 winsdk>=1.0.0b10; platform_system == "Windows"
+# Local four/five-digit ZeroWorld OCR (no remote image service).
+ddddocr==1.6.1

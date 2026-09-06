@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from engines.async_hot_path import create_isolated_session, create_shared_connector
 from engines.base_engine import BaseEngine
+from engines.zeroworld_captcha import recognize_digits, parse_digest, warm_ocr
 from engines.zeroworld_catalog import (
     ZeroWorldTimeSlot,
     calendar_contains_date,
@@ -37,6 +38,11 @@ class ZeroWorldContext:
     name: str
     phone: str
     people: str
+    theme_name: str = ""
+
+
+class ZeroWorldAuthenticationRequired(RuntimeError):
+    pass
 
 
 class ZeroWorldShinEngine(BaseEngine):
@@ -71,6 +77,9 @@ class ZeroWorldShinEngine(BaseEngine):
         self._slot_lookup_key: tuple[str, str, str] | None = None
         self._slot_lookup_payload: dict[str, str] = {}
         self._final_submission_state = "idle"
+        self._captcha_values: dict[int, tuple[str, float]] = {}
+        self._published_dates: set[tuple[str, str]] = set()
+        self._known_booking_number = ""
 
     @staticmethod
     def _elapsed_ms(started: float) -> float:
@@ -139,6 +148,7 @@ class ZeroWorldShinEngine(BaseEngine):
             name=str(reservation_data.get("name", "")),
             phone=self._format_phone(str(reservation_data.get("phone", ""))),
             people=str(reservation_data.get("people", "2")),
+            theme_name=str(reservation_data.get("theme_name") or reservation_data.get("theme_label") or reservation_data.get("themeLabel") or ""),
         )
 
     def _headers(self, context: ZeroWorldContext) -> dict[str, str]:
@@ -174,6 +184,15 @@ class ZeroWorldShinEngine(BaseEngine):
         context = self._build_context(reservation_data)
         self.session_pool = []
         self._final_submission_state = "idle"
+        self._published_dates.clear()
+        self._captcha_values.clear()
+        self._known_booking_number = ""
+        try:
+            await asyncio.to_thread(warm_ocr)
+        except Exception:
+            self.stop_event.set()
+            self.log("숫자 OCR 초기화 실패 · 예약을 시작하지 않았습니다.", "error")
+            return
         self._shared_connector = create_shared_connector(num_sessions)
         timeout = aiohttp.ClientTimeout(total=self.LOOKUP_TIMEOUT_SECONDS)
         self.log(f"제로월드 연결·예약 단계 예열 시작 · 세션 {num_sessions}개", "info")
@@ -251,6 +270,13 @@ class ZeroWorldShinEngine(BaseEngine):
                             continue
 
                     stage = "슬롯 조회"
+                    date_key = (context.branch, context.reservation_date)
+                    if date_key not in self._published_dates:
+                        stage = "날짜 공개 확인"
+                        if not await self._wait_for_date(session, context, worker_name):
+                            continue
+                        self._published_dates.add(date_key)
+                    stage = "슬롯 조회"
                     target_slot = await self._find_target_slot(
                         session, context, worker_name
                     )
@@ -295,6 +321,11 @@ class ZeroWorldShinEngine(BaseEngine):
                             result = await self._submit(
                                 session, context, slot_id, worker_name
                             )
+                        except ZeroWorldAuthenticationRequired as exc:
+                            self._final_submission_state = "authentication_required"
+                            self.stop_event.set()
+                            self.log(f"[{worker_name}] 인증 필요 · {exc} · 추가 예약 제출 중지", "error")
+                            return
                         except Exception as exc:
                             result = await self._reconcile_ambiguous_submit(
                                 session, context, worker_name
@@ -309,10 +340,13 @@ class ZeroWorldShinEngine(BaseEngine):
                                     "error",
                                 )
                                 return
+                        if result is not None:
+                            self._final_submission_state = "success" if result.success else "uncertain"
+                            self.stop_event.set()
                     if result:
-                        self._final_submission_state = "success"
-                        self.log(f"[{worker_name}] 🎉 {result.message}", "success")
-                        self.notify_success(result)
+                        self.log(f"[{worker_name}] {result.message}", "success" if result.success else "error")
+                        if result.success:
+                            self.notify_success(result)
                         return
                     self._final_submission_state = "idle"
                     # A pre-open time selection can be accepted at the HTTP
@@ -362,7 +396,7 @@ class ZeroWorldShinEngine(BaseEngine):
             body = decode_body(await response.read())
             status = response.status
         rtt_ms = self._elapsed_ms(started)
-        if calendar_contains_date(body, context.reservation_date):
+        if status == 200 and calendar_contains_date(body, context.reservation_date):
             self._log_http(
                 worker_name,
                 "날짜 조회",
@@ -507,6 +541,39 @@ class ZeroWorldShinEngine(BaseEngine):
             stage,
         )
 
+    async def _prepare_captcha(self, session, worker_name: str) -> str:
+        cached = self._captcha_values.get(id(session))
+        if cached and time.monotonic() - cached[1] < 60:
+            return cached[0]
+        origin = urllib.parse.urljoin(self.home_url, "/core/captcha/")
+        for attempt in range(3):
+            if self.stop_event.is_set():
+                raise ZeroWorldAuthenticationRequired("작업 중지")
+            async with session.post(origin + "session.php", data={}, timeout=aiohttp.ClientTimeout(total=8)) as response:
+                digest = parse_digest(decode_body(await response.read()))
+                if response.status != 200 or not digest:
+                    raise ZeroWorldAuthenticationRequired("인증 세션 응답 확인 불가")
+            async with session.get(origin + f"image.php?t={time.time_ns()}", timeout=aiohttp.ClientTimeout(total=8)) as response:
+                image_bytes = await response.read()
+                if response.status != 200:
+                    raise ZeroWorldAuthenticationRequired("인증 이미지 조회 실패")
+            try:
+                digits = await recognize_digits(image_bytes, digest)
+            except Exception as exc:
+                raise ZeroWorldAuthenticationRequired("숫자 OCR 사용 불가 또는 인증 구조 변경") from exc
+            if digits:
+                self._captcha_values[id(session)] = (digits, time.monotonic())
+                self.log(f"[{worker_name}] 숫자 인증 OCR 검증 완료 · 동일 세션 · 시도 {attempt + 1}/3", "info")
+                return digits
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+        raise ZeroWorldAuthenticationRequired("3회 제한 내 숫자 판독 실패")
+
+    @staticmethod
+    def _uncertain_result(reason: str) -> BookingResult:
+        return BookingResult(False, f"예약 접수 여부 확인 필요 · {reason} · 추가 제출 없음",
+                             details={"outcome": "uncertain"})
+
     async def _submit(
         self,
         session: aiohttp.ClientSession,
@@ -514,6 +581,9 @@ class ZeroWorldShinEngine(BaseEngine):
         slot_id: str,
         worker_name: str = "작업 1",
     ) -> BookingResult | None:
+        captcha = await self._prepare_captcha(session, worker_name)
+        if self.stop_event.is_set():
+            raise ZeroWorldAuthenticationRequired("작업 중지")
         action_data = {
             "name": context.name,
             "mobile": context.phone,
@@ -524,7 +594,9 @@ class ZeroWorldShinEngine(BaseEngine):
             "theme_time_num": slot_id,
             "act": "make",
             "s_subj": context.subject,
+            "input_captcha": captcha,
         }
+        self._captcha_values.pop(id(session), None)
         started = time.perf_counter()
         async with session.post(
             self.action_url,
@@ -543,7 +615,12 @@ class ZeroWorldShinEngine(BaseEngine):
             f"슬롯 ID {slot_id} · 리디렉션 {len(history_urls)}회",
         )
 
-        if not self._submission_accepted(body, final_url, history_urls):
+        if status != 200 or not self._submission_accepted(body, final_url, history_urls):
+            alert = self._extract_alert(body)
+            if "자동등록" in alert or "captcha" in alert.lower():
+                raise ZeroWorldAuthenticationRequired("사이트가 인증값을 거절했습니다")
+            if status != 200 or not alert:
+                return self._uncertain_result("예약 응답에 명확한 승인·거절 근거 없음")
             error = self._safe_text(
                 self._extract_alert(body) or "예약 제출 승인 표식을 찾지 못했습니다.",
                 extra_secrets=(context.name, context.phone),
@@ -578,10 +655,9 @@ class ZeroWorldShinEngine(BaseEngine):
                 f"{self._format_exception(exc, context)}",
                 "warning",
             )
-            return BookingResult(
-                True,
-                "예약 선점 성공 · 결제/완료 상태는 사이트에서 확인해주세요.",
-            )
+            if self._known_booking_number:
+                return await self._confirm_booking(session, context, self._known_booking_number)
+            return self._uncertain_result("승인 이후 완료 단계 응답 확인 실패")
 
     async def _reconcile_ambiguous_submit(
         self,
@@ -589,8 +665,10 @@ class ZeroWorldShinEngine(BaseEngine):
         context: ZeroWorldContext,
         worker_name: str,
     ) -> BookingResult | None:
-        """Read session state after an ambiguous mutation without another POST."""
+        """Read state after ambiguity without another reservation/payment POST."""
 
+        if self._known_booking_number:
+            return await self._confirm_booking(session, context, self._known_booking_number)
         reconcile_url = f"{self.home_url}?go=rev.kcp"
         try:
             async with session.get(
@@ -618,14 +696,9 @@ class ZeroWorldShinEngine(BaseEngine):
                 return None
             if not self._submission_accepted(body, final_url, history_urls):
                 return None
-            return await self._complete_payment(
-                session,
-                body,
-                final_url,
-                history_urls,
-                context,
-                worker_name,
-            )
+            # Reconciliation is read-only. Never replay payment after an
+            # exception that may itself have happened after payment submission.
+            return self._receipt_result(body, context)
         except Exception:
             return None
 
@@ -665,7 +738,8 @@ class ZeroWorldShinEngine(BaseEngine):
     def _submission_accepted(body: str, final_url: str, history_urls: list[str]) -> bool:
         combined = " ".join([body, final_url, *history_urls]).lower()
         failure_alert = ZeroWorldShinEngine._extract_alert(body)
-        if failure_alert and not any(word in failure_alert for word in ("완료", "성공")):
+        if failure_alert and (any(word in failure_alert for word in ("불가", "실패", "잘못", "취소", "환불", "이미"))
+                              or not any(word in failure_alert for word in ("완료", "성공"))):
             return False
         markers = ("rev.pay", "rev.kcp", "rev.make.mutong", "toss", "vbank")
         return any(marker in combined for marker in markers) or (
@@ -702,11 +776,11 @@ class ZeroWorldShinEngine(BaseEngine):
         if not reservation_code:
             debug_path = self._save_debug("zeroworld_submit_debug.html", body, "예약 제출")
             self.log(
-                f"[{worker_name}] 예약 코드 미확인 · 제출 승인 경로 근거로 선점 판정 유지 · "
+                f"[{worker_name}] 예약 코드 미확인 · 성공 판정 보류 · "
                 f"민감정보 제외 진단 요약 저장{f' ({debug_path.name})' if debug_path else ''}",
                 "warning",
             )
-            return BookingResult(True, "예약 선점 성공 · 사이트에서 예약 내역을 확인해주세요.")
+            return self._uncertain_result("예약 코드 미확인")
 
         if not check_code:
             kcp_url = f"{self.home_url}?go=rev.kcp&code={urllib.parse.quote(reservation_code)}"
@@ -724,7 +798,12 @@ class ZeroWorldShinEngine(BaseEngine):
                 self._elapsed_ms(started),
                 "확인값 존재" if check_code else "확인값 없음",
             )
+            if status != 200:
+                return self._uncertain_result("결제 확인 정보 조회 오류")
 
+        if not check_code:
+            return self._uncertain_result("결제 확인값 미확인")
+        self._known_booking_number = check_code
         payment_data = {
             "code": reservation_code,
             "ck_code": check_code,
@@ -758,7 +837,7 @@ class ZeroWorldShinEngine(BaseEngine):
                 next_url,
                 timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT_SECONDS),
             ) as response:
-                payment_body += decode_body(await response.read())
+                payment_body = decode_body(await response.read())
                 refresh_status = response.status
             self._log_http(
                 worker_name,
@@ -767,36 +846,42 @@ class ZeroWorldShinEngine(BaseEngine):
                 self._elapsed_ms(started),
             )
 
-        number_match = re.search(r"ck_code=(\d+)", payment_body)
-        if not number_match:
-            number_match = re.search(r"예약번호[^0-9]*(\d+)", payment_body)
-        booking_number = number_match.group(1) if number_match else check_code
-        completed = any(
-            marker in payment_body
-            for marker in ("rev.make.exe.php", "rev.make.end", "완료", "접수", "성공")
-        )
-        if completed:
+        receipt = (self._receipt_result(payment_body, context)
+                   if payment_status == 200 and (not refresh or refresh_status == 200)
+                   else self._uncertain_result("결제/완료 응답 오류"))
+        if not receipt.success:
+            # One read-only receipt fetch; never repeat the payment POST.
+            end_url = f"{self.home_url}?go=rev.make.end&code={urllib.parse.quote(reservation_code)}"
+            async with session.get(end_url, timeout=aiohttp.ClientTimeout(total=self.SUBMIT_TIMEOUT_SECONDS)) as response:
+                end_body = decode_body(await response.read())
+                if response.status == 200:
+                    receipt = self._receipt_result(end_body, context)
+        if not receipt.success:
+            receipt = await self._confirm_booking(session, context, check_code)
+        booking_number = receipt.booking_number
+        if receipt.success:
             self.log(
                 f"[{worker_name}] 예약 완료 표식 확인 · "
                 f"예약번호 {booking_number or '확인 필요'}",
                 "info",
             )
-            append_history(
-                {
+            try:
+                append_history({
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "site": "제로월드",
                     "branch": context.branch,
                     "date": context.reservation_date,
                     "time": context.target_time,
                     "booking_number": booking_number,
-                }
-            )
+                })
+            except Exception as exc:
+                self.log(f"예약은 확인됐지만 로컬 이력 저장 실패 · {self._format_exception(exc, context)}", "warning")
             try:
                 webbrowser.open(
                     f"{self.home_url}?go=rev.make.end&code={urllib.parse.quote(reservation_code)}"
                 )
-            except OSError:
-                pass
+            except Exception:
+                self.log("예약은 확인됐지만 완료 화면을 열지 못했습니다.", "warning")
             return BookingResult(
                 True,
                 f"예약 최종 완료 · 예약번호 {booking_number or '확인 필요'}",
@@ -806,22 +891,59 @@ class ZeroWorldShinEngine(BaseEngine):
 
         debug_path = self._save_debug("zeroworld_payment_debug.html", payment_body, "결제/접수 완료")
         self.log(
-            f"[{worker_name}] 예약 완료 표식 미확인 · 앞 단계 승인 근거로 선점 판정 유지 · "
+            f"[{worker_name}] 예약 완료 표식 미확인 · 성공 판정 보류 · "
             f"민감정보 제외 진단 요약 저장{f' ({debug_path.name})' if debug_path else ''}",
             "warning",
         )
-        return BookingResult(
-            True,
-            f"예약 선점 성공 · 예약번호 {booking_number or '확인 필요'} · 사이트 확인 필요",
-            booking_number=booking_number,
-            details={"reservation_code": reservation_code},
-        )
+        return receipt
+
+    async def _confirm_booking(self, session, context: ZeroWorldContext, number: str) -> BookingResult:
+        """The live site's reservation lookup, not make/cancel/payment."""
+        if not re.fullmatch(r"[0-9]{4,10}", number):
+            return self._uncertain_result("예약 확인번호 형식 미확인")
+        try:
+            async with session.post(self.action_url,
+                data={"act": "rev_view", "not_html": "Y", "name": context.name,
+                      "mobile": context.phone, "ck_code": number},
+                    timeout=aiohttp.ClientTimeout(total=self.SUBMIT_RECONCILE_SECONDS)) as response:
+                body = decode_body(await response.read())
+                if response.status != 200:
+                    return self._uncertain_result("예약내역 조회 응답 오류")
+        except Exception:
+            # A read failure after an accepted mutation must never escape to
+            # the scan loop and authorize another reservation submission.
+            return self._uncertain_result("예약내역 재확인 통신 실패")
+        return self._receipt_result(body, context, lookup_number=number)
+
+    def _receipt_result(self, body: str, context: ZeroWorldContext, *, lookup_number: str = "") -> BookingResult:
+        soup = BeautifulSoup(body, "html.parser")
+        for node in soup.select("script, style, noscript"):
+            node.decompose()
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        text = re.sub(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일",
+                      lambda m: f"{m[1]}-{int(m[2]):02d}-{int(m[3]):02d}", text)
+        number = re.search(r"예약\s*번호\s*[:：#]?\s*([A-Za-z0-9-]{3,40})(?![A-Za-z0-9-])", text)
+        booking_number = number.group(1) if number else lookup_number
+        if lookup_number and number and booking_number != lookup_number:
+            return self._uncertain_result("조회한 예약번호와 응답의 예약번호 불일치")
+        rejected = re.search(r"(?:예약\s*상태|처리\s*상태|진행\s*상태)\s*[:：]?\s*(?:취소|환불|실패|거절)", text)
+        normal = re.search(r"(?:예약\s*상태|처리\s*상태|진행\s*상태)\s*[:：]?\s*(?:신청|접수|입금\s*대기|예약\s*완료|확정)(?=\s|$)", text)
+        normal = normal or re.search(r"예약(?:이|\s*신청이)?\s*(?:정상적으로\s*)?(?:완료|접수)되었습니다", text)
+        date_present = bool(re.search(r"(?<!\d)" + re.escape(context.reservation_date).replace(r"\-", r"[-./]") + r"(?!\d)", text))
+        theme_field = soup.select_one('[name="theme_num"]')
+        theme_matches = bool((theme_field and str(theme_field.get("value", "")) == context.theme)
+                             or (context.theme_name and re.search(r"(?<!\w)" + re.escape(context.theme_name) + r"(?!\w)", text)))
+        people = re.search(r"인원\s*[:：]?\s*(\d+)\s*명", text)
+        people_match = (people.group(1) == context.people) if people else not lookup_number
+        time_matches = bool(re.search(r"(?<!\d)" + re.escape(context.target_time) + r"(?!\d)", text))
+        if not (booking_number and normal and not rejected and date_present and time_matches and theme_matches and people_match):
+            return self._uncertain_result("예약번호·정상 접수 상태·목표 일시/테마 검증 미완료")
+        return BookingResult(True, f"예약 최종 완료 · 예약번호 {booking_number}", booking_number)
 
     @staticmethod
     def _extract_value(body: str, name: str) -> str:
-        pattern = rf"name=['\"]?{re.escape(name)}['\"]?\s*value=['\"]?([^'\"'>\s]+)"
-        match = re.search(pattern, body, re.I)
-        return match.group(1) if match else ""
+        field = BeautifulSoup(body, "html.parser").find("input", attrs={"name": name})
+        return str(field.get("value", "")) if field else ""
 
     @classmethod
     def _save_debug(cls, filename: str, body: str, stage: str = "응답 분석"):

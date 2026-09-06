@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from engines.keyescape_schedule_cache import (
     remember_slot_template as remember_keyescape_slot_template,
 )
-from engines.zeroworld_catalog import ZeroWorldTimeSlot, parse_time_slots, decode_body
+from engines.zeroworld_catalog import ZeroWorldTimeSlot, parse_time_slots, decode_body, calendar_contains_date
 from pengucro.storage import load_json, save_json
 
 
@@ -44,6 +44,16 @@ def fetch_zeroworld_slots(
 ) -> list[ZeroWorldTimeSlot]:
     select_url = engine_options.get("select_url") or urllib.parse.urljoin(base_url, "/core/res/rev.make.sel.php")
     subject = engine_options.get("subject_by_branch", {}).get(branch_id, "A")
+    estimate = engine_options.get("estimate_unopened_same_weekday", False)
+    published = True
+    if estimate:
+        target_day = date.fromisoformat(date_str)
+        calendar = requests.post(select_url,
+            data={"act": "calendar", "zizum_num": branch_id, "rev_days": date_str,
+                  "year": str(target_day.year), "month": str(target_day.month), "s_subj": subject},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+        calendar.raise_for_status()
+        published = calendar_contains_date(decode_body(calendar.content), date_str)
     response = requests.post(
         select_url,
         data={
@@ -57,7 +67,35 @@ def fetch_zeroworld_slots(
         timeout=timeout,
     )
     response.raise_for_status()
-    return parse_time_slots(decode_body(response.content))
+    slots = parse_time_slots(decode_body(response.content))
+    if (published and slots) or not estimate:
+        return slots
+    target = date.fromisoformat(date_str)
+    # Picker-only estimates; no historical product/slot IDs reach the engine.
+    for weeks in range(1, 5):
+        source = target - timedelta(days=7 * weeks)
+        if estimate and not published and not calendar_contains_date(decode_body(calendar.content), source.isoformat()):
+            # A source in another month needs its own bounded calendar check.
+            source_calendar = requests.post(select_url,
+                data={"act":"calendar", "zizum_num":branch_id,"rev_days":source.isoformat(),
+                      "year":str(source.year),"month":str(source.month),"s_subj":subject},
+                headers={"User-Agent":"Mozilla/5.0"},timeout=timeout)
+            source_calendar.raise_for_status()
+            if not calendar_contains_date(decode_body(source_calendar.content), source.isoformat()):
+                continue
+        prior = requests.post(
+            select_url,
+            data={"act": "theme_time_list", "zizum_num": branch_id,
+                  "rev_days": source.isoformat(), "theme_num": theme_id, "s_subj": subject},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout,
+        )
+        prior.raise_for_status()
+        previous = parse_time_slots(decode_body(prior.content))
+        if previous:
+            return [ZeroWorldTimeSlot(time=value, slot_id="", available=False,
+                    estimated=True, source_date=source.isoformat(), estimate_basis="same_weekday")
+                    for value in sorted({row.time for row in previous})]
+    return []
 
 
 def fetch_keyescape_slots(
@@ -1066,7 +1104,10 @@ def fetch_any_time_slots(
         return []
 
     if engine_id in ("zeroworld_laravel", "zeroworld_gu", "zeroworld_shin", "sinbiworld"):
-        return fetch_zeroworld_slots(base_url, branch_id, theme_id, date_str, site_config.get("engine_options", {}), timeout)
+        options = dict(site_config.get("engine_options", {}))
+        if engine_id == "zeroworld_shin":
+            options["estimate_unopened_same_weekday"] = True
+        return fetch_zeroworld_slots(base_url, branch_id, theme_id, date_str, options, timeout)
     elif engine_id == "keyescape":
         return fetch_keyescape_slots(base_url, branch_id, theme_id, date_str, timeout)
     elif engine_id == "jigubyeol":

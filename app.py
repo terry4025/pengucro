@@ -160,6 +160,12 @@ def main() -> int:
     if helper_exit_code is not None:
         return helper_exit_code
 
+    # Release diagnostics run the bundled OCR models against local images only.
+    # No GUI, site requests, reservation dispatch or user settings are loaded.
+    if sys.argv[1:2] == ["--verify-zeroworld-ocr"]:
+        from tools.verify_zeroworld_ocr import main as verify_ocr
+        return verify_ocr(sys.argv[2:])
+
     startup_update = consume_startup_update_args()
     configure_windows_app_identity()
 

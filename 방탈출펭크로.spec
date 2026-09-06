@@ -1,4 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+
+ocr_models = collect_data_files('ddddocr', includes=['common.onnx', 'common_old.onnx'])
+
 a = Analysis(
     ['app.py'],
     pathex=[],
@@ -7,7 +11,7 @@ a = Analysis(
         ('icon.ico', '.'),
         ('app_icon.png', '.'),
         ('keyescape_slot_templates_seed.json', '.'),
-    ],
+    ] + ocr_models,
     hiddenimports=[
         # Engines are selected by name at runtime in engines/registry.py, so
         # static analysis cannot see them.
@@ -99,7 +103,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로6.79_yescaptcha',
+    name='방탈출펭크로6.81_yescaptcha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
