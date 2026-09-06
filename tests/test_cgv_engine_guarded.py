@@ -191,7 +191,7 @@ def test_claim_in_progress_is_not_misclassified_as_stopped_fetch_errors(monkeypa
     assert engine._fast_monitor_fallback_reason == ""
 
 
-def test_missing_monitor_state_uses_safe_fallback(monkeypatch):
+def test_missing_monitor_state_stops_without_unverified_rebooking(monkeypatch):
     logs = []
     engine = _make_engine(logs)
 
@@ -210,10 +210,10 @@ def test_missing_monitor_state_uses_safe_fallback(monkeypatch):
         {},
     )
 
-    assert (held, fallback) == (False, True)
-    assert engine._last_fast_monitor_exit_reason == "monitor-state-lost"
+    assert (held, fallback) == (False, False)
+    assert engine._last_fast_monitor_exit_reason == "hold-uncertain"
     messages = [message for message, _level in logs]
-    assert any("감시 상태를 읽지 못해" in message for message in messages)
+    assert any("추가 선점 없이 중지" in message for message in messages)
 
 
 def test_browser_fallback_keeps_existing_seat_dom_without_reload():

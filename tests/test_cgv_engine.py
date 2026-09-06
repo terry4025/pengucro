@@ -549,7 +549,7 @@ def test_direct_hold_result_never_reloads_browser_page():
     )
 
     assert held is False
-    assert fallback is True
+    assert fallback is False  # A confirmed hold must not trigger a new booking.
     assert not hasattr(page, "reload")
 
 

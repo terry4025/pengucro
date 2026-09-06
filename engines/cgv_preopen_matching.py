@@ -242,6 +242,7 @@ def rank_preopen_schedules(
     preferred_times: Iterable[str] = (),
     *,
     drift_window_minutes: int = PREOPEN_TIME_DRIFT_WINDOW_MINUTES,
+    include_zero_inventory: bool = False,
 ) -> list[dict[str, Any]]:
     """Map reference-day time priorities onto the real published schedule.
 
@@ -255,16 +256,14 @@ def rank_preopen_schedules(
     for raw in candidates:
         item = dict(raw)
         unique.setdefault(_schedule_identity(item), item)
-    # A published-but-not-yet-selling row (zero seat inventory) must never win
-    # an earlier chronological slot while a stocked counterpart exists.
-    # A row with an explicit zero free-seat count is published metadata, not a
-    # bookable screening. Keep polling until CGV publishes positive inventory
-    # instead of promoting that row to the visitor/seat flow.
+    # Preview callers retain the positive-inventory filter. The live preopen
+    # ladder explicitly includes zero aggregates and validates fresh real seats
+    # before any hold. Publication metadata alone never proves availability.
     remaining = sorted(
         (
             item
             for item in unique.values()
-            if has_published_seat_inventory(item)
+            if include_zero_inventory or has_published_seat_inventory(item)
         ),
         key=_chronological_key,
     )
@@ -334,6 +333,9 @@ def select_preopen_schedule(
     auditorium: str = "",
     preferred_times: Iterable[str] = (),
     format_name: str = "",
+    drift_window_minutes: int = PREOPEN_TIME_DRIFT_WINDOW_MINUTES,
+    include_zero_inventory: bool = False,
+    require_movie_id: bool = False,
 ) -> dict[str, Any] | None:
     preferred = list(preferred_times)
     if not preferred and show_time:
@@ -345,5 +347,33 @@ def select_preopen_schedule(
         auditorium=auditorium,
         format_name=format_name,
     )
-    ranked = rank_preopen_schedules(candidates, preferred)
+    if require_movie_id:
+        candidates = booking_ready_schedules(candidates, mov_no)
+    ranked = rank_preopen_schedules(candidates, preferred,
+                                   drift_window_minutes=drift_window_minutes,
+                                   include_zero_inventory=include_zero_inventory)
     return ranked[0] if ranked else None
+
+
+def booking_ready_schedules(candidates, verified_movie_id=""):
+    """Use only rows already checked by matching_schedule_candidates.
+
+    That matcher rejects conflicting IDs and requires an exact title when the
+    row has no movie ID. Only that validated saved/discovered ID can fill it.
+    Unknown IDs keep waiting; never send a blank movie ID to the price API.
+    """
+    ready = []
+    for row in candidates:
+        movie_id = str(row.get("movNo") or row.get("mov_no") or verified_movie_id or "").strip()
+        if movie_id:
+            ready.append(dict(row, movNo=movie_id))
+    return ready
+
+
+def normalize_preopen_time_drift(value: Any) -> int:
+    """Only an explicit supported preference can widen the booking time."""
+    try:
+        minutes = int(str(value))
+    except (TypeError, ValueError):
+        return 0
+    return minutes if minutes in {0, 15, 30, 60, 90} else 0

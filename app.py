@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from pengucro import __release_sequence__, logging_setup
+from pengucro import __version__, __release_sequence__, logging_setup
 from pengucro.update_bootstrap import (
     StartupUpdateContext,
     consume_startup_update_args,
@@ -166,7 +166,8 @@ def main() -> int:
     # Install the rotating log handler before importing the full UI so catalog
     # and engine diagnostics emitted during start-up are captured.
     log_path = logging_setup.configure()
-    LOGGER.info("Pengucro starting (log file: %s)", log_path)
+    LOGGER.info("Pengucro starting v%s (release=%s, log file: %s)",
+                __version__, __release_sequence__, log_path)
 
     if "--dpsnnn-plan" in sys.argv:
         index = sys.argv.index("--dpsnnn-plan")
