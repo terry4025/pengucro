@@ -269,6 +269,7 @@ def test_final_registry_retries_groups_then_next_time_after_hold_conflicts(
     first_group = CgvSeatGroup(("C8", "C9"))
     second_group = CgvSeatGroup(("B8", "B9"))
     payload = _seat_payload("C8", "C9", "B8", "B9")
+    engine._fetch_priority_seat_payload = lambda *_args: {"ok": True, "status": 200, "data": payload}
     _configure_priority_ladder(
         engine,
         (first, second),

@@ -35,6 +35,8 @@ class CgvEngine(VisitorDomCgvEngine):
 
     PRIORITY_SEAT_REQUEST_INTERVAL_SECONDS = 0.350
     PRIORITY_SCHEDULE_REFRESH_SECONDS = 2.5
+    PRIORITY_AUTO_ATTEMPTS_PER_TIME = 3
+    PRIORITY_READ_TIMEOUT_MS = 2000
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -220,7 +222,9 @@ class CgvEngine(VisitorDomCgvEngine):
         try:
             result = page.evaluate(
                 r"""
-                async url => {
+                async ({url, timeoutMs}) => {
+                  const controller = new AbortController();
+                  const timeout = setTimeout(() => controller.abort(), timeoutMs);
                   try {
                     const headers = new Headers({
                       'Accept': 'application/json, text/plain, */*',
@@ -237,6 +241,7 @@ class CgvEngine(VisitorDomCgvEngine):
                       method: 'GET',
                       cache: 'no-store',
                       credentials: 'include',
+                      signal: controller.signal,
                       headers,
                     });
                     let data = null;
@@ -249,10 +254,12 @@ class CgvEngine(VisitorDomCgvEngine):
                     };
                   } catch (error) {
                     return {ok: false, status: 0, error: String(error || 'fetch failed')};
+                  } finally {
+                    clearTimeout(timeout);
                   }
                 }
                 """,
-                url,
+                {"url": url, "timeoutMs": self.PRIORITY_READ_TIMEOUT_MS},
             )
         except Exception as exc:
             result = {"ok": False, "status": 0, "error": str(exc)}
@@ -448,6 +455,11 @@ class CgvEngine(VisitorDomCgvEngine):
             )
 
         pass_no = 0
+        # Keep failed automatic combinations across sweeps. A fresh seat map
+        # that changes availability clears these exclusions for cancellation
+        # monitoring; cycling times must not restart the same losing shortlist.
+        auto_excluded: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
+        availability_by_time: dict[tuple[str, ...], frozenset[str]] = {}
         while not self.stop_event.is_set():
             self._refresh_priority_schedule_payload(page)
             candidates = self._ordered_schedule_candidates(schedule)
@@ -465,6 +477,9 @@ class CgvEngine(VisitorDomCgvEngine):
                 excluded_groups: set[tuple[str, ...]] = set()
                 candidate_payload: dict[str, Any] | None = None
                 first_candidate_read = True
+                auto_attempts = 0
+                manual_labels = {tuple(normalize_seat_name(s) for s in g.seats)
+                                 for g in self._priority_manual_groups}
 
                 while not self.stop_event.is_set():
                     if first_candidate_read:
@@ -476,6 +491,15 @@ class CgvEngine(VisitorDomCgvEngine):
                         )
                         first_candidate_read = False
                         candidate_payload = payload
+                        if isinstance(payload, dict):
+                            available = frozenset(s.label for s in parse_api_seats(payload) if s.available)
+                            if availability_by_time.get(candidate_key) != available:
+                                auto_excluded[candidate_key] = set()
+                            availability_by_time[candidate_key] = available
+                            excluded_groups.update(auto_excluded.get(candidate_key, set()))
+                            if excluded_groups:
+                                group = self._choose_priority_group(payload, candidate, people,
+                                                                    excluded=excluded_groups)
                     else:
                         payload = candidate_payload
                         status = 200
@@ -509,11 +533,24 @@ class CgvEngine(VisitorDomCgvEngine):
                         return False, True
 
                     if group is None or payload is None:
+                        # Exhausted automatic candidates may be reconsidered on
+                        # the next complete sweep, after later times got a turn.
+                        auto_excluded.pop(candidate_key, None)
                         self.silent_tick(
                             f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
                             "좌석 우선순위 일치 좌석 없음 · 다음 시간 확인"
                         )
                         break
+
+                    group_labels = tuple(normalize_seat_name(s) for s in group.seats)
+                    is_auto = group_labels not in manual_labels
+                    if is_auto and auto_attempts >= self.PRIORITY_AUTO_ATTEMPTS_PER_TIME:
+                        self.log(
+                            f"[CGV] 시간 {index}순위 자동 추천 {auto_attempts}개 시도 완료 · "
+                            "다음 희망 시간 확인 후 남은 추천 순서로 재개합니다.", "info")
+                        break
+                    if is_auto:
+                        auto_attempts += 1
 
                     self._priority_active_schedule = candidate
                     self._priority_active_groups = (group,)
@@ -548,13 +585,32 @@ class CgvEngine(VisitorDomCgvEngine):
                     if self._last_fast_monitor_exit_reason != "seat-conflict":
                         return held, use_fallback
 
-                    excluded_groups.add(
-                        tuple(normalize_seat_name(label) for label in group.seats)
-                    )
+                    excluded_groups.add(group_labels)
+                    if is_auto:
+                        auto_excluded.setdefault(candidate_key, set()).add(group_labels)
                     self.silent_tick(
                         f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
                         f"{', '.join(group.seats)} 선점 경합 · 다음 좌석 우선순위 확인"
                     )
+                    # A failed hold invalidates the preflight availability.
+                    # Never seed another candidate from that same stale map.
+                    refreshed = self._fetch_priority_seat_payload(page, candidate)
+                    status = int(refreshed.get("status", 0) or 0)
+                    candidate_payload = refreshed.get("data") if refreshed.get("ok") else None
+                    if status in {401, 403, 429}:
+                        self._last_fast_monitor_exit_reason = {
+                            401: "unauthorized", 403: "access-forbidden", 429: "rate-limited"
+                        }[status]
+                        self.log(f"[CGV] 경합 후 최신 좌석 조회 HTTP {status} · "
+                                 "다른 시간대의 추가 API 선점은 중단합니다.", "warning")
+                        return False, bool(self._priority_manual_groups)
+                    if not isinstance(candidate_payload, dict):
+                        break
+                    if int(candidate_payload.get("statusCode", 0) or 0) != 0:
+                        self._last_fast_monitor_exit_reason = "priority-refresh-api-error"
+                        self.log("[CGV] 경합 후 최신 좌석 API 오류 · 오래된 좌석표를 재사용하지 않습니다.",
+                                 "warning")
+                        return False, bool(self._priority_manual_groups)
 
             pass_no += 1
             order = " → ".join(

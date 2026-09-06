@@ -28,7 +28,7 @@ from engines.cgv_client import (
     schedule_items,
     select_schedule,
 )
-from pengucro.diagnostics import format_exception
+from pengucro.diagnostics import format_exception, redact_debug_text
 from pengucro.models import BookingResult, parse_bool_flag
 
 
@@ -921,6 +921,10 @@ class CgvEngine(BaseEngine):
                     lastError: '',
                     lastApiStatus: 0,
                     lastApiMessage: '',
+                    lastFailureStage: '',
+                    lastResultCode: '',
+                    priceElapsedMs: 0,
+                    holdElapsedMs: 0,
                     terminalError: '',
                     conflicts: 0,
                     hit: null,
@@ -931,10 +935,21 @@ class CgvEngine(BaseEngine):
                   const recordApiFailure = (stage, payload, fallbackStatus = -1) => {
                     const status = Number(payload && payload.statusCode != null
                       ? payload.statusCode : fallbackStatus);
-                    const message = String(payload && payload.statusMessage || '');
+                    const detail = payload && payload.data || {};
+                    const message = [payload && payload.statusMessage, detail.resultMessage, detail.resultMsg]
+                      .filter(Boolean).join(' · ');
+                    state.lastFailureStage = stage;
+                    state.lastResultCode = String(detail.resultCode ?? '');
                     state.lastApiStatus = status;
                     state.lastApiMessage = message;
                     state.lastError = `${stage} API ${status}${message ? `: ${message}` : ''}`;
+                  };
+                  const isSeatConflict = payload => {
+                    const detail = payload && payload.data || {};
+                    const message = [payload && payload.statusMessage, detail.resultMessage, detail.resultMsg]
+                      .filter(Boolean).join(' · ');
+                    return /좌석|seat/i.test(message) &&
+                      /이미|매진|판매완료|선점된|선점되어|다른.*(?:고객|사용자)|occupied|sold.out|not.available/i.test(message);
                   };
                   const normalize = value => String(value || '')
                     .toUpperCase().replace(/[\s_-]+/g, '');
@@ -1204,6 +1219,7 @@ class CgvEngine(BaseEngine):
                           () => transactionController.abort(),
                           transactionTimeoutMs,
                         );
+                        let holdSent = false;
                         try {
                           state.phase = 'pricing';
                           const pricePayload = buildPricePayload(group.seats);
@@ -1212,6 +1228,7 @@ class CgvEngine(BaseEngine):
                             pricePayload,
                             transactionController.signal,
                           );
+                          state.priceElapsedMs = performance.now() - transactionStarted;
                           state.lastStatus = price.status;
                           if (price.status === 401) {
                             state.unauthorized = true;
@@ -1245,17 +1262,21 @@ class CgvEngine(BaseEngine):
                           }
                           if (!price.ok || priceApiStatus !== 0) {
                             recordApiFailure('price', price.data);
-                            conflictOrResume();
+                            if (isSeatConflict(price.data)) conflictOrResume();
+                            else { state.terminalError = 'price-rejected'; state.stop(); }
                             return;
                           }
 
                           state.phase = 'holding';
                           const holdPayload = buildHoldPayload(group.seats);
+                          holdSent = true;
+                          const holdStarted = performance.now();
                           const hold = await postJson(
                             directHold.holdUrl,
                             holdPayload,
                             transactionController.signal,
                           );
+                          state.holdElapsedMs = performance.now() - holdStarted;
                           state.lastStatus = hold.status;
                           if (hold.status === 401) {
                             state.unauthorized = true;
@@ -1274,7 +1295,7 @@ class CgvEngine(BaseEngine):
                             return;
                           }
                           if (!hold.data || typeof hold.data !== 'object') {
-                            state.terminalError = 'hold-response-shape';
+                            state.terminalError = 'hold-uncertain';
                             state.lastError = 'hold response is not JSON';
                             state.stop();
                             return;
@@ -1294,7 +1315,11 @@ class CgvEngine(BaseEngine):
                             && Boolean(holdData.movAtktNo);
                           if (!held) {
                             recordApiFailure('hold', hold.data);
-                            conflictOrResume();
+                            if (holdData.movAtktNo || hold.status >= 500 ||
+                                (holdApiStatus === 0 && String(holdData.resultCode ?? '0') === '0')) {
+                              state.terminalError = 'hold-uncertain'; state.stop();
+                            } else if (isSeatConflict(hold.data)) conflictOrResume();
+                            else { state.terminalError = 'hold-rejected'; state.stop(); }
                             return;
                           }
                           state.claiming = false;
@@ -1311,16 +1336,16 @@ class CgvEngine(BaseEngine):
                             },
                           };
                         } catch (error) {
-                          if (!(error && error.name === 'AbortError' && !state.running)) {
-                            state.consecutiveErrors += 1;
-                            state.lastError = error && error.name === 'AbortError'
-                              ? 'seat hold transaction timeout'
-                              : `seat hold transaction: ${String(error || 'failed')}`;
-                            if (state.consecutiveErrors >= maxConsecutiveErrors) {
-                              state.stop();
-                            } else {
-                              resume();
-                            }
+                          if (holdSent) {
+                            state.lastFailureStage = 'hold';
+                            state.lastError = 'hold response lost; outcome unknown';
+                            state.terminalError = 'hold-uncertain';
+                            state.stop();
+                          } else {
+                            state.lastFailureStage = 'price';
+                            state.lastError = 'price request failed before hold';
+                            state.terminalError = 'price-transport-error';
+                            state.stop();
                           }
                         } finally {
                           clearTimeout(transactionTimer);
@@ -1391,6 +1416,10 @@ class CgvEngine(BaseEngine):
                     lastError: state.lastError,
                     lastApiStatus: state.lastApiStatus,
                     lastApiMessage: state.lastApiMessage,
+                    lastFailureStage: state.lastFailureStage,
+                    lastResultCode: state.lastResultCode,
+                    priceElapsedMs: state.priceElapsedMs,
+                    holdElapsedMs: state.holdElapsedMs,
                     terminalError: state.terminalError,
                     conflicts: state.conflicts,
                     initialPayloadUsed: state.initialPayloadUsed,
@@ -1575,6 +1604,21 @@ class CgvEngine(BaseEngine):
             if not isinstance(hit, dict):
                 status = int(snapshot.get("lastStatus", 0) or 0)
                 failure_kind = str(snapshot.get("failureKind", "") or "")
+                if failure_kind == "seat-conflict" or snapshot.get("terminalError"):
+                    detail = redact_debug_text(
+                        f"단계={snapshot.get('lastFailureStage', '')} · HTTP {status} · "
+                        f"API {snapshot.get('lastApiStatus', '')} · 결과 {snapshot.get('lastResultCode', '')} · "
+                        f"가격 {float(snapshot.get('priceElapsedMs', 0) or 0):.0f}ms · "
+                        f"선점 {float(snapshot.get('holdElapsedMs', 0) or 0):.0f}ms · "
+                        f"{snapshot.get('lastApiMessage', '')}",
+                        extra_secrets=[v for v in auth.values() if isinstance(v, str) and len(v) > 3],
+                    )
+                    self.log(f"[CGV] 선점 실패 진단 · {detail[:300]}", "warning")
+                if snapshot.get("terminalError") == "hold-uncertain":
+                    self._last_fast_monitor_exit_reason = "hold-uncertain"
+                    self.log("[CGV] 선점 요청의 결과가 불명확합니다 · 추가 선점 없이 중지합니다. "
+                             "열린 CGV 화면과 예매내역을 확인해주세요.", "warning")
+                    return False, False
                 if failure_kind == "seat-conflict":
                     self._last_fast_monitor_exit_reason = "seat-conflict"
                     return False, False
@@ -1590,7 +1634,11 @@ class CgvEngine(BaseEngine):
                     self._last_fast_monitor_exit_reason = str(
                         snapshot.get("terminalError") or "terminal-error"
                     )
-                    self.log("CGV 선점 API 응답 구조가 변경되어 브라우저 안전 경로로 전환합니다.", "warning")
+                    if self._last_fast_monitor_exit_reason in {"price-rejected", "hold-rejected"}:
+                        self.log("[CGV] 가격/선점 API가 요청을 거절했습니다 · 좌석 경합으로 간주하지 않고 "
+                                 "공식 예매 화면으로 전환합니다.", "warning")
+                    else:
+                        self.log("CGV 선점 API 응답 구조가 변경되어 브라우저 안전 경로로 전환합니다.", "warning")
                     return False, True
                 if snapshot.get("blocked") or status in {403, 429}:
                     concurrency = 1
