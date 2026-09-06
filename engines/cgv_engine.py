@@ -1013,15 +1013,22 @@ class CgvEngine(BaseEngine):
                     let items = data && data.items ? data.items : [];
                     if (!Array.isArray(items)) items = items ? [items] : [];
                     const seatsByLabel = new Map();
+                    const seen = new Set();
                     for (const item of items) {
                       const seats = item && Array.isArray(item.seats) ? item.seats : [];
                       for (const seat of seats) {
-                        if (String(seat.seatStusCd || '') !== '00') continue;
-                        if (String(seat.seatSaleYn || 'Y').toUpperCase() !== 'Y') continue;
-                        const row = String(seat.seatRowNm || '').toUpperCase();
-                        const no = String(seat.seatNo || '');
-                        const num = parseInt(no, 10);
+                        if (!seat || typeof seat !== 'object') continue;
+                        const row = String(seat.seatRowNm || '').trim().toUpperCase();
+                        const no = String(seat.seatNo ?? '').trim();
+                        if (!String(seat.seatLocNo || '').trim() || !row || !/^[+-]?\d+$/.test(no)) continue;
+                        const num = Number(no);
                         const label = normalize(`${row}${no}`);
+                        // Python keeps the first occurrence of each normalized seat.
+                        const canonical = normalize(`${row}${num}`);
+                        if (seen.has(canonical)) continue;
+                        seen.add(canonical);
+                        if (String(seat.seatStusCd ?? '').trim() !== '00') continue;
+                        if (String(seat.seatSaleYn === undefined ? 'Y' : seat.seatSaleYn).trim().toUpperCase() !== 'Y') continue;
                         seatsByLabel.set(label, seat);
                         if (!isNaN(num)) {
                           seatsByLabel.set(normalize(`${row}${num}`), seat);
@@ -1567,21 +1574,21 @@ class CgvEngine(BaseEngine):
     def _monitor_housekeeping(self, page) -> dict[str, Any]:
         return {}
 
-    def _interrupt_fast_monitor(self, page, *, only_before_hold=False) -> dict[str, Any]:
+    def _interrupt_fast_monitor(self, page, *, only_before_hold=False, reason="") -> dict[str, Any]:
         """Decide and stop atomically in Chrome, not from an old Python phase."""
         try:
-            result = page.evaluate(r"""({id, onlyBeforeHold}) => {
+            result = page.evaluate(r"""({id, onlyBeforeHold, reason}) => {
               const s = window.__pengucroFastSeatMonitor;
               if (!s || s.attemptId !== id) return {terminalError: 'hold-uncertain'};
               if (s.hit) return {hit: s.hit, timing: s.timing};
               if (s.holdSent && onlyBeforeHold) return {};
               const terminalError = s.holdSent ? 'hold-uncertain' :
-                (onlyBeforeHold ? 'schedule-observer-blocked' : 'prehold-timeout');
+                (onlyBeforeHold ? (reason || 'schedule-observer-blocked') : 'prehold-timeout');
               s.terminalError = terminalError;
               s.stop();
               return {terminalError, timing: s.timing, holdSent: s.holdSent};
             }""", {"id": getattr(self, "_fast_monitor_attempt_id", ""),
-                    "onlyBeforeHold": only_before_hold})
+                    "onlyBeforeHold": only_before_hold, "reason": reason})
             return result if isinstance(result, dict) else {"terminalError": "hold-uncertain"}
         except Exception:
             return {"terminalError": "hold-uncertain"}
@@ -1793,7 +1800,8 @@ class CgvEngine(BaseEngine):
                 if failure_kind == "seat-conflict":
                     self._last_fast_monitor_exit_reason = "seat-conflict"
                     return False, False
-                if snapshot.get("terminalError") in {"prehold-timeout", "schedule-observer-blocked"}:
+                if snapshot.get("terminalError") in {"prehold-timeout", "schedule-observer-blocked",
+                                                     "candidate-timeout", "candidate-invalidated"}:
                     self._last_fast_monitor_exit_reason = snapshot["terminalError"]
                     self.log("[CGV] 선점 발송 전 대기 한도/회차 제한 확인 · 현재 시도 종료", "warning")
                     if snapshot["terminalError"] == "prehold-timeout" and conflict_limit == 0:

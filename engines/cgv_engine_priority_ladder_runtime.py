@@ -40,6 +40,16 @@ class CgvEngine(PriorityLadderCgvEngine):
             self._refresh_priority_schedule_payload(page)
         if self._priority_schedule_blocked:
             return self._interrupt_fast_monitor(page, only_before_hold=True)
+        if self._priority_claim_returns_on_conflict:
+            reason = ""
+            if not self._priority_candidate_is_current(self._priority_active_schedule):
+                reason = "candidate-invalidated"
+            elif self._priority_claim_deadline is not None and now >= self._priority_claim_deadline:
+                reason = "candidate-timeout"
+            if reason:
+                # A hold may have been sent since the last host snapshot. Only
+                # Chrome can atomically prove that moving on is still safe.
+                return self._interrupt_fast_monitor(page, only_before_hold=True, reason=reason)
         return {}
 
     def _refresh_priority_schedule_payload(self, page) -> None:

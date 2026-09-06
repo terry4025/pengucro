@@ -17,6 +17,15 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.83",
+        changes=(
+            "CGV 일부 회차만 공개될 때 희망 시간 후보가 누락되던 문제 수정",
+            "CGV 좌석 상태 공백·중복 정보의 예약 가능 판정 통일",
+            "CGV 선점 전 후보 대기 한도 적용으로 다음 시간 전환 보강",
+            "CGV 좌석 조회 중 변경·제한된 회차를 건너뛰도록 개선",
+        ),
+    ),
+    PatchNote(
         version="6.82",
         changes=(
             "CGV 감시 상태 읽기 실패 시 성공 응답 복구가 생략되던 문제 수정",

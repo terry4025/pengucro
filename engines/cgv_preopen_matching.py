@@ -138,8 +138,9 @@ def matching_schedule_candidates(
     Once a pre-open request has a ``movNo``, another published ``movNo`` can
     never be accepted merely because its display title is the same. Rows whose
     movie ID has not been published yet remain usable only through an exact
-    normalized-title match. Exact-ID rows take precedence over those temporary
-    title fallbacks whenever both are present.
+    normalized-title match. A published movie ID must not suppress a different
+    requested screening whose ID is still being published. Time ranking runs
+    on all validated candidates; schedule_items owns identity deduplication.
     """
 
     target_mov_no = str(mov_no or "").strip().casefold()
@@ -171,7 +172,7 @@ def matching_schedule_candidates(
         if not has_booking_identity(item):
             continue
         destination.append(item)
-    return exact_identity or title_fallbacks
+    return exact_identity + title_fallbacks
 
 
 def _time_minutes(value: Any) -> int | None:

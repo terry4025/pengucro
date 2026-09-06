@@ -319,10 +319,11 @@ def test_seat_preflight_uses_host_wave_deadline_and_cleanup(monkeypatch):
     assert isinstance(actions[-1], str)
 
 
-def test_v682_release_contract():
+def test_current_release_contract_preserves_v682_notes():
     from pathlib import Path
     from pengucro import __version__, __release_sequence__
     from pengucro.patch_notes import PATCH_NOTES
-    assert __version__ == '6.82' and __release_sequence__ == 6820001
+    assert __release_sequence__ >= 6820001
+    assert any(note.version == '6.82' for note in PATCH_NOTES)
     assert PATCH_NOTES[0].version == __version__
     assert f'방탈출펭크로{__version__}_yescaptcha' in (Path(__file__).resolve().parents[1]/'방탈출펭크로.spec').read_text()

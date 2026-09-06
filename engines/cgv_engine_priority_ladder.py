@@ -63,6 +63,7 @@ class CgvEngine(VisitorDomCgvEngine):
         self._priority_active_schedule: dict[str, Any] | None = None
         self._priority_active_groups: tuple[CgvSeatGroup, ...] = ()
         self._priority_claim_returns_on_conflict = False
+        self._priority_claim_deadline = None
         self._priority_page_schedule_key: tuple[str, ...] = ()
 
     @staticmethod
@@ -82,6 +83,11 @@ class CgvEngine(VisitorDomCgvEngine):
         if self._priority_claim_returns_on_conflict:
             return 1
         return super()._fast_monitor_conflict_limit()
+
+    def _priority_candidate_is_current(self, candidate):
+        return any(self._schedule_key(item) == self._schedule_key(candidate)
+                   and normalize_time(item.get("scnsrtTm")) == normalize_time(candidate.get("scnsrtTm"))
+                   for item in self._ordered_schedule_candidates(candidate))
 
     @staticmethod
     def _synthetic_engine_group(people: int) -> list[str]:
@@ -572,6 +578,13 @@ class CgvEngine(VisitorDomCgvEngine):
                         self._priority_active_groups = self._priority_manual_groups
                         return False, True
 
+                    # The observer can replace the schedule while the seat GET
+                    # is pending. Revalidate that cached publication before any
+                    # price/hold dispatch, without another network request.
+                    if not self._priority_candidate_is_current(candidate):
+                        self.log("[CGV] 좌석 조회 중 회차 변경·제한 확인 · 다음 희망 시간 탐색", "info")
+                        break
+
                     if group is None or payload is None:
                         self.silent_tick(
                             f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
@@ -614,6 +627,11 @@ class CgvEngine(VisitorDomCgvEngine):
                     self._seed_initial_payload(candidate, payload)
                     clean_cgv = dict(self._priority_original_cgv or cgv)
                     self._priority_claim_returns_on_conflict = True
+                    self._priority_claim_deadline = (
+                        candidate_started + self.PRIORITY_TIME_BUDGET_SECONDS
+                        if self._priority_rotation_mode == "fast"
+                        else time.monotonic() + self.FAST_HOLD_TRANSACTION_TIMEOUT_MS / 1000
+                    )
                     self._last_fast_monitor_exit_reason = ""
                     try:
                         held, use_fallback = super()._watch_and_hold_api(
@@ -626,12 +644,13 @@ class CgvEngine(VisitorDomCgvEngine):
                         )
                     finally:
                         self._priority_claim_returns_on_conflict = False
+                        self._priority_claim_deadline = None
 
                     self.log(candidate_timing_log, "info")
                     if held or use_fallback or self.stop_event.is_set():
                         return held, use_fallback
-                    if self._last_fast_monitor_exit_reason == "prehold-timeout":
-                        self.log("[CGV] 선점 발송 전 응답 대기 초과 · 다음 희망 시간 확인", "warning")
+                    if self._last_fast_monitor_exit_reason in {"prehold-timeout", "candidate-timeout", "candidate-invalidated"}:
+                        self.log("[CGV] 선점 발송 전 대기 한도 또는 회차 변경 · 다음 희망 시간 확인", "warning")
                         break
                     if self._last_fast_monitor_exit_reason != "seat-conflict":
                         return held, use_fallback
