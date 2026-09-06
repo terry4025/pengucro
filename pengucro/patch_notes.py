@@ -17,6 +17,17 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.80",
+        changes=(
+            "CGV 미오픈 감시에서 응답 시간만큼 중복되던 대기 단축",
+            "CGV 시간대 전환 직전 불필요한 좌석 재조회 제거",
+            "CGV 무관한 좌석 판매로 실패 후보를 반복하던 문제 수정",
+            "CGV 자동 추천 순위 재사용으로 매진 후 후보 탐색 개선",
+            "CGV 수동 좌석 우선·빠른 시간 순환 선택 및 남은 좌석 탐색 재개",
+            "CGV 브라우저에 남은 동일 선점 성공 응답 복구 및 단계별 속도 표시",
+        ),
+    ),
+    PatchNote(
         version="6.79",
         changes=(
             "CGV 미오픈 날짜와 상영일 공개 후 회차 감시 간격 단축",

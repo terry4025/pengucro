@@ -6,7 +6,7 @@ from typing import Any, Iterable
 from engines.cgv_client import (
     CgvSeat,
     CgvSeatGroup,
-    choose_recommended_seat_group,
+    rank_recommended_seat_groups,
     normalize_seat_name,
     normalize_time,
     parse_api_seats,
@@ -37,9 +37,14 @@ class CgvEngine(VisitorDomCgvEngine):
     PRIORITY_SCHEDULE_REFRESH_SECONDS = 2.5
     PRIORITY_AUTO_ATTEMPTS_PER_TIME = 3
     PRIORITY_READ_TIMEOUT_MS = 2000
+    PRIORITY_FAILURE_RETRY_SECONDS = 30.0
+    PRIORITY_TIME_BUDGET_SECONDS = 3.0
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._priority_rotation_mode = "strict"
+        self._priority_rank_cache = {}
+        self._priority_failures = {}
         self._priority_movie = ""
         self._priority_auditorium = ""
         self._priority_format = ""
@@ -114,6 +119,9 @@ class CgvEngine(VisitorDomCgvEngine):
         self._priority_auto_mode = auto_mode
         self._priority_auto_label = auto_label
         self._priority_original_cgv = dict(cgv)
+        self._priority_rotation_mode = "fast" if cgv.get("priority_rotation_mode") == "fast" else "strict"
+        self._priority_rank_cache.clear()
+        self._priority_failures.clear()
         self._priority_schedule_payload = {}
         self._priority_schedule_url = ""
         self._priority_last_schedule_refresh = 0.0
@@ -293,42 +301,54 @@ class CgvEngine(VisitorDomCgvEngine):
         mode = self._priority_auto_mode
         if not mode or not seats:
             return None
-        recommendations = recommend_cgv_seats(
-            seats,
-            site_no=str(schedule.get("siteNo", "") or ""),
-            auditorium=str(schedule.get("expoScnsNm") or schedule.get("scnsNm") or ""),
-            format_name=str(
-                schedule.get("movkndDsplEnm") or schedule.get("movkndDsplNm") or ""
-            ),
-        )
-        excluded_groups: list[tuple[str, ...]] = [
-            tuple(normalize_seat_name(label) for label in group)
-            for group in excluded
-        ]
-        available = {
-            normalize_seat_name(seat.label)
-            for seat in seats
-            if bool(seat.available)
-        }
-        # choose_recommended_seat_group intentionally allows sold seats so setup
-        # can save future priorities. Runtime resolution instead walks those
-        # ranked groups until it reaches one whose every seat is available now.
-        max_attempts = max(1, len(seats))
-        for _ in range(max_attempts):
-            group = choose_recommended_seat_group(
-                seats,
-                recommendations,
-                people,
-                mode=mode,
-                excluded=excluded_groups,
-            )
-            if not group:
-                return None
-            canonical = tuple(normalize_seat_name(label) for label in group)
-            if all(label in available for label in canonical):
-                return CgvSeatGroup(tuple(group))
-            excluded_groups.append(tuple(group))
+        # Cache geometry/rank only: a sale must not rebuild the seating layout.
+        layout = tuple((seat.label, seat.row, seat.number, seat.left_passage, seat.right_passage)
+                       for seat in seats)
+        site = str(schedule.get("siteNo", "") or "")
+        auditorium = str(schedule.get("expoScnsNm") or schedule.get("scnsNm") or "")
+        format_name = str(schedule.get("movkndDsplEnm") or schedule.get("movkndDsplNm") or "")
+        excluded_groups = {frozenset(normalize_seat_name(s) for s in group) for group in excluded}
+        available = {normalize_seat_name(seat.label) for seat in seats if seat.available}
+        for candidate_mode in ((mode, "best") if mode != "best" else (mode,)):
+            key = (site, auditorium, format_name, people, candidate_mode, layout)
+            ranked = self._priority_rank_cache.get(key)
+            if ranked is None:
+                recommendations = recommend_cgv_seats(
+                    seats, site_no=site, auditorium=auditorium, format_name=format_name)
+                ranked = rank_recommended_seat_groups(
+                    seats, recommendations, people, mode=candidate_mode, include_fallback=False)
+                if len(self._priority_rank_cache) >= 8:
+                    self._priority_rank_cache.pop(next(iter(self._priority_rank_cache)))
+                self._priority_rank_cache[key] = ranked
+            for group in ranked:
+                labels = frozenset(normalize_seat_name(label) for label in group)
+                if labels not in excluded_groups and labels <= available:
+                    return CgvSeatGroup(group)
         return None
+
+    def _priority_failed_groups(self, key, payload):
+        """Retry a failed group only after its own reopening or a bounded TTL."""
+        available = {normalize_seat_name(s.label) for s in parse_api_seats(payload) if s.available}
+        records = self._priority_failures.setdefault(key, {})
+        now = time.monotonic()
+        for labels, (failed_at, seen_unavailable) in list(records.items()):
+            group_available = set(labels) <= available
+            if now - failed_at >= self.PRIORITY_FAILURE_RETRY_SECONDS or (seen_unavailable and group_available):
+                del records[labels]
+            elif not group_available:
+                records[labels] = (failed_at, True)
+        return set(records)
+
+    def _priority_should_rotate(self, started, attempts, auto_attempts, excluded):
+        if self._priority_rotation_mode == "fast" and attempts:
+            if time.monotonic() - started >= self.PRIORITY_TIME_BUDGET_SECONDS:
+                return True
+        if auto_attempts < self.PRIORITY_AUTO_ATTEMPTS_PER_TIME:
+            return False
+        # Do not fetch the old screening simply to discover the auto quota is
+        # exhausted. Untried manual priorities must still get their turn.
+        return not any(tuple(normalize_seat_name(s) for s in group.seats) not in excluded
+                       for group in self._priority_manual_groups)
 
     def _choose_priority_group(
         self,
@@ -455,11 +475,8 @@ class CgvEngine(VisitorDomCgvEngine):
             )
 
         pass_no = 0
-        # Keep failed automatic combinations across sweeps. A fresh seat map
-        # that changes availability clears these exclusions for cancellation
-        # monitoring; cycling times must not restart the same losing shortlist.
-        auto_excluded: dict[tuple[str, ...], set[tuple[str, ...]]] = {}
-        availability_by_time: dict[tuple[str, ...], frozenset[str]] = {}
+        self._priority_failures.clear()
+        previous_conflict_at = None
         while not self.stop_event.is_set():
             self._refresh_priority_schedule_payload(page)
             candidates = self._ordered_schedule_candidates(schedule)
@@ -478,6 +495,9 @@ class CgvEngine(VisitorDomCgvEngine):
                 candidate_payload: dict[str, Any] | None = None
                 first_candidate_read = True
                 auto_attempts = 0
+                candidate_started = time.monotonic()
+                candidate_attempts = 0
+                selection_started = candidate_started
                 manual_labels = {tuple(normalize_seat_name(s) for s in g.seats)
                                  for g in self._priority_manual_groups}
 
@@ -492,11 +512,7 @@ class CgvEngine(VisitorDomCgvEngine):
                         first_candidate_read = False
                         candidate_payload = payload
                         if isinstance(payload, dict):
-                            available = frozenset(s.label for s in parse_api_seats(payload) if s.available)
-                            if availability_by_time.get(candidate_key) != available:
-                                auto_excluded[candidate_key] = set()
-                            availability_by_time[candidate_key] = available
-                            excluded_groups.update(auto_excluded.get(candidate_key, set()))
+                            excluded_groups.update(self._priority_failed_groups(candidate_key, payload))
                             if excluded_groups:
                                 group = self._choose_priority_group(payload, candidate, people,
                                                                     excluded=excluded_groups)
@@ -533,9 +549,6 @@ class CgvEngine(VisitorDomCgvEngine):
                         return False, True
 
                     if group is None or payload is None:
-                        # Exhausted automatic candidates may be reconsidered on
-                        # the next complete sweep, after later times got a turn.
-                        auto_excluded.pop(candidate_key, None)
                         self.silent_tick(
                             f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
                             "좌석 우선순위 일치 좌석 없음 · 다음 시간 확인"
@@ -549,8 +562,12 @@ class CgvEngine(VisitorDomCgvEngine):
                             f"[CGV] 시간 {index}순위 자동 추천 {auto_attempts}개 시도 완료 · "
                             "다음 희망 시간 확인 후 남은 추천 순서로 재개합니다.", "info")
                         break
+                    if self._priority_should_rotate(candidate_started, candidate_attempts, auto_attempts, excluded_groups):
+                        self.log(f"[CGV] 시간 {index}순위 탐색 시간 사용 · 다음 시간 확인 후 남은 좌석 재개", "info")
+                        break
                     if is_auto:
                         auto_attempts += 1
+                    candidate_attempts += 1
 
                     self._priority_active_schedule = candidate
                     self._priority_active_groups = (group,)
@@ -564,6 +581,12 @@ class CgvEngine(VisitorDomCgvEngine):
                     # seed for every candidate.  For a fallback screening this
                     # lets price/hold finish before the slower route and visitor
                     # UI transition; the UI is synchronized only after the hold.
+                    selected_at = time.monotonic()
+                    opened_at = getattr(self, "_cgv_open_detected_at", None)
+                    open_detail = f" · 회차 감지 후 {(selected_at-opened_at)*1000:.0f}ms" if opened_at is not None else ""
+                    switch_detail = f" · 직전 경합 후 {(selected_at-previous_conflict_at)*1000:.0f}ms" if previous_conflict_at is not None else ""
+                    candidate_timing_log = (f"[CGV 속도] 후보 확정 · {self._priority_time_label(candidate)} · "
+                                            f"조회·선택 {(selected_at-selection_started)*1000:.0f}ms{open_detail}{switch_detail}")
                     self._seed_initial_payload(candidate, payload)
                     clean_cgv = dict(self._priority_original_cgv or cgv)
                     self._priority_claim_returns_on_conflict = True
@@ -580,20 +603,26 @@ class CgvEngine(VisitorDomCgvEngine):
                     finally:
                         self._priority_claim_returns_on_conflict = False
 
+                    self.log(candidate_timing_log, "info")
                     if held or use_fallback or self.stop_event.is_set():
                         return held, use_fallback
                     if self._last_fast_monitor_exit_reason != "seat-conflict":
                         return held, use_fallback
 
                     excluded_groups.add(group_labels)
-                    if is_auto:
-                        auto_excluded.setdefault(candidate_key, set()).add(group_labels)
+                    previous_conflict_at = time.monotonic()
+                    if is_auto or self._priority_rotation_mode == "fast":
+                        self._priority_failures.setdefault(candidate_key, {})[group_labels] = (previous_conflict_at, False)
+                    if self._priority_should_rotate(candidate_started, candidate_attempts, auto_attempts, excluded_groups):
+                        self.log(f"[CGV] 시간 {index}순위 탐색 한도 · 추가 좌석 조회 없이 다음 희망 시간 확인", "info")
+                        break
                     self.silent_tick(
                         f"CGV 시간 {index}순위 {self._priority_time_label(candidate)} · "
                         f"{', '.join(group.seats)} 선점 경합 · 다음 좌석 우선순위 확인"
                     )
                     # A failed hold invalidates the preflight availability.
                     # Never seed another candidate from that same stale map.
+                    selection_started = time.monotonic()
                     refreshed = self._fetch_priority_seat_payload(page, candidate)
                     status = int(refreshed.get("status", 0) or 0)
                     candidate_payload = refreshed.get("data") if refreshed.get("ok") else None
@@ -611,6 +640,7 @@ class CgvEngine(VisitorDomCgvEngine):
                         self.log("[CGV] 경합 후 최신 좌석 API 오류 · 오래된 좌석표를 재사용하지 않습니다.",
                                  "warning")
                         return False, bool(self._priority_manual_groups)
+                    self._priority_failed_groups(candidate_key, candidate_payload)
 
             pass_no += 1
             order = " → ".join(

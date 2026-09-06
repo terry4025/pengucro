@@ -100,6 +100,7 @@ class ReservationForm(BaseReservationForm):
             # base form call and must not escape into reservation metadata.
             cgv["seats"] = ""
 
+        cgv["priority_rotation_mode"] = "fast" if selection.get("priority_rotation_mode") == "fast" else "strict"
         metadata["cgv"] = cgv
         request = replace(request, engine_metadata=metadata)
         return request, message, threads, is_async
