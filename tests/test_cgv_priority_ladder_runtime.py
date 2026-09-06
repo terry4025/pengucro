@@ -1,6 +1,7 @@
 from engines.cgv_client import CgvSeatGroup
 from engines.cgv_engine_movie_identity_runtime import (
     _PREOPEN_SELECTION_ACTIVE,
+    _PREOPEN_TIME_DRIFT,
     select_schedule,
 )
 from engines.cgv_engine_priority_ladder import CgvEngine as PriorityLadderCgvEngine
@@ -122,12 +123,14 @@ def test_final_registry_prioritizes_live_replacement_over_stale_primary():
     engine._priority_schedule_payload = {"data": [replacement]}
 
     token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    drift_token = _PREOPEN_TIME_DRIFT.set(15)
     try:
         candidates = engine._ordered_schedule_candidates(primary)
     finally:
+        _PREOPEN_TIME_DRIFT.reset(drift_token)
         _PREOPEN_SELECTION_ACTIVE.reset(token)
 
-    assert [item["scnSseq"] for item in candidates] == ["new", "old"]
+    assert [item["scnSseq"] for item in candidates] == ["new"]  # Removed publications cannot remain booking fallbacks.
 
 
 def test_final_registry_staged_unlock_drift_and_base_conflict_reach_next_time():
@@ -150,6 +153,7 @@ def test_final_registry_staged_unlock_drift_and_base_conflict_reach_next_time():
     }
 
     token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    drift_token = _PREOPEN_TIME_DRIFT.set(15)
     try:
         assert select_schedule({"data": []}, **selection) is None
         assert select_schedule({"data": [partial]}, **selection) is None
@@ -248,6 +252,7 @@ def test_final_registry_staged_unlock_drift_and_base_conflict_reach_next_time():
             {},
         )
     finally:
+        _PREOPEN_TIME_DRIFT.reset(drift_token)
         _PREOPEN_SELECTION_ACTIVE.reset(token)
 
     assert result == (True, False)
@@ -269,6 +274,7 @@ def test_final_registry_retries_groups_then_next_time_after_hold_conflicts(
     first_group = CgvSeatGroup(("C8", "C9"))
     second_group = CgvSeatGroup(("B8", "B9"))
     payload = _seat_payload("C8", "C9", "B8", "B9")
+    engine._fetch_priority_seat_payload = lambda *_args: {"ok": True, "status": 200, "data": payload}
     _configure_priority_ladder(
         engine,
         (first, second),

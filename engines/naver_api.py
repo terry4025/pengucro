@@ -959,17 +959,18 @@ class NaverServerClock:
         round_trip, response_end, server_epoch = min(samples, key=lambda row: row[0])
         self._anchor_server = server_epoch
         self._anchor_monotonic = response_end
-        # The server timestamp is produced close to response completion.  Keep a
-        # conservative upper bound for logging instead of reintroducing the old
-        # midpoint bias into the anchor itself.
-        self.last_precision = min(round_trip / 2, 0.025)
+        # RTT and sample disagreement are estimates, not a measured arrival
+        # error. Never cap a slow/noisy clock at an artificial 25 ms precision.
+        mappings = [server - end for _rtt, end, server in samples]
+        spread = max(mappings) - min(mappings)
+        self.last_precision = max(round_trip / 2, spread / 2)
         self.last_offset = self._anchor_server - (
             time.time() - (time.monotonic() - response_end)
         )
         if announce and self.log:
             self.log(
                 f"서버 시간 동기화 완료 · 로컬 시계와 차이 {self.last_offset:+.2f}초 · "
-                f"정밀도 약 {self.last_precision * 1000:.0f}ms",
+                f"표본 기준 불확실성 약 {self.last_precision * 1000:.0f}ms",
                 "success",
             )
             if abs(self.last_offset) > 5:

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from engines.cgv_preopen_matching import normalize_preopen_time_drift
+
+import customtkinter as ctk
+
 import ui.theme as theme
 from ui.cgv_booking_dialog_controls import CgvBookingDialog as ControlsCgvBookingDialog
 
@@ -23,6 +27,29 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
         ).strip()
         super().__init__(*args, **kwargs)
         self._refresh_preopen_auto_controls()
+        self.priority_rotation_mode = "fast" if initial.get("priority_rotation_mode") == "fast" else "strict"
+        labels = {"수동 좌석 우선": "strict", "빠른 시간 순환 · 약 3초": "fast"}
+        self.priority_rotation_menu = ctk.CTkOptionMenu(
+            self.auto_seat_menu.master, values=list(labels),
+            command=lambda value: setattr(self, "priority_rotation_mode", labels[value]),
+            fg_color=theme.ELEVATED_COLOR, text_color=theme.TEXT_PRIMARY,
+            height=theme.H_CONTROL,
+        )
+        self.priority_rotation_menu.set(next(label for label, mode in labels.items()
+                                            if mode == self.priority_rotation_mode))
+        self.priority_rotation_menu.pack(fill="x", padx=theme.SPACE_3,
+                                         pady=(0, theme.SPACE_1), after=self.auto_seat_menu)
+        self.preopen_time_drift_minutes = normalize_preopen_time_drift(initial.get("preopen_time_drift_minutes"))
+        time_labels = {"희망 시간 정확히 일치": 0, **{
+            f"미오픈 시간 변경 ±{minutes}분 허용": minutes for minutes in (15, 30, 60, 90)}}
+        self.preopen_time_drift_menu = ctk.CTkOptionMenu(
+            self.auto_seat_menu.master, values=list(time_labels),
+            command=lambda value: setattr(self, "preopen_time_drift_minutes", time_labels[value]),
+            fg_color=theme.ELEVATED_COLOR, text_color=theme.TEXT_PRIMARY, height=theme.H_CONTROL)
+        self.preopen_time_drift_menu.set(next(label for label, minutes in time_labels.items()
+                                             if minutes == self.preopen_time_drift_minutes))
+        self.preopen_time_drift_menu.pack(fill="x", padx=theme.SPACE_3,
+                                          pady=(0, theme.SPACE_1), after=self.priority_rotation_menu)
 
     def _clear_auto_preference(self) -> None:
         self.auto_seat_preference = ""
@@ -297,6 +324,8 @@ class CgvBookingDialog(ControlsCgvBookingDialog):
             "scns_no": "" if is_preopen else str((self.selected_schedule or {}).get("scnsNo", "")),
             "seats": " | ".join(",".join(group) for group in self.priority_groups),
             "seat_groups": [list(group) for group in self.priority_groups],
+            "priority_rotation_mode": getattr(self, "priority_rotation_mode", "strict"),
+            "preopen_time_drift_minutes": getattr(self, "preopen_time_drift_minutes", 0),
             "auto_seat_mode": self.auto_seat_preference,
             "auto_seat_label": self.auto_seat_preference_label,
         }

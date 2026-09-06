@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 import engines.cgv_engine as base_engine_module
 import engines.cgv_engine_priority_ladder as ladder_module
 from engines.cgv_engine_movie_identity_runtime import (
     CgvEngine,
     _PREOPEN_MOV_NO,
     _PREOPEN_SELECTION_ACTIVE,
+    _PREOPEN_TIME_DRIFT,
     select_schedule,
 )
 from engines.cgv_engine_priority_ladder_runtime import CgvEngine as PriorityRuntimeCgvEngine
@@ -65,7 +68,16 @@ def test_open_date_keeps_exact_time_semantics():
     assert chosen is None
 
 
-def test_preopen_reference_time_maps_to_nearby_real_time():
+@pytest.fixture
+def allow_time_drift():
+    token = _PREOPEN_TIME_DRIFT.set(15)
+    try:
+        yield
+    finally:
+        _PREOPEN_TIME_DRIFT.reset(token)
+
+
+def test_preopen_reference_time_maps_to_nearby_real_time(allow_time_drift):
     payload = _payload(_schedule("1350"), _schedule("1730", seq="2"))
     token = _PREOPEN_SELECTION_ACTIVE.set(True)
     try:
@@ -82,7 +94,7 @@ def test_preopen_reference_time_maps_to_nearby_real_time():
     assert chosen["scnsrtTm"] == "1350"
 
 
-def test_preopen_saved_mov_no_wins_over_same_title_row():
+def test_preopen_saved_mov_no_wins_over_same_title_row(allow_time_drift):
     wrong_same_title = _schedule("1400", seq="1", mov_no="wrong-movie")
     expected = _schedule("1410", seq="2", mov_no="target-movie")
     active_token = _PREOPEN_SELECTION_ACTIVE.set(True)
@@ -102,7 +114,7 @@ def test_preopen_saved_mov_no_wins_over_same_title_row():
     assert chosen == expected
 
 
-def test_preopen_saved_mov_no_uses_exact_title_only_for_unpublished_row_id():
+def test_preopen_saved_mov_no_uses_exact_title_only_for_unpublished_row_id(allow_time_drift):
     wrong_known_id = _schedule("1400", seq="1", mov_no="wrong-movie")
     ambiguous_unpublished = _schedule(
         "1405",

@@ -272,5 +272,5 @@ def test_hint_state_keeps_half_second_burst_without_using_four_connections():
 
 def test_quiet_long_watch_interval_is_not_subsecond():
     engine = _engine()
-    assert 2.0 <= engine.PREOPEN_IDLE_INTERVAL <= 3.0
+    assert engine.PREOPEN_IDLE_INTERVAL == 1.0
     assert engine.SCHEDULE_REQUEST_TIMEOUT_MS == 6000

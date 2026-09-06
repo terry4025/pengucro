@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -19,7 +20,6 @@ from typing import Any, Mapping
 
 from engines.naver_api import (
     ACCOUNT_QUERY,
-    BIZ_ITEM_QUERY,
     KST,
     SUBMIT_BOOKING_MUTATION,
     SUBMIT_NOT_OPEN_CODES,
@@ -746,7 +746,6 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         query: request.query,
         variables: {input},
     });
-    const delayMs = Math.max(0, Number(request.delayMs) || 0);
     const timeoutMs = Math.max(100, Number(request.timeoutMs) || 3000);
     const maxAttempts = Math.max(1, Math.min(3, Number(request.maxAttempts) || 1));
     const retryDelayMs = Math.max(0, Number(request.retryDelayMs) || 0);
@@ -756,81 +755,23 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     const notOpenCodes = new Set(
         (request.notOpenCodes || []).map(value => String(value || "")));
 
-    // Read Naver's clock over the same warmed browser connection that will send
-    // the mutation. currentDateTime is emitted near response completion, so it
-    // maps directly onto performance.now() without a Python/CDP clock hand-off.
-    let serverOpenAt = 0;
-    let clockRttMs = 0;
-    let clockSampleCount = 0;
-    let clockUncertaintyMs = 0;
-    let clockSpreadMs = 0;
-    let estimatedOutboundMs = 0;
-    const requestedOpenEpochMs = Number(request.openAtEpochMs) || 0;
-    const clockSamples = Math.max(0, Math.min(5, Number(request.clockSamples) || 0));
-    if (requestedOpenEpochMs > 0 && clockSamples > 0 && request.clockQuery) {
-        const samples = [];
-        for (let index = 0; index < clockSamples; index += 1) {
-            const clockStartedAt = performance.now();
-            try {
-                const clockResponse = await fetch("/graphql?opName=bizItem", {
-                    method: "POST",
-                    credentials: "include",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({
-                        operationName: "bizItem",
-                        query: request.clockQuery,
-                        variables: request.clockVariables || {},
-                    }),
-                });
-                let clockBody = null;
-                try { clockBody = await clockResponse.json(); } catch (_) {}
-                const clockEndedAt = performance.now();
-                const currentDateTime = clockBody && clockBody.data &&
-                    clockBody.data.bizItem && clockBody.data.bizItem.currentDateTime;
-                const serverEpochMs = Date.parse(String(currentDateTime || ""));
-                if (Number.isFinite(serverEpochMs)) {
-                    samples.push({
-                        rtt: clockEndedAt - clockStartedAt,
-                        startedAt: clockStartedAt,
-                        endedAt: clockEndedAt,
-                        serverEpochMs,
-                    });
-                }
-            } catch (_) {}
-        }
-        if (samples.length) {
-            samples.sort((left, right) => left.rtt - right.rtt);
-            const best = samples[0];
-            // Live measurements show currentDateTime advances near response
-            // completion, not the request midpoint. Preserve that anchor (the
-            // Python server clock uses the same rule), then subtract estimated
-            // outbound transit separately so the configured target describes
-            // server arrival rather than browser dispatch.
-            const selected = samples.slice(0, Math.min(3, samples.length));
-            const openEstimates = selected.map(sample =>
-                sample.endedAt + (requestedOpenEpochMs - sample.serverEpochMs));
-            openEstimates.sort((left, right) => left - right);
-            serverOpenAt = openEstimates[Math.floor(openEstimates.length / 2)];
-            clockRttMs = best.rtt;
-            clockSampleCount = samples.length;
-            estimatedOutboundMs = best.rtt / 2;
-            clockSpreadMs = openEstimates.length > 1
-                ? openEstimates[openEstimates.length - 1] - openEstimates[0]
-                : 0;
-            clockUncertaintyMs = Math.max(best.rtt / 2, clockSpreadMs / 2);
-        }
+    // The synchronized Naver clock is the sole opening-time authority. Only
+    // transfer its monotonic deadline to Chrome; do not replace it with a new
+    // batch of independent server samples just before submission.
+    if (Number(request.clockOrigin) !== performance.timeOrigin) {
+        return {error: "clock-context-changed"};
     }
-
+    const serverOpenAt = Number(request.serverOpenAtPerfMs) || 0;
+    const clockRttMs = 0;
+    const clockSampleCount = 0;
+    const clockBridgeRttMs = Number(request.clockBridgeRttMs) || 0;
+    const clockUncertaintyMs = Number(request.clockUncertaintyMs) || 0;
+    const clockSpreadMs = 0;
+    const estimatedOutboundMs = retryLeadMs;
     const armedAt = performance.now();
-    const targetArrivalBeforeOpenMs = Math.max(
-        -20, Math.min(120, Number(request.targetArrivalBeforeOpenMs) || 0));
-    const fallbackLeadMs = Math.max(0, Number(request.leadMs) || 0);
-    const appliedLeadMs = serverOpenAt > 0
-        ? Math.max(0, estimatedOutboundMs + targetArrivalBeforeOpenMs)
-        : fallbackLeadMs;
-    const dueAt = serverOpenAt > 0
-        ? Math.max(armedAt, serverOpenAt - appliedLeadMs)
-        : armedAt + delayMs;
+    const targetArrivalBeforeOpenMs = Number(request.targetArrivalBeforeOpenMs) || 0;
+    const appliedLeadMs = Math.max(0, Number(request.leadMs) || 0);
+    const dueAt = Math.max(armedAt, Number(request.dueAtPerfMs) || armedAt);
     const state = {
         id: String(request.armId || ""),
         status: "armed",
@@ -838,6 +779,7 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         dueAt,
         serverOpenAt,
         clockRttMs,
+        clockBridgeRttMs,
         clockSampleCount,
         clockUncertaintyMs,
         clockSpreadMs,
@@ -944,6 +886,7 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         dueAt: state.dueAt,
         serverOpenAt: state.serverOpenAt,
         clockRttMs: state.clockRttMs,
+        clockBridgeRttMs: state.clockBridgeRttMs,
         clockSampleCount: state.clockSampleCount,
         clockUncertaintyMs: state.clockUncertaintyMs,
         clockSpreadMs: state.clockSpreadMs,
@@ -965,6 +908,7 @@ BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
         dueAt: Number(state.dueAt) || 0,
         serverOpenAt: Number(state.serverOpenAt) || 0,
         clockRttMs: Number(state.clockRttMs) || 0,
+        clockBridgeRttMs: Number(state.clockBridgeRttMs) || 0,
         clockSampleCount: Number(state.clockSampleCount) || 0,
         clockUncertaintyMs: Number(state.clockUncertaintyMs) || 0,
         clockSpreadMs: Number(state.clockSpreadMs) || 0,
@@ -1099,6 +1043,10 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
     if status >= 400:
         return SubmitResult(SubmitOutcome.ERROR, message=f"HTTP {status}")
     return SubmitResult(SubmitOutcome.ERROR, message="예약번호가 비어 있습니다")
+
+
+class NaverArmUncertainError(RuntimeError):
+    """Chrome may own a live mutation; a second submit is unsafe."""
 
 
 class NaverBrowserSubmitter:
@@ -1275,6 +1223,30 @@ class NaverBrowserSubmitter:
             url=result.url,
         )
 
+    async def _browser_clock_bridge(self) -> tuple[float, float, float]:
+        """Map Python monotonic milliseconds to this page's performance clock.
+
+        These are local CDP reads, not server requests. The opening deadline was
+        already derived from Naver currentDateTime by NaverServerClock.
+        """
+        samples = []
+        for _ in range(3):
+            before = time.monotonic() * 1000
+            stamp = await asyncio.wait_for(self.page.evaluate(
+                "() => ({now: performance.now(), origin: performance.timeOrigin})"
+            ), timeout=0.25)
+            after = time.monotonic() * 1000
+            if not isinstance(stamp, dict):
+                raise RuntimeError("Chrome 시계 응답 오류")
+            now, origin = float(stamp["now"]), float(stamp["origin"])
+            if not all(math.isfinite(v) for v in (now, origin)):
+                raise RuntimeError("Chrome 시계 값 오류")
+            samples.append((after - before, now - (before + after) / 2, origin))
+        if len({row[2] for row in samples}) != 1:
+            raise RuntimeError("Chrome 페이지가 시계 전송 중 이동했습니다")
+        rtt, offset, origin = min(samples)
+        return offset, rtt, origin
+
     async def _arm_submit(
         self,
         payload: dict[str, Any],
@@ -1284,10 +1256,20 @@ class NaverBrowserSubmitter:
         lead_seconds: float = 0.0,
         retry_lead_seconds: float = 0.0,
         target_arrival_before_open_seconds: float = 0.0,
+        open_at_monotonic: float | None = None,
+        clock_precision_seconds: float = 0.0,
     ) -> str:
         arm_id = f"naver-{time.monotonic_ns()}"
-        business_id = str(payload.get("businessId") or "")
-        biz_item_id = str(payload.get("bizItemId") or "")
+        # Capture before any awaits: preparing the bridge must not push the
+        # relative fallback or the server deadline later.
+        started = time.monotonic()
+        open_deadline = (
+            float(open_at_monotonic) if open_at_monotonic is not None
+            else started + max(0.0, delay_seconds) + max(0.0, lead_seconds)
+        )
+        due_deadline = open_deadline - max(0.0, lead_seconds)
+        offset_ms, bridge_rtt_ms, origin = await self._browser_clock_bridge()
+        self.last_armed_timing = {}
         try:
             response = await asyncio.wait_for(
                 self.page.evaluate(
@@ -1305,15 +1287,11 @@ class NaverBrowserSubmitter:
                         "targetArrivalBeforeOpenMs": round(
                             float(target_arrival_before_open_seconds) * 1000
                         ),
-                        "clockSamples": 5 if open_at_epoch and business_id and biz_item_id else 0,
-                        "clockQuery": BIZ_ITEM_QUERY,
-                        "clockVariables": {
-                            "input": {
-                                "businessId": business_id,
-                                "bizItemId": biz_item_id,
-                                "lang": "ko",
-                            }
-                        },
+                        "clockOrigin": origin,
+                        "serverOpenAtPerfMs": open_deadline * 1000 + offset_ms if open_at_epoch else 0,
+                        "dueAtPerfMs": due_deadline * 1000 + offset_ms,
+                        "clockBridgeRttMs": bridge_rtt_ms,
+                        "clockUncertaintyMs": max(0.0, clock_precision_seconds) * 1000 + bridge_rtt_ms / 2,
                         "timeoutMs": round(self.timeout_seconds * 1000),
                         "maxAttempts": 3,
                         "retryDelayMs": 10,
@@ -1324,14 +1302,21 @@ class NaverBrowserSubmitter:
                 timeout=1.5,
             )
         except Exception as exc:
-            raise RuntimeError("브라우저 내부 예약 타이머를 준비하지 못했습니다") from exc
+            # A lost evaluate reply is not evidence that Chrome failed to arm.
+            # Fall back only after positively cancelling this exact timer.
+            if await self.cancel_armed_submit(arm_id):
+                raise RuntimeError("브라우저 예약 타이머 취소 확인") from exc
+            raise NaverArmUncertainError("브라우저 예약 타이머 상태 불명확") from exc
+        if isinstance(response, dict) and response.get("error") == "clock-context-changed":
+            raise RuntimeError("Chrome 페이지 변경으로 타이머 설치하지 않음")
         if not isinstance(response, dict) or response.get("id") != arm_id:
-            raise RuntimeError("브라우저 내부 예약 타이머 응답이 올바르지 않습니다")
+            raise NaverArmUncertainError("브라우저 내부 예약 타이머 응답 불명확")
         for key in (
             "armedAt",
             "dueAt",
             "serverOpenAt",
             "clockRttMs",
+            "clockBridgeRttMs",
             "clockSampleCount",
             "clockUncertaintyMs",
             "clockSpreadMs",
@@ -1358,8 +1343,10 @@ class NaverBrowserSubmitter:
         lead_seconds: float,
         retry_lead_seconds: float,
         target_arrival_before_open_seconds: float = 0.0,
+        open_at_monotonic: float | None = None,
+        clock_precision_seconds: float = 0.0,
     ) -> str:
-        """Arm in Chrome's clock domain after same-origin Naver clock samples."""
+        """Transfer the synchronized Naver deadline into Chrome's clock domain."""
         return await self._arm_submit(
             payload,
             delay_seconds,
@@ -1367,6 +1354,8 @@ class NaverBrowserSubmitter:
             lead_seconds=lead_seconds,
             retry_lead_seconds=retry_lead_seconds,
             target_arrival_before_open_seconds=target_arrival_before_open_seconds,
+            open_at_monotonic=open_at_monotonic,
+            clock_precision_seconds=clock_precision_seconds,
         )
 
     async def read_armed_submit(self, arm_id: str, payload: Mapping[str, Any]) -> tuple[str, SubmitResult | None, float | None]:
@@ -1392,6 +1381,7 @@ class NaverBrowserSubmitter:
             "dueAt",
             "serverOpenAt",
             "clockRttMs",
+            "clockBridgeRttMs",
             "clockSampleCount",
             "clockUncertaintyMs",
             "clockSpreadMs",
@@ -1462,8 +1452,8 @@ class NaverBrowserSubmitter:
 
     async def cancel_armed_submit(self, arm_id: str) -> bool:
         try:
-            return bool(await self.page.evaluate(
+            return (await asyncio.wait_for(self.page.evaluate(
                 BROWSER_CANCEL_ARMED_SUBMIT_SCRIPT, {"armId": arm_id}
-            ))
+            ), timeout=0.5)) is True
         except Exception:
             return False
