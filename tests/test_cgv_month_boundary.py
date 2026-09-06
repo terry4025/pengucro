@@ -6,6 +6,7 @@ from engines.cgv_browser_client import CgvBrowserClient
 from engines.cgv_engine_movie_identity_runtime import (
     _PREOPEN_MOV_NO,
     _PREOPEN_SELECTION_ACTIVE,
+    _PREOPEN_TIME_DRIFT,
     select_schedule,
 )
 from engines.cgv_engine_preopen_live_runtime import CgvEngine
@@ -173,6 +174,7 @@ def test_preferred_schedule_selection_preserves_new_period_date(target_date):
     earlier = _schedule(target_date, "1350", seq="1")
     later = _schedule(target_date, "1730", seq="2")
     active_token = _PREOPEN_SELECTION_ACTIVE.set(True)
+    drift_token = _PREOPEN_TIME_DRIFT.set(15)
     movie_token = _PREOPEN_MOV_NO.set("30001323")
     try:
         chosen = select_schedule(
@@ -184,6 +186,7 @@ def test_preferred_schedule_selection_preserves_new_period_date(target_date):
         )
     finally:
         _PREOPEN_MOV_NO.reset(movie_token)
+        _PREOPEN_TIME_DRIFT.reset(drift_token)
         _PREOPEN_SELECTION_ACTIVE.reset(active_token)
 
     assert chosen is not None

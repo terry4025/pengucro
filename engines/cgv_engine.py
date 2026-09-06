@@ -98,6 +98,7 @@ class CgvEngine(BaseEngine):
         self._initial_seat_response: dict[str, Any] | None = None
         self._last_fast_retry_after_seconds = 0.0
         self._developer_hold_cleanup: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self._confirmed_hold_for_recovery = None
         self._api_hold_ui_schedule_key: tuple[str, ...] = ()
 
     def start_reservation(
@@ -1798,41 +1799,58 @@ class CgvEngine(BaseEngine):
                 f"· {transaction_ms:.0f}ms",
                 "success",
             )
-            if not self._prepare_api_hold_ui(page, schedule, people):
-                self._cancel_api_hold(page, hold_payload, hold_response)
-                self._last_fast_monitor_exit_reason = "held-schedule-ui-failed"
-                self.log(
-                    "CGV 확보 회차 화면 전환에 실패해 임시선점을 해제하고 안전 경로로 전환합니다.",
-                    "warning",
-                )
-                return False, True
-            if not self._sync_held_seats_for_checkout(page, seat_payload, selected):
-                self._cancel_api_hold(page, hold_payload, hold_response)
-                self._last_fast_monitor_exit_reason = "ui-sync-failed"
-                self.log(
-                    "CGV 화면 동기화 복구 한도를 모두 사용해 확보 좌석을 해제하고 "
-                    "안전 경로로 전환합니다.",
-                    "warning",
-                )
-                return False, True
+            return self._connect_confirmed_hold(
+                page, schedule, people, seat_payload, selected,
+                price_response, hold_response, hold_payload, developer_mode)
+        return False, False
 
-            self._install_cached_hold_responses(page, price_response, hold_response)
-            if self._submit_seat_selection(page):
+    def _connect_confirmed_hold(self, page, schedule, people, seat_payload, selected,
+                                price_response, hold_response, hold_payload, developer_mode):
+        """Keep the won hold across UI failures; never launch a replacement hold."""
+        cleanup = (dict(hold_payload), dict(hold_response))
+        self._confirmed_hold_for_recovery = cleanup
+        if developer_mode:
+            self._developer_hold_cleanup = cleanup
+        reason = "held-schedule-ui-failed"
+        try:
+            prepared = False
+            for attempt in range(2):
+                if self.stop_event.is_set():
+                    break
+                try:
+                    prepared = self._prepare_api_hold_ui(page, schedule, people)
+                except Exception:
+                    prepared = False
+                if prepared:
+                    break
+                if attempt == 0:
+                    self.log("[CGV] 확보 좌석 유지 · 같은 회차 화면 연결 1회 재시도", "warning")
+            if prepared:
+                reason = "ui-sync-failed"
+                # This method already has bounded seat/UI recovery attempts.
+                if self._sync_held_seats_for_checkout(page, seat_payload, selected):
+                    reason = "checkout-transition-failed"
+                    self._install_cached_hold_responses(page, price_response, hold_response)
+                    # Never blindly repeat a click which may have reached checkout.
+                    if self._submit_seat_selection(page):
+                        self._confirmed_hold_for_recovery = None
+                        return True, False
+        except Exception:
+            # A UI exception cannot undo the previously verified server hold.
+            pass
+        finally:
+            try:
                 self._restore_fetch(page)
-                if developer_mode:
-                    self._developer_hold_cleanup = (
-                        dict(hold_payload),
-                        dict(hold_response),
-                    )
-                return True, False
-            self._restore_fetch(page)
-            self._cancel_api_hold(page, hold_payload, hold_response)
-            self._last_fast_monitor_exit_reason = "checkout-transition-failed"
-            self.log(
-                "CGV 결제 화면 연결이 확인되지 않아 임시선점을 취소하고 브라우저 안전 경로로 전환합니다.",
-                "warning",
-            )
-            return False, True
+            except Exception:
+                pass
+        self._last_fast_monitor_exit_reason = reason
+        if developer_mode:
+            if self._release_developer_api_hold(page):
+                self._confirmed_hold_for_recovery = None
+        else:
+            self.log("[CGV] 임시선점 성공·화면 연결 미확인 · 확보 좌석을 자동 취소하지 않고 "
+                     "추가 선점을 중단합니다. 만료 전에 열린 CGV 화면/예매내역을 확인하세요. "
+                     "결제 완료 상태는 아닙니다.", "warning")
         return False, False
 
     @staticmethod
@@ -3549,6 +3567,7 @@ class CgvEngine(BaseEngine):
         cgv = metadata.get("cgv", {}) if isinstance(metadata, dict) else {}
         self._developer_hold_cleanup = None
         site_no = str(reservation_data.get("branch", "")).strip()
+        self._confirmed_hold_for_recovery = None
         movie = str(cgv.get("movie") or reservation_data.get("themePK", "")).strip()
         auditorium = str(cgv.get("auditorium", "")).strip()
         format_name = str(cgv.get("format", "")).strip()

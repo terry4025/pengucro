@@ -17,6 +17,16 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.81",
+        changes=(
+            "CGV 좌석 탐색 중 나중에 공개된 희망 회차를 같은 순환에 반영",
+            "CGV 미오픈 회차의 잔여석 집계가 늦어도 실제 좌석 확인",
+            "CGV 화면 연결 실패 시 확보 좌석 유지 및 중복 선점 방지",
+            "CGV 미오픈 시간 변경 허용 범위 선택 및 기본 정확한 시간 일치",
+            "CGV 첫 회차 조회의 타이머 대기 제거 및 응답 대기 제한 보강",
+        ),
+    ),
+    PatchNote(
         version="6.80",
         changes=(
             "CGV 미오픈 감시에서 응답 시간만큼 중복되던 대기 단축",

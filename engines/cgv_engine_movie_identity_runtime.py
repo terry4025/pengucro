@@ -17,6 +17,7 @@ from engines.cgv_preopen_matching import (
     context_matches as _resilient_context_matches,
     has_booking_identity,
     matching_schedule_candidates,
+    normalize_preopen_time_drift,
     rank_preopen_schedules,
     select_preopen_schedule,
 )
@@ -30,6 +31,8 @@ _PREOPEN_MOV_NO: ContextVar[str] = ContextVar(
     "pengucro_cgv_preopen_mov_no",
     default="",
 )
+_PREOPEN_TIME_DRIFT: ContextVar[int] = ContextVar("pengucro_cgv_time_drift", default=0)
+_PREOPEN_ZERO_PROBE: ContextVar[bool] = ContextVar("pengucro_cgv_zero_probe", default=False)
 
 
 def _compact(value: Any) -> str:
@@ -87,7 +90,8 @@ def select_schedule(
     bookings are different: their displayed times came from a reference date,
     so those values are priorities rather than immutable screening IDs.  During
     the pre-open -> real transition we therefore map each saved time to the
-    nearest real matching screening, while still requiring the same movie and
+    nearest real matching screening inside the explicitly allowed window
+    (exact-time by default), while still requiring the same movie and
     premium-format family and still rejecting ``cntlYn=Y`` controlled rows.
     """
 
@@ -105,6 +109,8 @@ def select_schedule(
             auditorium=auditorium,
             preferred_times=preferred_values,
             format_name=format_name,
+            drift_window_minutes=_PREOPEN_TIME_DRIFT.get(),
+            include_zero_inventory=_PREOPEN_ZERO_PROBE.get(),
         )
 
     legacy = _legacy_select_schedule(
@@ -195,16 +201,23 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
             else ""
         )
         mov_no_token = _PREOPEN_MOV_NO.set(mov_no)
+        drift = normalize_preopen_time_drift(cgv.get("preopen_time_drift_minutes")) if isinstance(cgv, Mapping) else 0
+        drift_token = _PREOPEN_TIME_DRIFT.set(drift)
+        zero_token = _PREOPEN_ZERO_PROBE.set(preopen)
+        self._priority_preopen_monitor = preopen
         self._preopen_diag_signature = None
         try:
             if preopen:
                 self.log(
-                    "[CGV] 미오픈 복원 모드 · 참고 날짜의 시간은 우선순위로 사용하고 "
-                    "실제 공개 회차에 자동 매핑합니다.",
+                    f"[CGV] 미오픈 복원 모드 · 시간 변경 {'±' + str(drift) + '분 허용' if drift else '불허 (정확히 일치)'} · "
+                    "잔여석 집계가 0이어도 실제 좌석을 제한 조회합니다.",
                     "info",
                 )
             return super().make_reservation_thread(reservation_data)
         finally:
+            _PREOPEN_ZERO_PROBE.reset(zero_token)
+            _PREOPEN_TIME_DRIFT.reset(drift_token)
+            self._priority_preopen_monitor = False
             _PREOPEN_MOV_NO.reset(mov_no_token)
             _PREOPEN_SELECTION_ACTIVE.reset(token)
 
@@ -300,7 +313,9 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
         if not selectable:
             return
 
-        ranked = rank_preopen_schedules(selectable, preferred)
+        ranked = rank_preopen_schedules(selectable, preferred,
+                                       drift_window_minutes=_PREOPEN_TIME_DRIFT.get(),
+                                       include_zero_inventory=_PREOPEN_ZERO_PROBE.get())
         if not ranked:
             return
         chosen = ranked[0]
@@ -333,13 +348,12 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
     def _ordered_schedule_candidates(
         self, primary: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        ordered = list(super()._ordered_schedule_candidates(primary))
         if not _PREOPEN_SELECTION_ACTIVE.get():
-            return ordered
+            return list(super()._ordered_schedule_candidates(primary))
 
         payload = getattr(self, "_priority_schedule_payload", {}) or {}
         if not isinstance(payload, Mapping) or not payload:
-            return ordered
+            return list(super()._ordered_schedule_candidates(primary))
         candidates = matching_schedule_candidates(
             payload,
             movie=str(getattr(self, "_priority_movie", "") or ""),
@@ -350,11 +364,10 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
         ranked = rank_preopen_schedules(
             candidates,
             list(getattr(self, "_priority_preferred_times", ()) or ()),
+            drift_window_minutes=_PREOPEN_TIME_DRIFT.get(),
+            include_zero_inventory=_PREOPEN_ZERO_PROBE.get(),
         )
-        seen = {self._schedule_key(item) for item in ordered}
-        for item in ranked:
-            key = self._schedule_key(item)
-            if key not in seen:
-                ordered.append(item)
-                seen.add(key)
-        return ordered or [primary]
+        # A fresh publication is authoritative: do not retain a vanished or
+        # newly controlled primary row as a synthetic fallback.
+        return [item for item in ranked if all(str(item.get(k, "")) == str(primary.get(k, ""))
+                                               for k in ("siteNo", "scnYmd"))]

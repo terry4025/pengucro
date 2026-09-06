@@ -469,7 +469,8 @@ class CgvEngine(VisitorDomCgvEngine):
 
         # A single explicit time with only manual groups already has exactly the
         # desired semantics in the mature monitor. Avoid any extra preflight.
-        if len(self._priority_preferred_times) <= 1 and not self._priority_auto_mode:
+        if (len(self._priority_preferred_times) <= 1 and not self._priority_auto_mode
+                and not getattr(self, "_priority_preopen_monitor", False)):
             return super()._watch_and_hold_api(
                 page, schedule, groups, people, developer_mode, cgv
             )
@@ -479,12 +480,19 @@ class CgvEngine(VisitorDomCgvEngine):
         previous_conflict_at = None
         while not self.stop_event.is_set():
             self._refresh_priority_schedule_payload(page)
+            if getattr(self, "_priority_schedule_blocked", False):
+                return False, False
             candidates = self._ordered_schedule_candidates(schedule)
             if not candidates:
                 self.stop_event.wait(self.PRIORITY_SEAT_REQUEST_INTERVAL_SECONDS)
                 continue
 
-            for index, candidate in enumerate(candidates, start=1):
+            visited = set()
+            index = 0
+            while candidates:
+                candidate = candidates.pop(0)
+                index += 1
+                visited.add(self._schedule_key(candidate))
                 if self.stop_event.is_set():
                     return False, False
                 candidate_key = self._schedule_key(candidate)
@@ -502,6 +510,12 @@ class CgvEngine(VisitorDomCgvEngine):
                                  for g in self._priority_manual_groups}
 
                 while not self.stop_event.is_set():
+                    self._refresh_priority_schedule_payload(page)
+                    if getattr(self, "_priority_schedule_blocked", False):
+                        return False, False
+                    if candidate_key not in {self._schedule_key(item)
+                                             for item in self._ordered_schedule_candidates(schedule)}:
+                        break
                     if first_candidate_read:
                         group, payload, status = self._read_schedule_once(
                             page,
@@ -642,9 +656,17 @@ class CgvEngine(VisitorDomCgvEngine):
                         return False, bool(self._priority_manual_groups)
                     self._priority_failed_groups(candidate_key, candidate_payload)
 
+                # Fold sequential publication into this pass before revisiting
+                # time #1. Preserve user ordering among all unvisited rows.
+                self._refresh_priority_schedule_payload(page)
+                if getattr(self, "_priority_schedule_blocked", False):
+                    return False, False
+                candidates = [item for item in self._ordered_schedule_candidates(schedule)
+                              if self._schedule_key(item) not in visited]
+
             pass_no += 1
             order = " → ".join(
-                self._priority_time_label(item) for item in candidates
+                self._priority_time_label(item) for item in self._ordered_schedule_candidates(schedule)
             )
             self.silent_tick(
                 f"CGV 시간 우선순위 순환 감시 · {order} · 원하는 좌석 대기"

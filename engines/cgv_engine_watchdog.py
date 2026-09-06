@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 from engines.cgv_client import schedule_items
 from engines.cgv_engine_runtime import CgvEngine as RuntimeCgvEngine
+from engines.cgv_schedule_observer import run_schedule_wave
 
 
 class CgvEngine(RuntimeCgvEngine):
@@ -126,13 +127,14 @@ class CgvEngine(RuntimeCgvEngine):
         """Run one bounded same-origin hedge wave."""
 
         script = r"""
-        async ({url, concurrency, hedgeDelayMs, hardTimeoutMs}) => {
+        async ({url, concurrency, hedgeDelayMs, hardTimeoutMs, observerKey}) => {
           const started = performance.now();
           const controllers = Array.from(
             {length: concurrency}, () => new AbortController()
           );
           const statuses = [];
           const timers = [];
+          const dispatches = [];
           let failed = 0;
           let settled = false;
           let hardTimer = null;
@@ -167,6 +169,8 @@ class CgvEngine(RuntimeCgvEngine):
 
             const launch = (controller, index) => {
               if (settled) return;
+              dispatches.push({index, delayMs: performance.now() - started,
+                               visibility: document.visibilityState || 'unknown'});
               fetch(url, {
                 method: 'GET',
                 cache: 'no-store',
@@ -175,6 +179,11 @@ class CgvEngine(RuntimeCgvEngine):
                 signal: controller.signal
               }).then(async (response) => {
                 statuses.push(response.status);
+                if ([401, 403, 429].includes(response.status)) {
+                  finish({ok: false, status: response.status, statuses,
+                          elapsedMs: performance.now() - started}, index);
+                  return;
+                }
                 if (!response.ok) throw new Error(String(response.status));
                 const data = await response.json();
                 finish({
@@ -184,6 +193,7 @@ class CgvEngine(RuntimeCgvEngine):
                   statuses,
                   elapsedMs: performance.now() - started,
                   effectiveConcurrency: concurrency,
+                  dispatches,
                 }, index);
               }).catch((error) => {
                 if (settled || (error && error.name === 'AbortError')) return;
@@ -202,10 +212,12 @@ class CgvEngine(RuntimeCgvEngine):
             };
 
             controllers.forEach((controller, index) => {
-              timers.push(
-                setTimeout(() => launch(controller, index), index * hedgeDelayMs)
-              );
+              if (index === 0) launch(controller, index);
+              else timers.push(setTimeout(() => launch(controller, index), index * hedgeDelayMs));
             });
+
+            const entry = (window.__pengucroScheduleWaves || {})[observerKey];
+            if (entry) entry.cancel = () => finish({ok: false, status: 0, error: 'schedule-host-cancel'});
 
             hardTimer = setTimeout(() => {
               finish({
@@ -222,14 +234,15 @@ class CgvEngine(RuntimeCgvEngine):
         }
         """
 
-        result = page.evaluate(
-            script,
+        result = run_schedule_wave(
+            page, script,
             {
                 "url": url,
                 "concurrency": max(1, int(concurrency)),
                 "hedgeDelayMs": self.HEDGE_DELAY_MS,
                 "hardTimeoutMs": self.SCHEDULE_REQUEST_TIMEOUT_MS,
             },
+            self.stop_event, self.SCHEDULE_REQUEST_TIMEOUT_MS / 1000,
         )
         return (
             dict(result)

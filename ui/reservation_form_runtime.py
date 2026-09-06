@@ -101,6 +101,8 @@ class ReservationForm(BaseReservationForm):
             cgv["seats"] = ""
 
         cgv["priority_rotation_mode"] = "fast" if selection.get("priority_rotation_mode") == "fast" else "strict"
+        from engines.cgv_preopen_matching import normalize_preopen_time_drift
+        cgv["preopen_time_drift_minutes"] = normalize_preopen_time_drift(selection.get("preopen_time_drift_minutes"))
         metadata["cgv"] = cgv
         request = replace(request, engine_metadata=metadata)
         return request, message, threads, is_async
