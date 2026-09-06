@@ -17,6 +17,16 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.79",
+        changes=(
+            "둠이스케이프 환불·취소 상태의 예약 성공 오표시 방지",
+            "둠이스케이프 예약 결과 불명확 시 재주문 없이 상태 확인",
+            "CGV 미오픈 날짜 감시 대기 간격 단축",
+            "CGV 좌석 경합 후 최신 좌석표로 재탐색하고 자동 추천 시간대 순환 개선",
+            "CGV 가격 오류와 선점 경합 구분 및 응답 유실 시 중복 선점 방지",
+        ),
+    ),
+    PatchNote(
         version="6.78",
         changes=(
             "단편선 여러 프로그램 실행 시 감시 지연과 작업 중단 오류 수정",
