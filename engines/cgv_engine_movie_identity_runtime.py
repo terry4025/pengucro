@@ -17,6 +17,7 @@ from engines.cgv_preopen_matching import (
     context_matches as _resilient_context_matches,
     has_booking_identity,
     matching_schedule_candidates,
+    booking_ready_schedules,
     normalize_preopen_time_drift,
     rank_preopen_schedules,
     select_preopen_schedule,
@@ -111,6 +112,7 @@ def select_schedule(
             format_name=format_name,
             drift_window_minutes=_PREOPEN_TIME_DRIFT.get(),
             include_zero_inventory=_PREOPEN_ZERO_PROBE.get(),
+            require_movie_id=_PREOPEN_ZERO_PROBE.get(),
         )
 
     legacy = _legacy_select_schedule(
@@ -313,6 +315,12 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
         if not selectable:
             return
 
+        if _PREOPEN_ZERO_PROBE.get():
+            selectable = booking_ready_schedules(selectable, _PREOPEN_MOV_NO.get())
+            if not selectable:
+                self.log("[CGV] 회차 부분 공개 · 검증된 영화 ID가 없어 가격 요청 없이 완성 대기", "warning")
+                return
+
         ranked = rank_preopen_schedules(selectable, preferred,
                                        drift_window_minutes=_PREOPEN_TIME_DRIFT.get(),
                                        include_zero_inventory=_PREOPEN_ZERO_PROBE.get())
@@ -361,6 +369,8 @@ class CgvEngine(PriorityLadderRuntimeCgvEngine):
             auditorium=str(getattr(self, "_priority_auditorium", "") or ""),
             format_name=str(getattr(self, "_priority_format", "") or ""),
         )
+        if _PREOPEN_ZERO_PROBE.get():
+            candidates = booking_ready_schedules(candidates, _PREOPEN_MOV_NO.get())
         ranked = rank_preopen_schedules(
             candidates,
             list(getattr(self, "_priority_preferred_times", ()) or ()),

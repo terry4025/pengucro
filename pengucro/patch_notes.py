@@ -17,6 +17,17 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.82",
+        changes=(
+            "CGV 감시 상태 읽기 실패 시 성공 응답 복구가 생략되던 문제 수정",
+            "CGV 늦게 수집한 완료 회차 응답과 접근 제한 응답 보존",
+            "CGV 좌석·가격·선점 응답 지연 시 대기 제한과 중복 예약 방지 보강",
+            "CGV 선점 전 대기 초과 시 다음 희망 시간 탐색",
+            "CGV 가격·선점 대기 중 새 회차 감시 유지",
+            "CGV 부분 공개 회차의 영화 정보 확인 및 반복 인증 조회 감소",
+        ),
+    ),
+    PatchNote(
         version="6.81",
         changes=(
             "CGV 좌석 탐색 중 나중에 공개된 희망 회차를 같은 순환에 반영",

@@ -335,6 +335,7 @@ def select_preopen_schedule(
     format_name: str = "",
     drift_window_minutes: int = PREOPEN_TIME_DRIFT_WINDOW_MINUTES,
     include_zero_inventory: bool = False,
+    require_movie_id: bool = False,
 ) -> dict[str, Any] | None:
     preferred = list(preferred_times)
     if not preferred and show_time:
@@ -346,10 +347,27 @@ def select_preopen_schedule(
         auditorium=auditorium,
         format_name=format_name,
     )
+    if require_movie_id:
+        candidates = booking_ready_schedules(candidates, mov_no)
     ranked = rank_preopen_schedules(candidates, preferred,
                                    drift_window_minutes=drift_window_minutes,
                                    include_zero_inventory=include_zero_inventory)
     return ranked[0] if ranked else None
+
+
+def booking_ready_schedules(candidates, verified_movie_id=""):
+    """Use only rows already checked by matching_schedule_candidates.
+
+    That matcher rejects conflicting IDs and requires an exact title when the
+    row has no movie ID. Only that validated saved/discovered ID can fill it.
+    Unknown IDs keep waiting; never send a blank movie ID to the price API.
+    """
+    ready = []
+    for row in candidates:
+        movie_id = str(row.get("movNo") or row.get("mov_no") or verified_movie_id or "").strip()
+        if movie_id:
+            ready.append(dict(row, movNo=movie_id))
+    return ready
 
 
 def normalize_preopen_time_drift(value: Any) -> int:

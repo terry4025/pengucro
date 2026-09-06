@@ -13,6 +13,7 @@ from engines.cgv_engine_visitor_dom_runtime import CgvEngine as Parent
 
 def schedule(hour, seq):
     return dict(siteNo='0013', scnYmd='20260912', scnsNo='018', scnSseq=seq,
+                movNo='test-movie',
                 scnsrtTm=hour, movNm='오디세이', expoProdNm='오디세이',
                 expoScnsNm='IMAX관', movkndDsplEnm='IMAX LASER 2D')
 

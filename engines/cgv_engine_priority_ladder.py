@@ -15,6 +15,7 @@ from engines.cgv_client import (
     select_schedule,
 )
 from engines.cgv_engine_visitor_dom_runtime import CgvEngine as VisitorDomCgvEngine
+from engines.cgv_schedule_observer import run_schedule_wave
 
 
 class CgvEngine(VisitorDomCgvEngine):
@@ -226,12 +227,16 @@ class CgvEngine(VisitorDomCgvEngine):
         if not self._wait_for_priority_seat_read_slot():
             return {"ok": False, "status": 0, "stopped": True}
         auth = self._browser_auth_data(page)
+        self._priority_auth_snapshot = (page, self._schedule_key(schedule), dict(auth), time.monotonic())
         url = self._seat_url(schedule, auth.get("custNo", ""))
         try:
-            result = page.evaluate(
+            result = run_schedule_wave(
+                page,
                 r"""
-                async ({url, timeoutMs}) => {
+                async ({url, timeoutMs, observerKey}) => {
                   const controller = new AbortController();
+                  const entry = (window.__pengucroScheduleWaves || {})[observerKey];
+                  if (entry) entry.cancel = () => controller.abort();
                   const timeout = setTimeout(() => controller.abort(), timeoutMs);
                   try {
                     const headers = new Headers({
@@ -268,6 +273,8 @@ class CgvEngine(VisitorDomCgvEngine):
                 }
                 """,
                 {"url": url, "timeoutMs": self.PRIORITY_READ_TIMEOUT_MS},
+                self.stop_event, self.PRIORITY_READ_TIMEOUT_MS / 1000,
+                on_poll=lambda: self._refresh_priority_schedule_payload(page),
             )
         except Exception as exc:
             result = {"ok": False, "status": 0, "error": str(exc)}
@@ -496,6 +503,7 @@ class CgvEngine(VisitorDomCgvEngine):
                 if self.stop_event.is_set():
                     return False, False
                 candidate_key = self._schedule_key(candidate)
+                self._priority_auth_snapshot = None
                 allow_initial = (
                     pass_no == 0 and candidate_key == self._priority_primary_key
                 )
@@ -544,6 +552,8 @@ class CgvEngine(VisitorDomCgvEngine):
                             else None
                         )
 
+                    if getattr(self, "_priority_schedule_blocked", False):
+                        return False, False
                     if status in {401, 403, 429}:
                         self._last_fast_monitor_exit_reason = {
                             401: "unauthorized",
@@ -620,6 +630,9 @@ class CgvEngine(VisitorDomCgvEngine):
                     self.log(candidate_timing_log, "info")
                     if held or use_fallback or self.stop_event.is_set():
                         return held, use_fallback
+                    if self._last_fast_monitor_exit_reason == "prehold-timeout":
+                        self.log("[CGV] 선점 발송 전 응답 대기 초과 · 다음 희망 시간 확인", "warning")
+                        break
                     if self._last_fast_monitor_exit_reason != "seat-conflict":
                         return held, use_fallback
 
