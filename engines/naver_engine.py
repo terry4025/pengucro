@@ -68,11 +68,13 @@ from engines.naver_api import (
     NaverServerClock,
     NaverSlot,
     SubmitOutcome,
+    SubmitResult,
     parse_ids,
 )
 from engines.naver_forms import NaverFormAnswer, prepare_custom_form_answers
 from engines.naver_submit import (
     NaverBrowserSubmitter,
+    NaverArmUncertainError,
     NaverSubmitPayloadBuilder,
     NaverSubmitPreparation,
     PAYMENT_BOOKING,
@@ -1384,7 +1386,7 @@ class NaverEngine(BaseEngine):
                         30.0,
                     )
                     await asyncio.sleep(
-                        min(self._poll_base,
+                        min(max(1.0, self._poll_base),
                             max(0.05, until_open - self.OPEN_ARM_SECONDS))
                     )
                     continue
@@ -1853,7 +1855,7 @@ class NaverEngine(BaseEngine):
         precision_ms = float(self.clock.last_precision or 0.0) * 1000
         self.log(
             f"[정보] 오픈 직전 서버 시계 정밀 보정 완료 · "
-            f"최저 지연 표본 오차 약 {precision_ms:.0f}ms",
+            f"표본 기준 불확실성 약 {precision_ms:.0f}ms (실제 서버 도착 오차 아님)",
             "success",
         )
         return True
@@ -1892,7 +1894,7 @@ class NaverEngine(BaseEngine):
             try:
                 precision = max(
                     0.0,
-                    min(0.10, float(getattr(self.clock, "last_precision", 0.0) or 0.0)),
+                    float(getattr(self.clock, "last_precision", 0.0) or 0.0),
                 )
             except (TypeError, ValueError):
                 precision = 0.0
@@ -1911,7 +1913,7 @@ class NaverEngine(BaseEngine):
         self._last_api_lead_detail = (
             f"최저 RTT {transport_rtt * 1000:.0f}ms · "
             f"서버 선점 도착 목표 -{target_before_open * 1000:.0f}ms · "
-            f"시계 오차 {precision * 1000:.0f}ms"
+            f"시계 표본 불확실성 {precision * 1000:.0f}ms"
         )
         return lead
 
@@ -1998,6 +2000,7 @@ class NaverEngine(BaseEngine):
                 else None
             ),
             "clock_rtt_ms": timing.get("clockRttMs"),
+            "clock_bridge_rtt_ms": timing.get("clockBridgeRttMs"),
             "clock_uncertainty_ms": timing.get("clockUncertaintyMs"),
             "clock_spread_ms": timing.get("clockSpreadMs"),
             "ttfb_ms": diagnostics.get("ttfbMs"),
@@ -2346,7 +2349,12 @@ class NaverEngine(BaseEngine):
                 dev_mode=dev_mode,
             )
         remaining = self._seconds_until_open()
+        open_monotonic = time.monotonic() + remaining if remaining is not None else None
         if remaining is None or remaining < self.API_BROWSER_ARM_MIN_SECONDS:
+            if remaining is not None and remaining > 0:
+                await self._wait_for_api_send()
+                if self.stop_event.is_set():
+                    return "stopped", "중지됨"
             return await self._submit_api_first(
                 signature,
                 reservation_data=reservation_data,
@@ -2373,17 +2381,29 @@ class NaverEngine(BaseEngine):
                         lead - target_before_open,
                     ),
                     target_arrival_before_open_seconds=target_before_open,
+                    open_at_monotonic=open_monotonic,
+                    clock_precision_seconds=float(getattr(self.clock, "last_precision", 0.0) or 0.0),
                 )
             else:
                 arm_id = await self._api_submitter.arm_submit_at(
                     self._api_preparation.payload, delay
                 )
+        except NaverArmUncertainError:
+            return await self._handle_api_submit_result(
+                SubmitResult(SubmitOutcome.UNKNOWN, message="타이머 설치 응답 유실 · 추가 제출 없이 예약내역 확인"),
+                signature=signature,
+                reservation_data=reservation_data,
+                dev_mode=dev_mode,
+            )
         except Exception as exc:
             self.log(
                 f"[정보] 브라우저 내부 예약 타이머 준비 실패 ({type(exc).__name__}) · "
                 "기존 직접 제출로 진행합니다.",
                 "info",
             )
+            await self._wait_for_api_send()
+            if self.stop_event.is_set():
+                return "stopped", "중지됨"
             return await self._submit_api_first(
                 signature,
                 reservation_data=reservation_data,
@@ -2394,6 +2414,9 @@ class NaverEngine(BaseEngine):
         clock_samples = armed_timing.get("clockSampleCount")
         clock_rtt = armed_timing.get("clockRttMs")
         clock_detail = ""
+        bridge_rtt = armed_timing.get("clockBridgeRttMs")
+        if isinstance(bridge_rtt, (int, float)):
+            clock_detail = f" · 동기화한 네이버 서버 시각 유지 · Chrome 시계 전송 RTT {bridge_rtt:.1f}ms"
         if (
             isinstance(clock_samples, (int, float))
             and clock_samples > 0
@@ -2411,7 +2434,7 @@ class NaverEngine(BaseEngine):
         )
         uncertainty_ms = armed_timing.get("clockUncertaintyMs")
         if isinstance(uncertainty_ms, (int, float)) and uncertainty_ms > 0:
-            clock_detail += f" · 경계 추정 오차 ±{float(uncertainty_ms):.0f}ms 이내"
+            clock_detail += f" · 표본 기준 불확실성 약 {float(uncertainty_ms):.0f}ms (상한 보장 아님)"
         self.log(
             f"[정보] 브라우저 내부 API 제출 예약 · 추정 오픈 대비 {-logged_lead:+.3f}초 · "
             f"{self._last_api_lead_detail}{clock_detail} · "

@@ -152,3 +152,25 @@ def test_v1_postpaid_explicit_gate_learning_is_preserved():
     profile = load_timing_profile("1498729", "7094790", "postpaid")
 
     assert profile.target_before_open_seconds == pytest.approx(0.050)
+
+
+def test_migrating_one_product_does_not_reactivate_other_v1_prepaid_targets():
+    entries = {
+        f"business|{item}|npay_prepaid": {
+            "target_before_open_seconds": 0.070,
+            "observations": [{"outcome": "refused"}],
+        } for item in ("first", "second")
+    }
+    update_json("naver_timing_history.json", lambda _: {"version": 1, "entries": entries}, {})
+    record_timing_observation("business", "first", "postpaid", outcome="success", booking_confirmed=True)
+    for item in ("first", "second"):
+        assert load_timing_profile("business", item, "npay_prepaid").target_before_open_seconds == pytest.approx(0.02)
+
+
+def test_previously_mislabelled_v2_prepaid_target_is_also_repaired():
+    update_json("naver_timing_history.json", lambda _: {
+        "version": 2, "entries": {"b|i|npay_prepaid": {
+            "target_before_open_seconds": 0.070, "observations": [],
+        }},
+    }, {})
+    assert load_timing_profile("b", "i", "npay_prepaid").target_before_open_seconds == pytest.approx(0.02)

@@ -334,21 +334,23 @@ def can_extend_physical_seat_group(
     return True
 
 
-def choose_recommended_seat_group(
+def rank_recommended_seat_groups(
     seats: Iterable[CgvSeat],
     recommendations: Mapping[str, CgvSeatRecommendation],
     people: int,
     *,
     mode: str = "best",
     excluded: Iterable[Iterable[str]] = (),
-) -> tuple[str, ...] | None:
-    """Choose one physical, same-row adjacent block for a recommendation mode.
+    include_fallback: bool = True,
+) -> tuple[tuple[str, ...], ...]:
+    """Rank physical, same-row adjacent blocks once for a recommendation mode.
 
     Availability is deliberately not a filter: sold seats are valid priorities
     for future openings and cancellation-ticket monitoring.
     """
 
     people = max(1, int(people))
+    excluded = tuple(tuple(group) for group in excluded)
     excluded_groups = {
         tuple(sorted((normalize_seat_name(label) for label in group), key=_seat_parts))
         for group in excluded
@@ -357,7 +359,7 @@ def choose_recommended_seat_group(
     for seat in seats:
         rows.setdefault(seat.row, []).append(seat)
     if not rows:
-        return None
+        return ()
 
     mode = str(mode or "best").strip().lower()
     preferred_rows = {
@@ -402,15 +404,31 @@ def choose_recommended_seat_group(
                 ((row_preference, worst_tier, average_tier, abs(group_center - center), group[0].number), labels)
             )
 
-    if not candidates and mode != "best":
-        return choose_recommended_seat_group(
+    ordered = tuple(labels for _, labels in sorted(candidates, key=lambda item: item[0]))
+    if include_fallback and mode != "best":
+        # Exhaust the requested mode first, then preserve the legacy best-mode
+        # fallback. Availability is filtered by the runtime, never cached here.
+        fallback = rank_recommended_seat_groups(
             tuple(seat for row in rows.values() for seat in row),
-            recommendations,
-            people,
-            mode="best",
-            excluded=excluded,
+            recommendations, people, mode="best", excluded=excluded,
         )
-    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+        seen = set(ordered)
+        ordered += tuple(group for group in fallback if group not in seen)
+    return ordered
+
+
+def choose_recommended_seat_group(
+    seats: Iterable[CgvSeat],
+    recommendations: Mapping[str, CgvSeatRecommendation],
+    people: int,
+    *,
+    mode: str = "best",
+    excluded: Iterable[Iterable[str]] = (),
+) -> tuple[str, ...] | None:
+    ranked = rank_recommended_seat_groups(
+        seats, recommendations, people, mode=mode, excluded=excluded,
+    )
+    return ranked[0] if ranked else None
 
 
 def normalize_time(value: Any) -> str:
