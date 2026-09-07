@@ -64,6 +64,7 @@ class CgvEngine(BaseEngine):
     FAST_MONITOR_READ_INTERVAL = 0.025
     FAST_MONITOR_MAX_CONSECUTIVE_ERRORS = 5
     FAST_HOLD_TRANSACTION_TIMEOUT_MS = 8000
+    FAST_SEAT_REQUEST_TIMEOUT_MS = 2000
     FAST_MONITOR_RECONCILE_SECONDS = 1.0
     HEDGE_DELAY_MS = 110
     MAX_BACKOFF = 15.0
@@ -915,6 +916,7 @@ class CgvEngine(BaseEngine):
                     timing: {started: performance.now()},
                     running: true,
                     claiming: false,
+                    holdSent: false,
                     phase: 'monitoring',
                     attempts: 0,
                     completed: 0,
@@ -1137,6 +1139,7 @@ class CgvEngine(BaseEngine):
                   const resume = () => {
                     if (state.hit || state.blocked || state.unauthorized || state.terminalError) return;
                     state.claiming = false;
+                    state.holdSent = false;
                     state.phase = 'monitoring';
                     state.running = true;
                     if (state.timer) clearInterval(state.timer);
@@ -1193,6 +1196,7 @@ class CgvEngine(BaseEngine):
                         if (!response.ok) throw new Error(`HTTP ${response.status}`);
                         payload = await response.json();
                       }
+                      if (!state.running || controller.signal.aborted) return;
                       const apiStatus = Number(payload && payload.statusCode != null
                         ? payload.statusCode : 0);
                       if (apiStatus !== 0) {
@@ -1284,9 +1288,14 @@ class CgvEngine(BaseEngine):
                             return;
                           }
 
+                          // Host cancellation can race a delayed price response.
+                          // Never dispatch a hold after the monitor was stopped.
+                          if (!state.running || transactionController.signal.aborted) return;
+
                           state.phase = 'holding';
                           const holdPayload = buildHoldPayload(group.seats);
                           holdSent = true;
+                          state.holdSent = true;
                           const holdStarted = performance.now();
                           state.timing.holdStarted = holdStarted;
                           const hold = await postJson(
@@ -1367,7 +1376,8 @@ class CgvEngine(BaseEngine):
                           } else {
                             state.lastFailureStage = 'price';
                             state.lastError = 'price request failed before hold';
-                            state.terminalError = 'price-transport-error';
+                            state.terminalError = transactionController.signal.aborted
+                              ? 'prehold-timeout' : 'price-transport-error';
                             state.stop();
                           }
                         } finally {
@@ -1427,6 +1437,7 @@ class CgvEngine(BaseEngine):
                   if (!state) return null;
                   return {
                     attemptId: state.attemptId,
+                    holdSent: state.holdSent,
                     timing: state.timing,
                     running: state.running,
                     claiming: state.claiming,
@@ -1494,9 +1505,11 @@ class CgvEngine(BaseEngine):
                             and response.get("statusCode") == 0
                             and str(data.get("resultCode", "0")) == "0" and data.get("movAtktNo")):
                         self.log("[CGV] 동일 선점 요청의 브라우저 성공 응답 복원 · 추가 제출 없이 결제 연결", "success")
+                        self._fast_monitor_fallback_reason = ""
                         return {"hit": receipt, "timing": transaction.get("timing", {})}
                 snapshot = self._read_fast_seat_monitor(page)
-                if snapshot.get("attemptId") == attempt_id:
+                if (snapshot.get("attemptId") == attempt_id and
+                        snapshot.get("terminalError") not in {"hold-uncertain", "monitor-state-lost"}):
                     return snapshot
             except Exception:
                 pass
@@ -1550,6 +1563,31 @@ class CgvEngine(BaseEngine):
         """
 
         return 0
+
+    def _monitor_housekeeping(self, page) -> dict[str, Any]:
+        return {}
+
+    def _interrupt_fast_monitor(self, page, *, only_before_hold=False) -> dict[str, Any]:
+        """Decide and stop atomically in Chrome, not from an old Python phase."""
+        try:
+            result = page.evaluate(r"""({id, onlyBeforeHold}) => {
+              const s = window.__pengucroFastSeatMonitor;
+              if (!s || s.attemptId !== id) return {terminalError: 'hold-uncertain'};
+              if (s.hit) return {hit: s.hit, timing: s.timing};
+              if (s.holdSent && onlyBeforeHold) return {};
+              const terminalError = s.holdSent ? 'hold-uncertain' :
+                (onlyBeforeHold ? 'schedule-observer-blocked' : 'prehold-timeout');
+              s.terminalError = terminalError;
+              s.stop();
+              return {terminalError, timing: s.timing, holdSent: s.holdSent};
+            }""", {"id": getattr(self, "_fast_monitor_attempt_id", ""),
+                    "onlyBeforeHold": only_before_hold})
+            return result if isinstance(result, dict) else {"terminalError": "hold-uncertain"}
+        except Exception:
+            return {"terminalError": "hold-uncertain"}
+
+    def _auth_for_hold(self, page, schedule):
+        return self._browser_auth_data(page)
 
     def _prepare_api_hold_ui(
         self,
@@ -1616,7 +1654,7 @@ class CgvEngine(BaseEngine):
     ) -> tuple[bool, bool]:
         self._last_fast_monitor_exit_reason = ""
         self._last_fast_retry_after_seconds = 0.0
-        auth = self._browser_auth_data(page)
+        auth = self._auth_for_hold(page, schedule)
         initial_response = self._consume_initial_seat_response(schedule)
         seat_url = str(initial_response.get("url", "") or "") or self._seat_url(
             schedule, auth.get("custNo", "")
@@ -1666,18 +1704,21 @@ class CgvEngine(BaseEngine):
                     return False, False
 
             last_completed = 0
+            last_progress_at = time.monotonic()
+            claiming_since = None
             snapshot: dict[str, Any] = {}
             try:
                 while not self.stop_event.wait(self.FAST_MONITOR_READ_INTERVAL):
                     snapshot = recovered_initial or self._read_fast_seat_monitor(page)
                     recovered_initial = {}
-                    if not snapshot:
+                    if not snapshot or snapshot.get("terminalError") == "monitor-state-lost":
                         snapshot = self._recover_fast_monitor_snapshot(page, schedule, groups)
                         if not snapshot:
                             snapshot = {"terminalError": "hold-uncertain"}
                             break
                     completed = max(0, int(snapshot.get("completed", 0) or 0))
                     if completed > last_completed:
+                        last_progress_at = time.monotonic()
                         self.silent_ticks(
                             completed - last_completed,
                             "선택한 CGV 좌석 묶음을 고속 API로 감시 중",
@@ -1694,6 +1735,30 @@ class CgvEngine(BaseEngine):
                         )
                     )
                     if terminal:
+                        if snapshot.get("terminalError") == "hold-uncertain":
+                            recovered = self._recover_fast_monitor_snapshot(page, schedule, groups)
+                            if recovered.get("hit"):
+                                snapshot = recovered
+                        break
+                    housekeeping = self._monitor_housekeeping(page)
+                    if housekeeping.get("terminalError") or housekeeping.get("hit"):
+                        snapshot = housekeeping
+                        if snapshot.get("terminalError") == "hold-uncertain":
+                            recovered = self._recover_fast_monitor_snapshot(page, schedule, groups)
+                            if recovered.get("hit"):
+                                snapshot = recovered
+                        break
+                    now = time.monotonic()
+                    if snapshot.get("claiming"):
+                        if claiming_since is None:
+                            claiming_since = now
+                        expired = now - claiming_since >= self.FAST_HOLD_TRANSACTION_TIMEOUT_MS / 1000
+                    else:
+                        claiming_since = None
+                        expired = (int(snapshot.get("inflight", 0) or 0) > 0 and
+                                   now - last_progress_at >= self.FAST_SEAT_REQUEST_TIMEOUT_MS / 1000)
+                    if expired:
+                        snapshot = self._interrupt_fast_monitor(page)
                         if snapshot.get("terminalError") == "hold-uncertain":
                             recovered = self._recover_fast_monitor_snapshot(page, schedule, groups)
                             if recovered.get("hit"):
@@ -1727,6 +1792,15 @@ class CgvEngine(BaseEngine):
                     return False, False
                 if failure_kind == "seat-conflict":
                     self._last_fast_monitor_exit_reason = "seat-conflict"
+                    return False, False
+                if snapshot.get("terminalError") in {"prehold-timeout", "schedule-observer-blocked"}:
+                    self._last_fast_monitor_exit_reason = snapshot["terminalError"]
+                    self.log("[CGV] 선점 발송 전 대기 한도/회차 제한 확인 · 현재 시도 종료", "warning")
+                    if snapshot["terminalError"] == "prehold-timeout" and conflict_limit == 0:
+                        # A published single-screen monitor has no outer ladder.
+                        # A proven unsubmitted hold can safely resume on fresh seats.
+                        self.stop_event.wait(1.0)
+                        continue
                     return False, False
                 self._last_fast_retry_after_seconds = max(
                     0.0,

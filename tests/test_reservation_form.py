@@ -476,7 +476,7 @@ def test_naver_time_picker_uses_selected_item_without_requiring_branch(monkeypat
     assert date_str == "2026-08-09"
 
 
-def test_dpsnnn_thread_policy_uses_measured_limit():
+def test_dpsnnn_thread_policy_distinguishes_workers_from_http_limit():
     from engines.dpsnnn_engine import DPSNNN_MAX_WORKERS
     slider = Widget(50)
     title = Widget()
@@ -500,7 +500,9 @@ def test_dpsnnn_thread_policy_uses_measured_limit():
     assert slider.config["number_of_steps"] == DPSNNN_MAX_WORKERS - 1
     assert slider.value == DPSNNN_MAX_WORKERS
     assert form.dpsnnn_threads == DPSNNN_MAX_WORKERS
-    assert f"프로그램당 최대 {DPSNNN_MAX_WORKERS}" in title.config["text"]
+    assert f"1~{DPSNNN_MAX_WORKERS}" in title.config["text"]
+    assert "기본 4" in title.config["text"]
+    assert "HTTP 자동 제한" in title.config["text"]
 
 
 def test_zeroworld_and_jigubyeol_thread_policy_caps_slider_at_32():

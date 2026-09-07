@@ -87,7 +87,8 @@ class DpsnnnSession(requests.Session):
                     getattr(self, "stop_event", None) is not None and self.stop_event.is_set()):
                 try:
                     callback(dict(self.last_timing), governor.snapshot(),
-                             parsed.path.endswith("/html_list.cm"), response is not None)
+                             parsed.path.endswith("/html_list.cm"),
+                             response is not None and 200 <= response.status_code < 300)
                 except Exception:
                     pass
 

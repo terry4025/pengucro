@@ -1787,7 +1787,7 @@ class ReservationForm(ctk.CTkFrame):
                 text=str(self.dpsnnn_threads), text_color=theme.ACCENT_BLUE
             )
             self.threads_title_label.configure(
-                text=f"동시 감시 세션 (단편선 프로그램당 최대 {DPSNNN_MAX_WORKERS})",
+                text=f"감시 작업 1~{DPSNNN_MAX_WORKERS} · 기본 4 · HTTP 자동 제한",
                 text_color=theme.TEXT_MUTE,
             )
             return

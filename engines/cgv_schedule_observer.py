@@ -5,7 +5,7 @@ import time
 import uuid
 
 
-def run_schedule_wave(page, script, arguments, stop_event, timeout_seconds):
+def run_schedule_wave(page, script, arguments, stop_event, timeout_seconds, on_poll=None):
     """Bound the network wait with the host clock; submit GETs only once."""
     key = uuid.uuid4().hex
     start = """({key, args}) => {
@@ -27,17 +27,21 @@ def run_schedule_wave(page, script, arguments, stop_event, timeout_seconds):
       delete entries[key];
     }"""
     deadline = time.monotonic() + timeout_seconds
+    last_service = time.monotonic()
     try:
         page.evaluate(start, {"key": key, "args": arguments})
         while not stop_event.is_set():
-            if time.monotonic() >= deadline:
-                return {"ok": False, "status": 0, "timedOut": True,
-                        "error": "schedule-host-timeout"}
             state = page.evaluate(read, key)
             if not isinstance(state, dict) or not state.get("present"):
                 return {"ok": False, "status": 0, "error": "schedule-wave-lost"}
             if isinstance(state.get("result"), dict):
                 return state["result"]
+            if time.monotonic() >= deadline:
+                return {"ok": False, "status": 0, "timedOut": True,
+                        "error": "schedule-host-timeout"}
+            if on_poll is not None and time.monotonic() - last_service >= 0.25:
+                on_poll()
+                last_service = time.monotonic()
             stop_event.wait(0.01)
         return {"ok": False, "status": 0, "error": "schedule-stopped"}
     finally:
@@ -109,10 +113,6 @@ class ScheduleObserver:
         now = time.monotonic()
         if self.blocked or (self.started_at is None and now < self.next_due):
             return None
-        if self.started_at is not None and now - self.started_at >= self.TIMEOUT_SECONDS:
-            self.close(page)
-            self.next_due = now + 2.0
-            return {"ok": False, "status": 0, "timedOut": True}
         try:
             state = page.evaluate(self.STEP_SCRIPT, {"key": self.key, "url": self.url, "action": "step"})
         except Exception:
@@ -124,6 +124,10 @@ class ScheduleObserver:
             self.blocked = True
             return {"ok": False, "status": 0, "observerLost": True}
         if state["state"] in {"started", "running"}:
+            if self.started_at is not None and now - self.started_at >= self.TIMEOUT_SECONDS:
+                self.close(page)
+                self.next_due = now + 2.0
+                return {"ok": False, "status": 0, "timedOut": True}
             if self.started_at is None:
                 self.started_at = now
             return None

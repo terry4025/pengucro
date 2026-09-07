@@ -15,9 +15,11 @@ from engines import browser_session
 from engines.base_engine import BaseEngine
 from engines.zeroworld_catalog import ZeroWorldTimeSlot
 from pengucro.diagnostics import format_exception
+from pengucro.logging_setup import scrub
 from pengucro.models import BookingResult, parse_bool_flag
 from engines.dpsnnn_runtime import DpsnnnSession, KST, WarmCheckout, wake_governors
 from engines.dpsnnn_orders import OrderJournal
+from engines.dpsnnn_shared import SharedReadGovernor
 
 
 USER_AGENT = (
@@ -25,7 +27,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 DPSNNN_MAX_WORKERS = 32
-DPSNNN_DEFAULT_WORKERS = 32
+DPSNNN_DEFAULT_WORKERS = 4
 DPSNNN_PAYMENT_FORM_SELECTOR = "form#order_payment"
 DPSNNN_PAYMENT_READY_SELECTOR = f'{DPSNNN_PAYMENT_FORM_SELECTOR}[data-init="Y"]'
 DPSNNN_ORDERER_NAME_SELECTOR = (
@@ -283,6 +285,8 @@ class DpsnnnEngine(BaseEngine):
         self._last_timing_log = 0.0
         self._last_target_poll = 0.0
         self._max_poll_gap = 0.0
+        self._order_retry_after = 0.0
+        self._order_diagnostic_secrets = ()
 
     def _record_request_timing(self, timings, budget, is_poll, received):
         now = time.monotonic()
@@ -297,13 +301,15 @@ class DpsnnnEngine(BaseEngine):
             gap = self._max_poll_gap
             self._max_poll_gap = 0.0
             since = now-self._last_target_poll if self._last_target_poll else None
+            if since is not None:
+                gap = max(gap, since)
         alive = sum(t.is_alive() for t in self.threads)
         age = f"{since:.2f}초" if since is not None else "아직 없음"
         self.log(
             f"[요청 진단] 내부 허가 대기 {timings['wait_ms']:.0f}ms · "
             f"HTTP 호출 {timings['http_ms']:.0f}ms · 전체 {timings['total_ms']:.0f}ms · "
             f"작업 생존 {alive}/{len(self.threads)} · 프로세스 HTTP 진행 {budget['active']}/"
-            f"{budget['limit']} · 대기 {budget['waiting']} · 최근 목표 조회 {age} 전 · "
+            f"{budget['limit']} · 대기 {budget['waiting']} · 최근 정상 목표 조회 {age} 전 · "
             f"최근 최대 감시 공백 {gap:.2f}초", "info")
 
     @staticmethod
@@ -360,6 +366,11 @@ class DpsnnnEngine(BaseEngine):
         self._journal = None
         self._last_target_poll = self._last_timing_log = self._max_poll_gap = 0.0
         self._order_claimed.clear()
+        self._order_retry_after = 0.0
+        self._order_diagnostic_secrets = tuple(
+            str(reservation_data.get(key, "")) for key in ("name", "phone", "depositor")
+            if reservation_data.get(key)
+        )
         with self._worker_index_lock:
             self._next_worker_index = 0
         with self._diagnostic_log_lock:
@@ -389,6 +400,12 @@ class DpsnnnEngine(BaseEngine):
         self.log(
             f"단편선 모드: {workers}개 독립 세션이 병렬로 슬롯을 감시합니다. "
             "주문 생성은 먼저 통과한 1개 세션만 실행합니다.",
+            "info",
+        )
+        self.log(
+            f"[요청 제한] 프로그램별 HTTP 최대 {SharedReadGovernor.LIMIT}개 · "
+            f"초당 최대 {1 / SharedReadGovernor.INTERVAL:g}회 · 제한 응답 시 자동 감속 · "
+            "여러 프로그램의 합산 요청량은 별도이며, 작업 수가 속도 배수는 아닙니다.",
             "info",
         )
         if not parse_bool_flag(reservation_data.get("devMode", False)):
@@ -556,26 +573,69 @@ class DpsnnnEngine(BaseEngine):
             timeout=self.REQUEST_TIMEOUT,
         )
         slot_id = str(payload.get("prod_idx", ""))
+        timing = getattr(session, "last_timing", None)
+        timing_detail = ""
+        if isinstance(timing, dict) and all(
+                isinstance(timing.get(key), (int, float)) for key in ("wait_ms", "http_ms")):
+            timing_detail = (f" · 내부 허가 대기 {timing['wait_ms']:.0f}ms · "
+                             f"HTTP 호출 {timing['http_ms']:.0f}ms")
         self._log_http_diagnostic(
             worker_label,
             "예약 주문 생성",
             "POST",
             getattr(response, "status_code", None),
             time.perf_counter() - started,
-            f"slotId={slot_id}" if slot_id else "",
+            (f"slotId={slot_id}" if slot_id else "") + timing_detail,
             force=True,
         )
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
             raise ValueError("주문 응답 형식이 불명확합니다.")
-        message = str(data.get("msg", ""))
-        order_code = str(data.get("order_code", ""))
+        raw_message = data.get("msg")
+        raw_code = data.get("order_code")
+        message = raw_message.strip() if isinstance(raw_message, str) else ""
+        order_code = raw_code.strip() if isinstance(raw_code, str) else ""
         if message.upper() == "SUCCESS" and order_code:
             return order_code, message
+        safe_message = self._safe_order_message(message or "서버 메시지 없음")
+        self.log(
+            f"[{worker_label}] [주문 응답] HTTP {response.status_code} · "
+            f"서버 메시지={safe_message} · 주문 코드 존재={bool(raw_code)}",
+            "warning",
+        )
+        if raw_code or (raw_code is not None and not isinstance(raw_code, str)):
+            # Conflicting success markers can still represent an accepted write.
+            # Keep the journal claimed; never turn this into a fresh POST.
+            raise ValueError("주문 코드와 성공 상태 불일치 · 결과 확인 필요")
         if not message or message.upper() == "SUCCESS":
             raise ValueError("주문 생성 여부를 확인할 수 없습니다.")
         return "", message
+
+    def _safe_order_message(self, message: str) -> str:
+        plain = BeautifulSoup(str(message), "html.parser").get_text(" ", strip=True)
+        return scrub(re.sub(r"\s+", " ", plain),
+                     extra_secrets=self._order_diagnostic_secrets)[:240]
+
+    @staticmethod
+    def _sold_out_rejection(message: str) -> bool:
+        # Only a definite inventory rejection permits another attempt. Unknown
+        # business errors must not silently release the persistent write claim.
+        if re.search(r"오류|에러|불명|확인.{0,8}(?:불가|실패)|아니|않|처리\s*중|진행\s*중|성공|접수|success", message, re.I):
+            return False
+        return bool(re.search(
+            r"(?:매진|품절|마감)(?:[.!]?$|입니다|되었|되었습니다|상태)|"
+            r"재고(?:가|는)?\s*(?:없|부족)|^sold[\s_-]*out[.!]?$", message, re.I))
+
+    def _access_denied(self, exc: BaseException, worker: str) -> bool:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status not in (401, 403):
+            return False
+        self.log(f"[{worker}] HTTP {status} 접근 제한 · 자동 요청을 중단했습니다. "
+                 "사이트의 정상 접속 상태를 확인해주세요.", "error")
+        self.stop_event.set()
+        wake_governors()
+        return True
 
     @staticmethod
     def _fill_first(page, selectors: list[str], value: str) -> bool:
@@ -1097,6 +1157,8 @@ class DpsnnnEngine(BaseEngine):
                 except requests.RequestException as exc:
                     if self.stop_event.is_set():
                         return
+                    if self._access_denied(exc, worker_label):
+                        return
                     self._log_http_diagnostic(worker_label, current_stage, "GET", None,
                                               time.perf_counter() - started, type(exc).__name__)
                     if self.stop_event.wait(0.5):
@@ -1123,8 +1185,11 @@ class DpsnnnEngine(BaseEngine):
             while not self.stop_event.is_set():
                 if self._order_claimed.is_set():
                     if self.submission_lock.acquire(blocking=False):
-                        self.submission_lock.release()
-                        break
+                        try:
+                            if self._order_claimed.is_set():
+                                break
+                        finally:
+                            self.submission_lock.release()
                     self.stop_event.wait(0.01)
                     continue
                 current_stage = "시간표 조회"
@@ -1135,9 +1200,9 @@ class DpsnnnEngine(BaseEngine):
                         retry_detail = detail
                         if status is None or (status is not None and not 200 <= status < 300):
                             retry_detail = (
-                                f"{detail} · {self.POLL_INTERVAL * 1000:.0f}ms 후 재시도"
+                                f"{detail} · 요청 제한 대기 후 재조회"
                                 if detail
-                                else f"{self.POLL_INTERVAL * 1000:.0f}ms 후 재시도"
+                                else "요청 제한 대기 후 재조회"
                             )
                         self._log_http_diagnostic(
                             worker_label,
@@ -1154,6 +1219,9 @@ class DpsnnnEngine(BaseEngine):
                         self.log(warm.error, "error")
                         self.stop_event.set()
                         return
+                    if (warm is not None and warm.native_slot
+                            and time.monotonic() - warm.native_seen_at > 2.0):
+                        warm.native_slot = ""
                     if warm is not None and warm.native_slot:
                         slots = [ZeroWorldTimeSlot(target_time, warm.native_slot, True)]
                     else:
@@ -1253,6 +1321,9 @@ class DpsnnnEngine(BaseEngine):
                     try:
                         if self._order_claimed.is_set() or self.stop_event.is_set():
                             break
+                        if time.monotonic() < self._order_retry_after:
+                            self.stop_event.wait(self.POLL_INTERVAL)
+                            continue
                         if parse_bool_flag(reservation_data.get("devMode", False)):
                             self._order_claimed.set()
                             self.log(
@@ -1320,8 +1391,19 @@ class DpsnnnEngine(BaseEngine):
                                 self.stop_event.set()
                                 self.log("주문 생성 여부 불명확 · 재주문 차단", "warning")
                                 return
+                            safe_message = self._safe_order_message(message)
+                            if not self._sold_out_rejection(message):
+                                self._remember_order("unknown")
+                                self.stop_event.set()
+                                wake_governors()
+                                self.log(f"주문 응답 확인 필요 · 서버 메시지={safe_message} · "
+                                         "자동 재전송 중단. 예약 조회·알림톡을 확인해주세요.", "warning")
+                                return
                             if self._journal is not None:
                                 self._journal.rejected()
+                            self._order_retry_after = time.monotonic() + 1.0
+                            self.log(f"[{worker_label}] [주문 거절] 서버 메시지={safe_message} · "
+                                     "전체 작업 주문 재시도 최소 1초 대기", "warning")
                             self._order_claimed.clear()
                             if warm is not None:
                                 warm.native_slot = ""
@@ -1333,7 +1415,7 @@ class DpsnnnEngine(BaseEngine):
                         self.submission_lock.release()
 
                     if not order_code:
-                        retry_state = "주문 생성 응답에 orderId 없음"
+                        retry_state = "서버 매진 응답 · 시간표를 다시 확인합니다"
                         if retry_state != last_message:
                             self.silent_tick(
                                 f"[{worker_label}] [재시도] 예약 주문 생성 · {retry_state} · 120ms 후 재시도"
@@ -1383,17 +1465,20 @@ class DpsnnnEngine(BaseEngine):
                 except (requests.RequestException, ValueError, KeyError) as exc:
                     if self.stop_event.is_set():
                         return
+                    if self._access_denied(exc, worker_label):
+                        return
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
                     self._log_http_diagnostic(
                         worker_label,
                         current_stage,
                         "처리",
-                        None,
+                        status,
                         0.0,
-                        f"{self._describe_exception(exc)} · {self.POLL_INTERVAL * 1000:.0f}ms 후 재시도",
+                        f"{self._describe_exception(exc)} · 요청 제한 대기 후 재조회",
                     )
                     self.silent_tick(
                         f"[{worker_label}] {current_stage} 실패 · "
-                        f"{type(exc).__name__} · {self.POLL_INTERVAL * 1000:.0f}ms 후 재시도"
+                        f"{type(exc).__name__} · 요청 제한 대기 후 재조회"
                     )
                     self.stop_event.wait(self.POLL_INTERVAL)
         except Exception as exc:
