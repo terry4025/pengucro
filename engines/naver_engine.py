@@ -58,6 +58,7 @@ import os
 import re
 import time
 import urllib.parse
+import uuid
 from typing import Any
 
 from engines.base_engine import BaseEngine
@@ -87,6 +88,12 @@ from engines.naver_timing import (
     NaverTimingProfile,
     load_timing_profile,
     record_timing_observation,
+)
+from engines.naver_shared import NaverSharedCoordinator
+from engines.naver_booking import (
+    BOOKING_DETAILS_QUERY,
+    extract_booking_id_from_resume_url,
+    verify_booking_details,
 )
 from pengucro.diagnostics import format_exception, write_redacted_debug_text
 from pengucro.models import parse_bool_flag
@@ -428,7 +435,7 @@ class NaverEngine(BaseEngine):
     POLL_RELAXED_SECONDS = 1.0
     RELAX_AFTER_SECONDS = 1800.0
     BURST_WINDOW_SECONDS = 120.0
-    CLOCK_RESYNC_SECONDS = 300.0
+    CLOCK_RESYNC_SECONDS = 60.0
     OPEN_SCHEDULE_REFRESH_FAR_SECONDS = 300.0
     OPEN_SCHEDULE_REFRESH_NEAR_SECONDS = 30.0
     OPEN_SCHEDULE_NEAR_WINDOW_SECONDS = 3600.0
@@ -466,6 +473,9 @@ class NaverEngine(BaseEngine):
     API_NOT_OPEN_RETRY_SECONDS = 0.01
     API_PREFLIGHT_MIN_SECONDS = 2.0
     API_PREFLIGHT_SLOT_TIMEOUT_SECONDS = 0.75
+    API_PREFLIGHT_TOTAL_TIMEOUT_SECONDS = 1.0
+    API_FINAL_CLOCK_MAX_SHIFT_MS = 100.0
+    API_FINAL_CLOCK_BUDGET_SECONDS = 3.0
     # Install one same-origin browser timer before the boundary so the final
     # booking fetch does not wait for a Python -> CDP wake-up at open time.
     API_BROWSER_ARM_MIN_SECONDS = 0.30
@@ -478,6 +488,8 @@ class NaverEngine(BaseEngine):
     API_SEND_MIN_LEAD_SECONDS = 0.020
     API_SEND_MAX_LEAD_SECONDS = 0.250
     API_PREOPEN_CLOCK_SAMPLES = 5
+    API_RECOVERY_PREFLIGHT_MIN_SECONDS = 12.0
+    API_TRANSPORT_SAMPLE_MAX_AGE_SECONDS = 15.0
     API_REFUSED_RECHECK_TIMEOUT_SECONDS = 0.30
     API_RECONCILE_ATTEMPTS = 120
     API_RECONCILE_WINDOW_SECONDS = 60.0
@@ -603,6 +615,19 @@ class NaverEngine(BaseEngine):
         )
         self._timing_profile_log_signature: tuple[str, float, int] | None = None
         self._last_post_submit_inventory: list[dict[str, Any]] = []
+        self._shared_reads = None
+        self._submission_lease = None
+        self._submission_lease_identity = None
+        self._submission_may_have_sent = False
+        self._recovery_preflight_done = False
+        self._recovery_status = "not_checked"
+        self._recovery_detail = ""
+        self._attempt_id = ""
+        self._submit_started_monotonic = None
+        self._submit_response_monotonic = None
+        self._armed_open_monotonic = None
+        self._preserve_checkout_page = False
+        self._reservation_target: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -623,7 +648,7 @@ class NaverEngine(BaseEngine):
                 f"{target} → 1로 조정합니다.",
                 "info",
             )
-        self.log("네이버는 탭 1개로 동작합니다. (여러 탭을 열지 않습니다)", "info")
+        self.log("네이버 예약 제출은 탭 1개로 동작합니다. 결과 확인용 읽기 전용 탭을 별도로 준비합니다.", "info")
         super().start_reservation(reservation_data, 1, is_async=True)
 
     async def run_async_tasks(self, reservation_data, num_tasks, start_idx_offset=0):
@@ -647,6 +672,23 @@ class NaverEngine(BaseEngine):
     # ------------------------------------------------------------------
     async def pre_fetch_sessions_async(self, num_sessions, reservation_data):
         self.session_pool = []
+        self._reservation_target = {
+            key: str(reservation_data.get(key) or "")
+            for key in ("reservationDate", "reservationTime")
+        }
+        self._attempt_id = uuid.uuid4().hex[:12]
+        self._shared_reads = NaverSharedCoordinator()
+        self._submission_lease = None
+        self._submission_lease_identity = None
+        self._submission_may_have_sent = False
+        self._recovery_preflight_done = False
+        self._recovery_status = "not_checked"
+        self._recovery_detail = ""
+        self._submit_started_monotonic = None
+        self._submit_response_monotonic = None
+        self._armed_open_monotonic = None
+        self._preserve_checkout_page = False
+        self.log(f"[진단] 네이버 실행 {self._attempt_id} · opening-reliability-1", "info")
         self._api_submitter = None
         self._api_preparation = None
         self._api_submit_enabled = False
@@ -682,6 +724,8 @@ class NaverEngine(BaseEngine):
         service_id, business_id, item_id = ids
 
         self.api = NaverBookingApi(business_id, item_id, service_id, log=self.log)
+        self.api.read_coordinator = self._shared_reads
+        self.api.read_stop_event = self.stop_event
         self._item_url = self.api.item_url
         self.clock = NaverServerClock(self.api, log=self.log)
 
@@ -709,7 +753,8 @@ class NaverEngine(BaseEngine):
                 "받지 못해 대상 슬롯 공개 후 다시 판별합니다.",
                 "info",
             )
-        await asyncio.to_thread(self.clock.sync, True)
+        await asyncio.to_thread(self.clock.sync_precise, 3, True)
+        self._log_clock_diagnostics("startup")
 
         blocked = meta.hard_block()
         if blocked:
@@ -1121,6 +1166,7 @@ class NaverEngine(BaseEngine):
             return
 
         self._api_submit_enabled = True
+        await self._prepare_recovery_lookup()
         if dev_mode:
             self.log(
                 f"[정보] 개발자 테스트 · Npay API 임시 선점 준비 완료 · "
@@ -1135,7 +1181,129 @@ class NaverEngine(BaseEngine):
                 "success",
             )
 
+    def _log_clock_diagnostics(self, phase: str) -> dict[str, Any]:
+        reader = getattr(self.clock, "diagnostic_snapshot", None)
+        snapshot = reader() if callable(reader) else {}
+        if snapshot:
+            self.log(
+                f"[진단] 네이버 시계 {self._attempt_id} · {phase} · "
+                + json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+                "info",
+            )
+        return snapshot
+
+    async def _prepare_recovery_lookup(self) -> None:
+        """Warm the authenticated read path well before the submission deadline."""
+        if self._recovery_preflight_done or self._api_submitter is None:
+            return
+        remaining = self._seconds_until_open()
+        if remaining is not None and remaining <= self.API_RECOVERY_PREFLIGHT_MIN_SECONDS:
+            return
+        preflight = getattr(self._api_submitter, "preflight_reconciliation", None)
+        if not callable(preflight):
+            return
+        self._recovery_preflight_done = True
+        try:
+            snapshot = await asyncio.wait_for(preflight(), timeout=4.0)
+            self._recovery_status = str(getattr(snapshot, "state", "not_checked"))
+            complete = bool(getattr(snapshot, "complete", False))
+        except Exception as exc:
+            self._recovery_status = type(exc).__name__
+            complete = False
+        self.log(
+            "[정보] 본인 예약내역 사전 확인 완료 · 제출 후 결과 확인을 준비했습니다."
+            if complete else
+            f"[경고] 본인 예약내역 사전 확인 불완전 ({self._recovery_status}) · "
+            "제출 후 조회 오류와 예약 없음 상태를 구분합니다.",
+            "info" if complete else "warning",
+        )
+
+    async def _claim_submission(self, reservation_data, *, mark_sent: bool = True) -> bool:
+        """Only the owning process may arm/click the same account's target slot."""
+        if self.stop_event.is_set():
+            self._recovery_detail = "중지됨 · 제출하지 않았습니다"
+            return False
+        if self._shared_reads is None:
+            return True
+        if self._submission_may_have_sent:
+            self._recovery_detail = "이 실행의 이전 제출 결과가 확정되지 않아 재전송하지 않습니다"
+            return False
+        data = reservation_data or {}
+        prepared = self._api_preparation
+        payload = prepared.payload if prepared is not None else {}
+        identity = {
+            "profile_identity": str(getattr(self._chrome_session, "profile_path", None) or data_path("chrome-profile")),
+            "account_id": str(getattr(self._api_account, "user_id", "") or ""),
+            "business_id": str(payload.get("businessId") or getattr(self.api, "business_id", "")),
+            "biz_item_id": str(payload.get("bizItemId") or getattr(self.api, "biz_item_id", "")),
+            "date_str": str(data.get("reservationDate") or ""),
+            "time_str": str(data.get("reservationTime") or "")[:5],
+        }
+        if not all(identity[key] for key in ("business_id", "biz_item_id", "date_str", "time_str")):
+            return False
+        if self._submission_lease is not None and self._submission_lease_identity != identity:
+            if self._submission_may_have_sent:
+                return False
+            await asyncio.to_thread(self._submission_lease.release_unsubmitted)
+            self._submission_lease = None
+        try:
+            if self._submission_lease is None:
+                self._submission_lease = await asyncio.to_thread(
+                    self._shared_reads.try_acquire_submission, **identity
+                )
+                self._submission_lease_identity = identity
+            if self._submission_lease is None:
+                self._recovery_detail = "같은 계정·상품·시간의 다른 실행 또는 이전 제출 결과를 먼저 확인해야 합니다"
+                self.log(f"[경고] {self._recovery_detail} · 추가 POST 없음", "warning")
+                return False
+            if self.stop_event.is_set():
+                await self._finish_submission_lease("not_sent")
+                return False
+            if mark_sent and not self._submission_may_have_sent:
+                await asyncio.to_thread(self._submission_lease.mark_submitted)
+                self._submission_may_have_sent = True
+                if self.stop_event.is_set():
+                    await self._finish_submission_lease("not_sent")
+                    return False
+        except Exception as exc:
+            self._recovery_detail = f"제출 소유권 확인 실패 ({type(exc).__name__})"
+            self.log(f"[경고] {self._recovery_detail} · 추가 POST 없음", "warning")
+            return False
+        return True
+
+    async def _finish_submission_lease(self, state: str) -> None:
+        lease = self._submission_lease
+        if lease is None:
+            return
+        try:
+            if state == "not_sent":
+                released = await asyncio.to_thread(lease.release_after_no_submission)
+                if released:
+                    self._submission_lease = None
+                    self._submission_lease_identity = None
+                    self._submission_may_have_sent = False
+            else:
+                await asyncio.to_thread(lease.finish, state)
+        except Exception as exc:
+            self.log(f"[경고] 제출 상태 보관 실패 ({type(exc).__name__}) · 추가 POST 없음", "warning")
+
     async def _refresh_api_submit(self, reservation_data) -> bool:
+        """Bound all optional final reads so they cannot consume the opening."""
+        remaining = self._seconds_until_open()
+        budget = self.API_PREFLIGHT_TOTAL_TIMEOUT_SECONDS
+        if remaining is not None and remaining > 0:
+            budget = min(budget, max(0.0, remaining - self.API_BROWSER_ARM_MIN_SECONDS))
+        if budget <= 0:
+            return False
+        try:
+            return await asyncio.wait_for(
+                self._refresh_api_submit_data(reservation_data), timeout=budget
+            )
+        except asyncio.TimeoutError:
+            self.log("[정보] 오픈 직전 갱신 시간 제한 · 기존 검증값으로 제출 시각을 유지합니다.", "info")
+            return False
+
+    async def _refresh_api_submit_data(self, reservation_data) -> bool:
         """Refresh volatile account/slot data without discarding a ready payload."""
         if (
             self.api is None
@@ -1153,7 +1321,8 @@ class NaverEngine(BaseEngine):
         async def fetch_slot():
             return await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.api.fetch_slot_raw, target_date, target_time
+                    self.api.fetch_slot_raw, target_date, target_time,
+                    **({"fresh": True} if isinstance(self.api, NaverBookingApi) else {}),
                 ),
                 timeout=self.API_PREFLIGHT_SLOT_TIMEOUT_SECONDS,
             )
@@ -1270,10 +1439,12 @@ class NaverEngine(BaseEngine):
             )
             if (
                 outside_blackout
+                and not (self._final_clock_sync_attempted and until_open is not None and until_open >= 0)
                 and time.monotonic() - last_resync >= self.CLOCK_RESYNC_SECONDS
             ):
                 last_resync = time.monotonic()
-                await asyncio.to_thread(self.clock.sync, False)
+                await self._sync_periodic_clock()
+                self._log_clock_diagnostics("periodic")
 
             # Seconds of server time until the published opening moment. None when
             # the item publishes none, in which case nothing below gates on it.
@@ -1303,12 +1474,26 @@ class NaverEngine(BaseEngine):
                 if outcome == "retry":
                     submit_attempts += 1
             else:
+                if (
+                    self._api_may_submit(dev_mode)
+                    and self._open_strike_pending
+                    and until_open is not None
+                    and self.OPEN_ARM_SECONDS < until_open <= self.OPEN_BLACKOUT_SECONDS
+                ):
+                    # The payload is ready. Optional polling must not occupy the
+                    # thread/connection while the fixed opening strike approaches.
+                    await asyncio.sleep(min(0.1, until_open - self.OPEN_ARM_SECONDS))
+                    continue
                 try:
-                    slot = await asyncio.to_thread(
-                        self.api.find_slot, target_date, target_time
-                    )
-                except NaverApiError as exc:
+                    lookup = asyncio.to_thread(self.api.find_slot, target_date, target_time)
+                    if until_open is not None and 0 < until_open <= self.OPEN_BLACKOUT_SECONDS:
+                        slot = await asyncio.wait_for(lookup, timeout=0.5)
+                    else:
+                        slot = await lookup
+                except (NaverApiError, asyncio.TimeoutError) as exc:
                     self.silent_tick(f"{target_time} 조회 실패")
+                    if until_open is not None and 0 < until_open <= self.OPEN_BLACKOUT_SECONDS:
+                        continue
                     self._log_throttled(
                         "poll_error", f"[경고] 조회 실패: {exc}", "warning", 15.0
                     )
@@ -1463,6 +1648,9 @@ class NaverEngine(BaseEngine):
             if outcome == "success":
                 self.log(f"🎉 네이버 예약 성공! {detail}", "success")
                 self.notify_success()
+                return
+            if outcome == "pending":
+                self.log(f"[정보] {detail} · 추가 예약 제출 없이 확인을 기다립니다.", "warning")
                 return
             if outcome == "stopped" or self.stop_event.is_set():
                 return
@@ -1634,13 +1822,7 @@ class NaverEngine(BaseEngine):
         )
 
     async def _close_stale_tabs(self) -> None:
-        """Tidy booking tabs left over from earlier runs.
-
-        The tab leak is fixed at teardown, but a profile that already accumulated
-        them -- or a run that was killed rather than stopped -- still needs
-        clearing, because attaching walks every target. Only booking pages are
-        touched; anything else the user has open is left alone.
-        """
+        """Report accumulated tabs without interrupting another active owner."""
         if self._context is None:
             return
         stale = []
@@ -1653,15 +1835,9 @@ class NaverEngine(BaseEngine):
                 stale.append(page)
         if len(stale) < self.STALE_TAB_LIMIT:
             return
-        closed = 0
-        for page in stale:
-            try:
-                await page.close()
-                closed += 1
-            except Exception:
-                continue
-        if closed:
-            self.log(f"[정보] 이전 실행에서 남은 예약 탭 {closed}개를 정리했습니다.", "info")
+        # URL and tab count do not prove the owner stopped. Another instance
+        # can still have an armed timer or unpaid booking in these pages.
+        self.log(f"[정보] 기존 예약 탭 {len(stale)}개 확인 · 진행 중인 다른 실행을 보호하기 위해 유지합니다.", "info")
 
     async def _launch_bundled(self, headless: bool):
         errors = []
@@ -1773,6 +1949,13 @@ class NaverEngine(BaseEngine):
         return self.clock.seconds_until(self._open_at_epoch)
 
     async def _refresh_open_schedule(self, target_date: str) -> bool | None:
+        try:
+            return await asyncio.wait_for(self._refresh_open_schedule_data(target_date), timeout=3.0)
+        except asyncio.TimeoutError:
+            self._log_throttled("open_schedule_timeout", "[정보] 오픈 일정 조회 시간 제한 · 기존 오픈 시각을 유지합니다.", "info", 30.0)
+            return None
+
+    async def _refresh_open_schedule_data(self, target_date: str) -> bool | None:
         """Re-resolve rolling opening metadata instead of freezing startup data."""
         if self.api is None or self.clock is None:
             return None
@@ -1837,6 +2020,23 @@ class NaverEngine(BaseEngine):
                 return
             await asyncio.sleep(0.05 if remaining > 0.5 else 0.005)
 
+    async def _sync_periodic_clock(self) -> None:
+        if not isinstance(self.clock, NaverServerClock):
+            await asyncio.to_thread(self.clock.sync, False)
+            return
+        # One sample per minute cannot establish three-sample agreement within
+        # the clock's 60-second consensus window. Measure a bounded batch while
+        # there is still time to correct a poor startup anchor.
+        budget = self.API_FINAL_CLOCK_BUDGET_SECONDS
+        deadline = time.monotonic() + budget
+        try:
+            await asyncio.wait_for(asyncio.to_thread(
+                self.clock.sync_precise, 3, False,
+                budget_seconds=budget, deadline=deadline,
+            ), timeout=budget + 0.1)
+        except asyncio.TimeoutError:
+            self.log("[정보] 서버 시각 재확인 시간 제한 · 기존 시각을 유지합니다.", "info")
+
     async def _sync_clock_before_open(self) -> bool:
         """Refresh the server clock once in the final safe pre-open window."""
         if self._final_clock_sync_attempted or self.clock is None:
@@ -1845,28 +2045,43 @@ class NaverEngine(BaseEngine):
         precise_sync = getattr(self.clock, "sync_precise", None)
         if not callable(precise_sync):
             return False
-        synced = await asyncio.to_thread(
-            precise_sync,
-            self.API_PREOPEN_CLOCK_SAMPLES,
-            False,
-        )
+        budget = self.API_FINAL_CLOCK_BUDGET_SECONDS
+        clock_deadline = time.monotonic() + budget
+        try:
+            synced = await asyncio.wait_for(asyncio.to_thread(
+                precise_sync, self.API_PREOPEN_CLOCK_SAMPLES, False,
+                **({"max_deadline_shift_ms": self.API_FINAL_CLOCK_MAX_SHIFT_MS,
+                    "budget_seconds": budget, "deadline": clock_deadline}
+                   if isinstance(self.clock, NaverServerClock) else {}),
+            ), timeout=budget + 0.1)
+        except asyncio.TimeoutError:
+            self.log("[정보] 최종 서버 시각 조회 시간 제한 · 기존 서버 시각으로 제출을 준비합니다.", "info")
+            return False
+        diagnostic = self._log_clock_diagnostics("preopen")
         if not synced:
             return False
         precision_ms = float(self.clock.last_precision or 0.0) * 1000
+        retained = diagnostic.get("status") == "retained"
         self.log(
-            f"[정보] 오픈 직전 서버 시계 정밀 보정 완료 · "
+            ("[정보] 오픈 직전 지연·불일치 표본 제외 · 기존 서버 시각 유지 · "
+             if retained else "[정보] 오픈 직전 서버 시각 보정 완료 · ")
+            +
             f"표본 기준 불확실성 약 {precision_ms:.0f}ms (실제 서버 도착 오차 아님)",
-            "success",
+            "info" if retained else "success",
         )
         return True
 
     def _api_one_way_seconds(self) -> float:
         browser_samples = []
         if self._api_submitter is not None:
-            browser_samples.extend(
-                getattr(self._api_submitter, "safe_rtt_samples", ()) or ()
-            )
-            browser_samples.append(getattr(self._api_submitter, "last_rtt", None))
+            recent = getattr(self._api_submitter, "recent_safe_rtt_samples", None)
+            if callable(recent):
+                browser_samples.extend(recent(self.API_TRANSPORT_SAMPLE_MAX_AGE_SECONDS))
+            else:
+                browser_samples.extend(
+                    getattr(self._api_submitter, "safe_rtt_samples", ()) or ()
+                )
+                browser_samples.append(getattr(self._api_submitter, "last_rtt", None))
 
         def normalized(values):
             result = []
@@ -1880,7 +2095,8 @@ class NaverEngine(BaseEngine):
             return result
 
         transport_samples = normalized(browser_samples)
-        if not transport_samples and self.api is not None:
+        if (not transport_samples and self.api is not None
+                and not callable(getattr(self._api_submitter, "recent_safe_rtt_samples", None))):
             transport_samples = normalized((getattr(self.api, "last_rtt", None),))
         if transport_samples:
             # The quickest warmed same-origin read best represents network
@@ -2009,6 +2225,24 @@ class NaverEngine(BaseEngine):
             "not_open_attempts": timing.get("notOpenAttempts"),
             "http_status": diagnostics.get("httpStatus"),
         }
+        reader = getattr(self.clock, "diagnostic_snapshot", None)
+        if callable(reader):
+            snapshot = reader()
+            payload.update({
+                "clock_rtt_ms": snapshot.get("rtt_ms"),
+                "clock_spread_ms": snapshot.get("spread_ms"),
+                "clock_anchor_age_ms": snapshot.get("anchor_age_ms"),
+                "clock_candidate_shift_ms": snapshot.get("candidate_deadline_shift_ms"),
+                "clock_applied_shift_ms": snapshot.get("applied_deadline_shift_ms"),
+            })
+        queue_ms = diagnostics.get("browserQueueMs")
+        if isinstance(queue_ms, (int, float)):
+            payload["dispatch_to_request_ms"] = queue_ms
+        if diagnostics.get("attemptTimings"):
+            payload["attempt_timings"] = diagnostics["attemptTimings"]
+        for key in ("armedVisibility", "dispatchVisibility", "foregroundRestore"):
+            if diagnostics.get(key) is not None:
+                payload[key] = diagnostics[key]
         return {key: value for key, value in payload.items() if value is not None}
 
     def _record_api_timing_result(
@@ -2086,12 +2320,18 @@ class NaverEngine(BaseEngine):
         started = time.monotonic()
         samples: list[dict[str, Any]] = []
         for offset in self.API_POST_SUBMIT_INVENTORY_OFFSETS:
+            if self.stop_event.is_set():
+                break
             wait_for = started + float(offset) - time.monotonic()
             if wait_for > 0:
                 await asyncio.sleep(wait_for)
+            requested_at = time.monotonic()
             try:
                 slot = await asyncio.wait_for(
-                    asyncio.to_thread(self.api.find_slot, target_date, target_time),
+                    asyncio.to_thread(
+                        self.api.find_slot, target_date, target_time,
+                        **({"fresh": True} if isinstance(self.api, NaverBookingApi) else {}),
+                    ),
                     timeout=1.0,
                 )
             except (asyncio.TimeoutError, NaverApiError, OSError):
@@ -2114,6 +2354,14 @@ class NaverEngine(BaseEngine):
                 "remaining": slot.remaining,
                 "status": reason or "예약 가능",
             })
+            samples[-1]["request_elapsed_ms"] = round((requested_at - started) * 1000, 1)
+            for label, anchor in (
+                ("since_dispatch_ms", self._submit_started_monotonic),
+                ("since_response_ms", self._submit_response_monotonic),
+                ("estimated_open_offset_ms", self._armed_open_monotonic),
+            ):
+                if anchor is not None:
+                    samples[-1][label] = round((time.monotonic() - anchor) * 1000, 1)
         self._last_post_submit_inventory = samples
         readable = []
         for sample in samples:
@@ -2126,8 +2374,12 @@ class NaverEngine(BaseEngine):
                 readable.append(f"+{float(elapsed):.0f}ms {sample.get('status', '알 수 없음')}")
         if readable:
             self.log(
-                "[정보] 제출 후 재고 관측(읽기 전용) · " + " · ".join(readable),
+                "[정보] 제출 후 재고 관측(읽기 전용·응답 후 관측 시작 기준) · " + " · ".join(readable),
                 "info",
+            )
+            self.log(
+                f"[진단] 네이버 재고 {self._attempt_id} · "
+                + json.dumps(samples, ensure_ascii=False, separators=(",", ":")), "info"
             )
         return samples
 
@@ -2145,7 +2397,10 @@ class NaverEngine(BaseEngine):
             return False
         try:
             slot = await asyncio.wait_for(
-                asyncio.to_thread(self.api.find_slot, target_date, target_time),
+                asyncio.to_thread(
+                    self.api.find_slot, target_date, target_time,
+                    **({"fresh": True} if isinstance(self.api, NaverBookingApi) else {}),
+                ),
                 timeout=self.API_REFUSED_RECHECK_TIMEOUT_SECONDS,
             )
         except (asyncio.TimeoutError, NaverApiError, OSError):
@@ -2205,10 +2460,20 @@ class NaverEngine(BaseEngine):
                 item_name=item_name,
                 attempts=self.API_RECONCILE_ATTEMPTS,
                 window_seconds=self.API_RECONCILE_WINDOW_SECONDS,
+                **({"stop_event": self.stop_event} if isinstance(self._api_submitter, NaverBrowserSubmitter) else {}),
             )
-        except Exception:
+        except Exception as exc:
+            self._recovery_status = "lookup_error"
+            self._recovery_detail = f"예약내역 조회 자체 실패 ({type(exc).__name__})"
             await inventory_task
             return None
+        self._recovery_status = str(getattr(evidence, "state", "not_found"))
+        reads = int(getattr(evidence, "successful_reads", 0) or 0)
+        failures = int(getattr(evidence, "failed_reads", 0) or 0)
+        self._recovery_detail = (
+            f"본인 예약내역 조회 상태 {self._recovery_status} · 정상 {reads}회/오류 {failures}회"
+        )
+        self.log(f"[정보] {self._recovery_detail}", "info")
         if not getattr(evidence, "found", False) or not getattr(
             evidence, "booking_id", ""
         ):
@@ -2229,18 +2494,29 @@ class NaverEngine(BaseEngine):
                 "https://m.booking.naver.com", landing_url
             )
         self._api_submit_state = "success"
+        await self._finish_submission_lease("confirmed")
         self.log(
             f"[정보] 본인 예약내역 대조 성공 · 예약번호 {booking_id} · "
             "동일 상품·날짜·시간 확인",
             "success",
         )
         if self._api_preparation.requires_checkout:
+            verification = await self._read_booking_evidence(booking_id, reservation_data=data)
+            if verification is None or not verification.matched:
+                self._preserve_checkout_page = True
+                return "unknown", f"예약번호 {booking_id} 조회됨 · 결제 대상 상세 대조를 완료하지 못해 자동 결제하지 않습니다"
+            if verification.confirmed and verification.paid:
+                return "success", f"예약번호 {booking_id} · 예약 확정 및 결제 완료 확인"
+            if verification.paid:
+                return "pending", f"예약번호 {booking_id} · 결제 완료 확인 · 매장 예약 확정 대기"
             return await self._continue_npay_checkout(
                 booking_id=booking_id,
                 payment_url=landing_url,
                 dev_mode=dev_mode,
                 navigate_immediately=True,
             )
+        if str(getattr(evidence, "status", "")) == "RC02":
+            return "pending", f"예약번호 {booking_id} · 예약 접수 확인 · 매장 확인 대기"
         return "success", f"예약번호 {booking_id} · 본인 예약내역에서 확정"
 
     async def _handle_api_submit_result(
@@ -2252,8 +2528,26 @@ class NaverEngine(BaseEngine):
         dev_mode: bool,
     ) -> tuple[str, str]:
         """Handle one known result without issuing any additional mutation."""
+        self._submit_response_monotonic = time.monotonic()
+        timing = getattr(self._api_submitter, "last_armed_timing", {}) or {}
+        if self._armed_open_monotonic is not None and all(
+            isinstance(timing.get(key), (int, float)) for key in ("startedAt", "serverOpenAt")
+        ):
+            self._submit_started_monotonic = self._armed_open_monotonic + (
+                timing["startedAt"] - timing["serverOpenAt"]
+            ) / 1000
+        self.log(
+            f"[진단] 네이버 응답 {self._attempt_id} · "
+            + json.dumps({
+                "outcome": result.outcome,
+                "booking_id_present": bool(result.booking_id),
+                "resume_url_present": bool(result.url),
+                "timing": self._timing_observation_payload(),
+            }, ensure_ascii=False, separators=(",", ":")), "info"
+        )
         if result.outcome == SubmitOutcome.SUCCESS:
             self._api_submit_state = "success"
+            await self._finish_submission_lease("confirmed")
             self._api_delayed_open_started = 0.0
             self._api_delayed_open_slow_logged = False
             self._record_api_timing_result(
@@ -2274,6 +2568,7 @@ class NaverEngine(BaseEngine):
                 + (f" · {result.url}" if result.url else ""),
             )
         if result.outcome == SubmitOutcome.NOT_OPEN:
+            await self._finish_submission_lease("not_sent")
             self._api_submit_state = "idle"
             return "notopen", result.detail
         if result.outcome in {
@@ -2287,6 +2582,7 @@ class NaverEngine(BaseEngine):
             # final submission and reconcile the authenticated account instead
             # of risking a second reservation.
             self._api_submit_state = "uncertain"
+            await self._finish_submission_lease("uncertain")
             self._api_delayed_open_started = 0.0
             self._api_delayed_open_slow_logged = False
             self._api_submit_enabled = False
@@ -2294,6 +2590,22 @@ class NaverEngine(BaseEngine):
             self._api_refused_signature = (
                 signature if signature is not None else getattr(self, "_last_signature", None)
             )
+            candidate_id = extract_booking_id_from_resume_url(self._normalize_payment_url(result.url))
+            if candidate_id and self._api_preparation is not None and self._api_preparation.requires_checkout:
+                verification = await self._read_booking_evidence(candidate_id, reservation_data=reservation_data)
+                if verification is not None and verification.matched:
+                    await self._finish_submission_lease("confirmed")
+                    self._api_submit_state = "success"
+                    if verification.confirmed and verification.paid:
+                        return "success", f"예약번호 {candidate_id} · 예약 확정 및 결제 완료 확인"
+                    if verification.paid:
+                        return "pending", f"예약번호 {candidate_id} · 결제 완료 확인 · 매장 예약 확정 대기"
+                    return await self._continue_npay_checkout(
+                        booking_id=candidate_id,
+                        payment_url=self._normalize_payment_url(result.url),
+                        dev_mode=dev_mode,
+                        navigate_immediately=True,
+                    )
             recovered = await self._reconcile_ambiguous_api_submit(
                 reservation_data=reservation_data,
                 dev_mode=dev_mode,
@@ -2302,7 +2614,7 @@ class NaverEngine(BaseEngine):
                 self._record_api_timing_result(
                     outcome=SubmitOutcome.SUCCESS,
                     response_code=result.code,
-                    booking_confirmed=True,
+                    booking_confirmed=recovered[0] in {"success", "payment", "pending", "dev"},
                 )
                 return recovered
             self._record_api_timing_result(
@@ -2310,13 +2622,26 @@ class NaverEngine(BaseEngine):
                 response_code=result.code,
                 booking_confirmed=False,
             )
-            suffix = " · 본인 예약내역에서 아직 확정되지 않음 · 추가 POST 없음"
+            if result.url and self._api_preparation is not None and self._api_preparation.requires_checkout:
+                # A partial reply is evidence for inspection, never authority to
+                # pay or declare the slot acquired without a matching booking.
+                candidate = self._normalize_payment_url(result.url)
+                if self._is_npay_url(candidate) or self._is_trusted_booking_resume_url(candidate):
+                    self._preserve_checkout_page = True
+                    try:
+                        await self._page.goto(candidate, wait_until="domcontentloaded", timeout=10000)
+                        self.log("[경고] 부분 응답의 화면을 열었습니다 · 예약번호 확인 전 결제하지 않습니다.", "warning")
+                    except Exception:
+                        self.log("[경고] 부분 응답의 화면 이동을 확인하지 못했습니다 · 추가 제출 없이 Chrome을 유지합니다.", "warning")
+            suffix = f" · {self._recovery_detail or '본인 예약내역에서 아직 확정되지 않음'} · 추가 POST 없음"
             if result.outcome == SubmitOutcome.REFUSED:
                 return "unknown", result.detail + suffix
             if result.outcome == SubmitOutcome.DUPLICATED:
                 return "duplicate", result.detail + suffix
             return "unknown", result.detail + suffix
         self._api_submit_state = "idle"
+        # Authentication/payload rejection is distinct from an uncertain POST.
+        await self._finish_submission_lease("not_sent")
         self._api_delayed_open_started = 0.0
         self._api_delayed_open_slow_logged = False
         self._disable_api_submit(result.detail)
@@ -2366,6 +2691,9 @@ class NaverEngine(BaseEngine):
             or DEFAULT_TARGET_BEFORE_OPEN_SECONDS
         )
         delay = max(0.0, remaining - lead)
+        if not await self._claim_submission(reservation_data):
+            return "unknown", self._recovery_detail or "동일 예약 제출 소유권 확인 실패"
+        self._armed_open_monotonic = open_monotonic
         try:
             server_time_arm = getattr(
                 self._api_submitter, "arm_submit_at_server_time", None
@@ -2396,6 +2724,9 @@ class NaverEngine(BaseEngine):
                 dev_mode=dev_mode,
             )
         except Exception as exc:
+            # The submitter only raises an ordinary arm error after proving the
+            # browser timer cancelled; uncertain installation has its own branch.
+            await self._finish_submission_lease("not_sent")
             self.log(
                 f"[정보] 브라우저 내부 예약 타이머 준비 실패 ({type(exc).__name__}) · "
                 "기존 직접 제출로 진행합니다.",
@@ -2452,7 +2783,8 @@ class NaverEngine(BaseEngine):
             wait_for = due - time.monotonic() - self.API_BROWSER_ARM_FINAL_QUIET_SECONDS
             await asyncio.sleep(min(0.10, max(0.01, wait_for)))
         if self.stop_event.is_set():
-            await self._api_submitter.cancel_armed_submit(arm_id)
+            cancelled = await self._api_submitter.cancel_armed_submit(arm_id)
+            await self._finish_submission_lease("not_sent" if cancelled is True else "uncertain")
             self._api_submit_state = "idle"
             return "stopped", "중지됨"
         # Keep CDP traffic out of the final timer window; Chrome owns the exact
@@ -2554,10 +2886,12 @@ class NaverEngine(BaseEngine):
                     )
                 return outcome, detail
             if state == "cancelled":
+                await self._finish_submission_lease("not_sent")
                 self._api_submit_state = "idle"
                 return "stopped", "중지됨"
             await asyncio.sleep(self.API_BROWSER_ARM_STATUS_SECONDS)
-        await self._api_submitter.cancel_armed_submit(arm_id)
+        cancelled = await self._api_submitter.cancel_armed_submit(arm_id)
+        await self._finish_submission_lease("not_sent" if cancelled is True else "uncertain")
         self._api_submit_state = "idle"
         return "stopped", "중지됨"
 
@@ -2584,9 +2918,13 @@ class NaverEngine(BaseEngine):
 
         deadline = time.monotonic() + self.API_NOT_OPEN_WINDOW_SECONDS
         for attempt in range(1, self.API_SUBMIT_MAX_ATTEMPTS + 1):
+            if not await self._claim_submission(reservation_data):
+                return "unknown", self._recovery_detail or "동일 예약 제출 소유권 확인 실패"
             self._api_submit_state = "inflight"
             sent_at = time.monotonic()
+            self._submit_started_monotonic = sent_at
             offset = self._seconds_until_open()
+            self._armed_open_monotonic = sent_at + offset if offset is not None else None
             offset_text = (
                 f"{-offset:+.3f}초"
                 if offset is not None
@@ -2873,6 +3211,11 @@ class NaverEngine(BaseEngine):
             and account.user_id
             and previous.user_id != account.user_id
         )
+        if account_changed:
+            self._recovery_preflight_done = False
+            reset = getattr(self._api_submitter, "reset_reconciliation_baseline", None)
+            if callable(reset):
+                reset()
         self.log(
             "[정보] 현재 Chrome의 네이버 계정 변경을 반영했습니다. "
             "이전 제출 준비값을 새 로그인 기준으로 갱신합니다."
@@ -2977,25 +3320,33 @@ class NaverEngine(BaseEngine):
             pass
 
     async def _teardown_browser(self) -> None:
+        closer = getattr(self._api_submitter, "close_reconciliation_page", None)
+        if callable(closer):
+            await closer()
+        if self._submission_lease is not None and not self._submission_may_have_sent:
+            try:
+                await asyncio.to_thread(self._submission_lease.release_unsubmitted)
+            except Exception:
+                pass
         # Close the tab we opened. Detaching from a real Chrome leaves everything
         # else alone -- including, before this, the tab this run created. Those
         # accumulated: after roughly ten runs the profile held ten dead booking
         # tabs and connect_over_cdp started taking longer than its 30 s timeout,
         # so the engine hung during setup and never reached the polling loop.
-        if self._page is not None:
+        if self._page is not None and not self._preserve_checkout_page:
             try:
                 await self._page.close()
             except Exception:
                 pass
 
-        if self._owns_browser:
+        if self._owns_browser and not self._preserve_checkout_page:
             for closer in (self._context, self.browser):
                 try:
                     if closer is not None:
                         await closer.close()
                 except Exception:
                     continue
-        elif self.browser is not None:
+        elif self.browser is not None and not self._owns_browser:
             # A CDP close only detaches Playwright; the user's Chrome stays up.
             try:
                 await self.browser.close()
@@ -3005,14 +3356,14 @@ class NaverEngine(BaseEngine):
         self._context = None
         self._page = None
 
-        if self._playwright is not None:
+        if self._playwright is not None and not (self._owns_browser and self._preserve_checkout_page):
             try:
                 await self._playwright.stop()
             except Exception:
                 pass
             self._playwright = None
 
-        if self._chrome_session is not None and self._close_chrome_on_exit:
+        if self._chrome_session is not None and self._close_chrome_on_exit and not self._preserve_checkout_page:
             self._chrome_session.close_if_launched()
         self._chrome_session = None
 
@@ -3070,6 +3421,8 @@ class NaverEngine(BaseEngine):
         page = self._page
         if page is None:
             return "error", "브라우저가 준비되지 않았습니다"
+        if self._submission_may_have_sent:
+            return "unknown", "이전 제출 결과가 불명확해 추가 예약 버튼을 누르지 않습니다"
 
         self._dialog_state["message"] = ""
         hour, _, minute = target_time.partition(":")
@@ -3221,18 +3574,27 @@ class NaverEngine(BaseEngine):
                 return "dev", ""
 
             if is_npay:
+                if not await self._claim_submission(reservation_data):
+                    return "unknown", self._recovery_detail
                 return await self._submit_npay(
                     submit,
                     dev_mode=dev_mode,
                 )
 
+            if not await self._claim_submission(reservation_data):
+                return "unknown", self._recovery_detail
             await submit.click()
             self.log("🚀 '동의하고 예약하기' 클릭", "warning")
-            return await self._verify_result()
+            outcome, detail = await self._verify_result()
+            await self._finish_submission_lease("confirmed" if outcome == "success" else "uncertain")
+            return ("unknown" if outcome == "retry" else outcome), detail
 
         except Exception as exc:
             if self.stop_event.is_set():
                 return "error", "중지됨"
+            if self._submission_may_have_sent:
+                await self._finish_submission_lease("uncertain")
+                return "unknown", f"예약 버튼 제출 결과 불명 ({type(exc).__name__}) · 추가 POST 없음"
             return "retry", f"{type(exc).__name__}: {str(exc)[:120]}"
 
     async def _is_npay_submission(self, submit) -> bool:
@@ -3301,7 +3663,10 @@ class NaverEngine(BaseEngine):
     @staticmethod
     def _is_npay_url(url: str) -> bool:
         try:
-            host = (urllib.parse.urlparse(url).hostname or "").lower()
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
+                return False
         except Exception:
             return False
         return host == "pay.naver.com" or host.endswith(".pay.naver.com")
@@ -3312,6 +3677,8 @@ class NaverEngine(BaseEngine):
             parsed = urllib.parse.urlparse(url)
             host = (parsed.hostname or "").lower()
             path = (parsed.path or "").lower()
+            if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443):
+                return False
         except Exception:
             return False
         return (
@@ -3330,7 +3697,6 @@ class NaverEngine(BaseEngine):
             return "error", "브라우저가 준비되지 않았습니다"
 
         response = None
-        clicked = False
         capture_error = ""
         try:
             async with page.expect_response(
@@ -3338,16 +3704,12 @@ class NaverEngine(BaseEngine):
                 timeout=self.NAVIGATION_TIMEOUT_MS,
             ) as response_info:
                 await submit.click()
-                clicked = True
             response = await response_info.value
         except Exception as exc:
             capture_error = f"{type(exc).__name__}: {str(exc)[:100]}"
-            if not clicked:
-                try:
-                    await submit.click()
-                    clicked = True
-                except Exception as click_exc:
-                    return "retry", f"결제 예약 버튼 클릭 실패: {click_exc}"
+            # A click timeout does not prove no request was sent. Never click a
+            # second time after entering the final submission action.
+            await self._finish_submission_lease("uncertain")
 
         self.log("🚀 '동의하고 결제하기' 클릭", "warning")
 
@@ -3363,7 +3725,10 @@ class NaverEngine(BaseEngine):
                 capture_error = f"응답 해석 실패: {type(exc).__name__}"
 
         if server_error:
-            return self._classify(server_error), server_error
+            await self._finish_submission_lease("uncertain")
+            return "unknown", server_error + " · 추가 예약 버튼 클릭 없음"
+
+        await self._finish_submission_lease("confirmed" if booking_id else "uncertain")
 
         return await self._continue_npay_checkout(
             booking_id=booking_id,
@@ -3390,6 +3755,8 @@ class NaverEngine(BaseEngine):
                 "결제를 완료해야 최종 확정됩니다.",
                 "success",
             )
+
+        self._preserve_checkout_page = True
 
         if self.stop_event.is_set():
             return "stopped", "중지됨"
@@ -3418,6 +3785,8 @@ class NaverEngine(BaseEngine):
             )
 
         self._page = payment_page
+        if not booking_id:
+            return "unknown", "결제 화면은 열렸지만 예약번호를 확인하지 못했습니다 · 자동 결제 없이 화면을 유지합니다"
         selected, selection_detail = await self._select_npay_money(payment_page)
         if self.stop_event.is_set():
             return "stopped", "중지됨"
@@ -3463,7 +3832,7 @@ class NaverEngine(BaseEngine):
             return (
                 "payment",
                 f"예약번호 {booking_id or '확인 필요'} 임시 선점 완료 · "
-                f"최종 결제 버튼 클릭 실패 ({type(exc).__name__}) · 직접 눌러주세요.",
+                f"결제 클릭 응답 불명 ({type(exc).__name__}) · 추가 클릭 없이 결제 결과를 확인합니다.",
             )
 
         self.log(f"💳 Npay 머니 '{button_text}' 클릭", "warning")
@@ -3480,6 +3849,8 @@ class NaverEngine(BaseEngine):
         direct_npay = self._is_npay_url(payment_url)
         booking_resume = self._is_trusted_booking_resume_url(payment_url)
         if not direct_npay and not booking_resume:
+            return None
+        if booking_resume and extract_booking_id_from_resume_url(payment_url) != self._npay_booking_id:
             return None
         try:
             await self._page.goto(
@@ -3527,7 +3898,12 @@ class NaverEngine(BaseEngine):
                                 timeout=10000,
                             )
                             return self._page
-                    await control.click(timeout=1500)
+                    try:
+                        await control.click(timeout=1500)
+                    except Exception:
+                        # The resume click may already have dispatched. Inspect
+                        # this page once; never try another payment control.
+                        pass
                     return await self._wait_for_npay_page("")
                 except Exception:
                     continue
@@ -3536,8 +3912,10 @@ class NaverEngine(BaseEngine):
     async def _wait_for_npay_page(self, payment_url: str = ""):
         deadline = time.monotonic() + self.NPAY_PAGE_TIMEOUT_SECONDS
         while time.monotonic() < deadline and not self.stop_event.is_set():
+            # Existing checkout tabs can belong to another attempt. A returned
+            # exact URL can bind a popup; otherwise follow only this run's page.
             pages = []
-            if self._context is not None:
+            if payment_url and self._context is not None:
                 try:
                     pages.extend(list(self._context.pages))
                 except Exception:
@@ -3551,6 +3929,10 @@ class NaverEngine(BaseEngine):
                 except Exception:
                     continue
                 if not self._is_npay_url(url):
+                    continue
+                if candidate is not self._page and url.split("#", 1)[0] != payment_url.split("#", 1)[0]:
+                    continue
+                if payment_url and url.split("#", 1)[0] != payment_url.split("#", 1)[0]:
                     continue
                 try:
                     await candidate.bring_to_front()
@@ -3712,17 +4094,68 @@ class NaverEngine(BaseEngine):
             await asyncio.sleep(0.1)
         return None, "결제하기"
 
-    async def _monitor_npay_completion(self) -> str:
-        auth_reported = False
-        while not self.stop_event.is_set():
-            pages = []
-            if self._context is not None:
+    async def _read_booking_evidence(self, booking_id: str, *, page=None, reservation_data=None):
+        """Read authenticated detail status; never infer payment from a URL."""
+        if self.stop_event.is_set() or not booking_id:
+            return None
+        temporary = None
+        source = page
+        try:
+            if source is None:
+                if self._context is None:
+                    return None
+                temporary = await self._context.new_page()
+                source = temporary
+                await source.goto(
+                    f"https://m.booking.naver.com/my/bookings/{booking_id}",
+                    wait_until="domcontentloaded", timeout=5000,
+                )
+            parsed = urllib.parse.urlparse(source.url)
+            if parsed.scheme != "https" or parsed.hostname not in {"booking.naver.com", "m.booking.naver.com"}:
+                return None
+            reader = NaverBrowserSubmitter(source, timeout_seconds=2.0)
+            account_id = str(getattr(self._api_account, "user_id", "") or "")
+            if not account_id:
+                current_account = await reader.fetch_account()
+                if not current_account.is_logged_in or not current_account.user_id:
+                    return None
+                account_id = str(current_account.user_id)
+            response = await reader._graphql(
+                "bookingDetails", BOOKING_DETAILS_QUERY,
+                {"input": {"bookingId": booking_id, "lang": "ko"}},
+            )
+            target = reservation_data or self._reservation_target
+            payload = self._api_preparation.payload if self._api_preparation else {}
+            evidence = verify_booking_details(
+                response, booking_id=booking_id,
+                business_id=str(payload.get("businessId") or getattr(self.api, "business_id", "")),
+                biz_item_id=str(payload.get("bizItemId") or getattr(self.api, "biz_item_id", "")),
+                target_date=str(target.get("reservationDate") or ""),
+                target_time=str(target.get("reservationTime") or "")[:5],
+                account_id=account_id,
+            )
+            self._log_throttled("booking_detail_status", f"[정보] 예약 상세 확인 · {evidence.state}", "info", 10.0)
+            return evidence
+        except Exception as exc:
+            self._log_throttled("booking_detail_error", f"[정보] 예약 상세 조회 지연 ({type(exc).__name__}) · 완료 확인 대기", "info", 10.0)
+            return None
+        finally:
+            if temporary is not None:
                 try:
-                    pages.extend(list(self._context.pages))
+                    await temporary.close()
                 except Exception:
                     pass
-            if self._page is not None and self._page not in pages:
-                pages.append(self._page)
+                if self._page is not None:
+                    try:
+                        await self._page.bring_to_front()
+                    except Exception:
+                        pass
+
+    async def _monitor_npay_completion(self) -> str:
+        auth_reported = False
+        next_detail_check = 0.0
+        while not self.stop_event.is_set():
+            pages = [self._page] if self._page is not None else []
             if not pages:
                 return ""
 
@@ -3731,21 +4164,11 @@ class NaverEngine(BaseEngine):
                     url = page.url or ""
                 except Exception:
                     url = ""
-                if (
-                    page is not self._page
-                    and self._npay_booking_id
-                    and self._npay_booking_id not in url
-                ):
-                    continue
                 try:
                     body = await page.locator("body").inner_text(timeout=1000)
                 except Exception:
                     body = ""
 
-                success_text = (
-                    "결제가 완료", "결제 완료", "예약이 완료", "예약 완료",
-                    "예약되었습니다",
-                )
                 try:
                     parsed = urllib.parse.urlparse(url)
                     host = (parsed.hostname or "").lower()
@@ -3753,22 +4176,23 @@ class NaverEngine(BaseEngine):
                 except Exception:
                     host = ""
                     path = ""
-                success_by_url = (
-                    host.endswith("booking.naver.com")
+                booking_detail = (
+                    host in {"booking.naver.com", "m.booking.naver.com"}
                     and ("booking-detail" in path or "/my/bookings/" in path)
-                ) or (
-                    self._is_npay_url(url)
-                    and ("/complete" in path or "/completion" in path)
                 )
-                if success_by_url or any(
-                    token in body for token in success_text
-                ):
-                    self._page = page
-                    suffix = (
-                        f"예약번호 {self._npay_booking_id}"
-                        if self._npay_booking_id else url
+                if self._npay_booking_id and time.monotonic() >= next_detail_check:
+                    # A payment can complete even if its redirect or click reply
+                    # was lost. Query the known booking independent of UI hints.
+                    evidence = await self._read_booking_evidence(
+                        self._npay_booking_id, page=page if booking_detail else None
                     )
-                    return suffix or "완료 화면 확인"
+                    next_detail_check = time.monotonic() + 2.0
+                    if evidence is not None and evidence.matched and evidence.confirmed and evidence.paid:
+                        self._page = page
+                        return f"예약번호 {self._npay_booking_id} · 예약 확정 및 결제 완료 확인"
+                    if evidence is not None and evidence.state in {"cancelled", "payment_cancelled"}:
+                        self.log("[경고] 예약 또는 결제 취소 상태를 확인했습니다 · 추가 결제하지 않습니다.", "warning")
+                        return ""
 
                 if not auth_reported and any(
                     token in body

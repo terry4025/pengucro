@@ -13,6 +13,7 @@ slots forever, which is exactly what happened before these tests existed.
 """
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,6 +76,123 @@ def api_with(monkeypatch, body):
 
     monkeypatch.setattr(api.session, "post", fake_post)
     return api, calls
+
+
+@pytest.mark.parametrize("operation", ["hourlySchedule", "Slot", "business", "bizItem"])
+def test_public_reads_acquire_shared_budget(monkeypatch, operation):
+    api, calls = api_with(monkeypatch, {"data": {"value": "public"}})
+    permits = []
+    cached = []
+    stop_event = object()
+    api.read_stop_event = stop_event
+    api.read_coordinator = SimpleNamespace(
+        acquire_read=lambda name, **kwargs: permits.append((name, kwargs)),
+        get_public_read=lambda *args, **kwargs: None,
+        put_public_read=lambda *args, **kwargs: cached.append((args, kwargs)),
+    )
+
+    result = api._post(operation, "query", {"item": "example"})
+
+    assert len(calls) == 1
+    assert permits[0][0] == operation
+    assert permits[0][1]["stop_event"] is stop_event
+    assert "deadline" in permits[0][1]
+    assert result["value"] == "public"
+    assert bool(cached) == (operation == "hourlySchedule")
+
+
+def test_account_and_booking_mutation_never_use_public_read_sharing(monkeypatch):
+    api, calls = api_with(monkeypatch, {"data": {"value": "private"}})
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("private operation entered public read coordination")
+
+    api.read_coordinator = SimpleNamespace(
+        acquire_read=unexpected, get_public_read=unexpected, put_public_read=unexpected,
+    )
+    api._post("account", "query", {})
+    api._post_body("submitBooking", "mutation", {})
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("after_wait", [False, True])
+def test_shared_schedule_is_not_a_fresh_rtt_sample(monkeypatch, after_wait):
+    api, calls = api_with(monkeypatch, {"data": {"unused": True}})
+    cached = {"schedule": {"bizItemSchedule": {}}, "__rtt_window__": (1.0, 1.1)}
+    cache_results = iter([None, cached] if after_wait else [cached])
+    permits = []
+    api.last_rtt = 0.200
+    api.read_coordinator = SimpleNamespace(
+        acquire_read=lambda *args, **kwargs: permits.append(args),
+        get_public_read=lambda *args, **kwargs: next(cache_results),
+    )
+
+    result = api._post("hourlySchedule", "query", {"date": "2026-09-07"})
+
+    assert calls == []
+    assert len(permits) == int(after_wait)
+    assert "__rtt_window__" not in result
+    assert api.last_rtt is None
+    assert api.last_read_from_cache is True
+
+
+def test_server_clock_reads_always_go_to_network(monkeypatch):
+    api, calls = api_with(monkeypatch, {"data": {"bizItem": {
+        "currentDateTime": "2026-09-07T00:00:00.123Z",
+    }}})
+    permits = []
+
+    def unexpected_cache(*args, **kwargs):
+        raise AssertionError("server clock was cached")
+
+    api.read_coordinator = SimpleNamespace(
+        acquire_read=lambda *args, **kwargs: permits.append(args),
+        get_public_read=unexpected_cache,
+        put_public_read=unexpected_cache,
+    )
+    for _ in range(2):
+        meta = api.fetch_item_meta()
+        assert meta.request_started_monotonic <= meta.response_end_monotonic
+    assert len(calls) == 2
+    assert len(permits) == 2
+
+
+def test_cancelled_public_read_wait_does_not_send_request(monkeypatch):
+    import requests
+
+    api, calls = api_with(monkeypatch, {"data": {"bizItem": {}}})
+
+    def cancelled(*args, **kwargs):
+        raise requests.RequestException("cancelled before network")
+
+    api.read_coordinator = SimpleNamespace(acquire_read=cancelled)
+
+    with pytest.raises(NaverApiError, match="공개 조회 대기 실패"):
+        api.fetch_item_meta()
+    assert calls == []
+
+
+@pytest.mark.parametrize("method", ["fetch_slots_raw", "fetch_slots", "fetch_slot_raw", "find_slot"])
+def test_fresh_schedule_methods_bypass_cache_but_share_network_result(monkeypatch, method):
+    api, calls = api_with(monkeypatch, {"data": {
+        "schedule": {"bizItemSchedule": {"hourly": [slot_payload()]}},
+    }})
+    permits, writes = [], []
+
+    def stale_cache(*args, **kwargs):
+        raise AssertionError("fresh read consulted a cached schedule")
+
+    api.read_coordinator = SimpleNamespace(
+        acquire_read=lambda *args, **kwargs: permits.append(args),
+        get_public_read=stale_cache,
+        put_public_read=lambda *args, **kwargs: writes.append(args),
+    )
+    arguments = ("2026-07-26", "09:50") if method in {"fetch_slot_raw", "find_slot"} else ("2026-07-26",)
+
+    assert getattr(api, method)(*arguments, fresh=True) is not None
+
+    assert len(calls) == len(permits) == len(writes) == 1
+    assert api.last_read_from_cache is False
 
 
 # -- URL parsing ----------------------------------------------------------
@@ -492,7 +610,7 @@ def test_clock_reports_failure_without_raising(monkeypatch):
     assert any("서버 시간" in message for message in messages)
 
 
-def test_precise_clock_sync_keeps_the_lowest_rtt_sample(monkeypatch):
+def test_precise_clock_sync_prefers_consistent_low_rtt_samples(monkeypatch):
     import engines.naver_api as module
 
     server_times = [
@@ -516,8 +634,12 @@ def test_precise_clock_sync_keeps_the_lowest_rtt_sample(monkeypatch):
 
     assert clock.sync_precise(3) is True
     assert api.calls == 3
-    # The fastest response alone cannot hide disagreement between samples.
-    assert clock.last_precision == pytest.approx(0.15)
+    # The two agreeing samples win over the isolated first reply. The selected
+    # sample's uncertainty also grows slightly while later reads complete.
+    assert clock.last_precision == pytest.approx(
+        0.02 + 1.06 * clock.DRIFT_SECONDS_PER_SECOND
+    )
+    assert clock._last_diagnostic["raw_spread_ms"] == pytest.approx(300.0)
     # currentDateTime is emitted near response completion, so anchoring it to
     # the request midpoint would make the clock run half an RTT ahead.
     assert clock._anchor_monotonic == pytest.approx(1.04)

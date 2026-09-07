@@ -7,6 +7,283 @@ from copy import deepcopy
 from engines.naver_api import NaverAccount, SubmitOutcome
 
 
+def account_booking_row(booking_id="new", status="RC03", name="바야흐로, 여름이었다."):
+    return {
+        "id": booking_id, "businessId": "1498729", "bizItemName": name,
+        "formattedBookingDateText": "2026. 9. 13. 오후 12:50",
+        "bookingStatusCode": status,
+        "landingUrl": "https://m.booking.naver.com/my/bookings/999888",
+    }
+
+
+def account_booking_response(rows=(), *, has_more=False):
+    return {"status": 200, "body": {"data": {"me": {
+        "__typename": "MeSucceed", "upcomingBookings": {
+            "bookings": list(rows), "pageInfo": {"hasNextPage": has_more},
+        },
+    }}}}
+
+
+class AccountReadPage:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+        self.created = 0
+        self.closed = 0
+        self.context = self
+
+    async def new_page(self):
+        self.created += 1
+        return self
+
+    async def goto(self, *args, **kwargs):
+        pass
+
+    async def evaluate(self, _script, request):
+        self.calls.append(request)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def close(self):
+        self.closed += 1
+
+
+ACCOUNT_TARGET = dict(target_date="2026-09-13", target_time="12:50", business_id="1498729", item_name="바야흐로,여름이었다.")
+
+
+@pytest.mark.parametrize("response,expected", [
+    (account_booking_response(), "not_found"),
+    ({"status": 401, "body": {}}, "auth_error"),
+    ({"status": 200, "body": {"errors": [{"message": "Cannot query field private-value"}]}}, "schema_error"),
+    ({"status": 200, "body": {"data": {"me": None}}}, "auth_error"),
+    ({"status": 200, "body": {"data": {"me": {}}}}, "schema_error"),
+    (account_booking_response([{}]), "schema_error"),
+    ({"status": 429, "body": {}}, "http_error"),
+    (TimeoutError("private-value"), "network_error"),
+])
+def test_account_reconciliation_distinguishes_empty_auth_schema_and_transport(response, expected):
+    from engines.naver_submit import NaverBrowserSubmitter
+    page = AccountReadPage([response])
+    evidence = asyncio.run(NaverBrowserSubmitter(page).reconcile_upcoming_booking(**ACCOUNT_TARGET, attempts=1))
+    assert evidence.state == expected
+    assert evidence.found is False
+    assert evidence.successful_reads == (1 if expected == "not_found" else 0)
+    assert evidence.failed_reads == (0 if expected == "not_found" else 1)
+    assert "private-value" not in repr(evidence)
+    assert page.closed == 1
+
+
+def test_preflight_baseline_reuses_page_and_never_claims_old_booking_is_new():
+    from engines.naver_submit import NaverBrowserSubmitter
+    response = account_booking_response([account_booking_row("old")])
+    page = AccountReadPage([response, response])
+    submitter = NaverBrowserSubmitter(page)
+    async def run():
+        baseline = await submitter.preflight_reconciliation()
+        assert baseline.complete and baseline.booking_ids == {"old"}
+        return await submitter.reconcile_upcoming_booking(**ACCOUNT_TARGET, attempts=1)
+    evidence = asyncio.run(run())
+    assert evidence.state == "existing" and evidence.booking_id == "old"
+    assert not evidence.found and evidence.baseline_checked
+    assert page.created == 1 and page.closed == 1
+
+
+def test_preflight_paginates_and_reconciles_new_booking():
+    from engines.naver_submit import NaverBrowserSubmitter
+    page = AccountReadPage([
+        account_booking_response([account_booking_row("old1")], has_more=True),
+        account_booking_response([account_booking_row("old2")]),
+        account_booking_response([account_booking_row("new")]),
+    ])
+    submitter = NaverBrowserSubmitter(page)
+    async def run():
+        baseline = await submitter.preflight_reconciliation()
+        assert baseline.complete and baseline.booking_ids == {"old1", "old2"}
+        return await submitter.reconcile_upcoming_booking(**ACCOUNT_TARGET, attempts=1)
+    evidence = asyncio.run(run())
+    assert evidence.found and evidence.baseline_checked and evidence.status == "RC03"
+    assert [request["page"] for request in page.calls] == [1, 2, 1]
+
+
+def test_partial_baseline_still_rejects_known_existing_booking():
+    from engines.naver_submit import NaverBrowserSubmitter
+    response = account_booking_response([account_booking_row("old")], has_more=True)
+    page = AccountReadPage([response, response])
+    submitter = NaverBrowserSubmitter(page)
+    async def run():
+        assert not (await submitter.preflight_reconciliation(max_pages=1)).complete
+        return await submitter.reconcile_upcoming_booking(**ACCOUNT_TARGET, attempts=1)
+    evidence = asyncio.run(run())
+    assert not evidence.found and evidence.state == "existing"
+    assert not evidence.baseline_checked
+
+
+def test_delayed_booking_after_failed_read_reports_both_read_counts(monkeypatch):
+    from engines.naver_submit import NaverBrowserSubmitter
+    async def no_delay(_seconds):
+        pass
+    monkeypatch.setattr("engines.naver_submit.asyncio.sleep", no_delay)
+    page = AccountReadPage([TimeoutError(), account_booking_response(), account_booking_response([account_booking_row()])])
+    evidence = asyncio.run(NaverBrowserSubmitter(page).reconcile_upcoming_booking(**ACCOUNT_TARGET, attempts=3))
+    assert evidence.found and evidence.attempts == 3
+    assert evidence.successful_reads == 2 and evidence.failed_reads == 1
+    assert evidence.error_kind == "timeout"
+
+
+def test_reconciliation_follows_next_pages_until_target_is_observed(monkeypatch):
+    from engines.naver_submit import NaverBrowserSubmitter
+    async def no_delay(_seconds):
+        pass
+    monkeypatch.setattr("engines.naver_submit.asyncio.sleep", no_delay)
+    page = AccountReadPage([account_booking_response(has_more=True), account_booking_response(has_more=True), account_booking_response([account_booking_row()])])
+    evidence = asyncio.run(NaverBrowserSubmitter(page).reconcile_upcoming_booking(**ACCOUNT_TARGET, attempts=3))
+    assert evidence.found
+    assert [request["page"] for request in page.calls] == [1, 2, 3]
+
+
+def test_cancelled_preflight_closes_lookup_page_and_leaves_no_baseline():
+    from engines.naver_submit import NaverBrowserSubmitter
+    class HangingAccountPage(AccountReadPage):
+        async def evaluate(self, *_args):
+            await asyncio.Event().wait()
+    page = HangingAccountPage([])
+    submitter = NaverBrowserSubmitter(page)
+    async def run():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(submitter.preflight_reconciliation(), timeout=0.01)
+    asyncio.run(run())
+    assert page.closed == 1 and submitter.reconciliation_baseline is None
+
+
+def test_stop_event_prevents_reconciliation_network_reads():
+    from engines.naver_submit import NaverBrowserSubmitter
+    from threading import Event
+    stopped = Event()
+    stopped.set()
+    page = AccountReadPage([])
+    evidence = asyncio.run(NaverBrowserSubmitter(page).reconcile_upcoming_booking(**ACCOUNT_TARGET, stop_event=stopped))
+    assert evidence.state == "stopped" and page.calls == []
+
+
+def test_account_change_can_invalidate_baseline_synchronously():
+    from engines.naver_submit import NaverBrowserSubmitter, NaverBookingSnapshot
+    submitter = NaverBrowserSubmitter(AccountReadPage([]))
+    submitter.reconciliation_baseline = NaverBookingSnapshot("ok", booking_ids=frozenset({"old"}), complete=True)
+    submitter.reset_reconciliation_baseline()
+    assert submitter.reconciliation_baseline is None
+
+
+@pytest.mark.parametrize("response", [account_booking_response(), {"status": 401, "body": {}}])
+def test_preflight_restores_main_page_after_read_success_or_error(response):
+    from engines.naver_submit import NaverBrowserSubmitter
+    lookup = AccountReadPage([response])
+    class MainPage:
+        context = lookup
+        foreground_calls = 0
+        def is_closed(self):
+            return False
+        async def bring_to_front(self):
+            self.foreground_calls += 1
+    main = MainPage()
+    submitter = NaverBrowserSubmitter(main)
+    async def run():
+        await submitter.preflight_reconciliation()
+        await submitter.close_reconciliation_page()
+    asyncio.run(run())
+    assert main.foreground_calls == 1
+    assert submitter.last_foreground_restore == "restored"
+
+
+def test_preflight_does_not_focus_closed_main_page():
+    from engines.naver_submit import NaverBrowserSubmitter
+    class ClosedMain:
+        context = AccountReadPage([account_booking_response()])
+        def is_closed(self):
+            return True
+        async def bring_to_front(self):
+            raise AssertionError("closed page must not be focused")
+    submitter = NaverBrowserSubmitter(ClosedMain())
+    async def run():
+        await submitter.preflight_reconciliation()
+        await submitter.close_reconciliation_page()
+    asyncio.run(run())
+    assert submitter.last_foreground_restore == "closed"
+
+
+@pytest.mark.parametrize("status", ["CANCELLED", "RC04", "", "UNKNOWN"])
+def test_matching_cancelled_or_unverified_status_is_not_active_booking(status):
+    from engines.naver_submit import match_upcoming_booking
+    evidence = match_upcoming_booking([account_booking_row(status=status)], **ACCOUNT_TARGET)
+    assert not evidence.found and evidence.state == "invalid_status"
+    baseline_match = match_upcoming_booking([account_booking_row(status=status)], **ACCOUNT_TARGET, baseline_booking_ids={"new"})
+    assert not baseline_match.found and baseline_match.state == "invalid_status"
+
+
+def test_item_substrings_and_multiple_matching_reservations_are_not_success():
+    from engines.naver_submit import match_upcoming_booking
+    wrong = match_upcoming_booking([account_booking_row(name="여름")], **ACCOUNT_TARGET)
+    multiple = match_upcoming_booking([account_booking_row("one"), account_booking_row("two")], **ACCOUNT_TARGET)
+    assert not wrong.found
+    assert not multiple.found and multiple.state == "ambiguous_match"
+
+
+@pytest.mark.parametrize("status", ["RC02", "RC03"])
+def test_active_booking_status_is_preserved_for_pending_vs_confirmed_display(status):
+    from engines.naver_submit import match_upcoming_booking
+    evidence = match_upcoming_booking([account_booking_row(status=status)], **ACCOUNT_TARGET)
+    assert evidence.found and evidence.status == status
+
+
+@pytest.mark.parametrize("url,retained", [
+    ("https://order.pay.naver.com/orderSheet/test", True),
+    ("https://order.pay.naver.com.evil.test/my/bookings/999888", False),
+    ("http://order.pay.naver.com/orderSheet/test", False),
+    ("https://evil.test/?bookingId=999888", False),
+    ("https://evil.test/my/bookings/999888", False),
+    ("https://user:secret@order.pay.naver.com/orderSheet/test", False),
+])
+def test_partial_checkout_url_is_evidence_only_and_untrusted_urls_never_succeed(url, retained):
+    from engines.naver_submit import _submit_result_from_response
+    evidence = _submit_result_from_response({"status": 200, "body": {
+        "data": {"submitBooking": {"bookingId": None, "url": {"pc": url}}},
+        "errors": [{"message": "RT47", "extensions": {"code": "RT47", "reason": "OUT_OF_STOCK"}}],
+    }})
+    assert evidence.outcome == (SubmitOutcome.UNKNOWN if retained else SubmitOutcome.REFUSED)
+    assert not evidence.booking_id
+    assert evidence.url == (url if retained else None)
+
+
+def test_partial_checkout_url_never_permits_not_open_retry():
+    from engines.naver_submit import _submit_result_from_response
+    evidence = _submit_result_from_response({"status": 200, "body": {
+        "data": {"submitBooking": {"url": "https://order.pay.naver.com/orderSheet/test"}},
+        "errors": [{"message": "BizItem is not opened."}],
+    }})
+    assert evidence.outcome == SubmitOutcome.UNKNOWN
+
+
+def test_safe_browser_rtt_samples_expire_and_failed_reads_do_not_refresh(monkeypatch):
+    from engines.naver_submit import NaverBrowserSubmitter
+    clock = [100.0]
+    monkeypatch.setattr("engines.naver_submit.time.monotonic", lambda: clock[0])
+    class TimedPage(FakePage):
+        async def evaluate(self, *args):
+            response = await super().evaluate(*args)
+            response["elapsedMs"] = 10.0
+            return response
+    submitter = NaverBrowserSubmitter(TimedPage({"data": {"account": {"isLoggedIn": True}}}))
+    asyncio.run(submitter.fetch_account())
+    assert submitter.recent_safe_rtt_samples() == [0.01]
+    assert submitter.last_safe_rtt_at == 100.0
+    clock[0] = 116.0
+    assert submitter.recent_safe_rtt_samples() == []
+    submitter.page.body = {"errors": [{"message": "network failure"}]}
+    asyncio.run(submitter.fetch_account())
+    assert submitter.last_safe_rtt_at == 100.0
+
+
 BUSINESS = {
     "businessId": "1498729",
     "businessTypeId": 12,
@@ -461,7 +738,7 @@ def test_browser_submitter_prefers_partial_booking_id_over_rt47_error():
     assert result.booking_id == "999888"
 
 
-def test_browser_submitter_recovers_booking_id_from_partial_booking_url():
+def test_browser_submitter_keeps_partial_booking_url_as_unverified_candidate():
     from engines.naver_submit import NaverBrowserSubmitter
 
     page = FakePage({
@@ -479,8 +756,9 @@ def test_browser_submitter_recovers_booking_id_from_partial_booking_url():
         NaverBrowserSubmitter(page).submit({"slotId": "1331382668"})
     )
 
-    assert result.outcome == SubmitOutcome.SUCCESS
-    assert result.booking_id == "999888"
+    assert result.outcome == SubmitOutcome.UNKNOWN
+    assert not result.booking_id
+    assert result.url == "https://m.booking.naver.com/my/bookings/999888"
 
 
 def test_upcoming_booking_match_requires_business_item_date_and_time():
@@ -673,6 +951,10 @@ def test_browser_submitter_arms_one_in_page_submit_and_reads_its_result():
         "httpStatus": 200.0,
         "ttfbMs": 10.0,
         "responseMs": 30.0,
+        "attemptTimings": [],
+        "armedVisibility": "unknown",
+        "dispatchVisibility": "unknown",
+        "foregroundRestore": "unavailable",
     }
     assert page.calls[0]["delayMs"] == 125
     assert page.calls[0]["input"]["slotId"] == "1331382668"

@@ -548,8 +548,8 @@ def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_pat
 
 
 def test_current_release_contract_is_complete():
-    assert __version__ == "6.83"
-    assert __release_sequence__ == 6830001
+    assert __version__ == "6.84"
+    assert __release_sequence__ == 6840001
     note = notes_for("6.79")
     assert note is not None
     assert any("CGV" in change for change in note.changes)

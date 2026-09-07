@@ -312,7 +312,9 @@ def test_fetch_naver_slots(monkeypatch):
     )
 
     assert captured["url"] == "https://m.booking.naver.com/graphql"
-    assert captured["timeout"] == 5.0
+    # The API uses the remaining total read budget after local preparation.
+    assert captured["timeout"] == pytest.approx(5.0, abs=0.05)
+    assert captured["timeout"] <= 5.0
     assert captured["variables"]["scheduleParams"]["businessId"] == "123"
     assert captured["variables"]["scheduleParams"]["bizItemId"] == "456"
 

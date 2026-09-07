@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -395,6 +396,8 @@ class NaverItemMeta:
     uses_open_schedule: bool
     is_paused: bool
     custom_form: list[dict[str, Any]]
+    request_started_monotonic: float | None = None
+    response_end_monotonic: float | None = None
 
     def hard_block(self) -> str | None:
         """A reason polling is pointless, or None."""
@@ -505,6 +508,9 @@ class NaverBookingApi:
         self.session.headers.setdefault("User-Agent", USER_AGENT)
         self.session.headers.setdefault("Accept-Language", "ko")
         self.last_rtt: float | None = None
+        self.read_coordinator = None
+        self.read_stop_event = None
+        self.last_read_from_cache = False
 
     # -- plumbing -----------------------------------------------------------
     @property
@@ -519,13 +525,54 @@ class NaverBookingApi:
             "Referer": self.item_url,
         }
 
-    def _post(self, operation: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self, operation: str, query: str, variables: dict[str, Any], *, fresh: bool = False,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        request_deadline = time.monotonic() + self.timeout
+        if deadline is not None:
+            request_deadline = min(request_deadline, float(deadline))
+        coordinator = self.read_coordinator
+        self.last_read_from_cache = False
+        public_read = operation in {"hourlySchedule", "Slot", "business", "bizItem"}
+        if coordinator is not None and public_read:
+            try:
+                if operation == "hourlySchedule" and not fresh:
+                    cached = coordinator.get_public_read(operation, variables, max_age=0.15)
+                    if isinstance(cached, dict):
+                        self.last_rtt = None
+                        self.last_read_from_cache = True
+                        return {
+                            key: value for key, value in cached.items()
+                            if key != "__rtt_window__"
+                        }
+                coordinator.acquire_read(
+                    operation,
+                    stop_event=self.read_stop_event,
+                    deadline=request_deadline,
+                )
+                # Another process may have completed this schedule while we
+                # waited. A shared result is never a new network RTT sample.
+                if operation == "hourlySchedule" and not fresh:
+                    cached = coordinator.get_public_read(operation, variables, max_age=0.15)
+                    if isinstance(cached, dict):
+                        self.last_rtt = None
+                        self.last_read_from_cache = True
+                        return {
+                            key: value for key, value in cached.items()
+                            if key != "__rtt_window__"
+                        }
+            except (requests.RequestException, TimeoutError, OSError) as exc:
+                raise NaverApiError(f"네이버 공개 조회 대기 실패: {exc}") from exc
         payload = {"operationName": operation, "query": query, "variables": variables}
         before = time.monotonic()
+        remaining = request_deadline - before
+        if remaining <= 0:
+            raise NaverApiError("네이버 공개 조회 대기 중 요청 제한 시간이 지났습니다.")
         try:
             response = self.session.post(
                 GRAPHQL_URL, json=payload, headers=self._headers(),
-                timeout=self.timeout,
+                timeout=remaining,
             )
         except requests.RequestException as exc:
             raise NaverApiError(f"네이버 API 연결 실패: {exc}") from exc
@@ -546,9 +593,11 @@ class NaverBookingApi:
         data = body.get("data")
         if not isinstance(data, dict):
             raise NaverApiError("네이버 API가 빈 응답을 반환했습니다.")
-        # Anchoring the clock needs the midpoint of the request window, so it is
-        # carried alongside the payload rather than re-measured by the caller.
+        # Carry the actual network window. The outer caller may also have spent
+        # time waiting for a shared read permit; that is not network latency.
         data["__rtt_window__"] = (before, after)
+        if coordinator is not None and operation == "hourlySchedule":
+            coordinator.put_public_read(operation, variables, data, ttl=0.15)
         return data
 
     def _post_body(
@@ -626,7 +675,7 @@ class NaverBookingApi:
 
     # -- reads --------------------------------------------------------------
     def fetch_slots_raw(
-        self, date_from: str, date_to: str | None = None
+        self, date_from: str, date_to: str | None = None, *, fresh: bool = False,
     ) -> list[dict[str, Any]]:
         """Raw hourly records between two ``YYYY-MM-DD`` dates, inclusive."""
         end = date_to or date_from
@@ -637,21 +686,25 @@ class NaverBookingApi:
                 "startDateTime": f"{date_from}T00:00:00",
                 "endDateTime": f"{end}T23:59:59",
             },
-        })
+        }, **({"fresh": True} if fresh else {}))
         schedule = (data.get("schedule") or {}).get("bizItemSchedule") or {}
         hourly = schedule.get("hourly") or []
         return [entry for entry in hourly if isinstance(entry, dict)]
 
-    def fetch_slots(self, date_from: str, date_to: str | None = None) -> list[NaverSlot]:
+    def fetch_slots(
+        self, date_from: str, date_to: str | None = None, *, fresh: bool = False,
+    ) -> list[NaverSlot]:
         """Slots between two ``YYYY-MM-DD`` dates, inclusive."""
-        hourly = self.fetch_slots_raw(date_from, date_to)
+        hourly = self.fetch_slots_raw(date_from, date_to, **({"fresh": True} if fresh else {}))
         slots = [NaverSlot.from_payload(entry) for entry in hourly if entry]
         return sorted((slot for slot in slots if slot), key=lambda item: item.start)
 
-    def fetch_slot_raw(self, date_str: str, time_str: str) -> dict[str, Any] | None:
+    def fetch_slot_raw(
+        self, date_str: str, time_str: str, *, fresh: bool = False,
+    ) -> dict[str, Any] | None:
         """The page's complete hourly record for one date and ``HH:MM``."""
         wanted = (time_str or "")[:5]
-        for entry in self.fetch_slots_raw(date_str):
+        for entry in self.fetch_slots_raw(date_str, **({"fresh": True} if fresh else {})):
             slot = NaverSlot.from_payload(entry)
             if slot is not None and slot.time_str == wanted:
                 return entry
@@ -680,10 +733,12 @@ class NaverBookingApi:
             return None
         return slot.get("isPostPayment") is True
 
-    def find_slot(self, date_str: str, time_str: str) -> NaverSlot | None:
+    def find_slot(
+        self, date_str: str, time_str: str, *, fresh: bool = False,
+    ) -> NaverSlot | None:
         """The slot for one date and ``HH:MM``, or None when it does not exist yet."""
         wanted = (time_str or "")[:5]
-        for slot in self.fetch_slots(date_str):
+        for slot in self.fetch_slots(date_str, **({"fresh": True} if fresh else {})):
             if slot.time_str == wanted:
                 return slot
         return None
@@ -747,17 +802,20 @@ class NaverBookingApi:
         # must never authorize a submit before Naver's explicit opening marker.
         return max(announced, projected)
 
-    def fetch_item_meta(self) -> NaverItemMeta:
+    def fetch_item_meta(self, *, deadline: float | None = None) -> NaverItemMeta:
         data = self._post("bizItem", BIZ_ITEM_QUERY, {
             "input": {
                 "businessId": self.business_id,
                 "bizItemId": self.biz_item_id,
                 "lang": "ko",
             },
-        })
+        }, **({"deadline": deadline} if deadline is not None else {}))
         item = data.get("bizItem") or {}
         bookable = _as_json(item.get("bookableSettingJson"))
         custom_form = item.get("customFormJson")
+        window = data.get("__rtt_window__")
+        if not isinstance(window, (tuple, list)) or len(window) != 2:
+            window = (None, None)
         return NaverItemMeta(
             name=str(item.get("name") or ""),
             server_time=_parse_dt(item.get("currentDateTime")),
@@ -768,6 +826,8 @@ class NaverBookingApi:
             uses_open_schedule=bool(bookable.get("isUseOpen")),
             is_paused=bool(bookable.get("isPaused")),
             custom_form=custom_form if isinstance(custom_form, list) else [],
+            request_started_monotonic=window[0],
+            response_end_monotonic=window[1],
         )
 
     def fetch_business_form(self) -> list[dict[str, Any]]:
@@ -884,12 +944,22 @@ class NaverServerClock:
     carries milliseconds. Live measurements on 2026-08-30 showed that this field
     advances with response completion rather than request arrival: anchoring it
     to the request midpoint therefore made the local server clock run roughly
-    half an RTT ahead. Startup uses one sample; the final pre-open refresh retains
-    the quickest response-completion sample to reduce queueing noise.
+    half an RTT ahead. Startup uses one sample. Later samples must agree and pass
+    a quality check before replacing that response-completion mapping.
 
     The anchor is monotonic on purpose: an NTP correction part-way through a run
     cannot shift what the engine believes the server time to be.
     """
+
+    MAX_HISTORY_SAMPLES = 32
+    HISTORY_MAX_AGE_SECONDS = 600.0
+    CONSENSUS_MAX_AGE_SECONDS = 60.0
+    CONSENSUS_SPREAD_SECONDS = 0.050
+    MATERIAL_SHIFT_SECONDS = 0.050
+    MIN_SHIFT_CONSENSUS = 3
+    MAX_ANCHOR_AGE_SECONDS = 600.0
+    # This is an allowance for oscillator drift, not a measured error bound.
+    DRIFT_SECONDS_PER_SECOND = 0.0001
 
     def __init__(self, api: NaverBookingApi, log=None) -> None:
         self.api = api
@@ -898,6 +968,10 @@ class NaverServerClock:
         self._anchor_server: float | None = None
         self.last_offset: float | None = None
         self.last_precision: float | None = None
+        self._anchor_precision = 0.0
+        self._anchor_rtt = 0.0
+        self._samples: list[tuple[float, float, float]] = []
+        self._last_diagnostic: dict[str, Any] = {"status": "unsynced"}
 
     @property
     def synced(self) -> bool:
@@ -917,59 +991,243 @@ class NaverServerClock:
     def sync(self, announce: bool = False) -> bool:
         return self._sync_samples(1, announce=announce)
 
-    def sync_precise(self, sample_count: int = 3, announce: bool = False) -> bool:
-        """Anchor to the lowest-RTT read-only sample near an opening."""
+    def sync_precise(
+        self, sample_count: int = 3, announce: bool = False, *,
+        max_deadline_shift_ms: float | None = None,
+        budget_seconds: float | None = None,
+        deadline: float | None = None,
+    ) -> bool:
+        """Measure read-only samples, retaining a better existing clock if needed."""
+        if max_deadline_shift_ms is not None:
+            max_deadline_shift_ms = float(max_deadline_shift_ms)
+            if not math.isfinite(max_deadline_shift_ms) or max_deadline_shift_ms < 0:
+                raise ValueError("max_deadline_shift_ms must be finite and nonnegative")
+        if budget_seconds is not None:
+            budget_seconds = float(budget_seconds)
+            if not math.isfinite(budget_seconds) or budget_seconds < 0:
+                raise ValueError("budget_seconds must be finite and nonnegative")
+        if deadline is not None:
+            deadline = float(deadline)
+            if not math.isfinite(deadline):
+                raise ValueError("deadline must be finite")
         return self._sync_samples(
-            max(2, min(int(sample_count or 3), 5)), announce=announce
+            max(2, min(int(sample_count or 3), 5)), announce=announce,
+            max_deadline_shift_ms=max_deadline_shift_ms,
+            budget_seconds=budget_seconds,
+            deadline=deadline,
         )
 
-    def _sync_samples(self, sample_count: int, *, announce: bool) -> bool:
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        """Return bounded numeric clock evidence, without account or API payloads."""
+        snapshot = dict(self._last_diagnostic)
+        snapshot["samples"] = [dict(row) for row in snapshot.get("samples", [])]
+        if self._anchor_monotonic is not None:
+            age = max(0.0, time.monotonic() - self._anchor_monotonic)
+            snapshot["anchor_age_ms"] = round(age * 1000, 3)
+            snapshot["uncertainty_ms"] = round(
+                (self._anchor_precision + age * self.DRIFT_SECONDS_PER_SECOND) * 1000,
+                3,
+            )
+        return snapshot
+
+    @classmethod
+    def _sample_group(cls, samples):
+        """Prefer agreeing samples over one unusually fast, conflicting reply."""
+        ordered = sorted(samples, key=lambda row: row[2] - row[1])
+        groups = [
+            [row for row in ordered[index:]
+             if (row[2] - row[1]) - (first[2] - first[1])
+             <= cls.CONSENSUS_SPREAD_SECONDS]
+            for index, first in enumerate(ordered)
+        ]
+        group = min(
+            groups,
+            key=lambda rows: (-len(rows), min(row[0] for row in rows)),
+        )
+        return min(group, key=lambda row: row[0]), group
+
+    def _sync_samples(
+        self, sample_count: int, *, announce: bool,
+        max_deadline_shift_ms: float | None = None,
+        budget_seconds: float | None = None,
+        deadline: float | None = None,
+    ) -> bool:
         samples: list[tuple[float, float, float]] = []
         last_error: Exception | None = None
         missing_server_time = False
+        if budget_seconds is not None:
+            relative_deadline = time.monotonic() + budget_seconds
+            deadline = min(deadline, relative_deadline) if deadline is not None else relative_deadline
         for _index in range(max(1, int(sample_count))):
             before = time.monotonic()
+            if deadline is not None and before >= deadline:
+                break
             try:
-                meta = self.api.fetch_item_meta()
+                meta = self.api.fetch_item_meta(**(
+                    {"deadline": deadline}
+                    if deadline is not None and isinstance(self.api, NaverBookingApi)
+                    else {}
+                ))
             except NaverApiError as exc:
                 last_error = exc
                 continue
             after = time.monotonic()
+            request_start = getattr(meta, "request_started_monotonic", None)
+            response_end = getattr(meta, "response_end_monotonic", None)
+            if (
+                isinstance(request_start, (int, float))
+                and isinstance(response_end, (int, float))
+                and before <= request_start <= response_end <= after
+            ):
+                before, after = request_start, response_end
             if meta.server_time is None:
                 missing_server_time = True
                 continue
-            samples.append((after - before, after, meta.server_time.timestamp()))
+            server_epoch = meta.server_time.timestamp()
+            if not all(math.isfinite(value) for value in (before, after, server_epoch)):
+                continue
+            if after < before:
+                continue
+            samples.append((after - before, after, server_epoch))
+
+        measured_at = time.monotonic() if samples or deadline is not None else None
+        if deadline is not None and measured_at >= deadline:
+            # An asyncio timeout cannot stop an in-flight requests worker. The
+            # expired worker must never replace a clock already used to arm a
+            # submission, even if its eventual response looks very precise.
+            self._last_diagnostic = {
+                "status": "retained" if self.synced else "failed",
+                "reason": "budget_expired",
+                "sample_count": len(samples),
+                "rtt_ms": round(self._anchor_rtt * 1000, 3),
+                "samples": [
+                    {"rtt_ms": round(rtt * 1000, 3),
+                     "request_start_monotonic_ms": round((end - rtt) * 1000, 3),
+                     "response_end_monotonic_ms": round(end * 1000, 3),
+                     "server_epoch_ms": round(server * 1000, 3)}
+                    for rtt, end, server in samples
+                ],
+            }
+            if announce and self.log:
+                self.log("[경고] 서버 시계 확인 시간 제한 · 기존 시각을 유지합니다.", "warning")
+            return False
 
         if not samples:
+            self._last_diagnostic = {
+                "status": "retained" if self.synced else "failed",
+                "reason": "no_valid_samples",
+                "sample_count": 0,
+                "rtt_ms": round(self._anchor_rtt * 1000, 3),
+                "samples": [],
+            }
             if announce and self.log:
+                fallback = (
+                    "기존 서버 시각을 유지합니다."
+                    if self.synced else "로컬 시계로 진행합니다."
+                )
                 if missing_server_time:
                     self.log(
-                        "[경고] 서버 시간 필드가 비어 있습니다. 로컬 시계로 진행합니다.",
+                        f"[경고] 서버 시간 필드가 비어 있습니다. {fallback}",
                         "warning",
                     )
                 else:
                     suffix = f" ({last_error})" if last_error else ""
                     self.log(
                         f"[경고] 네이버 서버 시간을 읽지 못했습니다. "
-                        f"로컬 시계로 진행합니다.{suffix}",
+                        f"{fallback}{suffix}",
                         "warning",
                     )
             return False
 
-        round_trip, response_end, server_epoch = min(samples, key=lambda row: row[0])
-        self._anchor_server = server_epoch
-        self._anchor_monotonic = response_end
-        # RTT and sample disagreement are estimates, not a measured arrival
-        # error. Never cap a slow/noisy clock at an artificial 25 ms precision.
+        self._samples = [
+            row for row in self._samples
+            if measured_at - row[1] <= self.HISTORY_MAX_AGE_SECONDS
+        ]
+        self._samples = (self._samples + samples)[-self.MAX_HISTORY_SAMPLES:]
+        selected, group = self._sample_group(samples)
+        round_trip, response_end, server_epoch = selected
         mappings = [server - end for _rtt, end, server in samples]
-        spread = max(mappings) - min(mappings)
-        self.last_precision = max(round_trip / 2, spread / 2)
-        self.last_offset = self._anchor_server - (
-            time.time() - (time.monotonic() - response_end)
+        raw_spread = max(mappings) - min(mappings)
+        group_mappings = [server - end for _rtt, end, server in group]
+        spread = max(group_mappings) - min(group_mappings)
+        # Without any agreement, retain the disagreement in the uncertainty.
+        candidate_precision = max(
+            round_trip / 2,
+            (spread if len(group) > 1 else raw_spread) / 2,
         )
+        mapping = server_epoch - response_end
+        consensus_count = sum(
+            measured_at - end <= self.CONSENSUS_MAX_AGE_SECONDS
+            and abs((server - end) - mapping) <= self.CONSENSUS_SPREAD_SECONDS
+            for _rtt, end, server in self._samples
+        )
+        age = (
+            max(0.0, measured_at - self._anchor_monotonic)
+            if self.synced else 0.0
+        )
+        previous_precision = self._anchor_precision + age * self.DRIFT_SECONDS_PER_SECOND
+        mapping_change = (
+            mapping - (self._anchor_server - self._anchor_monotonic)
+            if self.synced else 0.0
+        )
+        material_shift = abs(mapping_change) > max(
+            self.MATERIAL_SHIFT_SECONDS,
+            min(previous_precision, 0.100),
+        )
+        worse_quality = candidate_precision > max(
+            previous_precision * 1.5,
+            previous_precision + 0.020,
+        )
+        accept, reason = True, "initial" if not self.synced else "consistent"
+        if self.synced:
+            if (
+                max_deadline_shift_ms is not None
+                and abs(mapping_change) * 1000 > max_deadline_shift_ms
+            ):
+                accept, reason = False, "final_shift_limit"
+            elif material_shift and consensus_count < self.MIN_SHIFT_CONSENSUS:
+                accept, reason = False, "unconfirmed_shift"
+            elif worse_quality and age < self.MAX_ANCHOR_AGE_SECONDS:
+                accept, reason = False, "lower_quality"
+            elif worse_quality and consensus_count < self.MIN_SHIFT_CONSENSUS:
+                accept, reason = False, "stale_unconfirmed"
+            elif material_shift:
+                reason = "confirmed_shift"
+            elif age >= self.MAX_ANCHOR_AGE_SECONDS:
+                reason = "stale_anchor_refreshed"
+        if accept:
+            self._anchor_server = server_epoch
+            self._anchor_monotonic = response_end
+            self._anchor_precision = candidate_precision
+            self._anchor_rtt = round_trip
+        age = max(0.0, measured_at - self._anchor_monotonic)
+        self.last_precision = self._anchor_precision + age * self.DRIFT_SECONDS_PER_SECOND
+        self.last_offset = self._anchor_server + age - time.time()
+        self._last_diagnostic = {
+            "status": "accepted" if accept else "retained",
+            "reason": reason,
+            "sample_count": len(samples),
+            "history_sample_count": len(self._samples),
+            "consensus_count": consensus_count,
+            "rtt_ms": round(self._anchor_rtt * 1000, 3),
+            "candidate_rtt_ms": round(round_trip * 1000, 3),
+            "candidate_uncertainty_ms": round(candidate_precision * 1000, 3),
+            "spread_ms": round(spread * 1000, 3),
+            "raw_spread_ms": round(raw_spread * 1000, 3),
+            "candidate_deadline_shift_ms": round(-mapping_change * 1000, 3),
+            "applied_deadline_shift_ms": round(-mapping_change * 1000, 3) if accept else 0.0,
+            "samples": [
+                {"rtt_ms": round(rtt * 1000, 3),
+                 "request_start_monotonic_ms": round((end - rtt) * 1000, 3),
+                 "response_end_monotonic_ms": round(end * 1000, 3),
+                 "server_epoch_ms": round(server * 1000, 3)}
+                for rtt, end, server in samples
+            ],
+        }
         if announce and self.log:
+            action = "동기화 완료" if accept else "기존 보정 유지"
             self.log(
-                f"서버 시간 동기화 완료 · 로컬 시계와 차이 {self.last_offset:+.2f}초 · "
+                f"서버 시간 {action} · 로컬 시계와 차이 {self.last_offset:+.2f}초 · "
                 f"표본 기준 불확실성 약 {self.last_precision * 1000:.0f}ms",
                 "success",
             )

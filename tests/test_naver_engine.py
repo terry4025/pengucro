@@ -1250,7 +1250,8 @@ def test_api_refusal_stops_after_reconciliation_without_browser_resubmission():
     assert engine._api_submitter.calls == 1
 
 
-def test_rt47_reconciles_postpaid_booking_without_second_post():
+@pytest.mark.parametrize("status,expected", [("RC03", "success"), ("RC02", "pending")])
+def test_rt47_reconciles_postpaid_booking_without_second_post(status, expected):
     engine = make_engine()
     engine._open_at_epoch = 1.0
     engine.clock = FakeClock(-0.01)
@@ -1260,7 +1261,7 @@ def test_rt47_reconciles_postpaid_booking_without_second_post():
             True,
             booking_id="999888",
             url="https://m.booking.naver.com/my/bookings/999888",
-            status="RC02",
+            status=status,
         ),
     )
     engine._api_preparation = NaverSubmitPreparation(
@@ -1276,7 +1277,7 @@ def test_rt47_reconciles_postpaid_booking_without_second_post():
         "2026-08-08", "14:30", PREPARATION_RESERVATION, False
     ))
 
-    assert outcome == "success"
+    assert outcome == expected
     assert "999888" in detail
     assert engine._api_submitter.calls == 1
     assert len(engine._api_submitter.reconcile_calls) == 1
@@ -1811,11 +1812,16 @@ def configure_fake_npay_checkout(engine, pay_button):
     async def dump_debug(_page, _filename):
         return None
 
+    async def booking_evidence(_booking_id, **_kwargs):
+        from engines.naver_booking import VerifiedBookingDetails
+        return VerifiedBookingDetails("payment_pending", matched=True, booking_id=_booking_id)
+
     engine._wait_for_npay_page = wait_for_page
     engine._navigate_to_npay_page = navigate_to_page
     engine._select_npay_money = select_money
     engine._find_npay_pay_button = find_pay_button
     engine._dump_debug = dump_debug
+    engine._read_booking_evidence = booking_evidence
 
 
 def test_npay_response_parser_extracts_booking_before_payment_redirect():

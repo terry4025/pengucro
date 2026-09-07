@@ -14,9 +14,10 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from urllib.parse import urljoin, urlparse
 
 from engines.naver_api import (
     ACCOUNT_QUERY,
@@ -37,10 +38,12 @@ PAYMENT_NPAY_PREPAID = "npay_prepaid"
 PAYMENT_POSTPAID = "postpaid"
 UPCOMING_BOOKINGS_URL = "https://m.place.naver.com/my/timeline?tab=RESERVATION"
 UPCOMING_BOOKINGS_ENDPOINT = "https://porta.place.naver.com/graphql"
+NOT_OPEN_WRAPPER_CODES = frozenset({"BAD_REQUEST", "BAD_USER_INPUT"})
 
 
 UPCOMING_BOOKINGS_QUERY = """query UpcomingBookingQuery($page: Int, $limit: Int) {
   me {
+    __typename
     ... on MeSucceed {
       upcomingBookings(page: $page, limit: $limit) {
         bookings {
@@ -93,6 +96,147 @@ class NaverBookingReconciliation:
     booking_id: str = ""
     url: str = ""
     status: str = ""
+    state: str = "not_found"
+    attempts: int = 0
+    successful_reads: int = 0
+    failed_reads: int = 0
+    http_status: int = 0
+    error_kind: str = ""
+    baseline_checked: bool = False
+
+    def __post_init__(self) -> None:
+        if self.found and self.state == "not_found":
+            object.__setattr__(self, "state", "found")
+
+
+@dataclass(frozen=True)
+class NaverBookingSnapshot:
+    """A classified account read; an error is never an empty booking list."""
+
+    state: str
+    rows: tuple[Mapping[str, Any], ...] = ()
+    booking_ids: frozenset[str] = frozenset()
+    complete: bool = False
+    pages_checked: int = 0
+    http_status: int = 0
+    error_kind: str = ""
+    has_more: bool = False
+
+
+# The official MY Place bundle (260903-151652/5.37.0, chunk 6629) distinguishes
+# RC03 confirmation from RC02 pending confirmation. Both identify an active
+# account booking, but RC02 must never be presented as final confirmation.
+VALID_BOOKING_STATUSES = frozenset({"RC02", "RC03"})
+
+
+def trusted_booking_evidence_url(raw_url: Any) -> str:
+    """Keep only an official HTTPS checkout/detail URL as unconfirmed evidence."""
+    candidates = (
+        (raw_url.get("pc"), raw_url.get("mobile"), raw_url.get("m"))
+        if isinstance(raw_url, Mapping) else (raw_url,)
+    )
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text.startswith("/") and not text.startswith("//"):
+            text = urljoin("https://m.booking.naver.com", text)
+        try:
+            parsed = urlparse(text)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or parsed.username or parsed.password:
+                continue
+            if parsed.port not in (None, 443):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if host == "pay.naver.com" or host.endswith(".pay.naver.com"):
+            return text
+        if (host == "booking.naver.com" or host.endswith(".booking.naver.com")) and (
+            parsed.path.startswith("/my/bookings/")
+        ):
+            return text
+    return ""
+
+
+def _submit_error_tokens(error: Mapping[str, Any]) -> tuple[str, ...]:
+    extensions = error.get("extensions")
+    extensions = extensions if isinstance(extensions, Mapping) else {}
+    return tuple(
+        str(value).strip() for value in (
+            error.get("message"), extensions.get("code"), extensions.get("reason")
+        ) if value is not None and str(value).strip()
+    )
+
+
+def _exclusive_not_open_errors(errors: Any) -> bool:
+    """Only unopposed, explicit not-open evidence can authorize another POST."""
+    if not isinstance(errors, list) or not errors:
+        return False
+    allowed = SUBMIT_NOT_OPEN_CODES | NOT_OPEN_WRAPPER_CODES
+    for error in errors:
+        if not isinstance(error, Mapping):
+            return False
+        extensions = error.get("extensions")
+        if extensions is not None and not isinstance(extensions, Mapping):
+            return False
+        values = set(_submit_error_tokens(error))
+        if not values.intersection(SUBMIT_NOT_OPEN_CODES) or not values.issubset(allowed):
+            return False
+    return True
+
+
+def _booking_snapshot(response: Any) -> NaverBookingSnapshot:
+    if not isinstance(response, Mapping):
+        return NaverBookingSnapshot("network_error", error_kind="missing_response")
+    try:
+        status = int(response.get("status") or 0)
+    except (ValueError, TypeError):
+        status = 0
+    if status in (401, 403):
+        return NaverBookingSnapshot("auth_error", http_status=status, error_kind="http_auth")
+    if status >= 400 or status <= 0:
+        return NaverBookingSnapshot("http_error", http_status=status, error_kind="http_status")
+    body = response.get("body")
+    if not isinstance(body, Mapping):
+        return NaverBookingSnapshot("schema_error", http_status=status, error_kind="non_json_body")
+    errors = body.get("errors") or []
+    if errors:
+        # Inspect errors for classification, but never retain messages that may
+        # echo account details or session data in the diagnostic result.
+        text = json.dumps(errors, ensure_ascii=False).casefold()
+        if any(token in text for token in ("unauthenticated", "authentication", "unauthorized", "not logged")):
+            state, kind = "auth_error", "graphql_auth"
+        elif any(token in text for token in ("cannot query field", "validation", "syntax error", "unknown argument")):
+            state, kind = "schema_error", "graphql_schema"
+        else:
+            state, kind = "query_error", "graphql_error"
+        return NaverBookingSnapshot(state, http_status=status, error_kind=kind)
+    data = body.get("data")
+    if not isinstance(data, Mapping) or "me" not in data:
+        return NaverBookingSnapshot("schema_error", http_status=status, error_kind="missing_account_field")
+    me = data.get("me")
+    if me is None:
+        return NaverBookingSnapshot("auth_error", http_status=status, error_kind="account_unavailable")
+    if not isinstance(me, Mapping):
+        return NaverBookingSnapshot("schema_error", http_status=status, error_kind="invalid_account")
+    typename = str(me.get("__typename") or "")
+    if typename and typename != "MeSucceed":
+        return NaverBookingSnapshot("auth_error", http_status=status, error_kind="account_not_succeeded")
+    upcoming = me.get("upcomingBookings")
+    if not isinstance(upcoming, Mapping) or not isinstance(upcoming.get("bookings"), list):
+        return NaverBookingSnapshot("schema_error", http_status=status, error_kind="missing_booking_list")
+    rows = upcoming["bookings"]
+    if any(not isinstance(row, Mapping) for row in rows):
+        return NaverBookingSnapshot("schema_error", http_status=status, error_kind="invalid_booking_row")
+    if any(not str(row.get("id") or "").strip() for row in rows):
+        return NaverBookingSnapshot("schema_error", http_status=status, error_kind="missing_booking_id")
+    page_info = upcoming.get("pageInfo")
+    has_more = bool(page_info.get("hasNextPage")) if isinstance(page_info, Mapping) else False
+    complete = isinstance(page_info, Mapping) and page_info.get("hasNextPage") is False
+    return NaverBookingSnapshot(
+        "ok", rows=tuple(rows),
+        booking_ids=frozenset(str(row.get("id")) for row in rows if row.get("id")),
+        complete=complete, pages_checked=1, http_status=status, has_more=has_more,
+    )
 
 
 def _compact_match_text(value: Any) -> str:
@@ -167,11 +311,14 @@ def match_upcoming_booking(
     target_time: str,
     business_id: str = "",
     item_name: str = "",
+    baseline_booking_ids: frozenset[str] | set[str] | None = None,
 ) -> NaverBookingReconciliation:
     """Require account booking id plus exact business/item/date/time evidence."""
-    if not isinstance(rows, list):
+    if not isinstance(rows, (list, tuple)):
         return NaverBookingReconciliation(False)
     expected_item = _compact_match_text(item_name)
+    candidates = []
+    rejected = None
     for raw in rows:
         if not isinstance(raw, Mapping):
             continue
@@ -183,19 +330,30 @@ def match_upcoming_booking(
             continue
         row_item = _compact_match_text(raw.get("bizItemName"))
         if expected_item:
-            if not row_item or not (
-                expected_item in row_item or row_item in expected_item
-            ):
+            if not row_item or row_item != expected_item:
                 continue
         if not _row_booking_datetime(raw, target_date, target_time):
             continue
-        return NaverBookingReconciliation(
-            True,
+        status = str(raw.get("bookingStatusCode") or "")
+        existing = baseline_booking_ids is not None and booking_id in baseline_booking_ids
+        evidence = NaverBookingReconciliation(
+            status in VALID_BOOKING_STATUSES and not existing,
             booking_id=booking_id,
-            url=str(raw.get("landingUrl") or ""),
-            status=str(raw.get("bookingStatusCode") or ""),
+            url=trusted_booking_evidence_url(raw.get("landingUrl")),
+            status=status,
+            state="invalid_status" if status not in VALID_BOOKING_STATUSES else "existing" if existing else "found",
+            baseline_checked=baseline_booking_ids is not None,
         )
-    return NaverBookingReconciliation(False)
+        if evidence.found:
+            candidates.append(evidence)
+        else:
+            rejected = evidence
+    unique = {candidate.booking_id: candidate for candidate in candidates}
+    if len(unique) == 1:
+        return next(iter(unique.values()))
+    if len(unique) > 1:
+        return NaverBookingReconciliation(False, state="ambiguous_match", baseline_checked=baseline_booking_ids is not None)
+    return rejected or NaverBookingReconciliation(False, baseline_checked=baseline_booking_ids is not None)
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -754,6 +912,10 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         0, Math.min(500, Number(request.retryWindowMs) || 0));
     const notOpenCodes = new Set(
         (request.notOpenCodes || []).map(value => String(value || "")));
+    const notOpenWrappers = new Set(
+        (request.notOpenWrapperCodes || []).map(value => String(value || "")));
+    const visibility = () => typeof document === "object"
+        ? String(document.visibilityState || "unknown") : "unknown";
 
     // The synchronized Naver clock is the sole opening-time authority. Only
     // transfer its monotonic deadline to Chrome; do not replace it with a new
@@ -794,6 +956,9 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         attempts: 0,
         notOpenAttempts: 0,
         response: null,
+        attemptTimings: [],
+        armedVisibility: visibility(),
+        dispatchVisibility: "unknown",
         error: "",
         timer: 0,
         controller: null,
@@ -802,14 +967,20 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
     const pause = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
     const isExplicitNotOpen = body => {
         const booking = body && body.data && body.data.submitBooking;
-        if (booking && booking.bookingId) return false;
+        // Partial data can identify a hold even when the sibling id is absent.
+        // Preserve it for reconciliation, never retry it as a not-open refusal.
+        if (booking && (booking.bookingId || booking.url)) return false;
         const errors = body && Array.isArray(body.errors) ? body.errors : [];
-        return errors.some(error => {
+        return errors.length > 0 && errors.every(error => {
             if (!error || typeof error !== "object") return false;
+            if (error.extensions != null && typeof error.extensions !== "object") return false;
             const extensions = error.extensions && typeof error.extensions === "object"
                 ? error.extensions : {};
-            return [error.message, extensions.code, extensions.reason]
-                .some(value => notOpenCodes.has(String(value || "")));
+            const values = [error.message, extensions.code, extensions.reason]
+                .filter(value => value != null).map(value => String(value).trim())
+                .filter(Boolean);
+            return values.some(value => notOpenCodes.has(value)) &&
+                values.every(value => notOpenCodes.has(value) || notOpenWrappers.has(value));
         });
     };
     const retryExpired = () => state.serverOpenAt > 0
@@ -826,11 +997,13 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
             while (performance.now() < state.dueAt) {}
             if (state.status !== "armed") return;
             state.status = "submitting";
+            state.dispatchVisibility = visibility();
             state.startedAt = performance.now();
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 if (attempt > 1 && retryExpired()) break;
                 state.attempts = attempt;
                 state.lastStartedAt = performance.now();
+                const attemptTiming = {attempt, dispatchAt: state.lastStartedAt};
                 const controller = new AbortController();
                 state.controller = controller;
                 const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -843,9 +1016,11 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
                         body: requestBody,
                     });
                     state.headersAt = performance.now();
+                    attemptTiming.headersAt = state.headersAt;
                     let body = null;
                     try { body = await response.json(); } catch (_) {}
                     state.responseBodyAt = performance.now();
+                    attemptTiming.bodyAt = state.responseBodyAt;
                     state.response = {status: response.status, body};
                     const explicitNotOpen = isExplicitNotOpen(body);
                     if (explicitNotOpen) state.notOpenAttempts += 1;
@@ -854,6 +1029,25 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
                 } finally {
                     clearTimeout(timeout);
                     state.controller = null;
+                    attemptTiming.completedAt = performance.now();
+                    // Optional diagnostics after the response, never another
+                    // network call or a delay in the final dispatch path.
+                    try {
+                        if (typeof performance.getEntriesByType === "function") {
+                            const entries = performance.getEntriesByType("resource");
+                            const entry = entries.filter(value =>
+                                value.name.includes("opName=submitBooking") &&
+                                value.startTime >= attemptTiming.dispatchAt - 1
+                            ).pop();
+                            if (entry) {
+                                for (const key of ["fetchStart", "requestStart", "responseStart", "responseEnd"]) {
+                                    const value = Number(entry[key]);
+                                    if (Number.isFinite(value) && value > 0) attemptTiming[key] = value;
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                    state.attemptTimings.push(attemptTiming);
                 }
                 if (state.serverOpenAt > 0) {
                     // After a deliberate early probe, align the retry with the
@@ -893,6 +1087,7 @@ BROWSER_ARMED_SUBMIT_SCRIPT = r"""async request => {
         estimatedOutboundMs: state.estimatedOutboundMs,
         targetArrivalBeforeOpenMs: state.targetArrivalBeforeOpenMs,
         appliedLeadMs: state.appliedLeadMs,
+        armedVisibility: state.armedVisibility,
     };
 }"""
 
@@ -922,6 +1117,9 @@ BROWSER_ARMED_SUBMIT_STATE_SCRIPT = r"""request => {
         completedAt: Number(state.completedAt) || 0,
         attempts: Number(state.attempts) || 0,
         notOpenAttempts: Number(state.notOpenAttempts) || 0,
+        attemptTimings: Array.isArray(state.attemptTimings) ? state.attemptTimings : [],
+        armedVisibility: state.armedVisibility || "unknown",
+        dispatchVisibility: state.dispatchVisibility || "unknown",
     };
 }"""
 
@@ -996,37 +1194,25 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
     # GraphQL may return partial data together with an error.  A concrete
     # bookingId is stronger evidence than RT47's generic wrapper and must not be
     # discarded, otherwise a real Npay hold is mistaken for somebody else's win.
-    booking = ((body.get("data") or {}).get("submitBooking")) or {}
+    data = body.get("data")
+    booking = data.get("submitBooking") if isinstance(data, Mapping) else None
+    booking = booking if isinstance(booking, Mapping) else {}
     booking_url = booking.get("url") if isinstance(booking, dict) else None
-    if isinstance(booking_url, dict):
-        booking_url_text = str(
-            booking_url.get("pc")
-            or booking_url.get("mobile")
-            or booking_url.get("m")
-            or ""
-        )
-    else:
-        booking_url_text = str(booking_url or "")
+    booking_url_text = trusted_booking_evidence_url(booking_url)
     booking_id = str(booking.get("bookingId") or "") if isinstance(booking, dict) else ""
-    if not booking_id and booking_url_text:
-        # Some partial GraphQL responses retain a trusted booking-detail URL but
-        # omit the sibling bookingId field. Recover only an explicit numeric id;
-        # an order-sheet URL without an id remains ambiguous and is reconciled.
-        identifier = re.search(
-            r"(?:/my/bookings/|[?&](?:bookingId|booking_id|bookingNo)=)(\d+)",
-            booking_url_text,
-            re.IGNORECASE,
-        )
-        if identifier:
-            booking_id = identifier.group(1)
+    # A URL can contain a candidate booking id, but only the explicit response
+    # field is authoritative here. Detail lookup must bind URL-only candidates
+    # to this account and target before resuming a checkout or reporting success.
     if booking_id:
         return SubmitResult(
             SubmitOutcome.SUCCESS,
             booking_id=booking_id,
-            url=booking_url,
+            url=booking_url_text or None,
         )
 
     errors = body.get("errors") or []
+    if not isinstance(errors, list):
+        return SubmitResult(SubmitOutcome.ERROR, message="예약 오류 응답 형식이 올바르지 않습니다", url=booking_url_text or None)
     if errors:
         first = errors[0] if isinstance(errors[0], dict) else {}
         extensions = first.get("extensions")
@@ -1034,15 +1220,31 @@ def _submit_result_from_response(response: Any) -> SubmitResult:
         code = str(extensions.get("code") or "")
         message = str(first.get("message") or "")
         reason = str(extensions.get("reason") or "")
+        outcome = classify_submit_error(code, message, reason)
+        if booking_url_text:
+            outcome = SubmitOutcome.UNKNOWN
+        # Any partial response URL may refer to a completed side effect. A
+        # not-open wrapper must not cause another POST before it is inspected.
+        has_not_open = any(
+            value in SUBMIT_NOT_OPEN_CODES
+            for error in errors if isinstance(error, Mapping)
+            for value in _submit_error_tokens(error)
+        )
+        if (outcome == SubmitOutcome.NOT_OPEN or has_not_open) and (
+            booking_url or not _exclusive_not_open_errors(errors)
+        ):
+            outcome = SubmitOutcome.UNKNOWN
         return SubmitResult(
-            classify_submit_error(code, message, reason),
+            outcome,
             code=code or message,
             message=reason or message,
+            url=booking_url_text or None,
         )
 
     if status >= 400:
-        return SubmitResult(SubmitOutcome.ERROR, message=f"HTTP {status}")
-    return SubmitResult(SubmitOutcome.ERROR, message="예약번호가 비어 있습니다")
+        return SubmitResult(SubmitOutcome.ERROR, message=f"HTTP {status}", url=booking_url_text or None)
+    return SubmitResult(SubmitOutcome.UNKNOWN if booking_url_text else SubmitOutcome.ERROR,
+                        message="예약번호가 비어 있습니다", url=booking_url_text or None)
 
 
 class NaverArmUncertainError(RuntimeError):
@@ -1057,8 +1259,14 @@ class NaverBrowserSubmitter:
         self.timeout_seconds = max(0.01, float(timeout_seconds))
         self.last_rtt: float | None = None
         self.safe_rtt_samples: list[float] = []
+        self.last_safe_rtt_at: float | None = None
+        self._safe_rtt_history: list[tuple[float, float]] = []
+        self._reconciliation_page = None
+        self.reconciliation_baseline: NaverBookingSnapshot | None = None
         self.last_armed_timing: dict[str, float] = {}
-        self.last_armed_diagnostics: dict[str, float] = {}
+        self.last_armed_diagnostics: dict[str, Any] = {}
+        self.last_armed_visibility = "unknown"
+        self.last_foreground_restore = "unavailable"
         # ``False`` distinguishes a failed GraphQL request from a successful
         # response that explicitly says the current browser is logged out.
         self.last_account_fetch_ok = False
@@ -1093,9 +1301,39 @@ class NaverBrowserSubmitter:
                 if 0.005 <= browser_elapsed <= 3.0:
                     measured = browser_elapsed
             self.last_rtt = measured
-            if operation_name != "submitBooking" and 0.005 <= measured <= 3.0:
+            body = response.get("body") if isinstance(response, dict) else None
+            healthy_read = (
+                isinstance(response, dict) and response.get("status") == 200
+                and isinstance(body, dict) and isinstance(body.get("data"), dict)
+                and not body.get("errors")
+            )
+            if operation_name != "submitBooking" and healthy_read and 0.005 <= measured <= 3.0:
+                self.last_safe_rtt_at = time.monotonic()
                 self.safe_rtt_samples.append(measured)
                 del self.safe_rtt_samples[:-8]
+                self._safe_rtt_history.append((self.last_safe_rtt_at, measured))
+                del self._safe_rtt_history[:-8]
+
+    def recent_safe_rtt_samples(self, max_age_seconds: float = 15.0) -> list[float]:
+        cutoff = time.monotonic() - max(0.0, float(max_age_seconds))
+        return [rtt for recorded, rtt in self._safe_rtt_history if recorded >= cutoff]
+
+    def reset_reconciliation_baseline(self) -> None:
+        self.reconciliation_baseline = None
+
+    async def _restore_submission_foreground(self) -> None:
+        self.last_foreground_restore = "unavailable"
+        try:
+            is_closed = getattr(self.page, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                self.last_foreground_restore = "closed"
+                return
+            bring_to_front = getattr(self.page, "bring_to_front", None)
+            if callable(bring_to_front):
+                await asyncio.wait_for(bring_to_front(), timeout=0.5)
+                self.last_foreground_restore = "restored"
+        except Exception:
+            self.last_foreground_restore = "failed"
 
     async def fetch_account(self) -> NaverAccount:
         self.last_account_fetch_ok = False
@@ -1117,6 +1355,71 @@ class NaverBrowserSubmitter:
             nickname=str(account.get("nickname") or ""),
         )
 
+    async def _get_reconciliation_page(self):
+        if self._reconciliation_page is not None:
+            return self._reconciliation_page
+        context = getattr(self.page, "context", None)
+        if context is None or not hasattr(context, "new_page"):
+            return None
+        self._reconciliation_page = await asyncio.wait_for(context.new_page(), timeout=3.0)
+        try:
+            await self._reconciliation_page.goto(
+                UPCOMING_BOOKINGS_URL, wait_until="domcontentloaded", timeout=5000,
+            )
+        except Exception:
+            await self.close_reconciliation_page()
+            raise
+        return self._reconciliation_page
+
+    async def close_reconciliation_page(self) -> None:
+        page, self._reconciliation_page = self._reconciliation_page, None
+        if page is not None:
+            try:
+                await asyncio.wait_for(page.close(), timeout=2.0)
+            except Exception:
+                pass
+
+    async def _read_upcoming_bookings(self, page_number: int = 1) -> NaverBookingSnapshot:
+        try:
+            lookup_page = await self._get_reconciliation_page()
+            if lookup_page is None:
+                return NaverBookingSnapshot("unavailable", error_kind="no_browser_context")
+            response = await asyncio.wait_for(lookup_page.evaluate(
+                BROWSER_UPCOMING_BOOKINGS_SCRIPT, {
+                    "endpoint": UPCOMING_BOOKINGS_ENDPOINT,
+                    "query": UPCOMING_BOOKINGS_QUERY,
+                    "timeoutMs": 2000, "page": page_number, "limit": 20,
+                },
+            ), timeout=2.5)
+            return _booking_snapshot(response)
+        except (asyncio.TimeoutError, TimeoutError):
+            return NaverBookingSnapshot("network_error", error_kind="timeout")
+        except Exception:
+            return NaverBookingSnapshot("network_error", error_kind="browser_read_failed")
+
+    async def preflight_reconciliation(self, max_pages: int = 5) -> NaverBookingSnapshot:
+        """Warm the read-only page and capture existing ids before any submit."""
+        self.reconciliation_baseline = None
+        rows: list[Mapping[str, Any]] = []
+        try:
+            for page_number in range(1, max(1, min(int(max_pages), 10)) + 1):
+                snapshot = await self._read_upcoming_bookings(page_number)
+                if snapshot.state != "ok":
+                    return replace(snapshot, pages_checked=page_number)
+                rows.extend(snapshot.rows)
+                snapshot = replace(
+                    snapshot, rows=tuple(rows), pages_checked=page_number,
+                    booking_ids=frozenset(str(row.get("id")) for row in rows if row.get("id")),
+                )
+                if not snapshot.has_more:
+                    break
+            self.reconciliation_baseline = snapshot
+            return snapshot
+        finally:
+            if self.reconciliation_baseline is None:
+                await self.close_reconciliation_page()
+            await self._restore_submission_foreground()
+
     async def reconcile_upcoming_booking(
         self,
         *,
@@ -1126,73 +1429,58 @@ class NaverBrowserSubmitter:
         item_name: str = "",
         attempts: int = 40,
         window_seconds: float = 20.0,
+        baseline_booking_ids: frozenset[str] | set[str] | None = None,
+        stop_event=None,
     ) -> NaverBookingReconciliation:
         """Read the logged-in account's booking list without another mutation."""
-        context = getattr(self.page, "context", None)
-        if context is None or not hasattr(context, "new_page"):
-            return NaverBookingReconciliation(False)
-        lookup_page = None
+        baseline_complete = baseline_booking_ids is not None
+        if baseline_booking_ids is None and self.reconciliation_baseline is not None:
+            baseline_booking_ids = self.reconciliation_baseline.booking_ids
+            baseline_complete = self.reconciliation_baseline.complete
+        reads = failures = 0
+        last_error = ""
+        evidence = NaverBookingReconciliation(False, baseline_checked=baseline_booking_ids is not None)
+        attempt_limit = max(1, min(int(attempts or 1), 128))
+        deadline = time.monotonic() + max(0.5, min(float(window_seconds or 0.5), 90.0))
+        page_number = 1
         try:
-            lookup_page = await context.new_page()
-            await lookup_page.goto(
-                UPCOMING_BOOKINGS_URL,
-                wait_until="domcontentloaded",
-                timeout=5000,
-            )
-            attempt_limit = max(1, min(int(attempts or 1), 128))
-            deadline = time.monotonic() + max(
-                0.5, min(float(window_seconds or 0.5), 90.0)
-            )
             for attempt in range(attempt_limit):
-                try:
-                    response = await asyncio.wait_for(
-                        lookup_page.evaluate(
-                            BROWSER_UPCOMING_BOOKINGS_SCRIPT,
-                            {
-                                "endpoint": UPCOMING_BOOKINGS_ENDPOINT,
-                                "query": UPCOMING_BOOKINGS_QUERY,
-                                "timeoutMs": 2000,
-                                # The newest reservation should be on page 1.
-                                # Periodically checking page 2 also covers a
-                                # delayed ordering/index update without doubling
-                                # every reconciliation request.
-                                "page": 2 if attempt > 0 and attempt % 5 == 0 else 1,
-                                "limit": 20,
-                            },
-                        ),
-                        timeout=2.5,
+                if stop_event is not None and stop_event.is_set():
+                    return replace(evidence, found=False, state="stopped")
+                snapshot = await self._read_upcoming_bookings(page_number)
+                if stop_event is not None and stop_event.is_set():
+                    return replace(evidence, found=False, state="stopped")
+                page_number = page_number + 1 if snapshot.has_more and page_number < 10 else 1
+                if snapshot.state == "ok":
+                    reads += 1
+                    evidence = match_upcoming_booking(
+                        snapshot.rows, target_date=target_date, target_time=target_time,
+                        business_id=business_id, item_name=item_name,
+                        baseline_booking_ids=baseline_booking_ids,
                     )
-                except (asyncio.TimeoutError, TimeoutError):
-                    response = None
-                body = response.get("body") if isinstance(response, dict) else None
-                data = body.get("data") if isinstance(body, dict) else None
-                me = data.get("me") if isinstance(data, dict) else None
-                upcoming = (
-                    me.get("upcomingBookings") if isinstance(me, dict) else None
+                else:
+                    failures += 1
+                    last_error = snapshot.error_kind
+                    evidence = NaverBookingReconciliation(
+                        False, state=snapshot.state,
+                        baseline_checked=baseline_booking_ids is not None,
+                    )
+                evidence = replace(
+                    evidence, attempts=attempt + 1, successful_reads=reads,
+                    failed_reads=failures, http_status=snapshot.http_status,
+                    error_kind=last_error, baseline_checked=baseline_complete,
                 )
-                rows = upcoming.get("bookings") if isinstance(upcoming, dict) else []
-                matched = match_upcoming_booking(
-                    rows,
-                    target_date=target_date,
-                    target_time=target_time,
-                    business_id=business_id,
-                    item_name=item_name,
-                )
-                if matched.found:
-                    return matched
+                if evidence.found or evidence.state in {
+                    "existing", "ambiguous_match", "auth_error", "schema_error", "unavailable",
+                } or snapshot.http_status == 429:
+                    return evidence
                 remaining = deadline - time.monotonic()
                 if attempt + 1 >= attempt_limit or remaining <= 0:
                     break
-                await asyncio.sleep(min(0.50, remaining))
-        except Exception:
-            return NaverBookingReconciliation(False)
+                await asyncio.sleep(min(0.50 if snapshot.state == "ok" else 1.0, remaining))
         finally:
-            if lookup_page is not None:
-                try:
-                    await lookup_page.close()
-                except Exception:
-                    pass
-        return NaverBookingReconciliation(False)
+            await self.close_reconciliation_page()
+        return evidence
 
     async def submit(self, payload: dict[str, Any]) -> SubmitResult:
         try:
@@ -1268,6 +1556,7 @@ class NaverBrowserSubmitter:
             else started + max(0.0, delay_seconds) + max(0.0, lead_seconds)
         )
         due_deadline = open_deadline - max(0.0, lead_seconds)
+        await self._restore_submission_foreground()
         offset_ms, bridge_rtt_ms, origin = await self._browser_clock_bridge()
         self.last_armed_timing = {}
         try:
@@ -1297,6 +1586,7 @@ class NaverBrowserSubmitter:
                         "retryDelayMs": 10,
                         "retryWindowMs": 500,
                         "notOpenCodes": sorted(SUBMIT_NOT_OPEN_CODES),
+                        "notOpenWrapperCodes": sorted(NOT_OPEN_WRAPPER_CODES),
                     },
                 ),
                 timeout=1.5,
@@ -1311,6 +1601,8 @@ class NaverBrowserSubmitter:
             raise RuntimeError("Chrome 페이지 변경으로 타이머 설치하지 않음")
         if not isinstance(response, dict) or response.get("id") != arm_id:
             raise NaverArmUncertainError("브라우저 내부 예약 타이머 응답 불명확")
+        visibility_value = response.get("armedVisibility")
+        self.last_armed_visibility = visibility_value if visibility_value in {"visible", "hidden", "prerender"} else "unknown"
         for key in (
             "armedAt",
             "dueAt",
@@ -1426,6 +1718,27 @@ class NaverBrowserSubmitter:
                 else 0.0
             ),
         }
+        attempt_timings = []
+        for record in (state.get("attemptTimings") or [])[:3]:
+            if not isinstance(record, dict):
+                continue
+            clean = {
+                key: float(record[key])
+                for key in ("attempt", "dispatchAt", "headersAt", "bodyAt", "completedAt", "fetchStart", "requestStart", "responseStart", "responseEnd")
+                if isinstance(record.get(key), (int, float)) and math.isfinite(record[key])
+            }
+            attempt_timings.append(clean)
+        self.last_armed_diagnostics["attemptTimings"] = attempt_timings
+        for key in ("armedVisibility", "dispatchVisibility"):
+            value = state.get(key)
+            self.last_armed_diagnostics[key] = value if value in {"visible", "hidden", "prerender"} else "unknown"
+        self.last_armed_diagnostics["foregroundRestore"] = self.last_foreground_restore
+        if attempt_timings:
+            latest = attempt_timings[-1]
+            dispatch = latest.get("dispatchAt", 0.0)
+            request_start = latest.get("requestStart", 0.0)
+            if request_start >= dispatch > 0:
+                self.last_armed_diagnostics["browserQueueMs"] = request_start - dispatch
         elapsed_ms: float | None = None
         started = state.get("startedAt")
         completed = state.get("completedAt")
