@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from engines.cgv_client import CGV_HOME_URL
+from engines.cgv_login import CgvLoginAssistant
 from engines.cgv_engine_pairwise_observer import CgvEngine as ObserverCgvEngine
 
 
@@ -66,6 +67,7 @@ class CgvEngine(ObserverCgvEngine):
             "로그인 확인 후 예약을 자동으로 계속합니다.",
             "warning",
         )
+        login_assistant = CgvLoginAssistant(self.log, self.stop_event)
         while not self.stop_event.is_set():
             try:
                 if hasattr(page, "is_closed") and page.is_closed():
@@ -77,6 +79,7 @@ class CgvEngine(ObserverCgvEngine):
             if not self._login_required(page):
                 self.log("[CGV] 로그인 완료를 확인했습니다 · 예약 흐름을 자동으로 재개합니다.", "success")
                 return True
+            login_assistant.step(page)
             self._visitor_wait(page, self.LOGIN_LOCAL_POLL_MS)
         return False
 

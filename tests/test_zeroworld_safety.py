@@ -205,6 +205,29 @@ def test_missing_digest_never_accepts_unverified_ocr():
         asyncio.run(captcha.recognize_digits(b"unused", ""))
 
 
+def test_dense_digit_fallback_remains_image_based_and_digest_checked(monkeypatch):
+    source = Image.new('RGB', (120, 60), (210, 220, 230))
+    for x in range(15, 100):
+        source.putpixel((x, 25), (x, x, x))
+    original = io.BytesIO()
+    source.save(original, 'PNG')
+    narrow = io.BytesIO()
+    source.resize((120, 30), Image.Resampling.BICUBIC).save(narrow, 'PNG')
+    matched = []
+
+    def recognize(raw, beta, width):
+        if raw == narrow.getvalue() and width == 128:
+            matched.append(beta)
+            return ['54321', '12345']
+        return []
+
+    monkeypatch.setattr(captcha, '_recognize', recognize)
+    result = asyncio.run(captcha.recognize_digits(
+        original.getvalue(), hashlib.md5(b'12345').hexdigest()))
+    assert result == '12345'
+    assert matched == [False]
+
+
 def test_model_assets_are_included_without_detector():
     from pathlib import Path
     from PyInstaller.utils.hooks import collect_data_files

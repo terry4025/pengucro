@@ -17,6 +17,16 @@ class PatchNote:
 
 PATCH_NOTES: tuple[PatchNote, ...] = (
     PatchNote(
+        version="6.83",
+        changes=(
+            "단편선 동시 감시 최대 8개 제한 및 기존 과다 설정 자동 조정",
+            "제로월드 겹친 숫자 인증 이미지 인식 보강",
+            "CGV 저장된 로그인 정보와 숫자 인식을 이용한 자동 로그인 지원",
+            "CGV 자동 로그인 중 불확실한 인식과 중복 제출 방지",
+            "CGV 좌석도 조회의 로그인 대기 중 취소 반영",
+        ),
+    ),
+    PatchNote(
         version="6.82",
         changes=(
             "단편선 요청량 자동 감속 및 감시 작업 기본값 조정",

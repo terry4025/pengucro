@@ -38,6 +38,27 @@ CALENDAR_HTML = """
 """
 
 
+def test_start_clamps_worker_count_even_without_ui(monkeypatch):
+    calls = []
+
+    def record_start(_self, data, workers, is_async=False):
+        calls.append((workers, is_async))
+
+    monkeypatch.setattr(BaseEngine, "start_reservation", record_start)
+    data = {
+        "branch": "gangnam",
+        "themePK": "상자",
+        "reservationDate": "2026-09-14",
+        "reservationTime": "13:00",
+        "devMode": True,
+    }
+    for requested in (0, 4, 8, 32):
+        engine = DpsnnnEngine(lambda *_args: None)
+        engine.start_reservation(data, requested)
+
+    assert calls == [(1, False), (4, False), (8, False), (8, False)]
+
+
 def test_calendar_parser_filters_theme_and_marks_closed_rows():
     slots = parse_dpsnnn_calendar(CALENDAR_HTML, "2026-08-09", "문장")
 

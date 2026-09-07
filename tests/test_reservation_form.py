@@ -477,13 +477,15 @@ def test_naver_time_picker_uses_selected_item_without_requiring_branch(monkeypat
 
 
 def test_dpsnnn_thread_policy_distinguishes_workers_from_http_limit():
-    from engines.dpsnnn_engine import DPSNNN_MAX_WORKERS
-    slider = Widget(50)
+    from engines.dpsnnn_engine import DPSNNN_DEFAULT_WORKERS, DPSNNN_MAX_WORKERS
+    assert DPSNNN_DEFAULT_WORKERS == 4
+    assert DPSNNN_MAX_WORKERS == 8
+    slider = Widget(32)
     title = Widget()
     value_label = Widget()
     form = SimpleNamespace(
         engine_mode_btn=Value(STANDARD_MODE),
-        dpsnnn_threads=50,
+        dpsnnn_threads=32,
         standard_threads=30,
         keyescape_threads=1,
         threads_slider=slider,

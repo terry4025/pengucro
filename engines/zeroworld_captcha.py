@@ -42,7 +42,7 @@ def warm_ocr():
         _get_model(True)
 
 
-def _decode_candidates(output, charset, width=12):
+def _decode_candidates(output, charset, width=12, *, min_length=4, max_length=5):
     """Bounded numeric CTC beam decoding of image model scores, not guesses."""
     import numpy as np
     scores = output[:, 0, :] if output.shape[1] == 1 else output[0, :, :]
@@ -63,15 +63,15 @@ def _decode_candidates(output, charset, width=12):
                 char = charset[index]
                 if prefix.endswith(char):
                     add(prefix, nonblank=nonblank + row[i])
-                    if len(prefix) < 5:
+                    if len(prefix) < max_length:
                         add(prefix + char, nonblank=blank + row[i])
-                elif len(prefix) < 5:
+                elif len(prefix) < max_length:
                     add(prefix + char, nonblank=total + row[i])
         beam = dict(sorted(next_beam.items(), key=lambda x: float(np.logaddexp(*x[1])), reverse=True)[:width])
-    return [value for value in beam if 4 <= len(value) <= 5]
+    return [value for value in beam if min_length <= len(value) <= max_length]
 
 
-def _recognize(image_bytes: bytes, beta=False, beam_width=12):
+def _recognize(image_bytes: bytes, beta=False, beam_width=12, *, expected_length=None):
     with _model_lock:
         engine = _get_model(beta).ocr_engine
         with Image.open(io.BytesIO(image_bytes)) as image:
@@ -85,6 +85,9 @@ def _recognize(image_bytes: bytes, beta=False, beam_width=12):
         })[0]
         charset = engine.charset_manager.get_charset()
         if output.ndim == 3:
+            if expected_length is not None:
+                return _decode_candidates(output, charset, beam_width,
+                                          min_length=expected_length, max_length=expected_length)
             return _decode_candidates(output, charset, beam_width)
         if output.ndim != 2:
             raise ValueError("OCR 모델 출력 구조 변경")
@@ -164,6 +167,9 @@ async def recognize_digits(image_bytes: bytes, expected_digest: str = "") -> str
                        min(original.width, int(xs[-1]) + 3), min(original.height, int(ys[-1]) + 3))
                 crop = ImageOps.expand(original.crop(box), border=5, fill=original.getpixel((0, 0)))
                 fallback.append((crop, height, True, 128))
+        # Narrow, heavily overlapping digits need more horizontal model steps.
+        # Keep this behind existing passes so ordinary images stay on the fast path.
+        fallback.extend((original, 30, beta, 128) for beta in (False, True))
         for variant, height, beta, width in fallback:
             buffer = io.BytesIO()
             variant.resize((120, height), Image.Resampling.BICUBIC).save(buffer, "PNG")

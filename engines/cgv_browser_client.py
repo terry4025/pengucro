@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 
 from engines import browser_session
+from engines.cgv_login import CgvLoginAssistant
 from engines.cgv_client import (
     CGV_COMPANY_CODE,
     CGV_HOME_URL,
@@ -373,7 +374,9 @@ class CgvBrowserClient:
         *,
         timeout_seconds: int = 600,
         require_fresh_login: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> None:
+        _check_cancel(cancel_event)
         if self._has_member_session(page.context) and not require_fresh_login:
             return
         if "/mem/login" not in page.url:
@@ -388,8 +391,10 @@ class CgvBrowserClient:
             "warning",
         )
         deadline = time.monotonic() + max(1, int(timeout_seconds))
+        login_assistant = CgvLoginAssistant(self._emit, cancel_event)
         saw_login_page = "/mem/login" in page.url
         while time.monotonic() < deadline:
+            _check_cancel(cancel_event)
             if page.is_closed():
                 raise CgvLoginRequired("CGV 로그인 창이 닫혀 좌석도 조회를 중단했습니다.")
             on_login_page = "/mem/login" in page.url
@@ -401,6 +406,7 @@ class CgvBrowserClient:
                 self._wait_for_post_login_navigation(page)
                 self._emit("CGV 회원 로그인을 확인했습니다. 좌석도 조회를 계속합니다.", "success")
                 return
+            login_assistant.step(page)
             page.wait_for_timeout(500)
         raise CgvLoginRequired(
             "CGV 로그인 대기 시간이 끝났습니다. 좌석 불러오기를 다시 눌러주세요."
@@ -773,7 +779,7 @@ class CgvBrowserClient:
                             break
                 except Exception:
                     pass
-                self._wait_for_member_login(page, require_fresh_login=True)
+                self._wait_for_member_login(page, require_fresh_login=True, cancel_event=cancel_event)
                 body_text = open_visitor_page()
                 if "로그인후 이용해 주세요" in body_text or "/mem/login" in page.url:
                     raise CgvLoginRequired(

@@ -12,6 +12,7 @@ from PIL import Image
 
 from engines import browser_session
 from engines.base_engine import BaseEngine
+from engines.cgv_login import CgvLoginAssistant
 from engines.npay_keypad_recognizer import NpayKeypadRecognizer
 from engines.cgv_client import (
     CGV_BFF_BOOKING_URL,
@@ -3551,6 +3552,7 @@ class CgvEngine(BaseEngine):
             "회원 예매를 위해 열린 CGV Chrome에서 로그인해주세요. 로그인 완료 후 자동으로 예약을 시작합니다.",
             "warning",
         )
+        login_assistant = CgvLoginAssistant(self.log, self.stop_event)
         while not self.stop_event.is_set():
             if page.is_closed():
                 return False
@@ -3558,6 +3560,7 @@ class CgvEngine(BaseEngine):
             if "/mem/login" not in page.url and has_session():
                 self.log("CGV 회원 로그인을 확인했습니다. 예약을 시작합니다.", "success")
                 return True
+            login_assistant.step(page)
             page.wait_for_timeout(500)
         return False
 
