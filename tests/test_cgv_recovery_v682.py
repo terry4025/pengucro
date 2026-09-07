@@ -323,6 +323,6 @@ def test_current_release_contract():
     from pathlib import Path
     from pengucro import __version__, __release_sequence__
     from pengucro.patch_notes import PATCH_NOTES
-    assert __version__ == '6.84' and __release_sequence__ == 6840001
+    assert __version__ == '6.85' and __release_sequence__ == 6850001
     assert PATCH_NOTES[0].version == __version__
     assert f'방탈출펭크로{__version__}_yescaptcha' in (Path(__file__).resolve().parents[1]/'방탈출펭크로.spec').read_text(encoding='utf-8')

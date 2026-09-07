@@ -150,8 +150,8 @@ def test_opaque_member_session_is_reused_after_lightweight_auth_probe():
     class Page:
         @staticmethod
         def evaluate(script, argument):
-            if "setInterval(run, intervalMs)" in script:
-                assert argument["intervalMs"] == 60_000
+            if "({url, start, authCodes})" in script:
+                assert argument["start"] is True
                 return {"unauthorized": False, "checkedAt": 0, "inFlight": True}
             assert "searchMblTktTabPrdtypList" in argument["url"]
             assert argument["accessToken"] == "opaque-token"
@@ -182,9 +182,10 @@ def test_periodic_member_probe_is_installed_without_awaiting_network():
     assert state["unauthorized"] is False
     assert "const run = async () =>" in observed["script"]
     assert "run();" in observed["script"]
-    assert "setInterval(run, intervalMs)" in observed["script"]
-    assert observed["script"].lstrip().startswith("({url, intervalMs, authCodes})")
-    assert observed["argument"]["intervalMs"] == 60_000
+    assert "setInterval(" not in observed["script"]
+    assert observed["script"].lstrip().startswith("({url, start, authCodes})")
+    assert observed["argument"]["start"] is True
+    assert "signal: controller.signal" in observed["script"]
 
 
 def test_nonmember_run_never_starts_member_mypage_probe(monkeypatch):
@@ -265,7 +266,7 @@ def test_jwt_expiry_boundary_still_requires_live_member_api_confirmation(
     class Page:
         @staticmethod
         def evaluate(script, argument):
-            if "setInterval(run, intervalMs)" in script:
+            if "({url, start, authCodes})" in script:
                 return {"unauthorized": False, "checkedAt": 0, "inFlight": True}
             assert "searchMblTktTabPrdtypList" in argument["url"]
             return {
@@ -391,7 +392,7 @@ def test_http_200_auth_error_payload_routes_to_login(
             self.probes = 0
 
         def evaluate(self, script, _argument):
-            if "setInterval(run, intervalMs)" in script:
+            if "({url, start, authCodes})" in script:
                 return {"unauthorized": False, "checkedAt": 0, "inFlight": True}
             self.probes += 1
             if self.probes == 1:
@@ -548,8 +549,8 @@ def test_cgv_npay_password_persistence_and_reservation_data(monkeypatch, tmp_pat
 
 
 def test_current_release_contract_is_complete():
-    assert __version__ == "6.84"
-    assert __release_sequence__ == 6840001
+    assert __version__ == "6.85"
+    assert __release_sequence__ == 6850001
     note = notes_for("6.79")
     assert note is not None
     assert any("CGV" in change for change in note.changes)

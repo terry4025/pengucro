@@ -49,9 +49,11 @@ class ZeroWorldShinEngine(BaseEngine):
     """Reservation adapter for the current Sinbiweb ZeroWorld site."""
 
     USE_ASYNC_HOT_PATH = True
+    ASYNC_RETRY_AFTER_CAP_SECONDS = None
     LOOKUP_TIMEOUT_SECONDS = 8.0
     SUBMIT_TIMEOUT_SECONDS = 12.0
     SUBMIT_RECONCILE_SECONDS = 3.0
+    CAPTCHA_CACHE_SECONDS = 60.0
 
     SELECT_URL = "https://zeroworldkorea.com/core/res/rev.make.sel.php"
     ACTION_URL = "https://zeroworldkorea.com/core/res/rev.act.php"
@@ -204,7 +206,6 @@ class ZeroWorldShinEngine(BaseEngine):
                 timeout=timeout,
             )
             try:
-                await self.wait_async_scan_turn()
                 prepared = await self._prestage_session(
                     session,
                     context,
@@ -259,7 +260,6 @@ class ZeroWorldShinEngine(BaseEngine):
             while not self.stop_event.is_set():
                 stage = "예약 단계 사전 준비"
                 try:
-                    await self.wait_async_scan_turn()
                     if self.stop_event.is_set():
                         return
                     if not session_prepared:
@@ -322,6 +322,8 @@ class ZeroWorldShinEngine(BaseEngine):
                                 session, context, slot_id, worker_name
                             )
                         except ZeroWorldAuthenticationRequired as exc:
+                            if self.stop_event.is_set():
+                                return
                             self._final_submission_state = "authentication_required"
                             self.stop_event.set()
                             self.log(f"[{worker_name}] 인증 필요 · {exc} · 추가 예약 제출 중지", "error")
@@ -391,11 +393,15 @@ class ZeroWorldShinEngine(BaseEngine):
             "month": month,
             "s_subj": context.subject,
         }
+        await self.wait_async_scan_turn()
+        if self.stop_event.is_set():
+            return False
         started = time.perf_counter()
         async with session.post(self.select_url, data=payload) as response:
             body = decode_body(await response.read())
             status = response.status
         rtt_ms = self._elapsed_ms(started)
+        recovery_delay = self.observe_async_response(response, rtt_ms)
         if status == 200 and calendar_contains_date(body, context.reservation_date):
             self._log_http(
                 worker_name,
@@ -411,10 +417,11 @@ class ZeroWorldShinEngine(BaseEngine):
             if status != 200
             else f"{context.reservation_date} 미공개 · 재시도"
         )
+        recovery_detail = f" · 서버 복구 간격 {recovery_delay:.1f}초" if recovery_delay else ""
         self._log_throttled(
             f"date:{context.reservation_date}:{status}",
             f"[{worker_name}] 날짜 조회 응답 · HTTP {status} · RTT {rtt_ms:.0f}ms · "
-            f"{retry_reason}",
+            f"{retry_reason}{recovery_detail}",
             "warning" if status != 200 else "info",
         )
         return False
@@ -436,6 +443,9 @@ class ZeroWorldShinEngine(BaseEngine):
         context: ZeroWorldContext,
         worker_name: str = "작업 1",
     ) -> ZeroWorldTimeSlot | None:
+        await self.wait_async_scan_turn()
+        if self.stop_event.is_set():
+            return None
         lookup_key = (context.branch, context.reservation_date, context.theme)
         if lookup_key != self._slot_lookup_key:
             self._slot_lookup_key = lookup_key
@@ -514,6 +524,8 @@ class ZeroWorldShinEngine(BaseEngine):
             worker_name,
             "테마 목록 사전 준비",
         )
+        if not theme_list_ready:
+            return False
         theme_ready = await self._post_and_discard(
             session,
             {
@@ -543,18 +555,26 @@ class ZeroWorldShinEngine(BaseEngine):
 
     async def _prepare_captcha(self, session, worker_name: str) -> str:
         cached = self._captcha_values.get(id(session))
-        if cached and time.monotonic() - cached[1] < 60:
+        if cached and time.monotonic() - cached[1] < self.CAPTCHA_CACHE_SECONDS:
             return cached[0]
         origin = urllib.parse.urljoin(self.home_url, "/core/captcha/")
         for attempt in range(3):
+            await self.wait_async_scan_turn()
             if self.stop_event.is_set():
                 raise ZeroWorldAuthenticationRequired("작업 중지")
+            started = time.perf_counter()
             async with session.post(origin + "session.php", data={}, timeout=aiohttp.ClientTimeout(total=8)) as response:
                 digest = parse_digest(decode_body(await response.read()))
+                self.observe_async_response(response, self._elapsed_ms(started))
                 if response.status != 200 or not digest:
                     raise ZeroWorldAuthenticationRequired("인증 세션 응답 확인 불가")
+            await self.wait_async_scan_turn()
+            if self.stop_event.is_set():
+                raise ZeroWorldAuthenticationRequired("작업 중지")
+            started = time.perf_counter()
             async with session.get(origin + f"image.php?t={time.time_ns()}", timeout=aiohttp.ClientTimeout(total=8)) as response:
                 image_bytes = await response.read()
+                self.observe_async_response(response, self._elapsed_ms(started))
                 if response.status != 200:
                     raise ZeroWorldAuthenticationRequired("인증 이미지 조회 실패")
             try:
@@ -581,9 +601,20 @@ class ZeroWorldShinEngine(BaseEngine):
         slot_id: str,
         worker_name: str = "작업 1",
     ) -> BookingResult | None:
-        captcha = await self._prepare_captcha(session, worker_name)
-        if self.stop_event.is_set():
-            raise ZeroWorldAuthenticationRequired("작업 중지")
+        for _ in range(2):
+            captcha = await self._prepare_captcha(session, worker_name)
+            await self.wait_async_scan_turn()
+            if self.stop_event.is_set():
+                raise ZeroWorldAuthenticationRequired("작업 중지")
+            cached = self._captcha_values.get(id(session))
+            if cached and time.monotonic() - cached[1] >= self.CAPTCHA_CACHE_SECONDS:
+                # A late server cooldown can outlive the existing reuse policy.
+                # Refresh at most once, BEFORE any reservation POST is sent.
+                self._captcha_values.pop(id(session), None)
+                continue
+            break
+        else:
+            raise ZeroWorldAuthenticationRequired("서버 대기 중 인증 재사용 시간 초과 · 예약 요청 미전송")
         action_data = {
             "name": context.name,
             "mobile": context.phone,
@@ -709,6 +740,9 @@ class ZeroWorldShinEngine(BaseEngine):
         worker_name: str,
         stage: str,
     ) -> bool:
+        await self.wait_async_scan_turn()
+        if self.stop_event.is_set():
+            return False
         started = time.perf_counter()
         async with session.post(self.select_url, data=data) as response:
             await response.read()

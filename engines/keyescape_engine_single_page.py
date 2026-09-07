@@ -48,6 +48,9 @@ class KeyescapeEngine(_BaseKeyescapeEngine):
         )
         if not self.is_running:
             return result
+        if getattr(self, "_cancel_watch_state", None) is not None:
+            # Cancellation watches use only fresh live rows, never Fast Path.
+            return result
         requested = int(num_threads or 1)
         page_count = max(1, min(requested, self.MAX_STANDBY_PAGES))
         if page_count == 1:

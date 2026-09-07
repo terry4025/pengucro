@@ -130,14 +130,61 @@ def test_browser_prewarm_touches_exact_booking_controller():
 def test_trusted_fire_compensates_for_measured_controller_one_way_latency():
     engine, _logs = make_engine()
     engine.open_at = 1000.0
-    engine.clock.last_precision = 0.020
+    engine.clock.last_precision = 0.0246
     engine._browser_prewarm_metrics = {
-        "controller": {"reached": True, "duration": 80.0},
+        "controller": {"reached": True, "status": 200, "duration": 44.9},
     }
+    engine._browser_prewarm_observed_at = time.monotonic()
 
-    # Base safety is 25 ms after T0. An 80 ms warmed RTT contributes a 40 ms
-    # one-way estimate, so Chrome fires 15 ms before T0 for arrival at T+25 ms.
-    assert engine._trusted_fire_server_epoch() == pytest.approx(999.985)
+    # Apply the conservative RTT/2 estimate without crossing the opening gate.
+    assert engine._trusted_fire_server_epoch() == pytest.approx(1000.00715)
+
+
+@pytest.mark.parametrize("precision", [0.001, 0.020, 0.500])
+@pytest.mark.parametrize("duration", [80.0, 300.0])
+def test_controller_compensation_is_bounded_and_never_fires_before_open(precision, duration):
+    engine, _logs = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = precision
+    engine._browser_prewarm_metrics = {
+        "controller": {"reached": True, "status": 200, "duration": duration},
+    }
+    engine._browser_prewarm_observed_at = time.monotonic()
+    base = observed._ReliabilityKeyescapeEngine._trusted_fire_server_epoch(engine)
+
+    target = engine._trusted_fire_server_epoch()
+
+    assert target >= engine.open_at + engine.TRUSTED_FIRE_EXTRA_SECONDS
+    assert target <= base
+    assert base - target <= 0.025 + 1e-9
+
+
+@pytest.mark.parametrize("changes,age", [
+    ({"duration": float("nan")}, 0),
+    ({"duration": float("inf")}, 0),
+    ({"duration": -1}, 0),
+    ({"duration": 0}, 0),
+    ({"duration": 301}, 0),
+    ({"duration": 3000}, 0),
+    ({"status": 429}, 0),
+    ({"status": 503}, 0),
+    ({"reached": False}, 0),
+    ({}, 16),
+    ({}, -1),
+    ({}, None),
+])
+def test_invalid_or_stale_route_measurement_keeps_original_gate(changes, age):
+    engine, _logs = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = 0.020
+    controller = {"reached": True, "status": 200, "duration": 44.9}
+    controller.update(changes)
+    engine._browser_prewarm_metrics = {"controller": controller}
+    engine._browser_prewarm_observed_at = (
+        None if age is None else time.monotonic() - age
+    )
+
+    assert engine._trusted_fire_server_epoch() == pytest.approx(1000.025)
 
 
 def test_trusted_fire_keeps_original_gate_without_valid_route_measurement():
@@ -147,6 +194,52 @@ def test_trusted_fire_keeps_original_gate_without_valid_route_measurement():
     engine._browser_prewarm_metrics = {}
 
     assert engine._trusted_fire_server_epoch() == pytest.approx(1000.025)
+
+
+def test_final_timing_log_reports_applied_clamped_delta_and_throttles(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(observed.time, "monotonic", lambda: now[0])
+    engine, logs = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = 0.020
+    engine._browser_prewarm_metrics = {
+        "controller": {"reached": True, "status": 200, "duration": 80.0},
+    }
+    engine._browser_prewarm_observed_at = 98.0
+
+    assert engine._final_post_one_way_seconds() == pytest.approx(0.025)
+    assert engine._trusted_fire_server_epoch() == pytest.approx(1000.005)
+    engine._trusted_fire_server_epoch()
+    timing_logs = [message for message, _level in logs if "최종 타이밍" in message]
+    assert len(timing_logs) == 1
+    assert "적용 보정 20.0ms" in timing_logs[0]
+    assert "추정 오픈 기준 목표 T+5.0ms" in timing_logs[0]
+    assert "측정 나이 2.0초" in timing_logs[0]
+
+    now[0] += 61.0
+    engine._browser_prewarm_observed_at = now[0] - 1.0
+    engine._trusted_fire_server_epoch()
+    assert sum("최종 타이밍" in message for message, _level in logs) == 2
+
+
+def test_final_timing_log_refreshes_when_late_warmup_changes_applied_value():
+    engine, logs = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = 0.020
+
+    engine._trusted_fire_server_epoch()
+    assert "적용 보정 0.0ms" in logs[-1][0]
+    assert "추정 오픈 기준 목표 T+25.0ms" in logs[-1][0]
+    assert "측정 나이 없음 · 유효한 최신 측정 없음" in logs[-1][0]
+
+    engine._browser_prewarm_metrics = {
+        "controller": {"reached": True, "status": 405, "duration": 20.0},
+    }
+    engine._browser_prewarm_observed_at = time.monotonic()
+    engine._trusted_fire_server_epoch()
+    assert "적용 보정 10.0ms" in logs[-1][0]
+    assert "추정 오픈 기준 목표 T+15.0ms" in logs[-1][0]
+    assert sum("최종 타이밍" in message for message, _level in logs) == 2
 
 
 def test_requestfinished_records_booking_post_resource_timing():

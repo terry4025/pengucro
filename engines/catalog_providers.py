@@ -678,35 +678,6 @@ class TripComProvider(BaseProvider):
         return ValidationResult(not errors, errors)
 
 
-class ZeroWorldLaravelProvider(BaseProvider):
-    engine_id = "zeroworld_laravel"
-
-    def detect(self, url: str, html: str) -> DetectionResult:
-        evidence = []
-        score = 0
-        for token, points, label in (
-            ('name="csrf-token"', 30, "CSRF 토큰"),
-            ("/reservation/theme", 35, "테마 JSON API"),
-            ("reservationDate", 15, "예약 날짜 필드"),
-            ("themePK", 20, "테마 PK 필드"),
-        ):
-            if token in html:
-                score += points
-                evidence.append(label)
-        return DetectionResult(self.engine_id, min(score, 100), evidence)
-
-    def discover(self, site_config: dict[str, Any], target_date: str) -> SiteCatalog:
-        result = parse_booking_site(site_config["url"], site_config.get("name", ""))
-        if result.get("style") != "zeroworld":
-            raise ValueError("Laravel 제로월드 계열 카탈로그 구조가 아닙니다.")
-        catalog = _legacy_result_to_catalog(site_config, result, self.engine_id)
-        catalog.metadata["engine_options"] = {
-            "base_url": result["base_url"],
-            "reservation_url": result["url"],
-        }
-        return catalog
-
-
 def default_providers() -> dict[str, BaseProvider]:
     providers: list[BaseProvider] = [
         CgvProvider(),
@@ -715,7 +686,6 @@ def default_providers() -> dict[str, BaseProvider]:
         JigubyeolProvider(),
         KeyescapeProvider(),
         DpsnnnProvider(),
-        ZeroWorldLaravelProvider(),
         NaverProvider(),
     ]
     return {provider.engine_id: provider for provider in providers}
@@ -886,6 +856,8 @@ def legacy_style_for_engine(engine_id: str) -> str:
 
 
 def engine_id_for_legacy_style(style: str) -> str:
+    # Preserve the retired identifier when migrating saved settings. The
+    # registry rejects it explicitly; never guess a replacement booking engine.
     return {"naver": "naver", "jigubyeol": "jigubyeol"}.get(style, "zeroworld_laravel")
 
 

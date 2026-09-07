@@ -504,7 +504,8 @@ class AddSiteDialog(ctk.CTkToplevel):
             "sinbiworld": "SinbiWeb 제로월드 계열",
             "doomescape": "둠이스케이프 계열",
             "keyescape": "키이스케이프 계열",
-            "zeroworld_laravel": "Laravel 제로월드 계열",
+            "zeroworld_laravel": "구형 제로월드 (지원 종료)",
+            "zeroworld_gu": "구형 제로월드 (지원 종료)",
             "cgv": "CGV 영화 예매",
         }
         engine_id = result.get("engine_id", "")

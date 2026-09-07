@@ -7,6 +7,7 @@ that route, and compensating the trusted fire instant for its one-way latency.
 
 from __future__ import annotations
 
+import math
 import time
 
 from engines.keyescape_engine_single_page import (
@@ -21,24 +22,38 @@ class KeyescapeEngine(_ReliabilityKeyescapeEngine):
     CLOCK_REGRESSION_RATIO = 1.5
     CLOCK_REGRESSION_ABSOLUTE_SECONDS = 0.010
     FINAL_POST_ONE_WAY_MIN_SECONDS = 0.003
-    FINAL_POST_ONE_WAY_MAX_SECONDS = 0.150
+    FINAL_POST_ONE_WAY_MAX_SECONDS = 0.025
+    BROWSER_PREWARM_MAX_AGE_SECONDS = 15.0
+    BROWSER_PREWARM_MAX_RTT_MS = 300.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._browser_prewarm_metrics: dict = {}
+        self._browser_prewarm_observed_at: float | None = None
+        self._fire_compensation_log_state = None
 
     def _final_post_one_way_seconds(self) -> float:
-        """Estimate browser-to-controller transit from the warmed exact route."""
+        """Use only a fresh, bounded route estimate, not RTT/2 as ground truth."""
 
-        metrics = self._browser_prewarm_metrics
+        source = getattr(self, "_browser_prewarm_source", self)
+        metrics = source._browser_prewarm_metrics
         controller = metrics.get("controller") if isinstance(metrics, dict) else None
         if not isinstance(controller, dict) or not controller.get("reached"):
             return 0.0
         try:
+            observed_at = float(source._browser_prewarm_observed_at)
+            age = time.monotonic() - observed_at
+            status = int(controller.get("status", 0))
             duration_ms = float(controller.get("duration", 0.0) or 0.0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0.0
-        if not 1.0 <= duration_ms <= 3000.0:
+        if not math.isfinite(age) or not 0.0 <= age <= self.BROWSER_PREWARM_MAX_AGE_SECONDS:
+            return 0.0
+        # HEAD 405 still proves that the exact controller was reached. Redirects,
+        # overload responses and slow server processing are not transit samples.
+        if not (200 <= status < 300 or status == 405):
+            return 0.0
+        if not math.isfinite(duration_ms) or not 1.0 <= duration_ms <= self.BROWSER_PREWARM_MAX_RTT_MS:
             return 0.0
         return min(
             self.FINAL_POST_ONE_WAY_MAX_SECONDS,
@@ -50,9 +65,33 @@ class KeyescapeEngine(_ReliabilityKeyescapeEngine):
         if target is None:
             return None
         one_way = self._final_post_one_way_seconds()
-        if one_way <= 0:
-            return target
-        return float(target) - one_way
+        # HTTP RTT includes server processing; it cannot justify sending before
+        # the estimated opening. This floor does not remove server-clock error.
+        earliest = float(self.open_at) + self.TRUSTED_FIRE_EXTRA_SECONDS
+        adjusted = max(earliest, float(target) - one_way) if one_way > 0 else target
+        applied_ms = max(0.0, (float(target) - float(adjusted)) * 1000.0)
+        offset_ms = (float(adjusted) - float(self.open_at)) * 1000.0
+        signature = (round(applied_ms, 1), round(offset_ms, 1), one_way > 0)
+        now = time.monotonic()
+        previous = self._fire_compensation_log_state
+        # Log the applied (floor-clamped) delta, not merely the warmup estimate.
+        # Refresh on a changed decision so an earlier zero cannot hide a later
+        # valid warmup; unchanged page timers emit at most once per minute.
+        if previous is None or previous[0] != signature or now - previous[1] >= 60.0:
+            self._fire_compensation_log_state = (signature, now)
+            source = getattr(self, "_browser_prewarm_source", self)
+            try:
+                age = now - float(source._browser_prewarm_observed_at)
+                age_text = f"{age:.1f}초" if math.isfinite(age) and age >= 0 else "확인 불가"
+            except (TypeError, ValueError, OverflowError):
+                age_text = "없음"
+            fallback = " · 유효한 최신 측정 없음" if one_way <= 0 else ""
+            self.log(
+                f"최종 타이밍 · 적용 보정 {applied_ms:.1f}ms · "
+                f"추정 오픈 기준 목표 T+{offset_ms:.1f}ms · "
+                f"측정 나이 {age_text}{fallback}"
+            )
+        return adjusted
 
     # ------------------------------------------------------------------
     # Server-clock quality
@@ -175,8 +214,11 @@ class KeyescapeEngine(_ReliabilityKeyescapeEngine):
     # ------------------------------------------------------------------
     async def _prewarm_browser_connection(self, page) -> bool:
         """Warm both the page origin and the exact booking controller in Chrome."""
+        self._browser_prewarm_metrics = {}
+        self._browser_prewarm_observed_at = None
         if page is None:
             return False
+        started = time.monotonic()
         try:
             result = await page.evaluate(
                 """async (urls) => {
@@ -248,6 +290,7 @@ class KeyescapeEngine(_ReliabilityKeyescapeEngine):
 
         result = result if isinstance(result, dict) else {}
         self._browser_prewarm_metrics = result
+        self._browser_prewarm_observed_at = started
         controller = result.get("controller")
         controller = controller if isinstance(controller, dict) else {}
         if controller.get("reached"):

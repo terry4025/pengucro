@@ -82,6 +82,8 @@ class CgvEngine(GuardedCgvEngine):
     MEMBER_SESSION_EXPIRY_LEEWAY_SECONDS = 60.0
     MEMBER_SESSION_PROBE_INTERVAL_MS = 60_000
     MEMBER_SESSION_GUARD_READ_INTERVAL_SECONDS = 5.0
+    MEMBER_SESSION_PROBE_TIMEOUT_SECONDS = 5.0
+    MEMBER_SESSION_PROOF_MAX_AGE_SECONDS = 90.0
     MEMBER_SESSION_PROBE_URL = (
         f"{CGV_HOME_URL}/api/v1/mypage/tkt/mblTkt/"
         f"searchMblTktTabPrdtypList?coCd={CGV_COMPANY_CODE}&custNo="
@@ -367,20 +369,38 @@ class CgvEngine(GuardedCgvEngine):
         return None
 
     @classmethod
-    def _install_member_session_guard(cls, page) -> dict[str, Any]:
+    def _install_member_session_guard(cls, page, *, start: bool = True) -> dict[str, Any]:
+        """Start/read one probe without awaiting fetch or browser timers.
+
+        The host drives the one-minute cadence and cancels a stuck request.
+        Late responses belong to their controller and cannot revive a cancelled
+        request or overwrite a newly installed probe after login.
+        """
         try:
             result = page.evaluate(
                 r"""
-                ({url, intervalMs, authCodes}) => {
-                  if (window.__pengucroMemberSessionProbe) {
-                    return {...window.__pengucroMemberSessionProbe};
+                ({url, start, authCodes}) => {
+                  let state = window.__pengucroMemberSessionProbe;
+                  if (state && (state.version !== 2 ||
+                      !Number.isInteger(state.requestId) || !Number.isInteger(state.completedId))) {
+                    if (state.timer) clearInterval(state.timer);
+                    if (state.controller) state.controller.abort();
+                    state = null;
                   }
-                  const state = window.__pengucroMemberSessionProbe = {
-                    unauthorized: false, checkedAt: 0, inFlight: false,
+                  if (!state) state = window.__pengucroMemberSessionProbe = {
+                    version: 2, unauthorized: false, valid: false,
+                    checkedAt: 0, completedId: 0, requestId: 0,
+                    inFlight: false, controller: null, startedAt: null, completedAt: null,
                   };
                   const run = async () => {
                     if (state.inFlight || state.unauthorized) return;
+                    const controller = new AbortController();
+                    state.controller = controller;
+                    const requestId = ++state.requestId;
                     state.inFlight = true;
+                    state.startedAt = performance.now();
+                    const current = () => window.__pengucroMemberSessionProbe === state &&
+                      state.controller === controller && !controller.signal.aborted;
                     try {
                       const item = String(document.cookie || '').split('; ')
                         .find(value => value.startsWith('accessToken='));
@@ -393,37 +413,77 @@ class CgvEngine(GuardedCgvEngine):
                       if (token) headers.set('Authorization', `Bearer ${token}`);
                       const response = await fetch(url, {
                         method: 'GET', cache: 'no-store', credentials: 'include', headers,
+                        signal: controller.signal,
                       });
                       let data = null;
                       try { data = await response.json(); } catch (_) {}
+                      if (!current()) return;
                       const codes = [data && data.statusCode,
                         data && data.data && data.data.statusCode]
                         .map(value => String(value ?? '').trim());
                       if (response.status === 401 || codes.some(code => authCodes.includes(code))) {
                         state.unauthorized = true;
                       }
+                      state.valid = !state.unauthorized && [200, 400].includes(response.status) &&
+                        data !== null && typeof data === 'object' && !Array.isArray(data);
                       state.checkedAt = Date.now();
+                      state.completedAt = performance.now();
+                      state.completedId = requestId;
                     } catch (_) {
-                      // Network/WAF failures are handled by the existing schedule
-                      // backoff and must not be mistaken for an expired login.
+                      if (current()) {
+                        state.valid = false;
+                        state.completedAt = performance.now();
+                        state.completedId = requestId;
+                      }
                     } finally {
-                      state.inFlight = false;
+                      if (current()) {
+                        state.inFlight = false;
+                        state.controller = null;
+                      }
                     }
                   };
-                  run();
-                  state.timer = setInterval(run, intervalMs);
-                  return {...state, timer: Boolean(state.timer)};
+                  if (start) run();
+                  return {version: state.version, unauthorized: state.unauthorized,
+                    valid: state.valid, checkedAt: state.checkedAt,
+                    requestId: state.requestId, completedId: state.completedId,
+                    startedAgeMs: state.startedAt === null ? null : performance.now() - state.startedAt,
+                    completedAgeMs: state.completedAt === null ? null : performance.now() - state.completedAt,
+                    inFlight: state.inFlight};
                 }
                 """,
                 {
                     "url": cls.MEMBER_SESSION_PROBE_URL,
-                    "intervalMs": cls.MEMBER_SESSION_PROBE_INTERVAL_MS,
+                    "start": bool(start),
                     "authCodes": sorted(cls.MEMBER_SESSION_AUTH_ERROR_CODES),
                 },
             )
             return dict(result) if isinstance(result, Mapping) else {}
         except Exception:
             return {}
+
+    @staticmethod
+    def _cancel_member_session_probe(page, *, dispose: bool = False) -> None:
+        try:
+            page.evaluate(r"""dispose => {
+              const state = window.__pengucroMemberSessionProbe;
+              if (!state) return;
+              if (state.timer) clearInterval(state.timer);
+              if (state.controller) state.controller.abort();
+              state.controller = null;
+              state.inFlight = false;
+              if (dispose) delete window.__pengucroMemberSessionProbe;
+            }""", dispose)
+        except Exception:
+            pass
+
+    def _mark_member_session_confirmed(self, page) -> None:
+        now = time.monotonic()
+        self._member_guard_page = page
+        self._member_guard_last_proof = now
+        self._member_guard_last_start = now
+        self._member_guard_page_signature = None
+        self._member_guard_error = None
+        self._member_guard_retry_after = 0.0
 
     @staticmethod
     def _clear_invalid_member_tokens(context) -> None:
@@ -469,8 +529,11 @@ class CgvEngine(GuardedCgvEngine):
         return last_result
 
     def _recover_member_session(self, page, context) -> bool:
+        if self.stop_event.is_set():
+            return False
+        self._cancel_member_session_probe(page, dispose=True)
         recovered = super()._ensure_member_session(page, context)
-        if not recovered:
+        if not recovered or self.stop_event.is_set():
             return False
 
         confirmed = self._confirm_member_session(page, context)
@@ -480,6 +543,7 @@ class CgvEngine(GuardedCgvEngine):
                 "success",
             )
             self._install_member_session_guard(page)
+            self._mark_member_session_confirmed(page)
             return True
 
         if confirmed is False:
@@ -501,6 +565,7 @@ class CgvEngine(GuardedCgvEngine):
             "warning",
         )
         self._install_member_session_guard(page)
+        self._mark_member_session_confirmed(page)
         return True
 
     def _ensure_member_session(self, page, context) -> bool:
@@ -525,6 +590,7 @@ class CgvEngine(GuardedCgvEngine):
                 "success",
             )
             self._install_member_session_guard(page)
+            self._mark_member_session_confirmed(page)
             return True
 
         if confirmed is False:
@@ -540,9 +606,13 @@ class CgvEngine(GuardedCgvEngine):
             )
         return self._recover_member_session(page, context)
 
-    def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
+    def _check_member_session_guard(self, page) -> dict[str, Any] | None:
+        """Shared pre-scan gate used by BOTH parent and final watchdog paths."""
+        if self.stop_event.is_set():
+            self._cancel_member_session_probe(page, dispose=True)
+            return {"ok": False, "status": 0, "error": "stopped", "elapsedMs": 0.0}
         if not _MEMBER_SESSION_GUARD_ACTIVE.get():
-            return super()._race_schedule(page, url, concurrency)
+            return None
         now = time.monotonic()
         try:
             page_url = str(getattr(page, "url", "") or "")
@@ -556,24 +626,99 @@ class CgvEngine(GuardedCgvEngine):
             or now - last_read >= self.MEMBER_SESSION_GUARD_READ_INTERVAL_SECONDS
         )
         if should_read:
+            if page_signature != previous_signature:
+                if getattr(self, "_member_guard_page", None) is not page:
+                    old_page = getattr(self, "_member_guard_page", None)
+                    if old_page is not None:
+                        self._cancel_member_session_probe(old_page, dispose=True)
+                    self._member_guard_last_proof = getattr(self, "_member_guard_last_proof", now)
+                    self._member_guard_last_start = float("-inf")
+                    self._member_guard_error = getattr(self, "_member_guard_error", None)
+                self._member_guard_page = page
+                self._member_guard_request_id = None
+                self._member_guard_completed_id = None
+            last_activity = (last_read if previous_signature is not None else
+                             getattr(self, "_member_guard_last_start", now))
+            if math.isfinite(last_activity) and now - last_activity >= self.MEMBER_SESSION_PROOF_MAX_AGE_SECONDS:
+                # Discard results spanning a host pause even if a browser clock
+                # was frozen during OS sleep. Only a new post-resume probe may
+                # establish new proof; the old host proof is not renewed.
+                self._cancel_member_session_probe(page, dispose=True)
+                self._member_guard_last_start = float("-inf")
+                self._member_guard_request_id = None
+                self._member_guard_completed_id = None
             self._member_guard_page_signature = page_signature
             self._member_guard_last_read = now
-            state = self._install_member_session_guard(page)
+            start = now - getattr(self, "_member_guard_last_start", float("-inf")) >= self.MEMBER_SESSION_PROBE_INTERVAL_MS / 1000
+            if start:
+                self._member_guard_last_start = now
+            state = self._install_member_session_guard(page, start=start)
+            if self.stop_event.is_set():
+                self._cancel_member_session_probe(page, dispose=True)
+                return {"ok": False, "status": 0, "error": "stopped", "elapsedMs": 0.0}
             if state.get("unauthorized"):
                 context = getattr(page, "context", None) or getattr(self, "_context", None)
-                self.log(
-                    "[CGV] 감시 중 회원 세션 만료를 감지했습니다. 로그인/토큰 갱신 후 감시를 계속합니다.",
-                    "warning",
-                )
-                if context is None or not self._recover_member_session(page, context):
-                    return {
+                if now >= getattr(self, "_member_guard_retry_after", 0.0):
+                    self.log(
+                        "[CGV] 감시 중 회원 세션 만료를 감지했습니다. 로그인/토큰 갱신 후 감시를 계속합니다.",
+                        "warning",
+                    )
+                if (context is None or now < getattr(self, "_member_guard_retry_after", 0.0)
+                        or not self._recover_member_session(page, context)):
+                    if now >= getattr(self, "_member_guard_retry_after", 0.0):
+                        self._member_guard_retry_after = now + 30.0
+                    self._member_guard_error = {
                         "ok": False,
                         "status": 401,
                         "statuses": [401],
                         "error": "member-session-expired",
                         "elapsedMs": 0.0,
                     }
-                self._member_guard_page_signature = None
+                else:
+                    self._member_guard_page_signature = None
+                if self.stop_event.is_set():
+                    return {"ok": False, "status": 0, "error": "stopped", "elapsedMs": 0.0}
+                return self._member_guard_error
+            request_id = state.get("requestId")
+            if state.get("inFlight"):
+                if type(request_id) is not int or request_id < 1:
+                    self._cancel_member_session_probe(page, dispose=True)
+                else:
+                    if request_id != getattr(self, "_member_guard_request_id", None):
+                        self._member_guard_request_id = request_id
+                        self._member_guard_request_started = now
+                    started_age = state.get("startedAgeMs")
+                    if (type(started_age) in (int, float) and math.isfinite(started_age)
+                            and started_age >= 0):
+                        self._member_guard_request_started = min(
+                            getattr(self, "_member_guard_request_started", now), now - started_age / 1000)
+                    if now - getattr(self, "_member_guard_request_started", now) >= self.MEMBER_SESSION_PROBE_TIMEOUT_SECONDS:
+                        self._cancel_member_session_probe(page)
+            completed_id = state.get("completedId")
+            if (state.get("version") == 2 and type(completed_id) is int and completed_id > 0
+                    and completed_id != getattr(self, "_member_guard_completed_id", None)):
+                self._member_guard_completed_id = completed_id
+                completed_age = state.get("completedAgeMs")
+                if (state.get("valid") is True and state.get("unauthorized") is False
+                        and type(completed_age) in (int, float) and math.isfinite(completed_age)
+                        and 0 <= completed_age < self.MEMBER_SESSION_PROOF_MAX_AGE_SECONDS * 1000):
+                    # A result first collected after a long pause is not new
+                    # authentication proof. Transfer an AGE, never subtract
+                    # absolute timestamps from the browser and host clocks.
+                    self._member_guard_last_proof = max(
+                        getattr(self, "_member_guard_last_proof", 0.0), now - completed_age / 1000)
+                    self._member_guard_error = None
+            if now - getattr(self, "_member_guard_last_proof", now) >= self.MEMBER_SESSION_PROOF_MAX_AGE_SECONDS:
+                if not getattr(self, "_member_guard_error", None):
+                    self.log("[CGV] 회원 인증 확인이 오래 갱신되지 않았습니다 · 인증 재확인까지 신규 선점을 보류합니다.", "warning")
+                self._member_guard_error = {"ok": False, "status": 0,
+                    "error": "member-session-probe-stale", "elapsedMs": 0.0}
+        return getattr(self, "_member_guard_error", None)
+
+    def _race_schedule(self, page, url: str, concurrency: int) -> dict[str, Any]:
+        blocked = self._check_member_session_guard(page)
+        if blocked is not None:
+            return blocked
         return super()._race_schedule(page, url, concurrency)
 
     @staticmethod
@@ -619,6 +764,10 @@ class CgvEngine(GuardedCgvEngine):
         try:
             return super().make_reservation_thread(data)
         finally:
+            guard_page = getattr(self, "_member_guard_page", None)
+            if guard_page is not None:
+                self._cancel_member_session_probe(guard_page, dispose=True)
+            self._member_guard_page = None
             _MEMBER_SESSION_GUARD_ACTIVE.reset(member_guard_token)
 
     def _captured_initial_seat_ready(self) -> bool:

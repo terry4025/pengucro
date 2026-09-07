@@ -17,7 +17,6 @@ a = Analysis(
         # static analysis cannot see them.
         'engines.zeroworld_shin_engine',
         'engines.doomescape_engine',
-        'engines.zeroworld_gu_engine',
         'engines.jigubyeol_engine',
         'engines.async_hot_path',
         'engines.keyescape_engine',
@@ -103,7 +102,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='방탈출펭크로6.84_yescaptcha',
+    name='방탈출펭크로6.85_yescaptcha',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

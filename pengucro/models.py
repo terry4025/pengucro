@@ -94,6 +94,7 @@ class ReservationRequest:
     yescaptcha_client_key: str = ""
     yescaptcha_soft_id: str = "26273"
     engine_metadata: Mapping[str, Any] = field(default_factory=dict)
+    keyescape_cancel_watch: bool = False
 
     @classmethod
     def from_mapping(cls, site: str, values: Mapping[str, Any]) -> "ReservationRequest":
@@ -123,6 +124,7 @@ class ReservationRequest:
             yescaptcha_client_key=str(values.get("yescaptcha_client_key", "")).strip(),
             yescaptcha_soft_id=str(values.get("yescaptcha_soft_id", "26273")).strip() or "26273",
             engine_metadata=dict(values.get("engine_metadata", {})),
+            keyescape_cancel_watch=parse_bool_flag(values.get("keyescape_cancel_watch", False)),
         )
 
     def validate(
@@ -153,7 +155,7 @@ class ReservationRequest:
         return errors
 
     def to_engine_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "branch": self.branch,
             "reservationDate": self.reservation_date,
             "name": self.name,
@@ -178,6 +180,10 @@ class ReservationRequest:
             "yescaptcha_soft_id": self.yescaptcha_soft_id,
             "engine_metadata": dict(self.engine_metadata),
         }
+        if self.keyescape_cancel_watch:
+            payload["keyescape_cancel_watch"] = True
+            payload["keyescape_cancel_watch_seconds"] = 600
+        return payload
 
     def summary(self) -> str:
         return (
@@ -197,5 +203,9 @@ class ReservationRequest:
                     if self.site == "네이버 예약"
                     else "실제 예약 제출"
                 )
+            )
+            + (
+                "\n취소표 대기: 1페이지 · 준비 후 최대 10분 · 예약 가능 슬롯 확인 후 시도"
+                if self.keyescape_cancel_watch else ""
             )
         )

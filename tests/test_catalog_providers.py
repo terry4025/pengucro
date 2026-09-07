@@ -9,7 +9,6 @@ from engines.catalog_providers import (
     KeyescapeProvider,
     NaverProvider,
     SinbiWorldProvider,
-    ZeroWorldLaravelProvider,
     analyze_booking_site,
     catalog_to_site_config,
     detect_engine,
@@ -134,6 +133,24 @@ def test_legacy_custom_site_gets_stable_engine_and_catalog_ids():
     assert engine_id_for_legacy_style("zeroworld") == "zeroworld_laravel"
 
 
+def test_retired_zeroworld_is_not_advertised_or_reassigned_during_migration():
+    providers = provider_module.default_providers()
+    assert "zeroworld_laravel" not in providers
+    assert "zeroworld_gu" not in providers
+    assert "sinbiworld" in providers
+    assert "jigubyeol" in providers
+    original = {
+        "구형": {"url": "https://old.example", "style": "zeroworld", "themes": {"1": {"기존 테마": "2"}}},
+        "구형 별칭": {"url": "https://old-alias.example", "engine_id": "zeroworld_gu"},
+    }
+    migrated, changed = migrate_custom_sites(original)
+    assert changed
+    assert migrated["구형"]["engine_id"] == "zeroworld_laravel"
+    assert migrated["구형"]["themes"] == original["구형"]["themes"]
+    assert "engine_id" not in original["구형"]
+    assert migrated["구형 별칭"]["engine_id"] == "zeroworld_gu"
+
+
 def test_sinbiworld_fixture_discovers_subject_branches_and_themes(monkeypatch):
     class Session:
         def __init__(self):
@@ -241,7 +258,6 @@ def test_doomescape_fixture_discovers_theme_id_from_image(monkeypatch):
     [
         (JigubyeolProvider(), "jigubyeol"),
         (NaverProvider(), "naver"),
-        (ZeroWorldLaravelProvider(), "zeroworld_laravel"),
     ],
 )
 def test_legacy_backed_provider_fixture_projects_catalog(monkeypatch, provider, engine_id):

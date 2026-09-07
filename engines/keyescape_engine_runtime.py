@@ -139,6 +139,10 @@ class KeyescapeEngine(_ObservedKeyescapeEngine):
         worker._page_count = self._page_count
         worker._page_success_event = self._page_success_event
         worker._live_slot_state = self._live_slot_state
+        worker._cancel_watch_state = self._cancel_watch_state
+        # The coordinator warms the actual page after workers are constructed.
+        # Read its current snapshot; copying the initial dict misses reassignment.
+        worker._browser_prewarm_source = self
         worker._trusted_slot_id = (
             self._trusted_slot_id if page_index == 1 else ""
         )

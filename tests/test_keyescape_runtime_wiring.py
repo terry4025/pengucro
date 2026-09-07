@@ -1,4 +1,6 @@
+import asyncio
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -71,3 +73,64 @@ def test_runtime_clock_preserves_recent_real_precise_sample(monkeypatch):
 def test_runtime_does_not_override_final_submit_or_fire_wait_loop():
     assert "_submit" not in KeyescapeEngine.__dict__
     assert "_wait_for_trusted_fire" not in KeyescapeEngine.__dict__
+
+
+def test_existing_worker_reads_later_coordinator_prewarm_and_replacements(monkeypatch):
+    engine = make_engine()
+    engine.open_at = 1000.0
+    engine.clock.last_precision = 0.0246
+    engine._live_slot_state = {"status": "pending"}
+    worker = engine._make_page_worker(1)
+    engine._page_workers = [worker]
+    monkeypatch.setattr(engine.clock, "seconds_until", lambda _target: 1.0)
+    monkeypatch.setattr(engine, "_prewarm_slot_connections", AsyncMock(return_value=2))
+
+    class Page:
+        duration = 44.9
+
+        async def evaluate(self, _script, _urls):
+            return {
+                "networkReached": True,
+                "controller": {"reached": True, "status": 200, "duration": self.duration},
+            }
+
+    page = Page()
+    assert worker._trusted_fire_server_epoch() == pytest.approx(1000.0296)
+    # Production order: construct workers first, then prewarm the coordinator.
+    asyncio.run(engine._prewarm_near_open(page))
+    assert worker._final_post_one_way_seconds() == pytest.approx(0.02245)
+    assert worker._trusted_fire_server_epoch() == pytest.approx(1000.00715)
+
+    first_snapshot = engine._browser_prewarm_metrics
+    page.duration = 10.0
+    asyncio.run(engine._prewarm_browser_connection(page))
+    assert engine._browser_prewarm_metrics is not first_snapshot
+    assert worker._final_post_one_way_seconds() == pytest.approx(0.005)
+    assert worker._trusted_fire_server_epoch() == pytest.approx(1000.0246)
+
+    engine._browser_prewarm_observed_at = time.monotonic() - 16
+    assert worker._trusted_fire_server_epoch() == pytest.approx(1000.0296)
+
+
+def test_failed_or_missing_prewarm_invalidates_worker_compensation():
+    engine = make_engine()
+    worker = engine._make_page_worker(1)
+    engine._browser_prewarm_metrics = {
+        "controller": {"reached": True, "status": 200, "duration": 44.9},
+    }
+    engine._browser_prewarm_observed_at = time.monotonic()
+
+    class FailedPage:
+        async def evaluate(self, *_args):
+            raise RuntimeError("mock browser disconnected")
+
+    assert worker._final_post_one_way_seconds() > 0
+    assert not asyncio.run(engine._prewarm_browser_connection(FailedPage()))
+    assert worker._final_post_one_way_seconds() == 0
+
+    engine._browser_prewarm_metrics = {
+        "controller": {"reached": True, "status": 200, "duration": 44.9},
+    }
+    engine._browser_prewarm_observed_at = time.monotonic()
+    assert not asyncio.run(engine._prewarm_browser_connection(None))
+    assert worker._final_post_one_way_seconds() == 0

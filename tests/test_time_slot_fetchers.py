@@ -415,6 +415,21 @@ def test_fetch_naver_slots_uses_same_weekday_template_when_date_is_closed(monkey
     assert all(slot.estimate_basis == "same_weekday" for slot in slots)
 
 
+@pytest.mark.parametrize("legacy_config", [
+    {"engine_id": "zeroworld_laravel"},
+    {"engine_id": "zeroworld_gu"},
+    {"style": "zeroworld"},
+])
+def test_retired_zeroworld_never_uses_current_site_lookup(monkeypatch, legacy_config):
+    import engines.time_slot_fetchers as tsf
+
+    lookup = MagicMock(side_effect=AssertionError("retired sites must not make a lookup"))
+    monkeypatch.setattr(tsf, "fetch_zeroworld_slots", lookup)
+    with pytest.raises(ValueError, match="지원이 종료"):
+        fetch_any_time_slots({**legacy_config, "url": "https://old.example"}, "1", "2", "2026-09-20")
+    lookup.assert_not_called()
+
+
 def test_fetch_any_time_slots_routing(monkeypatch):
     import engines.time_slot_fetchers as tsf
     

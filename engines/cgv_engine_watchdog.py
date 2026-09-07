@@ -4,7 +4,9 @@ import time
 from typing import Any, Mapping
 
 from engines.cgv_client import schedule_items
-from engines.cgv_engine_runtime import CgvEngine as RuntimeCgvEngine
+from engines.cgv_engine_runtime import (
+    CgvEngine as RuntimeCgvEngine, _MEMBER_SESSION_GUARD_ACTIVE,
+)
 from engines.cgv_schedule_observer import run_schedule_wave
 
 
@@ -272,6 +274,10 @@ class CgvEngine(RuntimeCgvEngine):
             except Exception:
                 pass
             if "/mem/login" in str(getattr(page, "url", "") or ""):
+                context = getattr(page, "context", None) or getattr(self, "_context", None)
+                if (_MEMBER_SESSION_GUARD_ACTIVE.get() and context is not None
+                        and not self.stop_event.is_set()):
+                    return self._recover_member_session(page, context)
                 self.log(
                     "[CGV] 로그인 세션이 완전히 만료되었습니다. 감시는 종료하지 않고 유지합니다. "
                     "열린 슬롯 1 Chrome에서 로그인하면 다음 조회부터 자동으로 재개됩니다.",
@@ -388,6 +394,10 @@ class CgvEngine(RuntimeCgvEngine):
         improving the common fast-response case.
         """
 
+        blocked = self._check_member_session_guard(page)
+        if blocked is not None:
+            self._update_schedule_watch_health(blocked)
+            return blocked
         self._sync_schedule_poll_interval()
         effective = self._effective_schedule_concurrency(concurrency)
         result = self._run_schedule_race_once(page, url, effective)

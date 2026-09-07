@@ -1099,11 +1099,15 @@ def fetch_any_time_slots(
     timeout: float = 8.0
 ) -> list[ZeroWorldTimeSlot]:
     engine_id = site_config.get("engine_id", "")
+    if engine_id in {"zeroworld_laravel", "zeroworld_gu"} or (
+        not engine_id and site_config.get("style") == "zeroworld"
+    ):
+        raise ValueError("구형 제로월드(Laravel) 예약 엔진은 지원이 종료되었습니다.")
     base_url = site_config.get("base_url", "") or site_config.get("url", "")
     if not base_url:
         return []
 
-    if engine_id in ("zeroworld_laravel", "zeroworld_gu", "zeroworld_shin", "sinbiworld"):
+    if engine_id in ("zeroworld_shin", "sinbiworld"):
         options = dict(site_config.get("engine_options", {}))
         if engine_id == "zeroworld_shin":
             options["estimate_unopened_same_weekday"] = True

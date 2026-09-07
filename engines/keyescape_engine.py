@@ -32,6 +32,7 @@ import asyncio
 import ctypes
 import hashlib
 import json
+import math
 import re
 import statistics
 import threading
@@ -42,6 +43,7 @@ import requests
 
 from engines import browser_session
 from engines.base_engine import BaseEngine
+from engines.async_hot_path import AsyncHotPathScheduler
 from engines.keyescape_schedule_cache import remember_slot_template
 from engines.server_clock import ServerClock
 from engines.yescaptcha_client import YesCaptchaClient, DEFAULT_SOFT_ID
@@ -228,6 +230,8 @@ class KeyescapeEngine(BaseEngine):
     # How many times the step 2 screen may be rebuilt after the site's guard
     # wipes it, before giving up and handing the window to the user.
     MAX_PAGE_RESTORES = 3
+    CANCEL_WATCH_SECONDS = 600.0
+    CANCEL_WATCH_POLL_SECONDS = 1.0
 
     def __init__(self, log_callback, success_callback=None, site_url=None):
         super().__init__(log_callback, success_callback)
@@ -314,6 +318,88 @@ class KeyescapeEngine(BaseEngine):
         self._trusted_slot_id = ""
         self._trusted_slot_sources: tuple[str, ...] = ()
         self._slot_share = None
+        self._cancel_watch_state = None
+
+    def _configure_cancel_watch(self, reservation_data):
+        self._cancel_watch_state = (
+            {"deadline": None, "next_probe": 0.0, "failures": 0,
+             "submitted": False, "terminal": False, "lock": None}
+            if coerce_bool(reservation_data.get("keyescape_cancel_watch", False)) else None
+        )
+
+    def _start_cancel_watch_deadline(self):
+        state = self._cancel_watch_state
+        if state is not None and state["deadline"] is None:
+            state["deadline"] = time.monotonic() + self.CANCEL_WATCH_SECONDS
+            self.log("[취소표 감시] 화면 준비 완료 · 지금부터 최대 10분 감시하고 실제 예약 가능 시 한 번만 제출합니다.", "info")
+
+    def _cancel_watch_finished(self):
+        state = self._cancel_watch_state
+        if state is None:
+            return False
+        if state["submitted"] or state["terminal"] or self.stop_event.is_set() or self._page_success_event.is_set():
+            return True
+        if state["deadline"] is not None and time.monotonic() >= state["deadline"]:
+            state["terminal"] = True
+            self.log("[취소표 감시] 10분 감시 시간이 종료되었습니다 · 추가 제출 없이 종료합니다.", "info")
+            return True
+        return False
+
+    async def _wait_cancel_watch(self, seconds=1.0):
+        until = time.monotonic() + max(0.0, seconds)
+        while not self._cancel_watch_finished():
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.1, remaining))
+
+    def _record_cancel_watch_error(self, exc):
+        state = self._cancel_watch_state
+        if state is None:
+            return
+        response = getattr(exc, "response", None)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status == 403:
+            state["terminal"] = True
+            self.log("[취소표 감시] 사이트 접근 거절(403) · 추가 조회/제출 없이 종료합니다.", "error")
+            return
+        state["failures"] = min(6, int(state["failures"]) + 1)
+        delay = min(30.0, 2.0 ** (state["failures"] - 1))
+        if status == 429 or 500 <= status <= 599:
+            requested = AsyncHotPathScheduler._retry_after(getattr(response, "headers", None))
+            if requested is not None and math.isfinite(requested):
+                delay = max(delay, requested)
+        state["next_probe"] = max(float(state["next_probe"]), time.monotonic() + delay)
+        self._log_throttled("cancel_watch_error",
+            f"[취소표 감시] 조회 지연/오류 (HTTP {status or '미확인'}) · {delay:.1f}초 후 확인",
+            "warning", interval=5.0)
+
+    async def _resolve_cancel_watch_slot(self, target_date, target_time, zizum_num, theme_num):
+        """Only a fresh exact-target response can authorize a cancellation attempt."""
+        state = self._cancel_watch_state
+        if state is None or self._cancel_watch_finished():
+            return "", "pending"
+        if state["lock"] is None:
+            state["lock"] = asyncio.Lock()
+        async with state["lock"]:
+            if self._cancel_watch_finished() or time.monotonic() < state["next_probe"]:
+                return "", "pending"
+            state["next_probe"] = time.monotonic() + self.CANCEL_WATCH_POLL_SECONDS
+            try:
+                slots = await self._fetch_slots(target_date, zizum_num, theme_num)
+            except Exception as exc:
+                self._record_cancel_watch_error(exc)
+                return "", "pending"
+            if self._cancel_watch_finished():
+                return "", "pending"
+            state["failures"] = 0
+            slot_id, bookable = self._match_slot(slots, target_time)
+            if not bookable or not slot_id or slot_id == self.PLACEHOLDER_SLOT_ID:
+                return "", "pending"
+            state["live_target"] = (str(target_date), str(target_time), str(zizum_num), str(theme_num))
+            state["live_slot_id"] = slot_id
+            state["live_observed_at"] = time.monotonic()
+            return slot_id, "ready"
 
     def _new_site_session(self):
         session = requests.Session()
@@ -448,11 +534,13 @@ class KeyescapeEngine(BaseEngine):
         return False
 
     def start_reservation(self, reservation_data, num_threads, is_async=False):
+        self._configure_cancel_watch(reservation_data)
         enabled, client_key, _soft_id = self.read_yescaptcha_settings(reservation_data)
         test_mode = self.read_yescaptcha_test_mode(reservation_data)
 
         requested = int(num_threads or 1)
-        self._page_count = max(1, min(requested, self.MAX_STANDBY_PAGES))
+        self._page_count = (1 if self._cancel_watch_state is not None else
+                            max(1, min(requested, self.MAX_STANDBY_PAGES)))
         self._winner_page = None
         self._page_success_event.clear()
         if requested != self._page_count:
@@ -468,11 +556,14 @@ class KeyescapeEngine(BaseEngine):
                 + ("" if client_key else " (경고: API 키가 비어 있어 수동 인증으로 진행합니다)"),
                 "info" if client_key else "warning",
             )
-        self.log(
-            f"키이스케이프 모드: 브라우저 1개에서 {self._page_count}개 페이지를 "
-            "핫 스탠바이로 준비합니다. 캡차가 준비된 모든 페이지가 오픈 시각에 동시에 제출합니다.",
-            "info",
-        )
+        if self._cancel_watch_state is not None:
+            self.log("키이스케이프 취소표 모드 · 1페이지, 초당 최대 1회 실조회, 최대 10분, 최종 제출 1회", "info")
+        else:
+            self.log(
+                f"키이스케이프 모드: 브라우저 1개에서 {self._page_count}개 페이지를 "
+                "핫 스탠바이로 준비합니다. 캡차가 준비된 모든 페이지가 오픈 시각에 동시에 제출합니다.",
+                "info",
+            )
         # One coordinator thread owns one Playwright connection and all pages.
         # Page-level concurrency happens as asyncio tasks inside that thread.
         super().start_reservation(reservation_data, num_threads=1, is_async=False)
@@ -1307,6 +1398,7 @@ class KeyescapeEngine(BaseEngine):
         worker._page_count = self._page_count
         worker._page_success_event = self._page_success_event
         worker._live_slot_state = self._live_slot_state
+        worker._cancel_watch_state = self._cancel_watch_state
         worker._trusted_slot_id = (
             self._trusted_slot_id if page_index == 1 else ""
         )
@@ -1388,6 +1480,11 @@ class KeyescapeEngine(BaseEngine):
     async def _run_browser_booking_async(self, reservation_data):
         from playwright.async_api import async_playwright
 
+        if self._cancel_watch_state is None and coerce_bool(reservation_data.get("keyescape_cancel_watch", False)):
+            self._configure_cancel_watch(reservation_data)
+        if self._cancel_watch_state is not None:
+            self._page_count = 1
+
         target_date = reservation_data['reservationDate']
         target_time = reservation_data['reservationTime'][:5]
         zizum_num = str(reservation_data['branch'])
@@ -1413,6 +1510,11 @@ class KeyescapeEngine(BaseEngine):
         self.open_at = self._resolve_open_moment(
             zizum_num, target_date, doing_days, notice_open_time
         )
+        if self._cancel_watch_state is not None and (
+            self.open_at is None or self.clock.seconds_until(self.open_at) > 0
+        ):
+            self.log("[취소표 감시] 이미 열린 날짜만 지원합니다. 미오픈/오픈 시각 미확인 날짜는 일반 예약 모드를 사용해주세요.", "warning")
+            return
 
         # --- slot id -----------------------------------------------------
         # A pre-open row is useful only for building Step 2. The final request
@@ -1445,17 +1547,21 @@ class KeyescapeEngine(BaseEngine):
                     "warning",
                 )
         except Exception as exc:
+            self._record_cancel_watch_error(exc)
             self.log(f"[경고] 시간 조회 실패: {exc}", "warning")
 
-        self._trusted_slot_id, self._trusted_slot_sources = (
-            await self._prime_trusted_slot_template(
+        if self._cancel_watch_state is not None:
+            self._trusted_slot_id, self._trusted_slot_sources = "", ()
+            if self._cancel_watch_finished():
+                return
+        else:
+            self._trusted_slot_id, self._trusted_slot_sources = await self._prime_trusted_slot_template(
                 target_date,
                 target_time,
                 zizum_num,
                 theme_num,
                 doing_days,
             )
-        )
         if self._trusted_slot_id:
             basis = (
                 "동일 시간표 2개 날짜 일치"
@@ -1469,7 +1575,7 @@ class KeyescapeEngine(BaseEngine):
                 "1번 페이지만 오픈 직후 선발사하고 나머지는 실시간 조회를 유지합니다.",
                 "success",
             )
-        else:
+        elif self._cancel_watch_state is None:
             self.log(
                 "[정보] 빠른 제출 시간표가 안전 기준을 충족하지 않아 모든 페이지를 "
                 "기존 실시간 슬롯 조회 방식으로 유지합니다.",
@@ -1546,6 +1652,7 @@ class KeyescapeEngine(BaseEngine):
                     self.log("[에러] 준비된 키이스케이프 예약 페이지가 없습니다.", "error")
                     return
                 self._page_workers = [entry[0] for entry in prepared]
+                self._start_cancel_watch_deadline()
                 self.log(
                     f"[정보] 핫 스탠바이 {len(prepared)}개 페이지 준비 완료 · "
                     "각 페이지는 독립 YesCaptcha 토큰을 사용합니다.",
@@ -2774,7 +2881,10 @@ class KeyescapeEngine(BaseEngine):
                 await asyncio.sleep(0.5)
             return
 
+        self._start_cancel_watch_deadline()
         while not self.stop_event.is_set():
+            if self._cancel_watch_finished():
+                return
             if self._browser_connection_lost:
                 return
             # -- the site wiped the page? -------------------------------
@@ -2813,7 +2923,7 @@ class KeyescapeEngine(BaseEngine):
                 self.clock.seconds_until(self.open_at)
                 if self.open_at is not None else 0.0
             )
-            if getattr(self, "_clock_sync_enabled", True) and (
+            if self._cancel_watch_state is None and getattr(self, "_clock_sync_enabled", True) and (
                 time.monotonic() - last_resync >= self.RESYNC_INTERVAL or (
                     0 < remaining <= self.FINAL_SYNC_LEAD and
                     time.monotonic() - last_resync >= 5.0
@@ -3043,9 +3153,12 @@ class KeyescapeEngine(BaseEngine):
 
             # -- the moment has arrived ----------------------------------
             use_trusted_slot = bool(
-                self._trusted_slot_id and not trusted_attempted
+                self._cancel_watch_state is None and self._trusted_slot_id and not trusted_attempted
             )
-            if use_trusted_slot:
+            if self._cancel_watch_state is not None:
+                live_slot_id, live_slot_status = await self._resolve_cancel_watch_slot(
+                    target_date, target_time, zizum_num, theme_num)
+            elif use_trusted_slot:
                 live_slot_id = self._trusted_slot_id
                 live_slot_status = "trusted"
                 self._trace_timing(
@@ -3062,6 +3175,10 @@ class KeyescapeEngine(BaseEngine):
                 await self._report_capacity_result()
                 return
             if not live_slot_id:
+                if self._cancel_watch_state is not None:
+                    self._log_throttled("cancel_watch_wait", "[취소표 감시] 정확히 일치하는 시간대의 예약 가능 응답을 기다립니다.", "info", interval=30.0)
+                    await self._wait_cancel_watch()
+                    continue
                 self._log_throttled(
                     "await_live_slot",
                     "[정보] 오픈 시각 도달 · 대상 날짜의 실제 슬롯 ID 공개를 기다립니다.",
@@ -3102,6 +3219,12 @@ class KeyescapeEngine(BaseEngine):
             # mode. A first success stops pages that have not submitted yet,
             # while requests already handed to the site finish collecting their
             # own result below.
+            if self._cancel_watch_state is not None:
+                if self._cancel_watch_finished():
+                    return
+                # One event loop and one configured page: no await between the
+                # check and claim. Even an ambiguous click consumes this attempt.
+                self._cancel_watch_state["submitted"] = True
             submit_attempts += 1
             if use_trusted_slot:
                 trusted_attempted = True
@@ -3145,6 +3268,10 @@ class KeyescapeEngine(BaseEngine):
                     "결과를 확인해주세요.",
                     "error",
                 )
+                return
+
+            if self._cancel_watch_state is not None:
+                self.log(f"[취소표 감시] 최종 제출 시도 종료 ({result}) · 자동 재제출하지 않습니다.", "warning")
                 return
 
             message = dialog_state.get("message", "")
@@ -3282,6 +3409,8 @@ class KeyescapeEngine(BaseEngine):
             if self._is_browser_connection_error(exc):
                 self._browser_connection_lost = True
             self.log(f"[경고] 최종 예약 동작 실행 실패: {exc}", "warning")
+            if self._cancel_watch_state is not None or dialog_state.get("request_started"):
+                return "submission_uncertain"
             return "retry"
 
         action = action if isinstance(action, dict) else {}
@@ -3314,8 +3443,23 @@ class KeyescapeEngine(BaseEngine):
             f", 캡차 경과 {captcha_age:.1f}초"
             if captcha_age is not None else ""
         )
+        live_state = self._live_slot_state or {}
+        watch_state = self._cancel_watch_state or {}
+        live_match = (
+            watch_state.get("live_slot_id") == slot_id and
+            (watch_state.get("live_target") or ())[:3] == (str(target_date), str(target_time), str(zizum_num))
+        ) or (
+            str(live_state.get("slot_id") or "") == slot_id and
+            str(live_state.get("target_date") or "") == str(target_date) and
+            str(live_state.get("zizum_num") or "") == str(zizum_num)
+        ) or (
+            slot_id == self._trusted_slot_id and "실시간 HTTP 검증" in self._trusted_slot_sources
+        )
+        source = ("대상 날짜 실조회" if live_match else
+                  "사전 검증 시간표" if slot_id == self._trusted_slot_id and self._trusted_slot_sources else
+                  "출처 확인 불가")
         self.log(
-            f"예약하기를 클릭합니다. (실제 슬롯 ID {slot_id}, "
+            f"예약하기를 클릭합니다. (슬롯 ID {slot_id} · {source}, "
             f"필드 {written}개 갱신{age_text})",
             "info",
         )

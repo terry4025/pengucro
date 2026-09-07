@@ -28,8 +28,16 @@ class AsyncHotPathScheduler:
     MAX_RECOVERY_DELAY_SECONDS = 2.0
     MAX_RETRY_AFTER_SECONDS = 30.0
 
-    def __init__(self, workers: int) -> None:
+    def __init__(
+        self,
+        workers: int,
+        *,
+        max_retry_after_seconds: float | None = MAX_RETRY_AFTER_SECONDS,
+    ) -> None:
         self.workers = max(1, int(workers))
+        # None lets an engine honor the full server-directed cooldown without
+        # changing the established policy of other engines using this scheduler.
+        self._max_retry_after_seconds = max_retry_after_seconds
         self._dispatch_lock: asyncio.Lock | None = None
         self._next_dispatch = 0.0
         self._blocked_until = 0.0
@@ -102,10 +110,12 @@ class AsyncHotPathScheduler:
             self.MAX_RECOVERY_DELAY_SECONDS,
             0.1 * math.pow(2.0, self._failure_streak - 1),
         )
-        requested_delay = min(
-            self.MAX_RETRY_AFTER_SECONDS,
-            max(0.0, float(requested or 0.0)),
-        )
+        requested_delay = float(requested or 0.0)
+        if not math.isfinite(requested_delay):
+            requested_delay = 0.0
+        requested_delay = max(0.0, requested_delay)
+        if self._max_retry_after_seconds is not None:
+            requested_delay = min(self._max_retry_after_seconds, requested_delay)
         delay = max(exponential, requested_delay)
         self._blocked_until = max(self._blocked_until, time.monotonic() + delay)
         return delay

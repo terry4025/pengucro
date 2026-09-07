@@ -78,6 +78,8 @@ class BaseEngine:
     previously duplicated state and made graceful shutdown unreliable.
     """
 
+    ASYNC_RETRY_AFTER_CAP_SECONDS: float | None = AsyncHotPathScheduler.MAX_RETRY_AFTER_SECONDS
+
     def __init__(
         self,
         log_callback: LogCallback,
@@ -324,7 +326,10 @@ class BaseEngine:
         self.async_submission_lock = asyncio.Lock()
         self.async_csrf_lock = asyncio.Lock()
         if getattr(self, "USE_ASYNC_HOT_PATH", False):
-            self.async_request_scheduler = AsyncHotPathScheduler(num_tasks)
+            self.async_request_scheduler = AsyncHotPathScheduler(
+                num_tasks,
+                max_retry_after_seconds=self.ASYNC_RETRY_AFTER_CAP_SECONDS,
+            )
             self.async_csrf_semaphore = asyncio.Semaphore(max(1, min(num_tasks, 8)))
             self.log(
                 f"비동기 연속 스캔 시작 · 최대 동시 요청 {num_tasks}개 · "

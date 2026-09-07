@@ -1334,6 +1334,23 @@ class ReservationForm(ctk.CTkFrame):
         self.keyescape_cache_status.grid(
             row=0, column=1, sticky="e", padx=(theme.SPACE_2, 0)
         )
+        # Explicit per-run opt-in; never stored in or restored from config.json.
+        self.keyescape_cancel_watch_var = ctk.BooleanVar(value=False)
+        self.keyescape_cancel_watch_checkbox = ctk.CTkCheckBox(
+            self.keyescape_cache_frame,
+            text="취소표 대기 (1페이지 · 최대 10분 · 이번 실행만)",
+            variable=self.keyescape_cancel_watch_var,
+            font=theme.FONT_BODY_SM,
+            fg_color=theme.ACCENT_BLUE,
+            hover_color=theme.ACCENT_BLUE,
+            text_color=theme.TEXT_MUTE,
+            checkbox_width=14,
+            checkbox_height=14,
+            corner_radius=theme.ROUNDED_SM,
+        )
+        self.keyescape_cancel_watch_checkbox.grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(theme.SPACE_2, 0)
+        )
         self._keyescape_cache_busy = False
         self.keyescape_cache_frame.grid_remove()
 
@@ -1663,10 +1680,8 @@ class ReservationForm(ctk.CTkFrame):
         if engine_id in {
             "jigubyeol",
             "sinbiworld",
-            "zeroworld_laravel",
-            "zeroworld_gu",
             "zeroworld_shin",
-        } or style in {"jigubyeol", "zeroworld"}:
+        } or (not engine_id and style == "jigubyeol"):
             return ZEROWORLD_JIGUBYEOL_MAX_WORKERS
         return STANDARD_MAX_WORKERS
 
@@ -1686,6 +1701,24 @@ class ReservationForm(ctk.CTkFrame):
             self.engine_mode_btn.get() != NAVER_MODE
             and self._site_uses_keyescape()
         )
+
+    def keyescape_cancel_watch_enabled(self) -> bool:
+        checkbox = getattr(self, "keyescape_cancel_watch_checkbox", None)
+        return bool(
+            checkbox is not None
+            and self.engine_mode_btn.get() == STANDARD_MODE
+            and self._keyescape_ui_active()
+            and checkbox.get()
+        )
+
+    def _update_keyescape_cancel_watch_state(self) -> None:
+        checkbox = getattr(self, "keyescape_cancel_watch_checkbox", None)
+        if checkbox is None:
+            return
+        active = self.engine_mode_btn.get() == STANDARD_MODE and self._keyescape_ui_active()
+        if not active:
+            checkbox.deselect()
+        checkbox.configure(state="normal" if active else "disabled")
 
     def _remember_active_thread_value(self) -> None:
         """Save the slider under the policy that owned it before a mode change."""
@@ -1870,6 +1903,7 @@ class ReservationForm(ctk.CTkFrame):
         is_tripcom = (self.engine_mode_btn.get() == TRIPCOM_MODE)
         is_cgv = self._site_uses_cgv() and not is_naver and not is_tripcom
         keyescape_active = self._keyescape_ui_active()
+        ReservationForm._update_keyescape_cancel_watch_state(self)
         yescaptcha_on = (
             keyescape_active and bool(self.yescaptcha_enabled_var.get())
         )
@@ -2019,6 +2053,13 @@ class ReservationForm(ctk.CTkFrame):
     def set_running_state(self, running: bool):
         self._booking_running = running
         state = "disabled" if running else "normal"
+        cancel_watch = getattr(self, "keyescape_cancel_watch_checkbox", None)
+        if cancel_watch is not None:
+            cancel_watch.configure(state=state)
+            if running:
+                # MainWindow has already captured the confirmed request payload.
+                # Consume this opt-in so the next booking returns to normal mode.
+                cancel_watch.deselect()
         widgets = (
             self.branch_dropdown,
             self.cgv_selector_button,
@@ -2066,6 +2107,10 @@ class ReservationForm(ctk.CTkFrame):
     def set_site(self, site_name):
         was_initializing = getattr(self, "_is_initializing", False)
         self._is_initializing = True
+        if site_name != getattr(self, "current_site", None):
+            cancel_watch = getattr(self, "keyescape_cancel_watch_checkbox", None)
+            if cancel_watch is not None:
+                cancel_watch.deselect()
         self.current_site = site_name
         if site_name in self.custom_sites:
             self.config = self.custom_sites[site_name]
@@ -2584,6 +2629,7 @@ class ReservationForm(ctk.CTkFrame):
             # prevents a stale variable value from suppressing a real booking
             # after the user visibly turned developer mode off.
             "devMode": self.developer_mode_enabled(),
+            "keyescape_cancel_watch": ReservationForm.keyescape_cancel_watch_enabled(self),
             "site_url": self.config.get("url", ""),
             "yescaptcha_enabled": yescaptcha_enabled,
             "yescaptcha_test_mode": (
@@ -2703,7 +2749,7 @@ class ReservationForm(ctk.CTkFrame):
             threads = 1
         elif keyescape_active:
             threads = int(self.threads_slider.get())
-            threads = max(1, min(threads, 3))
+            threads = 1 if request.keyescape_cancel_watch else max(1, min(threads, 3))
         elif is_cgv:
             slider = getattr(self, "threads_slider", None)
             threads = max(1, min(int(slider.get() if slider else CGV_MAX_WORKERS), CGV_MAX_WORKERS))

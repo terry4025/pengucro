@@ -8,7 +8,6 @@ from engines.dpsnnn_engine import DpsnnnEngine
 from engines.jigubyeol_engine import JigubyeolEngine
 from engines.keyescape_engine_runtime import KeyescapeEngine
 from engines.naver_engine import NaverEngine
-from engines.zeroworld_gu_engine import ZeroWorldGuEngine
 from engines.zeroworld_shin_engine import ZeroWorldShinEngine
 from pengucro.models import NAVER_MODE, TRIPCOM_MODE
 
@@ -80,14 +79,24 @@ class EngineRegistry:
                 engine = importlib.import_module("engines.tripcom_engine").TripComEngine(**common)
             elif engine_id == "cgv":
                 engine = CgvEngine(**common)
-            elif engine_id == "sinbiworld":
+            elif engine_id in {"sinbiworld", "zeroworld_shin"}:
                 engine = ZeroWorldShinEngine(
                     site_url=site.get("url", ""),
                     engine_options=site.get("engine_options", {}),
                     **common,
                 )
+            elif engine_id in {"zeroworld_laravel", "zeroworld_gu"} or (
+                not engine_id and style == "zeroworld"
+            ):
+                raise ValueError(
+                    "구형 제로월드(Laravel) 예약 엔진은 지원이 종료되었습니다. "
+                    "저장된 사이트 설정은 유지되며 다른 엔진으로 자동 실행하지 않습니다."
+                )
             else:
-                engine = ZeroWorldGuEngine(site_url=site.get("url", ""), **common)
+                raise ValueError(
+                    f"지원하지 않는 커스텀 예약 엔진입니다: {engine_id or style or site_name}. "
+                    "사이트 분석으로 호환 엔진을 다시 확인해주세요."
+                )
         else:
             raise ValueError(f"지원하지 않는 예약 사이트입니다: {site_name}")
 
